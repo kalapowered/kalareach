@@ -603,8 +603,25 @@ export interface RecoveryArchive {
    * name differently, as decimal text.
    */
   readonly checkpoint_generation: string | null
-  /** Where the checkpoint that holds the archive back came from. */
-  readonly checkpoint_source: 'recovery_bundle' | 'pairing' | null
+  /**
+   * The host whose report holds the archive back, or that the recovery bundle disagrees with, or
+   * that names another backup than the one the service holds. Null when the recovery bundle's own
+   * checkpoint decides, or when no host is involved.
+   */
+  readonly host: RecoveryHost | null
+}
+
+/**
+ * A host as an archive's line names it: by the name it gives people, which is its own text and is
+ * shown as text, and by the mark of its endpoint, which tells it from another host of that name.
+ */
+export interface RecoveryHost {
+  /** Sixteen hexadecimal characters in four groups of four, such as `3fa9-1c07-b2e4-77ab`. */
+  readonly mark: string
+  /** The name the host gives people. Null when it gave none, or when this device no longer lists it. */
+  readonly name: string | null
+  /** False when this device no longer lists the host. */
+  readonly listed: boolean
 }
 
 /** Where an offline copy was written, and what is in it. */
@@ -935,6 +952,12 @@ export interface HostRow {
   /** True when this application's commands go to this host now. */
   readonly in_use: boolean
   readonly name: string
+  /**
+   * What tells this host from another of the same name: sixteen hexadecimal characters in four
+   * groups of four, made by native code from the host's endpoint. It is shown beside the name and
+   * never used to name or find a host.
+   */
+  readonly mark: string
   readonly owner: boolean
   /** What this computer may do there, in words. */
   readonly authority: string

@@ -625,8 +625,8 @@ describe('pairing with a host', () => {
     act(() => {
       controls.setPairing({
         hosts: [
-          { reference: 'studio-ref', in_use: false, name: 'studio', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
-          { reference: 'box-ref', in_use: false, name: 'build box', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
+          { reference: 'studio-ref', in_use: false, name: 'studio', mark: '3fa9-1c07-b2e4-77ab', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
+          { reference: 'box-ref', in_use: false, name: 'build box', mark: '77bc-db3b-2424-b1f2', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
         ]
       })
     })
@@ -646,6 +646,7 @@ describe('pairing with a host', () => {
             reference: 'studio-ref',
             in_use: false,
             name: 'studio',
+            mark: '3fa9-1c07-b2e4-77ab',
             owner: true,
             authority: 'manage the host as an owner',
             grant_expires_at_ms: null,
@@ -658,6 +659,29 @@ describe('pairing with a host', () => {
     const list = await screen.findByTestId('paired-hosts')
     expect(list.textContent).toContain('In contact')
     expect(screen.getByTestId('host-refusal')).toHaveTextContent(/sign in to your account again/)
+  })
+
+  it('shows the mark of each paired host beside its name, so two hosts of one name are two', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    act(() => {
+      controls.setPairing({
+        hosts: [
+          { reference: 'kitchen-ref', in_use: false, name: 'kitchen-pc', mark: '3fa9-1c07-b2e4-77ab', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
+          { reference: 'kitchen-ref-2', in_use: false, name: 'kitchen-pc', mark: '77bc-db3b-2424-b1f2', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
+        ]
+      })
+    })
+    const list = await screen.findByTestId('paired-hosts')
+    const marks = within(list).getAllByTestId('host-mark')
+    expect(marks.map((each) => each.textContent)).toEqual([
+      'Mark 3fa9-1c07-b2e4-77ab',
+      'Mark 77bc-db3b-2424-b1f2'
+    ])
+    // The mark is four groups, so that a narrow line breaks between them and never inside one.
+    for (const each of marks) {
+      expect([...each.querySelectorAll('.host-mark-group')].map((group) => group.textContent)).toHaveLength(4)
+    }
   })
 
   it('reads the state once it is listening, so a change while it registers is not lost', async () => {

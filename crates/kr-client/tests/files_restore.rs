@@ -2981,9 +2981,9 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     );
     assert_eq!(
         error.to_string(),
-        "the checkpoint a host this device paired with gave refuses that generation. The service \
+        "the checkpoint a host this device paired with reported refuses that generation. The service \
          offered backup generation 3. It is older than generation 5, the newest that a host this \
-         device paired with named when this device asked, so it is not being restored. No \
+         device paired with reported when this device asked, so it is not being restored. No \
          restore can show that the service is not holding a newer backup back."
     );
     assert_eq!(source.object_reads(), 0, "a replay costs no download");
@@ -3008,7 +3008,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     ));
     assert!(
         error.to_string().starts_with(
-            "the checkpoint a host this device paired with gave refuses that generation. "
+            "the checkpoint a host this device paired with reported refuses that generation. "
         ),
         "{error}"
     );
@@ -3744,7 +3744,7 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
     ));
     assert_eq!(
         error.to_string(),
-        "neither the recovery bundle nor a host this device paired with gives a checkpoint for \
+        "neither the recovery bundle nor a host this device paired with reports a checkpoint for \
          that archive, so there is none to accept an older generation past"
     );
 
@@ -3794,7 +3794,7 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     assert_eq!(
         RestoreError::named_generation_not_held(3, 5, pairing).to_string(),
         "generation 3 was named to be accepted past the checkpoint a host this device paired with \
-         gave, and the service holds generation 5, which needs no such word"
+         reported, and the service holds generation 5, which needs no such word"
     );
     assert_eq!(
         RestoreError::no_checkpoint_to_accept_past(false).to_string(),
@@ -3803,7 +3803,7 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     );
     assert_eq!(
         RestoreError::no_checkpoint_to_accept_past(true).to_string(),
-        "neither the recovery bundle nor a host this device paired with gives a checkpoint for that \
+        "neither the recovery bundle nor a host this device paired with reports a checkpoint for that \
          archive, so there is none to accept an older generation past"
     );
 
@@ -3836,9 +3836,9 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     );
     assert_eq!(
         refusal(pairing),
-        "the checkpoint a host this device paired with gave refuses that generation. The service \
+        "the checkpoint a host this device paired with reported refuses that generation. The service \
          offered backup generation 3. It is older than generation 5, the newest that a host this \
-         device paired with named when this device asked, so it is not being restored. No \
+         device paired with reported when this device asked, so it is not being restored. No \
          restore can show that the service is not holding a newer backup back."
     );
     // The words say whose kind of checkpoint it is and never which host: two hosts read alike, so

@@ -22,7 +22,7 @@ use kr_protocol::scalars::EndpointKey;
 pub enum CheckpointSource {
     /// The latest generation the owner's recovery bundle verified.
     RecoveryBundle,
-    /// The newest generation a host this device paired with named when this device asked, and the
+    /// The newest generation a host this device paired with reported when this device asked, and the
     /// endpoint of that host.
     Pairing(EndpointKey),
 }
@@ -236,7 +236,7 @@ impl RestoreGeneration {
         let pairing = matches!(self.source, Some(CheckpointSource::Pairing(_)));
         let standing = match self.standing {
             GenerationStanding::AtCheckpoint if pairing => {
-                "It is the generation a host this device paired with named when this device \
+                "It is the generation a host this device paired with reported when this device \
                  asked."
                     .to_owned()
             }
@@ -245,7 +245,7 @@ impl RestoreGeneration {
             }
             GenerationStanding::Ahead { checkpoint } if pairing => format!(
                 "It is newer than generation {}, the newest that a host this device paired with \
-                 named when this device asked.",
+                 reported when this device asked.",
                 checkpoint.get()
             ),
             GenerationStanding::Ahead { checkpoint } => format!(
@@ -254,7 +254,7 @@ impl RestoreGeneration {
             ),
             GenerationStanding::Replayed { checkpoint } if pairing => format!(
                 "It is older than generation {}, the newest that a host this device paired with \
-                 named when this device asked, so it is not being restored.",
+                 reported when this device asked, so it is not being restored.",
                 checkpoint.get()
             ),
             GenerationStanding::Replayed { checkpoint } => format!(
@@ -264,7 +264,7 @@ impl RestoreGeneration {
             ),
             GenerationStanding::Substituted { checkpoint } if pairing => format!(
                 "It claims generation {} but is not the archive a host this device paired with \
-                 named when this device asked, so it is not being restored.",
+                 reported when this device asked, so it is not being restored.",
                 checkpoint.get()
             ),
             GenerationStanding::Substituted { checkpoint } => format!(
@@ -279,7 +279,7 @@ impl RestoreGeneration {
             }
             GenerationStanding::OlderAccepted { checkpoint } if pairing => format!(
                 "It is older than generation {}, the newest that a host this device paired with \
-                 named when this device asked, and it is being restored because that generation \
+                 reported when this device asked, and it is being restored because that generation \
                  was named.",
                 checkpoint.get()
             ),

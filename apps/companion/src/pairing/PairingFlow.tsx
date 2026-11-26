@@ -23,6 +23,7 @@ import {
   type RefObject
 } from 'react'
 
+import { HostMark } from '../components/HostMark'
 import { sayingAddresses, ServiceAddress, spokenAddress } from '../components/ServiceAddress'
 import { TechnicalWord } from '../components/TechnicalWord'
 import { Button, Card, Switch } from '../components/ui'
@@ -961,6 +962,9 @@ function PairedHosts({
                 {host.owner
                   ? 'Owner'
                   : `Can ${host.authority}${until(host.grant_expires_at_ms)}`}
+              </p>
+              <p className="small muted" data-testid="host-mark">
+                Mark <HostMark mark={host.mark} />
               </p>
               {host.refusal === undefined ? null : (
                 <p className="small" data-testid="host-refusal">

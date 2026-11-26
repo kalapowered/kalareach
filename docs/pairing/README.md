@@ -434,3 +434,47 @@ transfer, and it names the action that will spend it, since that action decides 
 identity. Finally, the evidence that acceptance produces is bound to the host it was accepted for,
 the boot it was accepted in and the ceremony's monotonic deadline, and the transfer checks all
 three.
+
+## Whose checkpoint a paired host's backup counts for
+
+A paired host's checkpoint counts only for an archive that the host itself produces. A publication
+names the key of the host that made it, and the writer signs that name; the device keeps each
+checkpoint with the host's endpoint and that key, and applies it only to a publication that names
+the same key. A host proves that it holds the key each time it answers: the device sends a fresh
+challenge and a fresh key, and the host returns a box, sealed with its own key, that holds the
+challenge, the host's own endpoint and the checkpoint. A device that cannot open the box, or finds
+another challenge, endpoint or checkpoint in it, takes no answer and the pairing stays owed. A
+checkpoint stays when the host is forgotten, because it protects that host's own archive; forgetting
+a host changes no floor, and no checkpoint is ever lowered.
+
+When a host's checkpoint holds an archive back, the companion says which host it was by data, never
+by a sentence that holds the host's name. The line names the host by the name it gives people and by
+its mark: the first 8 bytes of SHA-256 over `kalareach host mark` and the host's 32 endpoint bytes,
+as 16 hexadecimal characters in four groups (`3fa9-1c07-b2e4-77ab`). The mark comes from the
+endpoint alone, so two hosts of one name have two marks and a rename leaves the mark as it is; a
+person compares it with the mark on the pairing screen, and nothing uses it to authorise, match or
+find a host. A host that the device no longer lists is shown by its mark alone, and its checkpoint
+still holds. No host shows its own mark.
+
+What this does not stop:
+
+- **A host that is wrong about its own archive.** A host that names a generation it never published,
+  or one that the service dropped, holds that archive back for ever, because no product path lowers
+  a checkpoint. `kr backup restore` on a host computer restores under the recovery bundle's own
+  record only and does not use what a host reported; with `--accept-older N` it restores that one
+  older generation.
+- **A host that works with the service and holds a writer the kit trusts.** It can serve its own
+  signed publication for another host's archive, naming no producer, so no entry counts for it. The
+  floor stops a replay, not authorship.
+- **An archive whose producer this device never paired with as an owner**: a viewer pairing, a host
+  paired only from another device, an unpaired host. The recovery bundle's floor alone applies, with
+  no fall-back.
+- **A host whose stored-envelope secret left it**, such as a copied store or a hostile
+  administrator: two endpoints can prove one secret only then. Nothing is built for it.
+- **A full file.** At 1,024 entries, or 16 for one host, a new answer is not kept and only a log
+  line says so; a host that no longer exists keeps its 16 entries for ever, which take room only.
+- **Freshness.** The entries say what this device learned, not that the service holds nothing newer.
+- **One producer for the life of an archive.** Each setup draws a new archive identifier and keys
+  never change in this level; a later change that continues an archive under another producer must
+  go back to this rule. A re-installed host has new keys, and its earlier archive keeps its earlier
+  entry.

@@ -653,7 +653,7 @@ impl RestoreError {
             checkpoint_words: match source {
                 CheckpointSource::RecoveryBundle => Shown::said("the bundle's checkpoint"),
                 CheckpointSource::Pairing(_) => {
-                    Shown::said("the checkpoint a host this device paired with gave")
+                    Shown::said("the checkpoint a host this device paired with reported")
                 }
             },
         }
@@ -667,7 +667,7 @@ impl RestoreError {
             pairing_consulted,
             none_words: if pairing_consulted {
                 Shown::said(
-                    "neither the recovery bundle nor a host this device paired with gives a \
+                    "neither the recovery bundle nor a host this device paired with reports a \
                      checkpoint for that archive",
                 )
             } else {

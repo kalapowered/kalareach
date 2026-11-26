@@ -6816,9 +6816,12 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
 
     // A host gave a checkpoint at generation 2, written as the companion's own store writes it. An
     // owner pairing that no list of hosts holds raises the entry and settles no pairing.
-    let host_keys = kr_crypto::keys::DeviceKeys::generate()
+    let mut host_keys = kr_crypto::keys::DeviceKeys::generate()
         .expect("keys")
         .public_keys();
+    // The key the host's archive names as its producer, and an endpoint of a fixed value.
+    host_keys.stored_envelope = host.keys.producer_public_key;
+    host_keys.transport = kr_protocol::scalars::EndpointKey::from_bytes([0x44; 32]);
     let folder = computer
         .data
         .path()
@@ -6870,7 +6873,7 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
         .expect("the archives");
     assert_eq!(listed[0]["withheld"], "nothing");
     assert_eq!(listed[0]["held_generation"], Value::Null);
-    assert_eq!(listed[0]["checkpoint_source"], Value::Null);
+    assert_eq!(listed[0]["host"], Value::Null);
 
     // It then holds generation 1, which is older than the host's 2.
     publish_generation(
@@ -6889,7 +6892,11 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     assert_eq!(listed[0]["generation"], Value::Null);
     assert_eq!(listed[0]["held_generation"], "1");
     assert_eq!(listed[0]["checkpoint_generation"], "2");
-    assert_eq!(listed[0]["checkpoint_source"], "pairing");
+    // No list of hosts holds the host: it has its mark and no name.
+    assert_eq!(
+        listed[0]["host"],
+        json!({ "mark": "1770-0074-af42-b5c0", "name": null, "listed": false })
+    );
     let archive_path = out.path().join("held-back.krexport");
     page.dialog_returns(&archive_path);
     let held_back = page
@@ -6901,8 +6908,10 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     assert_eq!(held_back["code"], "PERMISSION_DENIED");
     assert_eq!(
         held_back["message"],
-        "the service holds generation 1 of that archive, older than generation 2 that a host this \
-         device paired with named when this device asked"
+        "the checkpoint a host this device paired with reported refuses that generation. The \
+         service offered backup generation 1. It is older than generation 2, the newest that a \
+         host this device paired with reported when this device asked, so it is not being \
+         restored. No restore can show that the service is not holding a newer backup back."
     );
     assert!(!archive_path.exists());
 
@@ -6942,6 +6951,300 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     )
     .expect("the bundle alone is exported without reading the checkpoints");
     assert!(bundle_path.exists());
+}
+
+/// An owner pairing of a host, made with `producer`, the key its archives name as their producer, so
+/// that a checkpoint it settles holds those archives back. The endpoint and the device identifier
+/// come from the two seeds, so that a case makes two pairings that differ in one of them.
+fn an_owner_of(
+    producer: kr_protocol::scalars::StoredEnvelopeKey,
+    endpoint: u8,
+    device: u8,
+    name: Option<&str>,
+) -> kr_client::pairing::paired::PairedHost {
+    use kr_client::pairing::paired::PairedHost;
+    use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{DeviceId, DeviceKeyRevision, GrantId};
+    use kr_protocol::pairing::{NetworkConfig, ProposedGrant};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, EndpointKey, Nullable, Uuid};
+
+    let mut host_keys = kr_crypto::keys::DeviceKeys::generate()
+        .expect("keys")
+        .public_keys();
+    host_keys.transport = EndpointKey::from_bytes([endpoint; 32]);
+    host_keys.stored_envelope = producer;
+    PairedHost {
+        host_device_id: DeviceId::new(Uuid::from_bytes([device; 16])),
+        host_key_revision: DeviceKeyRevision::new(1),
+        host_endpoint_id: host_keys.transport,
+        host_keys,
+        network_config: NetworkConfig::empty(),
+        device_id: DeviceId::new(Uuid::from_bytes([0x41; 16])),
+        grant_id: GrantId::new(Uuid::from_bytes([0x46; 16])),
+        proposed_grant: ProposedGrant {
+            parent_grant_id: Nullable::null(),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [ActionRight::HostManage]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: true,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        },
+        name: name.map(str::to_owned),
+        paired_at_ms: 1_764_000_000_000,
+        device_key_revision: DeviceKeyRevision::new(1),
+    }
+}
+
+/// The checkpoint a host answers with for `archive` at the service of `computer`.
+fn a_checkpoint_at(
+    computer: &Computer,
+    archive: kr_protocol::ids::ArchiveId,
+    generation: u64,
+) -> kr_client::pairing::checkpoint::Answer {
+    kr_client::pairing::checkpoint::Answer::Checkpoint(
+        kr_protocol::backup_checkpoint::HostCheckpoint {
+            service_origin: computer.origin(),
+            archive_id: archive,
+            backup_generation: kr_protocol::ids::BackupGeneration::new(generation),
+            encrypted_manifest_hash: kr_protocol::scalars::Digest256::from_bytes([0xcd; 32]),
+        },
+    )
+}
+
+/// KR-REQ-20.12: the page is told which host holds an archive back as data: the name the host gives
+/// people, whether the list of hosts still holds it, and the mark of its endpoint, which equals a
+/// fixed value, stays when the host is renamed, and stays when it is forgotten and its entry holds
+/// on. A name is the host's own text and reaches the page as it is. A generation above the page's
+/// exact numbers is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_view_of_an_archive_held_back_names_the_host_by_data_and_mark() {
+    use kr_client::pairing::paired::PairedHosts;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
+    host.sets_up();
+    page.cover_host(&host, false).expect("the host is covered");
+    let archive = host.setups_sent()[0].0.archive_id;
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+    let folder = computer
+        .data
+        .path()
+        .join(companion_tauri::device::HOSTS_DIRECTORY);
+    let hosts = PairedHosts::open(&folder).expect("a list of hosts");
+    let kitchen = an_owner_of(
+        host.keys.producer_public_key,
+        0x42,
+        0x40,
+        Some("kitchen-pc"),
+    );
+    hosts
+        .record(kitchen.clone())
+        .expect("the pairing is listed");
+    hosts
+        .checkpoints()
+        .settle_checkpoint(&kitchen, &a_checkpoint_at(&computer, archive, 2), 3_000)
+        .expect("the host's checkpoint settles");
+    publish_generation(
+        &computer,
+        &seed,
+        &host,
+        archive,
+        &[("host/configuration.json", b"{\"revision\":1}".to_vec())],
+    )
+    .await;
+    let host_of = || {
+        let listed = page
+            .call("recovery_archives", json!({}))
+            .expect("the archives");
+        assert_eq!(listed[0]["withheld"], "held_back");
+        listed[0]["host"].clone()
+    };
+
+    // A listed host with a name: the name as data, the mark of its endpoint.
+    assert_eq!(
+        host_of(),
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": "kitchen-pc", "listed": true })
+    );
+
+    // A rename changes the name and not the mark.
+    hosts
+        .record(an_owner_of(
+            host.keys.producer_public_key,
+            0x42,
+            0x40,
+            Some("galley-pc"),
+        ))
+        .expect("the pairing is renamed");
+    assert_eq!(
+        host_of(),
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": "galley-pc", "listed": true })
+    );
+
+    // A host that gave no name is listed and has no name.
+    hosts
+        .record(an_owner_of(host.keys.producer_public_key, 0x42, 0x40, None))
+        .expect("the pairing is unnamed");
+    assert_eq!(
+        host_of(),
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": null, "listed": true })
+    );
+
+    // A name is text: markup, quotes, a mark's look and a right-to-left override reach the page as
+    // they are.
+    let hostile = "<img src=x onerror=alert(1)> & \"quoted\" \u{202e}0000-0000-0000-0000 forget";
+    hosts
+        .record(an_owner_of(
+            host.keys.producer_public_key,
+            0x42,
+            0x40,
+            Some(hostile),
+        ))
+        .expect("the pairing is renamed");
+    assert_eq!(
+        host_of(),
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": hostile, "listed": true })
+    );
+
+    // A host that is forgotten is not listed, has its mark and no name, and its entry holds on, at
+    // a generation the page's numbers cannot hold.
+    hosts
+        .forget(kitchen.host_device_id)
+        .expect("the host is forgotten");
+    hosts
+        .checkpoints()
+        .settle_checkpoint(
+            &kitchen,
+            &a_checkpoint_at(&computer, archive, u64::MAX),
+            4_000,
+        )
+        .expect_err("no list of hosts holds the pairing, so it settles none");
+    let listed = page
+        .call("recovery_archives", json!({}))
+        .expect("the archives");
+    assert_eq!(listed[0]["withheld"], "held_back");
+    assert_eq!(listed[0]["held_generation"], "1");
+    assert_eq!(listed[0]["checkpoint_generation"], "18446744073709551615");
+    assert_eq!(
+        listed[0]["host"],
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": null, "listed": false })
+    );
+}
+
+/// KR-REQ-20.12: two hosts that give one name show two marks, and the host the view names is the one
+/// that holds the archive back, not the first the list holds: the mark follows the endpoint, never
+/// the name or the declared device identifier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_hosts_with_one_name_show_two_marks_and_the_one_that_holds_is_named() {
+    use kr_client::pairing::paired::PairedHosts;
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
+    host.sets_up();
+    page.cover_host(&host, false).expect("the host is covered");
+    let archive = host.setups_sent()[0].0.archive_id;
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+    let folder = computer
+        .data
+        .path()
+        .join(companion_tauri::device::HOSTS_DIRECTORY);
+    let hosts = PairedHosts::open(&folder).expect("a list of hosts");
+    // Two pairings of one name, the first of them listed first. They name one producer, which two
+    // endpoints do only in a test: it makes the view choose between two holders.
+    let first = an_owner_of(
+        host.keys.producer_public_key,
+        0x42,
+        0x40,
+        Some("kitchen-pc"),
+    );
+    let second = an_owner_of(
+        host.keys.producer_public_key,
+        0x43,
+        0x50,
+        Some("kitchen-pc"),
+    );
+    hosts.record(first.clone()).expect("the first is listed");
+    hosts.record(second.clone()).expect("the second is listed");
+    let checkpoints = hosts.checkpoints();
+    checkpoints
+        .settle_checkpoint(&first, &a_checkpoint_at(&computer, archive, 2), 3_000)
+        .expect("the first host's checkpoint settles");
+    checkpoints
+        .settle_checkpoint(&second, &a_checkpoint_at(&computer, archive, 3), 3_100)
+        .expect("the second host's checkpoint settles");
+    publish_generation(
+        &computer,
+        &seed,
+        &host,
+        archive,
+        &[("host/configuration.json", b"{\"revision\":1}".to_vec())],
+    )
+    .await;
+    let listed = || {
+        page.call("recovery_archives", json!({}))
+            .expect("the archives")
+    };
+
+    // The second host reports the higher generation, so it holds the archive back and is named,
+    // though the first host is listed first.
+    let view = listed();
+    assert_eq!(view[0]["checkpoint_generation"], "3");
+    assert_eq!(
+        view[0]["host"],
+        json!({ "mark": "77bc-db3b-2424-b1f2", "name": "kitchen-pc", "listed": true })
+    );
+
+    // The first host then reports the higher one: the same name, the other mark.
+    checkpoints
+        .settle_checkpoint(&first, &a_checkpoint_at(&computer, archive, 4), 3_200)
+        .expect("the first host's checkpoint is raised");
+    let view = listed();
+    assert_eq!(view[0]["checkpoint_generation"], "4");
+    assert_eq!(
+        view[0]["host"],
+        json!({ "mark": "4885-5ba2-e7cf-e3f2", "name": "kitchen-pc", "listed": true })
+    );
+}
+
+/// KR-REQ-20.12: the pairing row carries the mark of the host's endpoint, and only of that: two
+/// records that declare one device identifier and name, at two endpoints, have two marks; a rename
+/// and a change of the declared identifier leave the mark as it is.
+#[test]
+fn the_pairing_row_carries_the_mark_of_the_hosts_endpoint_and_nothing_else() {
+    let producer = *kr_crypto::keys::StoredEnvelopeKeyPair::generate()
+        .expect("a key")
+        .public();
+    let mark_of_row = |host: &kr_client::pairing::paired::PairedHost| {
+        serde_json::to_value(companion_tauri::device::HostRow::of(host, false, None))
+            .expect("the row as the page receives it")["mark"]
+            .clone()
+    };
+    let first = an_owner_of(producer, 0x42, 0x40, Some("kitchen-pc"));
+    let second = an_owner_of(producer, 0x43, 0x40, Some("kitchen-pc"));
+    assert_eq!(first.host_device_id, second.host_device_id);
+    assert_eq!(mark_of_row(&first), "4885-5ba2-e7cf-e3f2");
+    assert_eq!(mark_of_row(&second), "77bc-db3b-2424-b1f2");
+
+    let renamed = an_owner_of(producer, 0x42, 0x40, Some("galley-pc"));
+    let unnamed = an_owner_of(producer, 0x42, 0x50, None);
+    assert_eq!(mark_of_row(&renamed), mark_of_row(&first));
+    assert_eq!(mark_of_row(&unnamed), mark_of_row(&first));
 }
 
 /// KR-REQ-20.12: each reason the checkpoints a paired host gave cannot be used is told to the page in

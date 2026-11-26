@@ -40,12 +40,19 @@ const STUDIO: HostRow = {
   reference: 'studio-reference',
   in_use: true,
   name: 'studio',
+  mark: '3fa9-1c07-b2e4-77ab',
   owner: false,
   authority: 'view sessions',
   grant_expires_at_ms: null,
   in_contact: null
 }
-const LAPTOP: HostRow = { ...STUDIO, reference: 'laptop-reference', in_use: false, name: 'laptop' }
+const LAPTOP: HostRow = {
+  ...STUDIO,
+  reference: 'laptop-reference',
+  in_use: false,
+  name: 'laptop',
+  mark: '77bc-db3b-2424-b1f2'
+}
 
 const REFUSAL: HostError = receivedFailure({
   code: 'PERMISSION_DENIED',

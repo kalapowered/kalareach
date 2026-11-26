@@ -25,6 +25,7 @@ const STUDIO: HostRow = {
   reference: 'studio-reference',
   in_use: false,
   name: 'studio',
+  mark: '3fa9-1c07-b2e4-77ab',
   owner: false,
   authority: 'view sessions',
   grant_expires_at_ms: null,

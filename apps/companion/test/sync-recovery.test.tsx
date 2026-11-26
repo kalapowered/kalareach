@@ -15,8 +15,10 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
-import type { RecoveryArchive, RecoveryView } from '../src/host/port'
+import type { RecoveryArchive, RecoveryHost, RecoveryView } from '../src/host/port'
 import { MobileApp } from '../src/mobile/MobileApp'
+import * as recoveryWords from '../src/model/recovery'
+import { describeArchive, describeRestoreCommand } from '../src/model/recovery'
 import { PURCHASE_WORDS } from './purchase-words'
 import { readAloud, shown } from './live-regions'
 import { technicalWordText } from './technical-word-text'
@@ -100,6 +102,105 @@ describe('the sync service setting', () => {
     expect(within(account).queryByTestId('recovery')).toBeNull()
   })
 })
+
+/* ---- The host that holds an archive back, in the words the page says of it ------------------------ */
+
+/** The mark a host of these cases has. */
+const MARK = '3fa9-1c07-b2e4-77ab'
+
+/** The three forms a host has in a sentence: named, listed with no name, and no longer listed. */
+const HOST_FORMS: readonly {
+  readonly label: string
+  readonly host: RecoveryHost
+  /** The host as a clause names it, with its mark. */
+  readonly who: string
+  /** The host as the command's sentence points at it. */
+  readonly short: string
+  /** The sentence that sends the person to the host. */
+  readonly look: string
+}[] = [
+  {
+    label: 'a named host',
+    host: { mark: MARK, name: 'kitchen-pc', listed: true },
+    who: `kitchen-pc (mark ${MARK})`,
+    short: 'kitchen-pc',
+    look: 'Look at the backup status on kitchen-pc first.'
+  },
+  {
+    label: 'a host that gave no name',
+    host: { mark: MARK, name: null, listed: true },
+    who: `your host (mark ${MARK})`,
+    short: 'your host',
+    look: 'Look at the backup status on your host first.'
+  },
+  {
+    label: 'a host this device no longer lists',
+    host: { mark: MARK, name: null, listed: false },
+    who: `a host that this device no longer lists (mark ${MARK})`,
+    short: 'that host',
+    look: "Look at that host's own backup status first."
+  }
+]
+
+/** A report that holds a generation back: the service offers 3 and the host reported 9. */
+const HELD_BACK = (who: string, look: string): string =>
+  `Archive 0a1b2c3d: the service offers generation 3, but ${who} reported generation 9 of this archive when this device asked, so generation 3 is not offered. Either the service does not show the newest backup, or ${who} reported a generation that it did not publish. ${look}`
+
+/** A host's report and the recovery bundle name different backups for one generation. */
+const DISAGREE = (who: string, look: string): string =>
+  `Archive 0a1b2c3d: ${who} and the recovery bundle name different backups for generation 9, so generation 9 is not offered. ${look}`
+
+/** The service offers a generation for which the host reported another backup. */
+const ANOTHER_BACKUP = (who: string, look: string): string =>
+  `Archive 0a1b2c3d: the service offers generation 9, but ${who} reported another backup as generation 9 when this device asked, so it is not offered. ${look}`
+
+/** The way that exists under each of those sentences. */
+const THE_WAY = (short: string): string =>
+  `On a host computer, kr backup restore restores under the recovery bundle's own record only, and it does not use what ${short} reported. It checks the publication's writer and signature, the hashes of the manifest and of every object, and the bundle's record; with --accept-older N it restores that one older generation. When you confirm its plan it writes the files, then records the generation it restored in the bundle.`
+
+/** An archive the service offers no generation of, for the reason given in `fields`. */
+function withheldArchive(suffix: string, fields: Partial<RecoveryArchive>): RecoveryArchive {
+  return {
+    archive_id: `0a1b2c3d-0000-4000-8000-0000000000${suffix}`,
+    generation: null,
+    published_at_ms: null,
+    withheld: 'nothing',
+    held_generation: null,
+    checkpoint_generation: null,
+    host: null,
+    ...fields
+  }
+}
+
+/** The line the list says of the archive that `suffix` names, as the text a person reads. */
+function lineOf(recovery: HTMLElement, suffix: string): string | null {
+  const copy = within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-0000000000${suffix}`)
+  return copy.closest('li')?.querySelector('.account-lead')?.textContent ?? null
+}
+
+/** The way beneath that archive's line, or null when it has none. */
+function wayOf(recovery: HTMLElement, suffix: string): string | null {
+  return (
+    within(recovery).queryByTestId(`recovery-way-0a1b2c3d-0000-4000-8000-0000000000${suffix}`)
+      ?.textContent ?? null
+  )
+}
+
+/** What the recovery page's sentences must not say. */
+const BANNED_WORDS: readonly RegExp[] = [
+  /two claimants/i,
+  /second host/i,
+  /same backup/i,
+  /forg(et|ot)/i,
+  /has lost/i
+]
+
+/** The banned words a sentence holds, with each host name in `names` taken out first: a name is the host's own text. */
+function bannedIn(sentence: string, names: readonly string[]): string[] {
+  let rest = sentence
+  for (const name of names) rest = rest.split(name).join(' ')
+  return BANNED_WORDS.filter((pattern) => pattern.test(rest)).map(String)
+}
 
 describe('recovery', () => {
   it('turns on, then saves the kit where the dialog put it, with focus on the result each time', async () => {
@@ -440,7 +541,7 @@ describe('recovery', () => {
           withheld: null,
           held_generation: null,
           checkpoint_generation: null,
-          checkpoint_source: null
+          host: null
         },
         {
           archive_id: '0a1b2c3d-0000-4000-8000-000000000002',
@@ -449,7 +550,7 @@ describe('recovery', () => {
           withheld: 'nothing',
           held_generation: null,
           checkpoint_generation: null,
-          checkpoint_source: null
+          host: null
         }
       ])
     })
@@ -511,7 +612,7 @@ describe('recovery', () => {
           withheld: 'held_back',
           held_generation: '9007199254740992',
           checkpoint_generation: '9007199254740993',
-          checkpoint_source: 'recovery_bundle'
+          host: null
         }
       ])
     })
@@ -547,69 +648,185 @@ describe('recovery', () => {
     })
   })
 
-  it('says why the service holds back an archive, by what holds it back, and offers no copy of it', async () => {
+  it('says why the service holds back an archive when no host is the reason, and offers no copy of it', async () => {
     const { person, controls, sheet } = await openSheet()
-    const withheld = (suffix: string, fields: Partial<RecoveryArchive>): RecoveryArchive => ({
-      archive_id: `0a1b2c3d-0000-4000-8000-00000000000${suffix}`,
-      generation: null,
-      published_at_ms: null,
-      withheld: 'nothing',
-      held_generation: null,
-      checkpoint_generation: null,
-      checkpoint_source: null,
-      ...fields
-    })
     act(() => {
       controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
       controls.account.set(SIGNED_IN)
       controls.recovery.setArchives([
-        withheld('1', {
-          withheld: 'held_back',
-          held_generation: '3',
-          checkpoint_generation: '5',
-          checkpoint_source: 'pairing'
-        }),
-        withheld('2', {
+        withheldArchive('b1', {
           withheld: 'held_back',
           held_generation: '4',
-          checkpoint_generation: '6',
-          checkpoint_source: 'recovery_bundle'
+          checkpoint_generation: '6'
         }),
-        withheld('3', { withheld: 'disagree', checkpoint_generation: '7' }),
-        withheld('4', { withheld: 'refused' }),
-        withheld('5', { withheld: 'nothing' }),
-        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: '8' }),
-        withheld('7', { withheld: 'host_contradicts', checkpoint_generation: '9' })
+        withheldArchive('b2', { withheld: 'refused' }),
+        withheldArchive('b3', { withheld: 'nothing' }),
+        withheldArchive('b4', { withheld: 'bundle_disagree', checkpoint_generation: '8' }),
+        {
+          archive_id: '0a1b2c3d-0000-4000-8000-0000000000b5',
+          generation: '5',
+          published_at_ms: Date.UTC(2026, 9, 12),
+          withheld: null,
+          held_generation: null,
+          checkpoint_generation: null,
+          host: null
+        }
       ])
     })
     const recovery = await within(sheet).findByTestId('recovery')
     await person.click(within(recovery).getByTestId('recovery-export-offline'))
     const copies = await within(recovery).findByTestId('recovery-copies')
 
-    expect(copies).toHaveTextContent(
-      'Archive 0a1b2c3d: the service holds generation 3, older than generation 5 that a host this device paired with named when this device asked, so it is not offered.'
-    )
-    expect(copies).toHaveTextContent(
+    expect(lineOf(recovery, 'b1')).toBe(
       'Archive 0a1b2c3d: the service holds generation 4, older than generation 6 that the recovery bundle verified, so it is not offered.'
     )
-    expect(copies).toHaveTextContent(
-      'Archive 0a1b2c3d: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation 7, so it is not offered.'
-    )
-    expect(copies).toHaveTextContent(
+    expect(lineOf(recovery, 'b2')).toBe(
       'Archive 0a1b2c3d: what the service holds is not an archive this kit trusts.'
     )
-    expect(copies).toHaveTextContent('Archive 0a1b2c3d: the service holds no generation of it.')
-    expect(copies).toHaveTextContent(
+    expect(lineOf(recovery, 'b3')).toBe('Archive 0a1b2c3d: the service holds no generation of it.')
+    expect(lineOf(recovery, 'b4')).toBe(
       'Archive 0a1b2c3d: the recovery bundle holds two checkpoints that name different backups for generation 8, so it is not offered.'
     )
-    expect(copies).toHaveTextContent(
-      'Archive 0a1b2c3d: what the service holds for generation 9 is not the archive a host this device paired with named for it, so it is not offered.'
-    )
-    for (const suffix of ['1', '2', '3', '4', '5', '6', '7']) {
+    expect(lineOf(recovery, 'b5')).toBe('Archive 0a1b2c3d, generation 5, backed up 2026-10-12.')
+    // No host is the reason, so there is no host's way beneath any of them.
+    expect(copies.querySelector('.archive-way')).toBeNull()
+    // A copy is offered where the bundle permits it and nowhere else.
+    for (const suffix of ['b1', 'b2', 'b3', 'b4']) {
       expect(
-        within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-00000000000${suffix}`),
+        within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-0000000000${suffix}`),
         `an archive that is not offered has no copy (${suffix})`
       ).toBeDisabled()
+    }
+    expect(
+      within(recovery).getByTestId('recovery-copy-0a1b2c3d-0000-4000-8000-0000000000b5')
+    ).toBeEnabled()
+  })
+
+  it('names the host whose report keeps an archive back, in each form of the host, with the way that exists beneath it', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.setArchives(
+        HOST_FORMS.flatMap(({ host }, index) => [
+          withheldArchive(`h${index}`, {
+            withheld: 'held_back',
+            held_generation: '3',
+            checkpoint_generation: '9',
+            host
+          }),
+          withheldArchive(`d${index}`, {
+            withheld: 'disagree',
+            checkpoint_generation: '9',
+            host
+          }),
+          withheldArchive(`s${index}`, {
+            withheld: 'host_contradicts',
+            checkpoint_generation: '9',
+            host
+          })
+        ])
+      )
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+    await within(recovery).findByTestId('recovery-copies')
+
+    HOST_FORMS.forEach((form, index) => {
+      const states = [
+        [`h${index}`, HELD_BACK(form.who, form.look)],
+        [`d${index}`, DISAGREE(form.who, form.look)],
+        [`s${index}`, ANOTHER_BACKUP(form.who, form.look)]
+      ] as const
+      for (const [suffix, sentence] of states) {
+        expect(lineOf(recovery, suffix), `${form.label}, ${suffix}`).toBe(sentence)
+        expect(wayOf(recovery, suffix), `${form.label}, ${suffix}`).toBe(THE_WAY(form.short))
+        // A report that holds an archive back is no copy to make: the way beneath it is the command.
+        expect(
+          within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-0000000000${suffix}`)
+        ).toBeDisabled()
+      }
+    })
+  })
+
+  it('shows a host name as the text it is, keeps its mark in groups, and states a generation above 2^53 exactly', async () => {
+    const { person, controls, sheet } = await openSheet()
+    const hostile = '<b>kitchen</b> & "pc" ‮</li>'
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.setArchives([
+        withheldArchive('h9', {
+          withheld: 'held_back',
+          held_generation: '9007199254740993',
+          checkpoint_generation: '18446744073709551615',
+          host: { mark: MARK, name: hostile, listed: true }
+        })
+      ])
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+    const copies = await within(recovery).findByTestId('recovery-copies')
+
+    const line = lineOf(recovery, 'h9') ?? ''
+    expect(line).toContain(`${hostile} (mark ${MARK}) reported generation 18446744073709551615 of this archive`)
+    expect(line).toContain('the service offers generation 9007199254740993, but ')
+    expect(line).toContain('so generation 9007199254740993 is not offered.')
+    expect(line).toContain(`Look at the backup status on ${hostile} first.`)
+    // The name is text: no element came from it, and the list still has its one row.
+    expect(copies.querySelector('b')).toBeNull()
+    expect(copies.querySelectorAll('li')).toHaveLength(3)
+    // The mark stands twice in that line, in four groups each, and reads as the mark on a copy.
+    const marks = [...copies.querySelectorAll('.host-mark')]
+    expect(marks.map((mark) => mark.textContent)).toEqual([MARK, MARK])
+    for (const mark of marks) {
+      expect([...mark.querySelectorAll('.host-mark-group')].map((group) => group.textContent)).toEqual([
+        '3fa9',
+        '1c07',
+        'b2e4',
+        '77ab'
+      ])
+    }
+  })
+
+  it('holds no word in any sentence of the recovery page that these sentences must not say', () => {
+    // Control: the scan finds each word in a sentence that plants it, and skips a host's own name.
+    expect(bannedIn('Forget kitchen-pc and pair it again.', ['kitchen-pc'])).not.toEqual([])
+    expect(bannedIn('kitchen-pc has lost the backup.', ['kitchen-pc'])).not.toEqual([])
+    expect(bannedIn('Two claimants name that backup.', [])).not.toEqual([])
+    expect(bannedIn('A second host reports the same backup.', [])).not.toEqual([])
+    expect(bannedIn('Look at the backup status on forget-pc first.', ['forget-pc'])).toEqual([])
+    expect(bannedIn('Look at the backup status on forget-pc first.', [])).not.toEqual([])
+
+    const names = ['kitchen-pc', 'forget-pc', 'the pc that has lost two claimants', 'a second host']
+    const sentences: string[] = []
+    for (const name of [...names, null]) {
+      for (const listed of [true, false]) {
+        const host: RecoveryHost = { mark: MARK, name: listed ? name : null, listed }
+        for (const state of ['held_back', 'disagree', 'host_contradicts'] as const) {
+          const archive = withheldArchive('x', {
+            withheld: state,
+            held_generation: '3',
+            checkpoint_generation: '9',
+            host
+          })
+          sentences.push(describeArchive(archive), describeRestoreCommand(archive) ?? '')
+        }
+      }
+    }
+    for (const withheld of ['held_back', 'refused', 'nothing', 'bundle_disagree'] as const) {
+      sentences.push(
+        describeArchive(
+          withheldArchive('x', { withheld, held_generation: '3', checkpoint_generation: '9' })
+        )
+      )
+    }
+    for (const value of Object.values(recoveryWords)) {
+      if (typeof value === 'string') sentences.push(value)
+    }
+    expect(sentences.filter((sentence) => sentence.includes('kr backup restore'))).not.toHaveLength(0)
+    for (const sentence of sentences) {
+      expect(bannedIn(sentence, names), sentence).toEqual([])
     }
   })
 

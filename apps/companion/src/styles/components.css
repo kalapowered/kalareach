@@ -1394,6 +1394,31 @@ textarea::placeholder {
   flex: none;
 }
 
+/*
+ * The way that exists when a host's report keeps an archive back, beneath the line that says so. It
+ * is three sentences, so it sits a little apart from the line and wraps at any text size.
+ */
+.archive-way {
+  margin: var(--gap-1) 0 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * A host's mark: four groups of four hexadecimal characters. A line breaks at a hyphen and never
+ * inside a group, and the groups are monospaced so that two marks compare by eye. Small text takes a
+ * little more tracking.
+ */
+.host-mark {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  letter-spacing: 0.02em;
+}
+
+.host-mark-group {
+  white-space: nowrap;
+}
+
 /* The hosts, one card each, with room between them. */
 .devices-hosts {
   display: flex;

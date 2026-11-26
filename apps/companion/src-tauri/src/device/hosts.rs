@@ -2,6 +2,7 @@
 
 use kr_client::pairing::paired::PairedHost;
 use kr_protocol::grant::GrantExpiry;
+use kr_protocol::scalars::EndpointKey;
 use serde::Serialize;
 
 /// What a host is named by to the page: a digest of its identity, truncated.
@@ -23,6 +24,30 @@ pub fn reference_of(host: &PairedHost) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// What a host is shown by beside its name, so that two hosts with one name stay two: the first
+/// eight bytes of a digest of its endpoint, as sixteen hexadecimal characters in four groups of four
+/// (`3fa9-1c07-b2e4-77ab`).
+///
+/// The endpoint is the one the host's pairing record names, so the mark is the same whatever the
+/// host is called and whatever its declared device identifier is. A person compares it to the mark
+/// another screen shows; nothing uses it to authorise, match or find a host.
+#[must_use]
+pub fn mark_of(endpoint: &EndpointKey) -> String {
+    use sha2::Digest as _;
+
+    let digest =
+        sha2::Sha256::digest([b"kalareach host mark".as_slice(), endpoint.as_bytes()].concat());
+    digest[..8]
+        .chunks(2)
+        .map(|pair| {
+            pair.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The name a host is shown by when it gave none this computer could read.
@@ -52,6 +77,8 @@ pub struct HostRow {
     pub in_use: bool,
     /// The name the host gives people.
     pub name: String,
+    /// What tells this host from another of the same name: see [`mark_of`].
+    pub mark: String,
     /// True when this computer is an owner of the host.
     pub owner: bool,
     /// What this computer may do there, in words.
@@ -76,6 +103,7 @@ impl HostRow {
             reference: reference_of(host),
             in_use,
             name: host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned()),
+            mark: mark_of(&host.host_endpoint_id),
             owner: host.is_owner(),
             authority: kr_client::pairing::owner::describe_rights(
                 &host.proposed_grant.actions,
@@ -91,5 +119,59 @@ impl HostRow {
                 _ => None,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// KR-REQ-20.12: the mark of an endpoint is a fixed value: the first eight bytes of the digest of
+    /// the domain and the endpoint's bytes, in four groups of four lower-case hexadecimal
+    /// characters. A different digest or a different cut shows here.
+    #[test]
+    fn the_mark_of_an_endpoint_is_a_fixed_value_in_four_groups() {
+        assert_eq!(
+            mark_of(&EndpointKey::from_bytes([0x42; 32])),
+            "4885-5ba2-e7cf-e3f2"
+        );
+        assert_eq!(
+            mark_of(&EndpointKey::from_bytes([0x43; 32])),
+            "77bc-db3b-2424-b1f2"
+        );
+        assert_eq!(
+            mark_of(&EndpointKey::from_bytes([0x00; 32])),
+            "13eb-f438-3891-17ac"
+        );
+        for seed in 0..=u8::MAX {
+            let mark = mark_of(&EndpointKey::from_bytes([seed; 32]));
+            let groups: Vec<&str> = mark.split('-').collect();
+            assert_eq!(groups.len(), 4, "{mark}");
+            for group in groups {
+                assert_eq!(group.len(), 4, "{mark}");
+                assert!(
+                    group
+                        .chars()
+                        .all(|each| each.is_ascii_digit() || ('a'..='f').contains(&each)),
+                    "{mark}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-20.12: two endpoints that differ in one byte have two marks, and the same endpoint
+    /// has the same mark each time.
+    #[test]
+    fn endpoints_that_differ_in_one_byte_have_two_marks() {
+        let mut other = [0x42; 32];
+        other[31] = 0x43;
+        assert_ne!(
+            mark_of(&EndpointKey::from_bytes([0x42; 32])),
+            mark_of(&EndpointKey::from_bytes(other))
+        );
+        assert_eq!(
+            mark_of(&EndpointKey::from_bytes(other)),
+            mark_of(&EndpointKey::from_bytes(other))
+        );
     }
 }

@@ -63,6 +63,7 @@ import {
   describeBlocker,
   describeHostCover,
   describeRecovery,
+  describeRestoreCommand,
   describeRestored,
   describeSettingsLine,
   describeStaysAt,
@@ -77,6 +78,7 @@ import {
   describeSettingsSync,
   describeWaiting
 } from '../model/settings'
+import { WithMark } from './HostMark'
 import { sayingAddresses, ServiceAddress } from './ServiceAddress'
 import { SettingsChoiceForm } from './SettingsChoice'
 import { SettingsDevices } from './SettingsDevices'
@@ -99,6 +101,26 @@ interface Said {
 interface Finished {
   readonly place: Place
   readonly invalid: boolean
+}
+
+/**
+ * What the list of offline copies says of one archive: its line, and, when a host's report keeps the
+ * archive back, the way that exists beneath it. A host's mark stays in groups on the line.
+ */
+function ArchiveWords({ archive }: { readonly archive: RecoveryArchive }): ReactElement {
+  const way = describeRestoreCommand(archive)
+  return (
+    <>
+      <p className="account-lead">
+        <WithMark text={describeArchive(archive)} mark={archive.host?.mark ?? null} />
+      </p>
+      {way === null ? null : (
+        <p className="small muted archive-way" data-testid={`recovery-way-${archive.archive_id}`}>
+          {way}
+        </p>
+      )}
+    </>
+  )
 }
 
 /** The sync service setting and, on a desktop, recovery. */
@@ -955,11 +977,11 @@ export function SyncPanel({
                   {[null, ...copies].map((archive) => (
                     <li key={archive?.archive_id ?? 'bundle'} className="device-row">
                       <div className="device-words">
-                        <p className="account-lead">
-                          {archive === null
-                            ? 'The recovery bundle alone.'
-                            : describeArchive(archive)}
-                        </p>
+                        {archive === null ? (
+                          <p className="account-lead">The recovery bundle alone.</p>
+                        ) : (
+                          <ArchiveWords archive={archive} />
+                        )}
                       </div>
                       <Button
                         data-testid={`recovery-copy-${archive?.archive_id ?? 'bundle'}`}

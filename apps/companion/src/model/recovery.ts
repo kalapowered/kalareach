@@ -13,6 +13,7 @@ import type {
   NotSavedWhy,
   RecoveryArchive,
   RecoveryBlocker,
+  RecoveryHost,
   RecoveryView,
   SettingsLine,
   SettingsRestored
@@ -200,6 +201,42 @@ export function exportFileName(archive: RecoveryArchive | null): string {
     : `kalareach-archive-${archive.archive_id.slice(0, 8)}.krexport`
 }
 
+/**
+ * How a host is said in a sentence, in the three forms there are. The name is the host's own text,
+ * set into the sentence as it is.
+ */
+interface HostWords {
+  /** The host as the subject or object of a clause, with its mark. */
+  readonly full: string
+  /** The host without its mark, where a sentence only needs to point at it. */
+  readonly short: string
+  /** The sentence that sends the person to the host's own backup status. */
+  readonly look: string
+}
+
+function hostWords(host: RecoveryHost): HostWords {
+  const mark = `(mark ${host.mark})`
+  if (!host.listed) {
+    return {
+      full: `a host that this device no longer lists ${mark}`,
+      short: 'that host',
+      look: "Look at that host's own backup status first."
+    }
+  }
+  if (host.name === null) {
+    return {
+      full: `your host ${mark}`,
+      short: 'your host',
+      look: 'Look at the backup status on your host first.'
+    }
+  }
+  return {
+    full: `${host.name} ${mark}`,
+    short: host.name,
+    look: `Look at the backup status on ${host.name} first.`
+  }
+}
+
 /** How one archive is named in the list of what can be copied. */
 export function describeArchive(archive: RecoveryArchive): string {
   const name = `Archive ${archive.archive_id.slice(0, 8)}`
@@ -212,25 +249,54 @@ export function describeArchive(archive: RecoveryArchive): string {
       archive.held_generation !== null &&
       archive.checkpoint_generation !== null
     ) {
-      const checkpoint =
-        archive.checkpoint_source === 'pairing'
-          ? 'a host this device paired with named when this device asked'
-          : 'the recovery bundle verified'
-      return `${name}: the service holds generation ${archive.held_generation}, older than generation ${archive.checkpoint_generation} that ${checkpoint}, so it is not offered.`
+      if (archive.host !== null) {
+        const { full, look } = hostWords(archive.host)
+        return `${name}: the service offers generation ${archive.held_generation}, but ${full} reported generation ${archive.checkpoint_generation} of this archive when this device asked, so generation ${archive.held_generation} is not offered. Either the service does not show the newest backup, or ${full} reported a generation that it did not publish. ${look}`
+      }
+      return `${name}: the service holds generation ${archive.held_generation}, older than generation ${archive.checkpoint_generation} that the recovery bundle verified, so it is not offered.`
     }
-    if (archive.withheld === 'disagree' && archive.checkpoint_generation !== null) {
-      return `${name}: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
+    if (
+      archive.withheld === 'disagree' &&
+      archive.host !== null &&
+      archive.checkpoint_generation !== null
+    ) {
+      const { full, look } = hostWords(archive.host)
+      return `${name}: ${full} and the recovery bundle name different backups for generation ${archive.checkpoint_generation}, so generation ${archive.checkpoint_generation} is not offered. ${look}`
     }
     if (archive.withheld === 'bundle_disagree' && archive.checkpoint_generation !== null) {
       return `${name}: the recovery bundle holds two checkpoints that name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
     }
-    if (archive.withheld === 'host_contradicts' && archive.checkpoint_generation !== null) {
-      return `${name}: what the service holds for generation ${archive.checkpoint_generation} is not the archive a host this device paired with named for it, so it is not offered.`
+    if (
+      archive.withheld === 'host_contradicts' &&
+      archive.host !== null &&
+      archive.checkpoint_generation !== null
+    ) {
+      const { full, look } = hostWords(archive.host)
+      return `${name}: the service offers generation ${archive.checkpoint_generation}, but ${full} reported another backup as generation ${archive.checkpoint_generation} when this device asked, so it is not offered. ${look}`
     }
     return `${name}: the service holds no generation of it.`
   }
   const day = new Date(archive.published_at_ms).toISOString().slice(0, 10)
   return `${name}, generation ${archive.generation}, backed up ${day}.`
+}
+
+/**
+ * The way that exists when a host's report keeps an archive back: the command on a host computer,
+ * which restores under the recovery bundle's own record and does not use what a host reported.
+ * Null when no host's report is the reason.
+ */
+export function describeRestoreCommand(archive: RecoveryArchive): string | null {
+  if (
+    archive.host === null ||
+    archive.generation !== null ||
+    (archive.withheld !== 'held_back' &&
+      archive.withheld !== 'disagree' &&
+      archive.withheld !== 'host_contradicts')
+  ) {
+    return null
+  }
+  const { short } = hostWords(archive.host)
+  return `On a host computer, kr backup restore restores under the recovery bundle's own record only, and it does not use what ${short} reported. It checks the publication's writer and signature, the hashes of the manifest and of every object, and the bundle's record; with --accept-older N it restores that one older generation. When you confirm its plan it writes the files, then records the generation it restored in the bundle.`
 }
 
 /* ---- The settings saved with the recovery bundle ---------------------------------------------- */

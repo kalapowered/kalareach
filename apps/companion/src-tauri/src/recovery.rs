@@ -65,12 +65,13 @@ use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{BackupEnableCause, BackupUnusable};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ArchiveId;
-use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs};
+use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Signature64, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::account::Account;
+use crate::device::hosts::mark_of;
 use crate::error::{CommandError, Result};
 use crate::services::SyncServices;
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
@@ -187,8 +188,10 @@ pub struct ArchiveView {
     /// The generation of the checkpoint that holds the archive back, or the one that two
     /// checkpoints name differently, as decimal text.
     pub checkpoint_generation: Option<String>,
-    /// Where the checkpoint that holds the archive back came from.
-    pub checkpoint_source: Option<CheckpointSourceView>,
+    /// The host whose report holds the archive back, or that the recovery bundle disagrees with, or
+    /// that names another backup than the service holds. None when the recovery bundle's own
+    /// checkpoint decides, and when no host is involved.
+    pub host: Option<HostView>,
 }
 
 impl ArchiveView {
@@ -201,7 +204,37 @@ impl ArchiveView {
             withheld: Some(why),
             held_generation: None,
             checkpoint_generation: None,
-            checkpoint_source: None,
+            host: None,
+        }
+    }
+}
+
+/// A host as an archive's line names it, as data: the page puts the name into its sentence as text,
+/// and no sentence of this program's holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HostView {
+    /// The mark of the host's endpoint, which tells it from another host of the same name.
+    pub mark: String,
+    /// The name the host gives people. None when it gave none, and when this computer no longer
+    /// lists it.
+    pub name: Option<String>,
+    /// False when this computer's list of hosts no longer holds the host. Its entry still holds
+    /// its archive back.
+    pub listed: bool,
+}
+
+impl HostView {
+    /// The host that `endpoint` names, as `listed` (the hosts this computer lists, by endpoint and
+    /// name) shows it. The endpoint finds the host, never the name or the declared device
+    /// identifier, so two hosts of one name are two.
+    fn of(endpoint: &EndpointKey, listed: &[(EndpointKey, Option<String>)]) -> Self {
+        let found = listed.iter().find(|(each, _)| each == endpoint);
+        Self {
+            mark: mark_of(endpoint),
+            name: found
+                .and_then(|(_, name)| name.clone())
+                .filter(|name| !name.trim().is_empty()),
+            listed: found.is_some(),
         }
     }
 }
@@ -226,25 +259,6 @@ pub enum WithheldView {
     /// A host this computer paired with named a different manifest for the generation the service
     /// holds.
     HostContradicts,
-}
-
-/// Where a checkpoint came from, as the page is told.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointSourceView {
-    /// The recovery bundle.
-    RecoveryBundle,
-    /// A host this computer paired with.
-    Pairing,
-}
-
-impl From<CheckpointSource> for CheckpointSourceView {
-    fn from(source: CheckpointSource) -> Self {
-        match source {
-            CheckpointSource::RecoveryBundle => Self::RecoveryBundle,
-            CheckpointSource::Pairing(_) => Self::Pairing,
-        }
-    }
 }
 
 /// What the page is told once an export has been written.
@@ -844,7 +858,14 @@ impl Recovery {
         let listed = FilesRestore::archives(self.kit_of(&record)?, source, &held)
             .await
             .map_err(said_by_restore)?;
-        Ok(listed.into_iter().map(archive_view).collect())
+        let hosts: &[(EndpointKey, Option<String>)] = match &held {
+            Held::Read { listed: kept, .. } => kept,
+            Held::Absent | Held::Unreadable { .. } => &[],
+        };
+        Ok(listed
+            .into_iter()
+            .map(|candidate| archive_view(candidate, hosts))
+            .collect())
     }
 
     /// Writes an offline export to `destination`: the recovery bundle as the service holds it and,
@@ -1346,8 +1367,10 @@ fn said(error: RecoveryError) -> CommandError {
     }
 }
 
-/// One archive of the list, as the page is told of it.
-fn archive_view(candidate: Candidate) -> ArchiveView {
+/// One archive of the list, as the page is told of it. `listed` is the hosts this computer lists, by
+/// endpoint and name: a host that holds an archive back is found there by its endpoint, and a host
+/// that is not there is still named by its mark.
+fn archive_view(candidate: Candidate, listed: &[(EndpointKey, Option<String>)]) -> ArchiveView {
     match candidate.newest {
         CandidateState::Newest(newest) => ArchiveView {
             archive_id: candidate.archive_id.to_string(),
@@ -1356,13 +1379,14 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
             withheld: None,
             held_generation: None,
             checkpoint_generation: None,
-            checkpoint_source: None,
+            host: None,
         },
         CandidateState::Nothing => {
             ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
         }
-        CandidateState::HostNamesAnother { generation, .. } => ArchiveView {
+        CandidateState::HostNamesAnother { generation, host } => ArchiveView {
             checkpoint_generation: Some(generation.get().to_string()),
+            host: Some(HostView::of(&host, listed)),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::HostContradicts)
         },
         CandidateState::Refused(_) => {
@@ -1375,11 +1399,15 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
         } => ArchiveView {
             held_generation: Some(held.get().to_string()),
             checkpoint_generation: Some(checkpoint.get().to_string()),
-            checkpoint_source: Some(source.into()),
+            host: match source {
+                CheckpointSource::Pairing(host) => Some(HostView::of(&host, listed)),
+                CheckpointSource::RecoveryBundle => None,
+            },
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
         },
-        CandidateState::CheckpointsDisagree { generation, .. } => ArchiveView {
+        CandidateState::CheckpointsDisagree { generation, host } => ArchiveView {
             checkpoint_generation: Some(generation.get().to_string()),
+            host: Some(HostView::of(&host, listed)),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
         },
         CandidateState::BundleCheckpointsDisagree { generation } => ArchiveView {
@@ -1404,9 +1432,7 @@ fn said_by_restore(error: RestoreError) -> CommandError {
         disagrees @ RestoreError::PairingCheckpointDisagrees { generation, .. } => {
             CommandError::refused(format!(
                 "{disagrees}. Generation {generation} of this archive stays refused while the two \
-                 disagree; a newer generation is not affected. Removing checkpoints.json leaves \
-                 the recovery bundle's checkpoint alone to decide, and removes what this device \
-                 recorded of each host's answer."
+                 disagree; a newer generation is not affected."
             ))
         }
         two @ RestoreError::BundleCheckpointsDisagree { generation, .. } => {
@@ -1564,11 +1590,21 @@ mod tests {
     use super::*;
 
     fn listed(newest: CandidateState) -> ArchiveView {
-        archive_view(Candidate {
-            archive_id: ArchiveId::new(Uuid::from_bytes([7; 16])),
-            newest,
-            pairing: PairingStanding::None,
-        })
+        listed_among(newest, &[])
+    }
+
+    fn listed_among(
+        newest: CandidateState,
+        hosts: &[(EndpointKey, Option<String>)],
+    ) -> ArchiveView {
+        archive_view(
+            Candidate {
+                archive_id: ArchiveId::new(Uuid::from_bytes([7; 16])),
+                newest,
+                pairing: PairingStanding::None,
+            },
+            hosts,
+        )
     }
 
     /// KR-REQ-20.12: two checkpoints in the bundle that name one generation differently are told to
@@ -1581,7 +1617,7 @@ mod tests {
         assert_eq!(in_bundle.withheld, Some(WithheldView::BundleDisagree));
         assert_eq!(in_bundle.checkpoint_generation.as_deref(), Some("8"));
         assert_eq!(in_bundle.generation, None);
-        assert_eq!(in_bundle.checkpoint_source, None);
+        assert_eq!(in_bundle.host, None);
 
         let with_a_host = listed(CandidateState::CheckpointsDisagree {
             generation: BackupGeneration::new(8),
@@ -1589,6 +1625,94 @@ mod tests {
         });
         assert_eq!(with_a_host.withheld, Some(WithheldView::Disagree));
         assert_eq!(with_a_host.checkpoint_generation.as_deref(), Some("8"));
+        assert_eq!(
+            with_a_host.host,
+            Some(HostView {
+                mark: "4885-5ba2-e7cf-e3f2".to_owned(),
+                name: None,
+                listed: false,
+            })
+        );
+    }
+
+    /// KR-REQ-20.12: each state that a host causes names that host to the page as data, found by
+    /// its endpoint among the hosts the list holds: by name, with no name, or not listed, and the
+    /// bundle's own hold names none. A name that is hostile text, or blank, is data and nothing
+    /// more.
+    #[test]
+    fn each_state_a_host_causes_names_that_host_by_its_endpoint_and_the_bundles_hold_names_none() {
+        let key = |seed: u8| EndpointKey::from_bytes([seed; 32]);
+        let hostile = "<script>alert(1)</script> \u{202e}[mark 0000-0000-0000-0000]";
+        let hosts = [
+            (key(0x41), Some("kitchen-pc".to_owned())),
+            (key(0x42), Some("kitchen-pc".to_owned())),
+            (key(0x43), None),
+            (key(0x44), Some(hostile.to_owned())),
+            (key(0x45), Some("  \t".to_owned())),
+        ];
+        let generation = BackupGeneration::new(9);
+        let held_back = |host| CandidateState::HeldBack {
+            held: BackupGeneration::new(3),
+            checkpoint: generation,
+            source: CheckpointSource::Pairing(host),
+        };
+        let named = |view: ArchiveView| view.host.expect("a host is named");
+
+        // Two hosts of one name: each is found by its own endpoint, never the first of that name.
+        let first = named(listed_among(held_back(key(0x41)), &hosts));
+        let second = named(listed_among(held_back(key(0x42)), &hosts));
+        assert_eq!(first.mark, mark_of(&key(0x41)));
+        assert_eq!(second.mark, "4885-5ba2-e7cf-e3f2");
+        assert_ne!(first.mark, second.mark);
+        assert_eq!(
+            (first.name.as_deref(), first.listed),
+            (Some("kitchen-pc"), true)
+        );
+        assert_eq!(
+            (second.name.as_deref(), second.listed),
+            (Some("kitchen-pc"), true)
+        );
+
+        // Listed with no name, with a hostile name, with a blank name, and not listed.
+        let unnamed = named(listed_among(held_back(key(0x43)), &hosts));
+        assert_eq!((unnamed.name, unnamed.listed), (None, true));
+        let odd = named(listed_among(held_back(key(0x44)), &hosts));
+        assert_eq!((odd.name.as_deref(), odd.listed), (Some(hostile), true));
+        let blank = named(listed_among(held_back(key(0x45)), &hosts));
+        assert_eq!((blank.name, blank.listed), (None, true));
+        let gone = named(listed_among(held_back(key(0x46)), &hosts));
+        assert_eq!((gone.name, gone.listed), (None, false));
+        assert_eq!(gone.mark, mark_of(&key(0x46)));
+
+        // The same host through each of the three states that a host causes.
+        let by_state = [
+            held_back(key(0x42)),
+            CandidateState::CheckpointsDisagree {
+                generation,
+                host: key(0x42),
+            },
+            CandidateState::HostNamesAnother {
+                generation,
+                host: key(0x42),
+            },
+        ];
+        for state in by_state {
+            assert_eq!(named(listed_among(state, &hosts)), second);
+        }
+
+        // The bundle's own hold, and the states no host causes, name none.
+        for state in [
+            CandidateState::HeldBack {
+                held: BackupGeneration::new(3),
+                checkpoint: generation,
+                source: CheckpointSource::RecoveryBundle,
+            },
+            CandidateState::BundleCheckpointsDisagree { generation },
+            CandidateState::Nothing,
+            CandidateState::Refused(PublicationRefusal::BadSignature),
+        ] {
+            assert_eq!(listed_among(state, &hosts).host, None);
+        }
     }
 
     /// KR-REQ-20.12: generations reach the page as exact decimal text, so two that differ only above
@@ -1632,10 +1756,10 @@ mod tests {
     }
 
     /// KR-REQ-20.12: a checkpoint a paired host gave and the recovery bundle's name different
-    /// manifests for one generation: the refusal says which two, that only that generation stays
-    /// refused, and what removing the file does, with the file named plainly.
+    /// manifests for one generation: the refusal says which two and that only that generation stays
+    /// refused. It advises no removal: removing the file would lower every host's floor.
     #[test]
-    fn the_refusal_for_a_host_checkpoint_the_bundle_contradicts_says_what_removing_the_file_does() {
+    fn the_refusal_for_a_host_checkpoint_the_bundle_contradicts_advises_no_removal() {
         let said = said_by_restore(RestoreError::PairingCheckpointDisagrees {
             generation: 8,
             paired: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
@@ -1647,10 +1771,108 @@ mod tests {
             "the checkpoint this device kept when it paired and the recovery bundle name \
              different manifests for generation 8 (11111111 and 22222222); the restore cannot \
              tell which is the archive that was published. Generation 8 of this archive stays \
-             refused while the two disagree; a newer generation is not affected. Removing \
-             checkpoints.json leaves the recovery bundle's checkpoint alone to decide, and \
-             removes what this device recorded of each host's answer."
+             refused while the two disagree; a newer generation is not affected."
         );
+        assert!(!said.message.contains("checkpoints.json"));
+    }
+
+    /// The words a sentence about a host's report must not hold, found in `sentence` once each name in
+    /// `names` is taken out: a host's name is the host's own text.
+    fn banned_in(sentence: &str, names: &[&str]) -> Vec<&'static str> {
+        let mut rest = sentence.to_lowercase();
+        for name in names {
+            rest = rest.replace(&name.to_lowercase(), " ");
+        }
+        [
+            "two claimants",
+            "second host",
+            "same backup",
+            "forget",
+            "forgot",
+            "has lost",
+        ]
+        .into_iter()
+        .filter(|word| rest.contains(word))
+        .collect()
+    }
+
+    /// KR-REQ-20.12: no sentence this program says of a host's report or of the checkpoints holds a
+    /// word these sentences must not say: two claimants, a second host that reports the same backup,
+    /// advice to forget a host, a loss by a host. The scan finds each word in a sentence that plants
+    /// it and skips a host's name.
+    #[test]
+    fn no_sentence_about_a_hosts_report_holds_a_word_it_must_not() {
+        // Control.
+        assert!(!banned_in("Forget kitchen-pc and pair it again.", &["kitchen-pc"]).is_empty());
+        assert!(!banned_in("kitchen-pc has lost the backup.", &["kitchen-pc"]).is_empty());
+        assert!(!banned_in("Two claimants name that backup.", &[]).is_empty());
+        assert!(!banned_in("A second host reports the same backup.", &[]).is_empty());
+        assert!(banned_in("Look at forget-pc first.", &["forget-pc"]).is_empty());
+        assert!(!banned_in("Look at forget-pc first.", &[]).is_empty());
+
+        let host = EndpointKey::from_bytes([0x42; 32]);
+        let mut sentences = vec![
+            said_by_restore(RestoreError::PairingCheckpointDisagrees {
+                generation: 8,
+                paired: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
+                bundle: Shown::manifest_digits(&Digest256::from_bytes([0x22; 32])),
+                host,
+            })
+            .message,
+            said_by_restore(RestoreError::BundleCheckpointsDisagree {
+                generation: 8,
+                first: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
+                second: Shown::manifest_digits(&Digest256::from_bytes([0x22; 32])),
+            })
+            .message,
+            RestoreError::named_generation_not_held(3, 5, CheckpointSource::Pairing(host))
+                .to_string(),
+            RestoreError::named_generation_not_held(3, 5, CheckpointSource::RecoveryBundle)
+                .to_string(),
+            RestoreError::no_checkpoint_to_accept_past(true).to_string(),
+            RestoreError::no_checkpoint_to_accept_past(false).to_string(),
+            RestoreError::nothing_as_new(5).to_string(),
+            RestoreError::older_than_the_checkpoint(1, 2).to_string(),
+        ];
+        let checkpoint = BackupGeneration::new(5);
+        for source in [
+            CheckpointSource::Pairing(host),
+            CheckpointSource::RecoveryBundle,
+        ] {
+            for standing in [
+                GenerationStanding::AtCheckpoint,
+                GenerationStanding::Ahead { checkpoint },
+                GenerationStanding::Replayed { checkpoint },
+                GenerationStanding::Substituted { checkpoint },
+                GenerationStanding::OlderAccepted { checkpoint },
+                GenerationStanding::NoCheckpoint,
+            ] {
+                let restoring = RestoreGeneration {
+                    archive_id: ArchiveId::new(Uuid::from_bytes([7; 16])),
+                    backup_generation: BackupGeneration::new(3),
+                    standing,
+                    source: Some(source),
+                };
+                sentences.push(Shown::restore_refusal(&restoring).into_string());
+                sentences.push(Shown::restore_standing(&restoring).into_string());
+            }
+        }
+        for cause in [
+            SnapshotCause::Unreadable,
+            SnapshotCause::NewerVersion,
+            SnapshotCause::Lock,
+            SnapshotCause::Busy,
+            SnapshotCause::HostsFile,
+        ] {
+            sentences.push(unreadable_recourse(cause).to_owned());
+        }
+        for sentence in sentences {
+            assert!(
+                banned_in(&sentence, &[]).is_empty(),
+                "{sentence}: {:?}",
+                banned_in(&sentence, &[])
+            );
+        }
     }
 
     /// KR-REQ-20.12: an archive whose publication a paired host's checkpoint contradicts is told to
@@ -1672,14 +1894,28 @@ mod tests {
             )))
             .expect("the view as the page receives it")
         };
-        let by_a_host = serde_json::to_value(listed(CandidateState::HostNamesAnother {
-            generation: BackupGeneration::new(9),
-            host: EndpointKey::from_bytes([0x42; 32]),
-        }))
+        let by_a_host = serde_json::to_value(listed_among(
+            CandidateState::HostNamesAnother {
+                generation: BackupGeneration::new(9),
+                host: EndpointKey::from_bytes([0x42; 32]),
+            },
+            &[(
+                EndpointKey::from_bytes([0x42; 32]),
+                Some("kitchen-pc".to_owned()),
+            )],
+        ))
         .expect("the view as the page receives it");
         assert_eq!(by_a_host["withheld"], "host_contradicts");
         assert_eq!(by_a_host["checkpoint_generation"], "9");
         assert_eq!(by_a_host["generation"], serde_json::Value::Null);
+        assert_eq!(
+            by_a_host["host"],
+            serde_json::json!({
+                "mark": "4885-5ba2-e7cf-e3f2",
+                "name": "kitchen-pc",
+                "listed": true
+            })
+        );
 
         let by_the_bundle = refusal(CheckpointSource::RecoveryBundle);
         assert_eq!(by_the_bundle["withheld"], "refused");
