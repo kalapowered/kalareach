@@ -37,8 +37,20 @@ on:
       - .cargo/config.toml
       - Cargo.lock
       - rust-toolchain.toml
-      - crates/kr-crypto/build.rs
-      - crates/kr-crypto/build/**
+      # The workspace crates that the program links: `cargo tree -p companion-tauri` lists them, and
+      # a case of `kr-release` fails when one is missing here.
+      - crates/kr-cbor/**
+      - crates/kr-client/**
+      - crates/kr-crypto/**
+      - crates/kr-flush/**
+      - crates/kr-ipc/**
+      - crates/kr-keys/**
+      - crates/kr-loopback/**
+      - crates/kr-pairing/**
+      - crates/kr-plugin-sdk/**
+      - crates/kr-protocol/**
+      - crates/kr-transport/**
+      - crates/kr-width/**
       - scripts/read-windows-imports.py
       - docs/releases/companion-third-party-notices.txt
       - scripts/place-libsodium-archive.sh
@@ -177,7 +189,7 @@ jobs:
           Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
           $installed = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
           if ($installed.Count -ne 1) { throw "expected one installed executable, found $($installed.Count)" }
-          $notices = @(Get-ChildItem $dir -Recurse -Filter 'THIRD-PARTY-NOTICES.txt')
+          $notices = @(Get-ChildItem $dir -Recurse -Filter 'companion-third-party-notices.txt')
           if ($notices.Count -ne 1) { throw "expected one installed notice, found $($notices.Count)" }
           if ((Get-FileHash $notices[0].FullName -Algorithm SHA256).Hash -ne (Get-FileHash 'docs/releases/companion-third-party-notices.txt' -Algorithm SHA256).Hash) { throw 'the installed notice is not the committed one' }
           $after = Get-Imports $installed[0].FullName
@@ -214,7 +226,7 @@ jobs:
           Get-ChildItem $dir -Recurse -File | ForEach-Object { '{0,12} {1}' -f $_.Length, $_.FullName.Substring($dir.Length + 1) }
           $extracted = @(Get-ChildItem $dir -Recurse -Filter 'kalareach-companion.exe')
           if ($extracted.Count -ne 1) { throw "expected one extracted executable, found $($extracted.Count)" }
-          $notices = @(Get-ChildItem $dir -Recurse -Filter 'THIRD-PARTY-NOTICES.txt')
+          $notices = @(Get-ChildItem $dir -Recurse -Filter 'companion-third-party-notices.txt')
           if ($notices.Count -ne 1) { throw "expected one extracted notice, found $($notices.Count)" }
           if ((Get-FileHash $notices[0].FullName -Algorithm SHA256).Hash -ne (Get-FileHash 'docs/releases/companion-third-party-notices.txt' -Algorithm SHA256).Hash) { throw 'the extracted notice is not the committed one' }
           $after = Get-Imports $extracted[0].FullName

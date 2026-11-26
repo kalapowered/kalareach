@@ -253,9 +253,12 @@ Xcode resolves.
 
 Every installer and store bundle carries the text. The interface's bundle holds it, and the account
 panel opens it under "Third-party notices" on every platform. The desktop installers also place it as
-`THIRD-PARTY-NOTICES.txt` among the application's resource files: `tauri.macos.conf.json`,
+`companion-third-party-notices.txt` among the application's resource files: `tauri.macos.conf.json`,
 `tauri.linux.conf.json` and `tauri.windows.conf.json` in `apps/companion/src-tauri` name it as a bundle
-resource, and the shared `tauri.conf.json`, which the mobile builds read, names none.
+resource, and the shared `tauri.conf.json`, which the mobile builds read, names none. A resource's
+target carries the file name of its source: the Windows Installer bundler of the Tauri command line
+names a file after its source whatever the target says, so a renamed target would be placed under two
+names, and `apps/companion/test/third-party-notices.test.tsx` refuses one.
 
 `pnpm install --frozen-lockfile --prod --filter "@kalareach/companion..."` and then
 `python3 scripts/generate-notices.py write --product companion --kr-release <a built kr-release>` make

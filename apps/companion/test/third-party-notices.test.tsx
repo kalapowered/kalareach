@@ -29,14 +29,32 @@ afterEach(() => {
 })
 
 describe('the notice the desktop installers carry', () => {
-  it('maps the committed text as THIRD-PARTY-NOTICES.txt in each desktop bundle', () => {
+  it('maps the committed text under its own file name in each desktop bundle', () => {
     const configurations = { macos, linux, windows }
     for (const [platform, configuration] of Object.entries(configurations)) {
       expect(configuration.bundle.resources, platform).toEqual({
-        [NOTICE_SOURCE]: 'THIRD-PARTY-NOTICES.txt'
+        [NOTICE_SOURCE]: 'companion-third-party-notices.txt'
       })
     }
     expect(committed).toContain('THIRD-PARTY NOTICES')
+  })
+
+  it('names every mapped resource by the file name of its source', () => {
+    // The WiX bundler of the Tauri command line keeps the directory part of a resource's target and
+    // names the file after its source, so an installed MSI and an administrative extract of it hold
+    // the source's file name whatever the target says. The NSIS installer keeps the whole target. A
+    // target that differs from its source in the file name would be placed differently by the two.
+    const lastComponent = (path: string): string => path.split('/').pop() ?? ''
+    const configurations = { macos, linux, windows }
+    const renamed: string[] = []
+    for (const [platform, configuration] of Object.entries(configurations)) {
+      const mapped = Object.entries(configuration.bundle.resources)
+      expect(mapped.length, platform).toBeGreaterThan(0)
+      for (const [source, target] of mapped) {
+        if (lastComponent(target) !== lastComponent(source)) renamed.push(`${platform}: ${source} -> ${target}`)
+      }
+    }
+    expect(renamed).toEqual([])
   })
 
   it('leaves the configuration the mobile builds read without resources', () => {

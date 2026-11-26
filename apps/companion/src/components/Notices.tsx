@@ -1,8 +1,8 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-// The text the installers carry as THIRD-PARTY-NOTICES.txt. The build emits it as a file of the
-// interface's own bundle, which every installer and store bundle embeds, and it is read only when a
-// person opens it.
+// The text the installers carry as companion-third-party-notices.txt. The build emits it as a file
+// of the interface's own bundle, which every installer and store bundle embeds, and it is read only
+// when a person opens it.
 import noticeUrl from '../../../../docs/releases/companion-third-party-notices.txt?url'
 
 import {
