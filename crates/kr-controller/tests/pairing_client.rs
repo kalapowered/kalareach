@@ -8,6 +8,8 @@
 
 #![cfg(unix)]
 
+#[path = "support/backup_seed.rs"]
+mod backup_seed;
 mod net_support;
 #[path = "../../kr-client/tests/support/room_tls.rs"]
 mod room_tls;
@@ -16,10 +18,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use backup_seed::SeededBackups;
 use iroh::endpoint::Connection;
 use kr_client::ClientError;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pairing, Stage};
+use kr_client::pairing::checkpoint::{Acquisition, Held};
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::FailureKind;
 use kr_client::pairing::invitation::{Invitation, read_invitation};
@@ -3750,4 +3754,185 @@ async fn a_device_on_another_connection_than_the_one_that_proved_it_recovers_and
         link.paired_connects.load(Ordering::SeqCst) >= 2,
         "the first connection was refused and a second was made"
     );
+}
+
+/// Pairs `device` by a code under `grant`, with the owner's approval, and returns the paired host.
+async fn pairs_as(
+    host: &Host,
+    owner_keys: &DeviceKeys,
+    device: &ProductDevice,
+    grant: &ProposedGrant,
+) -> PairedHost {
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(owner_keys);
+    let invited = invite_code(environment, &mut client, grant, None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    let value = awaiting_value(&mut shown).await;
+    let PairStatus::AwaitingApproval {
+        verification_value, ..
+    } = owner_status(&mut client, &invited).await
+    else {
+        panic!("the owner is asked to approve the device");
+    };
+    assert_eq!(value, group_verification_value(&verification_value));
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    let paired = outcome(attempt).await.expect("paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    paired
+}
+
+/// KR-REQ-20.12: a device the host commits as an owner keeps the newest backup generation the host
+/// published, as the host names it, and the host is not owed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_keeps_the_checkpoint_the_host_names_when_it_is_committed() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let service = host.controller().backup();
+    let seeded = SeededBackups::set_up(service);
+    let published = seeded.publish(service, 3);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+
+    let paired = pairs_as(
+        &host,
+        &owner_keys,
+        &device,
+        &proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+
+    let checkpoints = device.pairing.hosts.checkpoints();
+    let Held::Read { entries, owed } = checkpoints.held_checkpoints() else {
+        panic!("the checkpoints are readable");
+    };
+    assert_eq!(owed, 0, "the host has answered");
+    assert_eq!(entries.len(), 1, "one archive is held");
+    assert_eq!(entries[0].archive_id, SeededBackups::archive_id());
+    assert_eq!(entries[0].service_origin, published.service_origin);
+    assert_eq!(entries[0].backup_generation, published.backup_generation);
+    assert_eq!(
+        entries[0].encrypted_manifest_hash,
+        published.encrypted_manifest_hash
+    );
+    assert_eq!(checkpoints.acquisition(&paired), Ok(Acquisition::Told));
+    host.stop().await;
+}
+
+/// KR-REQ-20.12: a host that has accepted no generation says so, and the device that manages it is
+/// not owed an answer but is asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_asks_again() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+
+    let paired = pairs_as(
+        &host,
+        &owner_keys,
+        &device,
+        &proposal(&[ActionRight::HostManage]),
+    )
+    .await;
+
+    let checkpoints = device.pairing.hosts.checkpoints();
+    assert_eq!(
+        checkpoints.acquisition(&paired),
+        Ok(Acquisition::NothingPublished)
+    );
+    assert!(
+        matches!(
+            checkpoints.held_checkpoints(),
+            Held::Read { ref entries, owed: 0 } if entries.is_empty()
+        ),
+        "nothing is held and nothing is owed"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-20.12: a device the host commits without the right to manage it asks for nothing and keeps
+/// no file, whatever the host has published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_does_not_manage_the_host_keeps_no_checkpoint() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let service = host.controller().backup();
+    let seeded = SeededBackups::set_up(service);
+    seeded.publish(service, 1);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+
+    let paired = pairs_as(&host, &owner_keys, &device, &viewer()).await;
+
+    assert!(
+        !device
+            .pairing
+            .hosts
+            .directory()
+            .join("checkpoints.json")
+            .exists(),
+        "no file is written"
+    );
+    assert_eq!(
+        device.pairing.hosts.checkpoints().acquisition(&paired),
+        Ok(Acquisition::NotAnOwner)
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-20.12: a device that pairs with its host again, and whose first read of the new pairing
+/// fails, is owed an answer for that pairing and keeps the checkpoint it held, which no pairing
+/// owns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_pairs_again_and_fails_its_first_read_is_owed_and_keeps_its_checkpoint() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let service = host.controller().backup();
+    let seeded = SeededBackups::set_up(service);
+    let published = seeded.publish(service, 1);
+    let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
+    let grant = proposal(&[ActionRight::HostManage]);
+    let first = pairs_as(&host, &owner_keys, &device, &grant).await;
+    let checkpoints = device.pairing.hosts.checkpoints();
+    assert_eq!(checkpoints.acquisition(&first), Ok(Acquisition::Told));
+
+    // A device pairs with a host again after the host revokes it and it forgets the host.
+    host.controller()
+        .revoke_device_authority(first.device_id, None, None)
+        .await
+        .expect("the host revokes the device");
+    device
+        .pairing
+        .hosts
+        .forget(first.host_device_id)
+        .expect("the device can forget its first pairing");
+    // The host can no longer read back its newest generation, so its answer is a refusal.
+    let backups = host.registry_database().with_file_name("backup.sqlite");
+    rusqlite::Connection::open(backups)
+        .expect("the backup store")
+        .execute(
+            "UPDATE generations SET descriptor = NULL WHERE backup_generation = 1",
+            [],
+        )
+        .expect("the row can be damaged");
+    let second = pairs_as(&host, &owner_keys, &device, &grant).await;
+
+    assert_ne!(
+        second.device_id, first.device_id,
+        "the second pairing gives the device a new identity"
+    );
+    assert_eq!(
+        checkpoints.acquisition(&second),
+        Ok(Acquisition::Owed),
+        "the old pairing's answer does not settle the new one"
+    );
+    let Held::Read { entries, owed } = checkpoints.held_checkpoints() else {
+        panic!("the checkpoints are readable");
+    };
+    assert_eq!(owed, 1, "the host owes one answer");
+    assert_eq!(entries.len(), 1, "the checkpoint is kept");
+    assert_eq!(entries[0].backup_generation, published.backup_generation);
+    host.stop().await;
 }
