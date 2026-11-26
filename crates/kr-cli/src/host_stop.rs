@@ -3417,6 +3417,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// The ways to end the process that holds the environment name no command for a number that a
+    /// command line tool cannot read intact (4294967295 is the largest number a lock file holds):
+    /// they say what they say where no process is named.
+    #[cfg(unix)]
+    #[test]
+    fn the_ways_to_end_a_daemon_name_no_command_for_a_number_a_command_cannot_read_intact() {
+        for number in [4_294_967_295, 4_294_967_296] {
+            let said = [
+                how_to_end_the_process(Some(number)).to_string(),
+                ends_with_said(Some(number)).to_string(),
+            ];
+            assert!(
+                said.iter()
+                    .all(|said| !said.contains("kill -KILL") && !said.contains("taskkill")),
+                "{number}: {said:?}"
+            );
+            assert_eq!(
+                said[0],
+                how_to_end_the_process(None).to_string(),
+                "{number}"
+            );
+            assert_eq!(said[1], ends_with_said(None).to_string(), "{number}");
+        }
+    }
+
     /// The words of a daemon that was told and has not ended, and of an environment that is held after
     /// the daemon's process has gone, name no process they cannot show and promise no wait.
     #[test]

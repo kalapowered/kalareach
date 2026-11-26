@@ -357,12 +357,26 @@ pub(crate) const STOP_COMMAND: &str = if cfg!(windows) {
 /// and 1, which name no one process (`kill -KILL 0` ends a whole group), and not for this process
 /// or its parent, which is the person's shell or the program that runs this one. A number that a
 /// lock file names is read from a file anyone can write, and a command a message gives is run as
-/// it stands.
+/// it stands. A number above [`LARGEST_NAMED_PROCESS`] is refused too, since a command line tool may
+/// read the number into 32 bits, and a result of 0 or below names a group of processes.
 ///
 /// On Windows the standard library names no parent, so only 0, 1 and this process are refused there.
 pub(crate) fn may_tell_to_stop(pid: u64) -> bool {
-    pid > 1 && pid != u64::from(std::process::id()) && parent_process_id() != Some(pid)
+    pid > 1
+        && pid <= LARGEST_NAMED_PROCESS
+        && pid != u64::from(std::process::id())
+        && parent_process_id() != Some(pid)
 }
+
+/// The largest process number that a message may name: `i32::MAX`, the largest that `kill` reads
+/// intact where a process number is a signed 32-bit number.
+#[cfg(unix)]
+const LARGEST_NAMED_PROCESS: u64 = 0x7fff_ffff;
+
+/// The largest process number that a message may name: `u32::MAX`, since a process number on
+/// Windows is 32 bits unsigned.
+#[cfg(not(unix))]
+const LARGEST_NAMED_PROCESS: u64 = 0xffff_ffff;
 
 /// The number of this process's parent, where the standard library names it.
 #[cfg(unix)]
@@ -888,6 +902,32 @@ mod tests {
         }
     }
 
+    /// What `naming_holders` makes of `refusal` where the lock file names the process `number`.
+    fn refusal_naming(environment: &Environment, refusal: &'static str, number: u64) -> String {
+        let lock = environment.paths.singleton_lock();
+        std::fs::create_dir_all(lock.parent().expect("a state directory")).expect("a directory");
+        std::fs::write(&lock, format!("{number}\n")).expect("names a process");
+        let CliError::UpdateDeferred(said) = naming_holders(
+            CliError::UpdateDeferred(Shown::said(refusal)),
+            &[environment],
+        ) else {
+            panic!("the refusal stays a refusal to wait");
+        };
+        said.to_string()
+    }
+
+    /// What `hold` refuses with where the daemon that holds `environment` has not gone and the lock
+    /// file names the process `number`.
+    #[cfg(unix)]
+    async fn refusal_holding(environment: &Environment, number: u64) -> String {
+        std::fs::write(environment.paths.singleton_lock(), format!("{number}\n"))
+            .expect("names a process");
+        let Err(refused) = hold(environment, None).await else {
+            panic!("the daemon has not gone");
+        };
+        refused.to_string()
+    }
+
     /// A message may tell a person to end a process of a number above 1 that is not this process
     /// or its parent, and no other.
     #[test]
@@ -900,7 +940,34 @@ mod tests {
             .find(|number| !never_named().contains(number))
             .expect("a number");
         assert!(may_tell_to_stop(just_above), "{just_above}");
-        assert!(may_tell_to_stop(u64::MAX));
+    }
+
+    /// A number above the largest that a command line tool reads intact is not named: such a tool
+    /// may read it into 32 bits, and `kill -KILL 4294967295` then ends every process that the
+    /// caller may signal, `4294967296` the caller's whole group.
+    #[cfg(unix)]
+    #[test]
+    fn a_number_a_command_cannot_read_intact_is_not_one_a_person_may_end() {
+        assert!(may_tell_to_stop(2_147_483_647));
+        for number in [
+            2_147_483_648,
+            4_294_967_295,
+            4_294_967_296,
+            4_294_967_297,
+            u64::MAX,
+        ] {
+            assert!(!may_tell_to_stop(number), "{number}");
+        }
+    }
+
+    /// On Windows a process number is 32 bits unsigned, and `taskkill /PID` reads one intact.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_number_above_32_bits_is_not_one_a_person_may_end() {
+        assert!(may_tell_to_stop(4_294_967_295));
+        for number in [4_294_967_296, 4_294_967_297, u64::MAX] {
+            assert!(!may_tell_to_stop(number), "{number}");
+        }
     }
 
     /// A lock file that names such a number adds no clause about it to the refusal of an update
@@ -909,19 +976,8 @@ mod tests {
     fn a_lock_file_that_names_a_number_that_must_not_be_ended_adds_no_clause_to_the_refusal() {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = environment_of(&temp);
-        let lock = environment.paths.singleton_lock();
-        std::fs::create_dir_all(lock.parent().expect("a state directory")).expect("a directory");
         let refusal = "the store's install lock is held";
-        let said = |number: u64| {
-            std::fs::write(&lock, format!("{number}\n")).expect("names a process");
-            let CliError::UpdateDeferred(said) = naming_holders(
-                CliError::UpdateDeferred(Shown::said(refusal)),
-                &[&environment],
-            ) else {
-                panic!("the refusal stays a refusal to wait");
-            };
-            said.to_string()
-        };
+        let said = |number: u64| refusal_naming(&environment, refusal, number);
         for number in never_named() {
             assert_eq!(said(number), refusal, "{number}");
         }
@@ -954,16 +1010,73 @@ mod tests {
         );
         let ordinary = an_ordinary_number();
         for number in never_named().into_iter().chain([ordinary]) {
-            std::fs::write(&lock, format!("{number}\n")).expect("names a process");
-            let Err(refused) = hold(&environment, None).await else {
-                panic!("the daemon has not gone");
-            };
             let expected = if number == ordinary {
                 format!("{held}; it is process {number}, and `{STOP_COMMAND} {number}` stops it")
             } else {
                 held.clone()
             };
-            assert_eq!(refused.to_string(), expected, "{number}");
+            assert_eq!(
+                refusal_holding(&environment, number).await,
+                expected,
+                "{number}"
+            );
+        }
+    }
+
+    /// A lock file that names a number a command line tool cannot read intact adds no clause to the
+    /// refusal of an update that waited for the install lock: 4294967295 is the largest number
+    /// the lock file's reader takes.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_number_a_command_cannot_read_intact_adds_no_clause_to_the_refusal() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = environment_of(&temp);
+        let refusal = "the store's install lock is held";
+        assert_eq!(
+            refusal_naming(&environment, refusal, 4_294_967_295),
+            refusal
+        );
+    }
+
+    /// An environment held by a daemon that was not listening, whose lock file names a number a
+    /// command line tool cannot read intact, is said to be held with no process named.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lock_number_a_command_cannot_read_intact_leaves_the_refusal_with_no_process() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = environment_of(&temp);
+        let _daemon = SingletonLock::acquire(
+            &environment.paths.singleton_lock(),
+            environment.environment_id,
+        )
+        .expect("a daemon holds the environment");
+        assert_eq!(
+            refusal_holding(&environment, 4_294_967_295).await,
+            format!(
+                "a control daemon holds environment {}, and it was not listening when the update \
+                 asked each daemon to make way",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// What is said of a daemon that still holds an environment, where the lock names a number a
+    /// command line tool cannot read intact, names no command and says what it says where the lock
+    /// names no process.
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_number_a_command_cannot_read_intact_is_said_with_no_command() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+        let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let before = BuildId::new("kr-controller/0.1.0+aaaaaaaaaaaa").expect("a build");
+        let said = |holder| holder_said(environment_id, holder, &expected).to_string();
+        for answers_as in [Some(&before), None] {
+            let named = said(Some((Some(4_294_967_295), answers_as)));
+            assert!(
+                !named.contains("kill -KILL") && !named.contains("taskkill"),
+                "{named}"
+            );
+            assert_eq!(named, said(Some((None, answers_as))));
         }
     }
 
