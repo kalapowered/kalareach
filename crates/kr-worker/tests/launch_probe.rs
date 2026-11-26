@@ -13,7 +13,7 @@
 //! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so; a program is held to the deadline it is given, and an answer after it is not taken; the probe runs in the environment it is given and in no other; one that is created after the deadline is ended by the thread that created it, and the call returns at the deadline; one that prints and keeps running, or whose descendant holds the output, is ended within the cleanup bound; the whole call, a wait for a thread included, takes no longer than the deadline and the cleanup bound |
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kr_plugin_sdk::launch_probe::LaunchProbe;
 use kr_worker::broker::probe::{self, ProbeRun, Probed, ThreadEnd};
@@ -240,6 +240,83 @@ fn written_pid(directory: &Path, file: &str) -> Option<u32> {
         .ok()
 }
 
+/// One run of a case's probe, the last that the case made.
+struct Attempt {
+    /// The directory the stand-in ran in, and wrote its process numbers to.
+    here: tempfile::TempDir,
+    probed: Probed,
+    /// The deadline this run was given: the one every bound of the case is read against.
+    deadline: Duration,
+    /// Whether the stand-in had written every file the case waits for.
+    started: bool,
+}
+
+/// How long after `begun` the stand-in wrote `file` in `directory`, to the resolution of the file
+/// system's clock, or `None` where it has not written it.
+fn written_after(directory: &Path, file: &str, begun: SystemTime) -> Option<Duration> {
+    written_pid(directory, file)?;
+    let modified = std::fs::metadata(directory.join(file))
+        .ok()?
+        .modified()
+        .ok()?;
+    Some(modified.duration_since(begun).unwrap_or_default())
+}
+
+/// Runs a case's probe, with the deadline given to it doubling from `first` up to `GENEROUS`, until
+/// the stand-in it ran has written every file in `files` or no longer deadline is left, and gives the
+/// last run.
+///
+/// How soon a stand-in starts what it starts is the machine's to say: a Windows PowerShell that runs
+/// a cmdlet took 15 to 44 seconds to its first effect on a hosted runner. So the deadline is not what
+/// the case decides by. Each run has a directory of its own and a clock of its own, which `attempt`
+/// makes with the deadline it is given, and what the case decides is the state of the processes of
+/// the last run, read against the deadline of that run. A case whose stand-in never started says so
+/// in its own body, by `started`.
+///
+/// One line per run says how long the stand-in took to write each file, and how many variables the
+/// probe was given, so that a run on another machine measures what the stand-in needs.
+fn until_started(
+    label: &str,
+    first: Duration,
+    files: &[&str],
+    mut attempt: impl FnMut(&Path, Duration, &[(std::ffi::OsString, std::ffi::OsString)]) -> Probed,
+) -> Attempt {
+    let environment = given(&[]);
+    let mut deadline = first;
+    let mut number = 0;
+    loop {
+        number += 1;
+        let here = directory();
+        let begun = SystemTime::now();
+        let probed = attempt(here.path(), deadline, &environment);
+        let written: Vec<String> = files
+            .iter()
+            .map(|file| match written_after(here.path(), file, begun) {
+                Some(after) => format!("{file} written {} ms after the start", after.as_millis()),
+                None => format!("{file} not written"),
+            })
+            .collect();
+        println!(
+            "launch probe timing: {label}: attempt {number}, deadline {} ms, {}, the stand-in was given {} variables",
+            deadline.as_millis(),
+            written.join(", "),
+            environment.len()
+        );
+        let started = files
+            .iter()
+            .all(|file| written_pid(here.path(), file).is_some());
+        if started || deadline >= GENEROUS {
+            return Attempt {
+                here,
+                probed,
+                deadline,
+                started,
+            };
+        }
+        deadline = (deadline * 2).min(GENEROUS);
+    }
+}
+
 /// KR-REQ-07.64: a program that never finishes is ended when its deadline passes, with what it
 /// started, and records no mode. Neither the program nor its child is left running.
 ///
@@ -249,38 +326,39 @@ fn written_pid(directory: &Path, file: &str) -> Option<u32> {
 /// processes once a probe that the program was running in has been ended.
 #[test]
 fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_started() {
-    let mut deadline = if cfg!(windows) {
-        Duration::from_secs(10)
-    } else {
-        Duration::from_secs(3)
-    };
-    let (here, probed) = loop {
-        let here = directory();
-        let standin = Standin::running(
-            r#"echo $$ > main.pid; sleep 600 & echo $! > child.pid; wait"#,
-            r#"$PID | Out-File -Encoding ascii main.pid; $child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Out-File -Encoding ascii child.pid; Start-Sleep 600"#,
-        );
-        let probed = probe::run_within(
-            &standin.program,
-            &standin.probe(&[]),
-            &[],
-            here.path(),
-            &given(&[]),
-            &ProbeRun::within(deadline),
-            probe::MAX_OUTPUT_BYTES,
-        );
-        if ["main.pid", "child.pid"]
-            .iter()
-            .all(|file| written_pid(here.path(), file).is_some())
-        {
-            break (here, probed);
-        }
-        assert!(
-            deadline < GENEROUS,
-            "the program had not started what it starts within {deadline:?}: {probed:?}"
-        );
-        deadline = (deadline * 2).min(GENEROUS);
-    };
+    let standin = Standin::running(
+        r#"echo $$ > main.pid; sleep 600 & echo $! > child.pid; wait"#,
+        r#"$PID | Out-File -Encoding ascii main.pid; $child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -WindowStyle Hidden; $child.Id | Out-File -Encoding ascii child.pid; Start-Sleep 600"#,
+    );
+    let Attempt {
+        here,
+        probed,
+        deadline,
+        started,
+    } = until_started(
+        "a program that never finishes",
+        if cfg!(windows) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(3)
+        },
+        &["main.pid", "child.pid"],
+        |directory, deadline, environment| {
+            probe::run_within(
+                &standin.program,
+                &standin.probe(&[]),
+                &[],
+                directory,
+                environment,
+                &ProbeRun::within(deadline),
+                probe::MAX_OUTPUT_BYTES,
+            )
+        },
+    );
+    assert!(
+        started,
+        "premise: the stand-in wrote main.pid and child.pid within the longest deadline tried, {deadline:?}: {probed:?}"
+    );
     assert_eq!(probed.mode, None);
     assert!(
         probed
@@ -471,7 +549,9 @@ fn survivors(directory: &Path, files: &[&str]) -> Vec<String> {
     left
 }
 
-/// How long a stand-in is given to start what it starts, where a case needs that to have happened.
+/// How long the first run of a case is given for its stand-in to start what it starts, where the case
+/// needs that to have happened. A case whose stand-in had not started runs again with twice as much,
+/// up to `GENEROUS`.
 fn start_allowance() -> Duration {
     if cfg!(windows) {
         Duration::from_secs(15)
@@ -534,21 +614,34 @@ fn kr_req_07_64_a_probe_created_after_the_deadline_is_ended_by_its_creator() {
 /// bound after the deadline, and nothing it ran is left.
 #[test]
 fn kr_req_07_64_a_probe_that_prints_and_keeps_running_is_ended_within_the_cleanup_bound() {
-    let here = directory();
     let standin = Standin::running(
         r#"echo $$ > main.pid; printf '{"mode":"elevated"}'; sleep 600"#,
-        r#"$PID | Out-File -Encoding ascii main.pid; [Console]::Out.Write('{"mode":"elevated"}'); Start-Sleep 600"#,
+        r#"[IO.File]::WriteAllText('main.pid', [string]$PID); [Console]::Out.Write('{"mode":"elevated"}'); Start-Sleep 600"#,
     );
-    let deadline = start_allowance();
-    let run = ProbeRun::within(deadline);
-    let probed = probe::run_within(
-        &standin.program,
-        &standin.probe(&[]),
-        &[],
-        here.path(),
-        &given(&[]),
-        &run,
-        probe::MAX_OUTPUT_BYTES,
+    let Attempt {
+        here,
+        probed,
+        deadline,
+        started,
+    } = until_started(
+        "a probe that prints and keeps running",
+        start_allowance(),
+        &["main.pid"],
+        |directory, deadline, environment| {
+            probe::run_within(
+                &standin.program,
+                &standin.probe(&[]),
+                &[],
+                directory,
+                environment,
+                &ProbeRun::within(deadline),
+                probe::MAX_OUTPUT_BYTES,
+            )
+        },
+    );
+    assert!(
+        started,
+        "premise: the stand-in wrote main.pid within the longest deadline tried, {deadline:?}: {probed:?}"
     );
     assert!(probed.late, "its output had not ended: {probed:?}");
     assert!(
@@ -577,23 +670,37 @@ fn kr_req_07_64_a_probe_that_prints_and_keeps_running_is_ended_within_the_cleanu
 /// and the cleanup bound, and a call whose deadline passed in the wait starts nothing.
 #[test]
 fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound() {
-    let here = directory();
     let standin = Standin::running(
         "echo $$ > main.pid; sleep 600",
-        "$PID | Out-File -Encoding ascii main.pid; Start-Sleep 600",
+        "[IO.File]::WriteAllText('main.pid', [string]$PID); Start-Sleep 600",
     );
-    let deadline = start_allowance();
-    let run = ProbeRun::within(deadline);
-    // A queue: a second of the deadline goes before the call is made.
-    std::thread::sleep(Duration::from_secs(1));
-    let probed = probe::run_within(
-        &standin.program,
-        &standin.probe(&[]),
-        &[],
-        here.path(),
-        &given(&[]),
-        &run,
-        probe::MAX_OUTPUT_BYTES,
+    let Attempt {
+        here,
+        probed,
+        deadline,
+        started,
+    } = until_started(
+        "the total time",
+        start_allowance(),
+        &["main.pid"],
+        |directory, deadline, environment| {
+            let run = ProbeRun::within(deadline);
+            // A queue: a second of the deadline goes before the call is made.
+            std::thread::sleep(Duration::from_secs(1));
+            probe::run_within(
+                &standin.program,
+                &standin.probe(&[]),
+                &[],
+                directory,
+                environment,
+                &run,
+                probe::MAX_OUTPUT_BYTES,
+            )
+        },
+    );
+    assert!(
+        started,
+        "premise: the stand-in wrote main.pid within the longest deadline tried, {deadline:?}: {probed:?}"
     );
     assert!(probed.late, "{probed:?}");
     assert!(
@@ -654,21 +761,34 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
 /// not hold the call: it returns at the deadline, and the descendant is ended with the probe.
 #[test]
 fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call() {
-    let here = directory();
     let standin = Standin::running(
         r#"(sleep 600 & echo $! > child.pid); printf '{"mode":"elevated"}'; exit 0"#,
         r#"$child = Start-Process "$env:SystemRoot\System32\ping.exe" -ArgumentList '-n','600','127.0.0.1' -PassThru -NoNewWindow; $child.Id | Out-File -Encoding ascii child.pid; [Console]::Out.Write('{"mode":"elevated"}')"#,
     );
-    let deadline = start_allowance();
-    let run = ProbeRun::within(deadline);
-    let probed = probe::run_within(
-        &standin.program,
-        &standin.probe(&[]),
-        &[],
-        here.path(),
-        &given(&[]),
-        &run,
-        probe::MAX_OUTPUT_BYTES,
+    let Attempt {
+        here,
+        probed,
+        deadline,
+        started,
+    } = until_started(
+        "a probe whose descendant holds the output",
+        start_allowance(),
+        &["child.pid"],
+        |directory, deadline, environment| {
+            probe::run_within(
+                &standin.program,
+                &standin.probe(&[]),
+                &[],
+                directory,
+                environment,
+                &ProbeRun::within(deadline),
+                probe::MAX_OUTPUT_BYTES,
+            )
+        },
+    );
+    assert!(
+        started,
+        "premise: the stand-in wrote child.pid within the longest deadline tried, {deadline:?}: {probed:?}"
     );
     assert!(probed.late, "the output had not ended: {probed:?}");
     assert!(
