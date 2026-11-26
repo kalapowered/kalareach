@@ -468,9 +468,10 @@ pub fn absent_paths_in(
 /// harness. Every placeholder that names a place in the run expands from the run's one root path,
 /// as its handle gives it (`Run::root`), so the names above `config` are the same in `config` and
 /// in the expanded path. The run's tree is on one volume: the run's directory, the absence check
-/// and the end compare refuse another file system. The absence check ([`PersonGuard::absent_below`]) refuses a
-/// link and a `..` part below the root, so the path it looks at is the path the system opens. An
-/// absolute path cannot name a place in the run, since the run's folder takes a fresh name when the
+/// and the end compare refuse another file system. The absence check
+/// ([`PersonGuard::absent_below`]) refuses a link and a `..` part below the root, so the path it
+/// looks at is the path the system opens. An absolute path cannot name a place in the run, since
+/// the run's folder takes a fresh name when the
 /// run starts: `make_root` makes it `krm-` and eight characters of a new name, which no entry,
 /// written before the run, can spell. The macOS `/tmp` alias is why this matters: the run's base is
 /// `/tmp`, the root its handle gives is `/private/tmp/krm-<name>`, and

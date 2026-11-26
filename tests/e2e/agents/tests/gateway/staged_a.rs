@@ -791,8 +791,9 @@ pub(super) fn part_5a(subject: Option<Subject>, test: &str, placed: Option<&dyn 
     part_5a_declaring(subject, test, placed, Restart::Declared);
 }
 
-/// Part 5a with what the case declares of its restart: [`Restart::Survey`] for the survey of the
-/// files a restart changes ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
+/// Part 5a with what the case declares of its restart: [`Restart::Declared`] for the case itself
+/// and [`Restart::Survey`] for the survey of the files a restart changes
+/// ([`survey_the_files_a_restart_of_the_control_daemon_changes`]).
 fn part_5a_declaring(
     subject: Option<Subject>,
     test: &str,
