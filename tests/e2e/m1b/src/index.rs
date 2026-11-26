@@ -604,6 +604,34 @@ mod tests {
         }
     }
 
+    /// Two new rows that overlap are each refused and each named. The earlier ends after the next
+    /// row starts, and the later starts before the earlier ends; the later starts at or after the
+    /// end of every recorded row, so only the rule on the row before it refuses it.
+    #[test]
+    fn two_new_rows_that_overlap_are_each_refused_and_named() {
+        let mut now = recorded();
+        now.push(mark(30, 40, 310, 1));
+        now.push(mark(35, 45, 320, 1));
+        let world = world("overlapping-new-rows");
+        let lines = refused(&world, Some(0), &[VERSION], &now);
+        for (numbers, by) in [
+            (
+                "a new row 30..40 that is not placed",
+                "the rule on the row after it",
+            ),
+            (
+                "a new row 35..45 that is not placed",
+                "the rule on the row before it",
+            ),
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(numbers)),
+                "{numbers} is refused by {by}: {lines:#?}"
+            );
+        }
+        world.clean();
+    }
+
     /// An index that the record does not hold must hold the schema version the worker writes.
     #[test]
     fn a_new_index_holds_the_schema_version_the_worker_writes() {

@@ -2211,20 +2211,45 @@ mod tests {
                 "plugins/*/x".to_owned()
             ])
         );
-        for (bad, part) in [
-            ("/home/.claude.json", ""),
-            ("{config}/../x", ".."),
-            ("{config}/a*b", "a*b"),
-            ("{config}/**/x", "**"),
-            ("{config}/{home}/x", "{home}"),
-            ("{config}/a//b", ""),
-            ("{config}/", ""),
+        // A refused pattern is asserted by the words of the rule that refused it. Every refusal
+        // quotes the pattern, so a check for a part of the pattern in the reason holds for any
+        // rule, and a pattern that two rules refuse would pass with either rule gone. A pattern
+        // that begins with `*` or `**` is also refused by the reach rule (it names `rules`, which no
+        // entry may allow), so the leading rule changes only the words of that refusal.
+        let not_below =
+            |bad: &str| format!("the allowed file {bad:?} does not begin with `{{config}}/`");
+        let part_rule = |bad: &str, part: &str| {
+            format!(
+                "the allowed file {bad:?} holds {part:?}, and a part is a name, a lone \
+                 `*`, or a last `**`"
+            )
+        };
+        let leading_rule = |bad: &str, part: &str| {
+            format!(
+                "the allowed file {bad:?} begins with {part:?}, so it names any file of the \
+                 configuration directory"
+            )
+        };
+        for (bad, why) in [
+            ("/home/.claude.json", not_below("/home/.claude.json")),
+            ("{config}/../x", part_rule("{config}/../x", "..")),
+            ("{config}/a*b", part_rule("{config}/a*b", "a*b")),
+            // `**` before a part, in a pattern that does not begin with it: no other rule refuses it.
+            ("{config}/x/**/y", part_rule("{config}/x/**/y", "**")),
+            // The part rule is applied before the leading rule.
+            ("{config}/**/x", part_rule("{config}/**/x", "**")),
+            (
+                "{config}/{home}/x",
+                part_rule("{config}/{home}/x", "{home}"),
+            ),
+            ("{config}/a//b", part_rule("{config}/a//b", "")),
+            ("{config}/", part_rule("{config}/", "")),
+            // A pattern that begins with `*` or `**` and holds no part the part rule refuses.
+            ("{config}/**", leading_rule("{config}/**", "**")),
+            ("{config}/*", leading_rule("{config}/*", "*")),
+            ("{config}/*/x", leading_rule("{config}/*/x", "*")),
         ] {
-            let why = allowed(serde_json::json!([bad])).expect_err(bad);
-            assert!(
-                why.contains(&format!("{bad:?}")) && (part.is_empty() || why.contains(part)),
-                "{bad}: {why}"
-            );
+            assert_eq!(allowed(serde_json::json!([bad])), Err(why), "{bad}");
         }
     }
 

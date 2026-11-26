@@ -370,6 +370,28 @@ mod tests {
             lines(compare(&world.layout, &killed, &look_at(&world))),
             vec!["the session journal of a1 cannot be read: it is not there".to_owned()]
         );
+        // At the look before: a journal that is gone and one that is no database are refused
+        // though the look now reads it.
+        let gone_before = look_at(&world);
+        write(&world, SETUP);
+        assert_eq!(
+            lines(compare(&world.layout, &gone_before, &look_at(&world))),
+            vec![
+                "the session journal of a1 cannot be read at the look before: it is not there"
+                    .to_owned()
+            ]
+        );
+        std::fs::remove_file(journal(&world)).expect("removed");
+        std::fs::write(journal(&world), b"not a database at all").expect("a file");
+        let garbled_before = look_at(&world);
+        std::fs::remove_file(journal(&world)).expect("removed");
+        write(&world, SETUP);
+        let refused = lines(compare(&world.layout, &garbled_before, &look_at(&world)));
+        assert_eq!(refused.len(), 1, "{refused:#?}");
+        assert!(
+            refused[0].starts_with("the session journal of a1 cannot be read at the look before: "),
+            "{refused:#?}"
+        );
         world.clean();
     }
 
