@@ -61,13 +61,59 @@ jobs:
     name: rust
     runs-on: ubuntu-24.04
     steps:
-      # The runner arrives with toolchains this project never uses, and removing them and the
-      # container images widens the margin the build has to work in. This reading and the one the
-      # last step takes are what that margin was.
+      # The runner arrives with toolchains, SDKs, cloud command lines and browsers this project never
+      # uses, and removing them and the container images widens the margin the build has to work in.
+      # At the test step's peak the workspace's whole test build stands on this disk beside the
+      # releases that the update suite stages, and an earlier run ran out of it there
+      # with 111 GB free at the start. Each path prints its size just before it goes, so that the run
+      # records what each freed; this reading and the ones the steps before and after the tests take
+      # are what the margin was.
+      #
+      # Why none of them can be needed here: Android, .NET, Haskell and CodeQL are what the step
+      # always removed. Swift (the only case that runs swiftc is for macOS), Julia, Miniconda,
+      # Homebrew (not on the path), the pipx applications and the Go, Python, PyPy and Ruby of the
+      # tool cache are languages and tools no step or test of this job starts; the job's Python is
+      # the system's /usr/bin/python3, and Node stays. The Azure, Google Cloud, AWS and AWS SAM
+      # command lines and the browsers and their drivers are not started by any step or test
+      # either: the desktop packages that the workspace links come from apt, and `pwsh` itself
+      # stays, as do the C toolchain and LLVM, Docker's program, Node and the rustup and cargo
+      # homes. Only the PowerShell modules the image adds (Az, Graph, Pester, PSScriptAnalyzer) go:
+      # the cases that start `pwsh` set their own module path.
       - name: Free the disk the build needs
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          for path in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/share/swift \
+            /usr/local/julia* \
+            /usr/share/miniconda \
+            /home/linuxbrew \
+            /opt/pipx \
+            /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Python \
+            /opt/hostedtoolcache/PyPy \
+            /opt/hostedtoolcache/Ruby \
+            /opt/az \
+            /usr/lib/google-cloud-sdk \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /opt/google/chrome \
+            /opt/microsoft/msedge \
+            /usr/local/share/chromium \
+            /usr/local/share/chromedriver-linux64 \
+            /usr/local/share/edge_driver \
+            /usr/local/share/gecko_driver \
+            /usr/lib/firefox \
+            /usr/local/share/powershell/Modules
+          do
+            if [ -e "$path" ]; then
+              sudo du -sh "$path" || true
+              sudo rm -rf -- "$path"
+            fi
+          done
           sudo docker image prune --all --force
           df -h /
 
@@ -297,6 +343,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets --features kr-cli/upgrade-suite -- -D warnings
 
+      # The disk as the tests start, every mount of it: what is left once the image is cleared and
+      # the build output of the lint and of the components stands on it, and a second disk of the
+      # runner, if there is one, shows here. It runs after a failed step too.
+      - name: What the disk has before the tests
+        if: ${{ !cancelled() }}
+        run: df -h
+
       # The step grows with the tests. It took 120 to 166 minutes in each of the last seven runs in
       # which the job passed, and twice it ran to its limit of 110 minutes without finishing. A
       # test that waits for something that never comes would otherwise
@@ -340,6 +393,12 @@ jobs:
           # it.
           KR_REQUIRE_SEGMENTATION: "1"
         run: cargo test --locked --workspace
+
+      # The disk once the tests are over, beside the reading before them: the difference is what the
+      # workspace's test build took, and what the programs' temporary folders took has gone by now.
+      - name: What the disk has after the tests
+        if: ${{ !cancelled() }}
+        run: df -h /
 
       # The cases that start a daemon through test trees made without a service manager are ignored
       # in the run above, which has this runner's account and so its own user manager. Each checks
