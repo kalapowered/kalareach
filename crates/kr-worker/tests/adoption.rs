@@ -2462,6 +2462,71 @@ fn kr_req_12_07_a_replacement_inside_the_bracket_is_refused() {
     started.end();
 }
 
+/// KR-REQ-12.07: a program that no longer runs the file that was hashed is not adopted, though that
+/// file was neither written nor renamed. The folder that holds the file is moved aside and another
+/// folder, which holds another file, takes its name; the program then executes the path it was
+/// started by, which now names the other file, with the same process identifier. The first file
+/// keeps its device, file number, size and times, so only the comparison of the file the program
+/// runs with the file that was hashed can see the exec.
+#[test]
+fn kr_req_12_07_an_exec_of_another_file_at_the_same_path_with_the_first_file_untouched_is_refused()
+{
+    use std::os::unix::fs::MetadataExt as _;
+
+    // What the whole-identity comparison reads of a file.
+    let identity = |file: &std::fs::Metadata| {
+        (
+            file.dev(),
+            file.ino(),
+            file.len(),
+            (file.mtime(), file.mtime_nsec()),
+            (file.ctime(), file.ctime_nsec()),
+        )
+    };
+    let setup = Setup::new();
+    let name = setup.program.file_name().expect("a file name").to_owned();
+    let folder = setup.program.parent().expect("a folder").to_owned();
+    let moved = setup.host.root().join("moved-aside");
+    let other = setup.host.root().join("other");
+    std::fs::create_dir_all(&other).expect("a folder for the other file");
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own binary"),
+        &other.join(&name),
+    );
+    let first = identity(&std::fs::metadata(&setup.program).expect("the first file"));
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(
+        &[Hop::new(&go, &setup.program, "stand-in", "hop-b1")],
+        false,
+    );
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            std::fs::rename(&folder, &moved).expect("the folder of the first file moves aside");
+            std::fs::rename(&other, &folder).expect("the other folder takes its name");
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program that runs another file than the one hashed is not adopted: {told:?}"
+    );
+    assert_eq!(
+        identity(&std::fs::metadata(moved.join(&name)).expect("the first file, moved aside")),
+        first,
+        "the first file was neither written nor renamed"
+    );
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(profile.binary.resolved_path, canonical(&setup.program));
+    started.end();
+}
+
 /// KR-REQ-12.07, the stated limit: an exec from a thread other than the program's main one keeps
 /// the process's identifier and start identity, so it is the same case as any exec: the look that
 /// read the image before it and the arguments after it adopts nothing, and the next look adopts the
