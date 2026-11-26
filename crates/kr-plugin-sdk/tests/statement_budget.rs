@@ -67,18 +67,15 @@ fn package_with_launch(package: &str, declaration: &str) -> (PluginManifest, Con
     (manifest, connector)
 }
 
-/// The statement of each package: its length, and the statement itself.
-fn statements() -> Vec<(&'static str, PluginManifest, String)> {
+/// Each package with its manifest and the statement the host composes for it, where it composes
+/// one. Each case asserts on what it gets in its own body.
+fn statements() -> Vec<(&'static str, PluginManifest, Option<String>)> {
     PACKAGES
         .iter()
         .map(|(package, declaration)| {
             let (manifest, connector) = package_with_launch(package, declaration);
             let statement = whole_statement(&manifest, Some(&connector));
-            assert!(
-                statement.is_some(),
-                "{package} declares a launch, so the host composes a statement for it"
-            );
-            (*package, manifest, statement.unwrap_or_default())
+            (*package, manifest, statement)
         })
         .collect()
 }
@@ -109,22 +106,30 @@ fn kr_req_11_26_the_measured_launches_are_valid_declarations() {
 #[test]
 fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
     for (package, manifest, statement) in statements() {
+        assert!(
+            statement.is_some(),
+            "{package} declares a launch, so the host composes a statement for it"
+        );
+        let statement = statement.unwrap_or_default();
         let launch: &AcpLaunch = manifest.acp_launch.as_ref().expect("a launch");
         let integration = manifest
             .command_integration
             .as_ref()
             .expect("a command integration");
-        let words_at = statement
-            .find(launch.grant_statement.as_str())
-            .unwrap_or_else(|| panic!("{package}: the publisher's words of the launch are shown"));
-        let integration_words_at = statement
-            .find(integration.grant_statement.as_str())
-            .unwrap_or_else(|| panic!("{package}: the integration's own words are shown"));
-        let integration_label_at = statement
-            .find(INTEGRATION_STATEMENT_LABEL)
-            .unwrap_or_else(|| panic!("{package}: the integration's label is shown"));
+        let words_at = statement.find(launch.grant_statement.as_str());
+        let integration_words_at = statement.find(integration.grant_statement.as_str());
+        let integration_label_at = statement.find(INTEGRATION_STATEMENT_LABEL);
         assert!(
-            integration_words_at < words_at && words_at < integration_label_at,
+            words_at.is_some() && integration_words_at.is_some() && integration_label_at.is_some(),
+            "{package}: the publisher's words of the launch, the integration's own words and its \
+             label are all shown"
+        );
+        assert!(
+            matches!(
+                (integration_words_at, words_at, integration_label_at),
+                (Some(integration_words), Some(words), Some(label))
+                    if integration_words < words && words < label
+            ),
             "{package}: the launch's words follow the integration's, ahead of the host's labels"
         );
         assert_eq!(
@@ -139,7 +144,8 @@ fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
         assert!(
             statement
                 .find(ACP_STATEMENT_LABEL)
-                .is_some_and(|label_at| integration_label_at < label_at),
+                .zip(integration_label_at)
+                .is_some_and(|(label_at, integration_label)| integration_label < label_at),
             "{package}: the host's reading of the launch follows its reading of the integration"
         );
     }
@@ -150,13 +156,22 @@ fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
 /// rounded up to the next 1,000.
 #[test]
 fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin() {
-    let lengths: Vec<(&str, usize)> = statements()
+    let lengths: Vec<(&str, Option<usize>)> = statements()
         .iter()
-        .map(|(package, _, statement)| (*package, statement.chars().count()))
+        .map(|(package, _, statement)| {
+            (
+                *package,
+                statement.as_ref().map(|text| text.chars().count()),
+            )
+        })
         .collect();
+    assert!(
+        lengths.iter().all(|(_, length)| length.is_some()),
+        "every package declares a launch, so the host composes a statement for each: {lengths:?}"
+    );
     let longest = lengths
         .iter()
-        .map(|(_, length)| *length)
+        .filter_map(|(_, length)| *length)
         .max()
         .expect("two packages");
     assert!(

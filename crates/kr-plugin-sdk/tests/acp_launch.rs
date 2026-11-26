@@ -17,7 +17,7 @@ use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::matching::OperatingSystem;
 use kr_plugin_sdk::package::{MANIFEST_FILE, PRESENTATION_FILE};
-use kr_plugin_sdk::validate::{FindingCode, Validated, validate_package_directory};
+use kr_plugin_sdk::validate::{Finding, FindingCode, Validated, validate_package_directory};
 use serde_json::{Value, json};
 
 /// Both approval grants and the launch grant, as a package that declares a launch requests them.
@@ -79,19 +79,16 @@ fn validate(manifest: &Value) -> Validated {
     validate_package_directory(Path::new(&package))
 }
 
-/// Asserts that the validator reports `code` with a detail that begins with `reason`.
-fn assert_refused(manifest: &Value, code: FindingCode, reason: &str) {
-    let validated = validate(manifest);
-    assert!(
-        validated
-            .report
-            .findings
-            .iter()
-            .any(|finding| finding.code == code && finding.detail.starts_with(reason)),
-        "a finding {} that begins {reason:?} is expected: {:?}",
-        code.as_str(),
-        validated.report.findings
-    );
+/// The findings the validator reports for `manifest`. Each case asserts on them in its own body.
+fn findings_of(manifest: &Value) -> Vec<Finding> {
+    validate(manifest).report.findings
+}
+
+/// Whether `findings` holds one with `code` and a detail that begins with `reason`.
+fn has(findings: &[Finding], code: FindingCode, reason: &str) -> bool {
+    findings
+        .iter()
+        .any(|finding| finding.code == code && finding.detail.starts_with(reason))
 }
 
 /// KR-REQ-11.26: a launch is read from the verified manifest whole, beside the grants it needs.
@@ -193,10 +190,14 @@ fn kr_req_11_26_the_statement_of_a_launch_with_no_constant_says_so() {
 /// an approval the agent asks for could not be answered.
 #[test]
 fn kr_req_11_26_a_launch_without_the_approval_grants_is_refused() {
-    assert_refused(
-        &manifest_with(&declaration(), &["command_integration.launch"]),
-        FindingCode::AcpLaunchWithoutCapability,
-        "grants missing:",
+    let reason = "grants missing:";
+    let findings = findings_of(&manifest_with(
+        &declaration(),
+        &["command_integration.launch"],
+    ));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchWithoutCapability, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
     let validated = validate(&manifest_with(
         &declaration(),
@@ -220,10 +221,14 @@ fn kr_req_11_26_a_launch_without_the_approval_grants_is_refused() {
 /// KR-REQ-11.26: a package that declares a launch without `command_integration.launch` is refused.
 #[test]
 fn kr_req_11_26_a_launch_without_the_launch_grant_is_refused() {
-    assert_refused(
-        &manifest_with(&declaration(), &["approval.decode", "approval.respond"]),
-        FindingCode::AcpLaunchWithoutCapability,
-        "capability:",
+    let reason = "capability:";
+    let findings = findings_of(&manifest_with(
+        &declaration(),
+        &["approval.decode", "approval.respond"],
+    ));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchWithoutCapability, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -232,10 +237,11 @@ fn kr_req_11_26_a_launch_without_the_launch_grant_is_refused() {
 fn kr_req_11_26_a_launch_with_no_required_name_is_refused() {
     let mut launch = declaration();
     launch["required_names"] = json!([]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "names missing: acp_launch lists no required name",
+    let reason = "names missing: acp_launch lists no required name";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -244,10 +250,11 @@ fn kr_req_11_26_a_launch_with_no_required_name_is_refused() {
 fn kr_req_11_26_a_required_name_that_is_not_passed_is_refused() {
     let mut launch = declaration();
     launch["required_names"] = json!(["PATH", "OTHER_KEY"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "names missing: required name \"OTHER_KEY\" is not in passed_names",
+    let reason = "names missing: required name \"OTHER_KEY\" is not in passed_names";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -256,10 +263,11 @@ fn kr_req_11_26_a_required_name_that_is_not_passed_is_refused() {
 fn kr_req_11_26_a_launch_with_no_platform_is_refused() {
     let mut launch = declaration();
     launch["platforms"] = json!([]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "platform: acp_launch lists no platform",
+    let reason = "platform: acp_launch lists no platform";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -268,10 +276,11 @@ fn kr_req_11_26_a_launch_with_no_platform_is_refused() {
 fn kr_req_11_26_a_launch_on_windows_is_refused() {
     let mut launch = declaration();
     launch["platforms"] = json!(["mac_os", "windows"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "platform: acp_launch lists windows, which has no ACP launch",
+    let reason = "platform: acp_launch lists windows, which has no ACP launch";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -280,10 +289,11 @@ fn kr_req_11_26_a_launch_on_windows_is_refused() {
 fn kr_req_11_26_a_launch_on_a_platform_the_package_does_not_list_is_refused() {
     let mut manifest = manifest_with(&declaration(), &GRANTS);
     manifest["platforms"] = json!([{"os": "linux", "architectures": ["x86_64"]}]);
-    assert_refused(
-        &manifest,
-        FindingCode::AcpLaunchInvalid,
-        "platform: acp_launch lists mac_os, which the package's platforms do not support",
+    let reason = "platform: acp_launch lists mac_os, which the package's platforms do not support";
+    let findings = findings_of(&manifest);
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -306,10 +316,11 @@ fn kr_req_11_26_a_launch_cannot_declare_an_argument() {
 fn kr_req_11_26_a_command_that_the_package_does_not_match_is_refused() {
     let mut launch = declaration();
     launch["command"] = json!("other-agent");
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "the ACP launch's command \"other-agent\" is not the executable name",
+    let reason = "the ACP launch's command \"other-agent\" is not the executable name";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -318,24 +329,27 @@ fn kr_req_11_26_a_command_that_the_package_does_not_match_is_refused() {
 fn kr_req_11_26_a_name_outside_the_contract_is_refused() {
     let mut launch = declaration();
     launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "bad name"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "name: \"bad name\" in passed_names is not a variable name",
+    let reason = "name: \"bad name\" in passed_names is not a variable name";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
     let mut launch = declaration();
     launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "KR_TOKEN"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "name: \"KR_TOKEN\" in passed_names begins with KR_",
+    let reason = "name: \"KR_TOKEN\" in passed_names begins with KR_";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
     let mut launch = declaration();
     launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "PATH"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "name: \"PATH\" is listed more than once in passed_names",
+    let reason = "name: \"PATH\" is listed more than once in passed_names";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -346,10 +360,11 @@ fn kr_req_11_26_a_list_over_the_bound_is_refused() {
     let names: Vec<String> = (0..65).map(|index| format!("NAME_{index}")).collect();
     launch["passed_names"] = json!(names);
     launch["required_names"] = json!(["NAME_0"]);
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "name: passed_names lists 65 names, over the 64 one list may",
+    let reason = "name: passed_names lists 65 names, over the 64 one list may";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -362,28 +377,34 @@ fn kr_req_11_26_a_constant_outside_the_contract_is_refused() {
         launch["constants"] = constants;
         manifest_with(&launch, &GRANTS)
     };
-    assert_refused(
-        &with_constants(json!([{"name": "HOME", "value": "x"}])),
-        FindingCode::AcpLaunchInvalid,
-        "constant: \"HOME\" is both set by KalaReach and passed from the shell",
+    let reason = "constant: \"HOME\" is both set by KalaReach and passed from the shell";
+    let findings = findings_of(&with_constants(json!([{"name": "HOME", "value": "x"}])));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    assert_refused(
-        &with_constants(json!([
-            {"name": "A_ONE", "value": "x"},
-            {"name": "A_ONE", "value": "y"}
-        ])),
-        FindingCode::AcpLaunchInvalid,
-        "constant: \"A_ONE\" is set more than once",
+    let reason = "constant: \"A_ONE\" is set more than once";
+    let findings = findings_of(&with_constants(json!([
+        {"name": "A_ONE", "value": "x"},
+        {"name": "A_ONE", "value": "y"}
+    ])));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    assert_refused(
-        &with_constants(json!([{"name": "A_ONE", "value": ""}])),
-        FindingCode::AcpLaunchInvalid,
-        "constant: the value of \"A_ONE\" is empty",
+    let reason = "constant: the value of \"A_ONE\" is empty";
+    let findings = findings_of(&with_constants(json!([{"name": "A_ONE", "value": ""}])));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    assert_refused(
-        &with_constants(json!([{"name": "A_ONE", "value": "x{private_home}"}])),
-        FindingCode::AcpLaunchInvalid,
-        "constant: the value of \"A_ONE\" holds a brace",
+    let reason = "constant: the value of \"A_ONE\" holds a brace";
+    let findings = findings_of(&with_constants(
+        json!([{"name": "A_ONE", "value": "x{private_home}"}]),
+    ));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -396,11 +417,12 @@ fn kr_req_11_26_launch_words_that_hold_a_label_of_the_host_are_refused() {
         "Starts the agent. {} nothing",
         kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
     ));
-    assert_refused(
-        &manifest_with(&launch, &GRANTS),
-        FindingCode::AcpLaunchInvalid,
-        "the ACP launch's statement holds the words the host writes before its own reading of a \
-         command integration",
+    let reason = "the ACP launch's statement holds the words the host writes before its own reading of a \
+         command integration";
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
     let label = kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL;
     let (start, rest) = label
@@ -414,11 +436,12 @@ fn kr_req_11_26_launch_words_that_hold_a_label_of_the_host_are_refused() {
         "grant_statement": format!("Adds a flag. {start}")
     });
     manifest["acp_launch"]["grant_statement"] = json!(format!("{rest} and starts the agent"));
-    assert_refused(
-        &manifest,
-        FindingCode::AcpLaunchInvalid,
-        "the statements of the bridge, the command integration and the ACP launch, read \
-         together, hold the words the host writes before its own reading of a placement",
+    let reason = "the statements of the bridge, the command integration and the ACP launch, read \
+         together, hold the words the host writes before its own reading of a placement";
+    let findings = findings_of(&manifest);
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
@@ -467,23 +490,26 @@ fn kr_req_11_26_words_that_hold_the_launch_label_of_the_host_are_refused() {
     let label = kr_protocol::confirmation::ACP_STATEMENT_LABEL;
     let imitation = format!("Harmless. {label} Runs nothing.");
     let fine = "Adds a flag.";
-    assert_refused(
-        &manifest_with_words(fine, fine, &imitation),
-        FindingCode::AcpLaunchInvalid,
-        "the ACP launch's statement holds the words the host writes before its own reading of an \
-         ACP launch",
+    let reason = "the ACP launch's statement holds the words the host writes before its own reading of an \
+         ACP launch";
+    let findings = findings_of(&manifest_with_words(fine, fine, &imitation));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    assert_refused(
-        &manifest_with_words(fine, &imitation, fine),
-        FindingCode::IntegrationInvalid,
-        "the command integration's statement holds the words the host writes before its own \
-         reading of an ACP launch",
+    let reason = "the command integration's statement holds the words the host writes before its own \
+         reading of an ACP launch";
+    let findings = findings_of(&manifest_with_words(fine, &imitation, fine));
+    assert!(
+        has(&findings, FindingCode::IntegrationInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    assert_refused(
-        &manifest_with_words(&imitation, fine, fine),
-        FindingCode::BridgeRecipeInvalid,
-        "the bridge's statement holds the words the host writes before its own reading of an ACP \
-         launch",
+    let reason = "the bridge's statement holds the words the host writes before its own reading of an ACP \
+         launch";
+    let findings = findings_of(&manifest_with_words(&imitation, fine, fine));
+    assert!(
+        has(&findings, FindingCode::BridgeRecipeInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 
     // Three statements that form the label only where they join: neither holds it.
@@ -500,11 +526,12 @@ fn kr_req_11_26_words_that_hold_the_launch_label_of_the_host_are_refused() {
             .any(|words| words.contains(label)),
         "and none holds it"
     );
-    assert_refused(
-        &manifest_with_words(bridge, integration, launch),
-        FindingCode::AcpLaunchInvalid,
-        "the statements of the bridge, the command integration and the ACP launch, read \
-         together, hold the words the host writes before its own reading of an ACP launch",
+    let reason = "the statements of the bridge, the command integration and the ACP launch, read \
+         together, hold the words the host writes before its own reading of an ACP launch";
+    let findings = findings_of(&manifest_with_words(bridge, integration, launch));
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
     );
 }
 
