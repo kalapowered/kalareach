@@ -21,11 +21,12 @@
 //!   The host copies a passed name only when the person's shell has it. A required name is a
 //!   passed name too, and the launch is refused when the shell has no such variable or it is
 //!   empty.
-//! * No name is a loader or runtime name, passed or set: none begins with a word of
-//!   [`LOADER_BEGINNINGS`] (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest), and none is one of
-//!   [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
-//!   passed ([`DATA_NAMES`]). A constant is also none of [`COPIED_NAMES`], [`DATA_NAMES`] or
-//!   [`START_FILE_NAMES`], and does not begin with a word of [`SET_ONLY_BEGINNINGS`].
+//! * The floor refuses these names, passed or set: none begins with a word of
+//!   [`LOADER_BEGINNINGS`] (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest) and none is one of
+//!   [`LOADER_NAMES`]. It is a list, not a proof: a name that no list holds can pass. Three data
+//!   names of Node.js begin that way and may be passed ([`DATA_NAMES`]). A constant is also none
+//!   of [`COPIED_NAMES`], [`DATA_NAMES`] or [`START_FILE_NAMES`], and does not begin with a word
+//!   of [`SET_ONLY_BEGINNINGS`].
 //! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
 //!   which the host replaces with the path of a folder it makes new and empty for each start, or
 //!   only ASCII letters, digits, `_`, `.` and `-`, and not dots only.
@@ -98,8 +99,8 @@ pub const DATA_NAMES: [&str; 3] = [
     "NODE_USE_SYSTEM_CA",
 ];
 
-/// Names the host copies from the person's shell into every agent's start. A declaration may pass
-/// them and may not set them.
+/// Names that decide which program runs and where tools read their settings. The host copies only
+/// the names a declaration lists; these are refused as constants.
 pub const COPIED_NAMES: [&str; 3] = ["PATH", "HOME", "SHELL"];
 
 /// Names that make a shell or a tool run a command or read a start file. They are the person's
@@ -404,12 +405,13 @@ impl AcpLaunch {
 
 /// Returns why a variable name is not one a declaration may list in `role`, where it is not.
 ///
-/// The floor: no declaration passes or sets a loader or runtime name, whatever the name is. A name
-/// is one when, written in upper case, it begins with a word of
-/// [`LOADER_BEGINNINGS`], or is one of [`LOADER_NAMES`]. A beginning, not a first word, so
-/// `PYTHONSTARTUP` and `PERL5OPT` are held too. [`DATA_NAMES`] begin like them and load nothing: they may be passed. A constant is also
-/// refused when it is one the host copies ([`COPIED_NAMES`], [`DATA_NAMES`]) or one of the
-/// person's own that makes a shell or a tool run a command ([`START_FILE_NAMES`]).
+/// The floor refuses a name when, written in upper case, it begins with a word of
+/// [`LOADER_BEGINNINGS`] or is one of [`LOADER_NAMES`]: a list, not a proof. A beginning, not a
+/// first word, so `PYTHONSTARTUP` and `PERL5OPT` are held too, and so are data names that load
+/// nothing, such as `SSL_CERT_FILE`. [`DATA_NAMES`] begin like them and change only which
+/// certificates and proxy Node.js uses: they may be passed. A constant is also refused when it is
+/// one of [`COPIED_NAMES`], [`DATA_NAMES`] or [`START_FILE_NAMES`], or begins with a word of
+/// [`SET_ONLY_BEGINNINGS`].
 fn name_problem(name: &str, role: Role) -> Option<String> {
     if !name_has_shape(name) {
         return Some(format!(
@@ -427,7 +429,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
     if role == Role::Set {
         if COPIED_NAMES.contains(&upper.as_str()) || DATA_NAMES.contains(&name) {
             return Some(
-                "is a variable the host copies from the person's shell, and no ACP launch sets it"
+                "is a variable that decides which program runs, where tools read their settings, or \
+                 which trust store and proxy apply, and no ACP launch sets it"
                     .to_owned(),
             );
         }
@@ -449,7 +452,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
     }
     if let Some(listed) = LOADER_NAMES.iter().find(|listed| **listed == upper) {
         return Some(format!(
-            "is {listed}, a loader or runtime name that no ACP launch copies or sets"
+            "is {listed}, a name that can decide what code or command a loader, a runtime or a \
+             library loads or runs, and no ACP launch passes or sets it"
         ));
     }
     LOADER_BEGINNINGS
@@ -457,7 +461,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
         .find(|word| upper.starts_with(**word))
         .map(|word| {
             format!(
-                "begins with {word}, a loader or runtime name that no ACP launch copies or sets"
+                "begins with {word}; a name that begins so can decide what code or command a \
+                 loader, a runtime or a library loads or runs, and no ACP launch passes or sets one"
             )
         })
 }

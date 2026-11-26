@@ -632,8 +632,13 @@ fn kr_req_11_26_the_first_cause_in_the_hosts_order_is_the_one_refused() {
     );
 }
 
-/// The sentence a refused loader or runtime name carries after its beginning or its name.
-const LOADER_REASON: &str = ", a loader or runtime name that no ACP launch copies or sets";
+/// What a name refused for its beginning is told after the beginning.
+const BEGINNING_REASON: &str = "; a name that begins so can decide what code or command a loader, a \
+     runtime or a library loads or runs, and no ACP launch passes or sets one";
+
+/// What a name refused whole is told after the name.
+const NAME_REASON: &str = ", a name that can decide what code or command a loader, a runtime or a \
+     library loads or runs, and no ACP launch passes or sets it";
 
 /// KR-REQ-11.26: no launch passes a name that loads code into the agent or into a program it
 /// starts, whatever the name is: the loader and runtime names refuse by their beginning or their
@@ -657,7 +662,12 @@ fn kr_req_11_26_a_passed_name_that_loads_code_is_refused() {
         let mut launch = declaration();
         launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
         let findings = findings_of(&manifest_with(&launch, &GRANTS));
-        let reason = format!("name: \"{name}\" in passed_names {why}{LOADER_REASON}");
+        let because = if why.starts_with("begins") {
+            BEGINNING_REASON
+        } else {
+            NAME_REASON
+        };
+        let reason = format!("name: \"{name}\" in passed_names {why}{because}");
         assert!(
             has(&findings, FindingCode::AcpLaunchInvalid, &reason),
             "a finding that begins {reason:?} is expected: {findings:?}"
@@ -672,7 +682,7 @@ fn kr_req_11_26_a_required_name_that_loads_code_is_refused() {
     launch["required_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "LD_PRELOAD"]);
     launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "LD_PRELOAD"]);
     let findings = findings_of(&manifest_with(&launch, &GRANTS));
-    let reason = format!("name: \"LD_PRELOAD\" in required_names begins with LD{LOADER_REASON}");
+    let reason = format!("name: \"LD_PRELOAD\" in required_names begins with LD{BEGINNING_REASON}");
     assert!(
         has(&findings, FindingCode::AcpLaunchInvalid, &reason),
         "a finding that begins {reason:?} is expected: {findings:?}"
@@ -684,7 +694,8 @@ fn kr_req_11_26_a_required_name_that_loads_code_is_refused() {
 /// read a start file.
 #[test]
 fn kr_req_11_26_a_constant_that_loads_code_or_runs_a_command_is_refused() {
-    let copied = "is a variable the host copies from the person's shell, and no ACP launch sets it";
+    let copied = "is a variable that decides which program runs, where tools read their settings, \
+                  or which trust store and proxy apply, and no ACP launch sets it";
     let start = |name: &str| {
         format!(
             "is {name}, a variable that makes a shell or a tool run a command or read a start \
@@ -692,9 +703,12 @@ fn kr_req_11_26_a_constant_that_loads_code_or_runs_a_command_is_refused() {
         )
     };
     let mut refused: Vec<(&str, String)> = vec![
-        ("NODE_OPTIONS", format!("begins with NODE{LOADER_REASON}")),
-        ("BASH_ENV", format!("begins with BASH{LOADER_REASON}")),
-        ("ENV", format!("is ENV{LOADER_REASON}")),
+        (
+            "NODE_OPTIONS",
+            format!("begins with NODE{BEGINNING_REASON}"),
+        ),
+        ("BASH_ENV", format!("begins with BASH{BEGINNING_REASON}")),
+        ("ENV", format!("is ENV{NAME_REASON}")),
         ("PATH", copied.to_owned()),
         ("HOME", copied.to_owned()),
         ("SHELL", copied.to_owned()),
