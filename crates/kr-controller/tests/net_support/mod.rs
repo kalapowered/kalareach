@@ -473,6 +473,10 @@ pub struct Waits {
     /// about them gives deadlines longer than its own bound on a wait, so that a stalled machine
     /// does not make the client give a request up.
     pub feed_deadlines: Option<kr_client::services::HttpDeadlines>,
+    /// Whether the daemon joins the network with its own key store, as a daemon's start does, so
+    /// that the keys its pairings declare are the device keys it holds. A daemon started with a
+    /// `timer` does so too.
+    pub one_key_store: bool,
 }
 
 /// How a suite stands the signed release matrix up for a daemon.
@@ -497,6 +501,33 @@ impl Host {
         // The first owner is established the way a person establishes it: from this host's own
         // account, through the initial bootstrap, pairing the owner's device with a personal
         // owner grant. Every later confirmation in the suite is that device's.
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    /// Starts a daemon as a daemon starts in the product, with its network's keys and its own
+    /// device keys in one store, so that the keys its pairings declare are the device keys it holds,
+    /// with `owner` as its first owner.
+    pub async fn start_in_one_key_store(owner: &DeviceKeys) -> Self {
+        let mut host = Self::start_on(
+            kr_ipc::testing::TempHost::create(),
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            Clocks::system(),
+            None,
+            Waits {
+                one_key_store: true,
+                ..Waits::default()
+            },
+        )
+        .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
         host.owner = Some(record);
         host.owner_device = Some(device);
@@ -960,6 +991,7 @@ impl Host {
                 release_matrix: matrix,
                 effect_wait: None,
                 feed_deadlines: None,
+                ..Waits::default()
             },
         )
         .await;
@@ -1220,9 +1252,10 @@ impl Host {
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
         let ending = kr_ipc::testing::Serving::guarding(&clients);
         // The endpoint configuration is this suite's own, so the network is registered here rather
-        // than from the environment. Unless a case holds the daemon's timer, the network's keys
-        // are this suite's memory store, and the daemon's own keys stay in the environment's
-        // directory, so these cases run two key sets in one start where the product runs one.
+        // than from the environment. Unless a case holds the daemon's timer or asks for one key
+        // store, the network's keys are this suite's memory store, and the daemon's own keys stay
+        // in the environment's directory, so these cases run two key sets in one start where the
+        // product runs one.
         // The reason is scope: these suites do not test where the keys are kept, a restart on the
         // same tree would give the same endpoint back from the directory too, and rewriting them
         // all to one store is no part of what they check. `network_key_store.rs` is where the
@@ -1231,7 +1264,7 @@ impl Host {
             &controller,
             NetworkSetup {
                 settings: settings.clone(),
-                secrets: if waits.timer.is_some() {
+                secrets: if waits.timer.is_some() || waits.one_key_store {
                     Arc::clone(controller.secret_store())
                 } else {
                     Arc::clone(&secrets) as Arc<dyn kr_crypto::store::SecretStore>
@@ -1708,6 +1741,7 @@ impl Stopped {
                 release_matrix: waits.release_matrix,
                 effect_wait: waits.effect_wait,
                 feed_deadlines: waits.feed_deadlines,
+                ..Waits::default()
             },
         )
         .await;

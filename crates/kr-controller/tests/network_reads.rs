@@ -618,6 +618,48 @@ async fn the_box_of_an_answer_holds_the_challenge_the_hosts_endpoint_and_the_ans
     host.stop().await;
 }
 
+/// In a daemon that starts as the product's does, with the host's device keys and its network's in
+/// one store, the key that seals the box is the key the host's pairings declare: the key a paired
+/// device records for the host opens the box and the box holds the answer, and that key is the
+/// stored-envelope key the host's own store holds. A host that sealed with another key would give
+/// a box that the declared key does not open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_box_opens_under_the_key_the_hosts_pairing_declares() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_in_one_key_store(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(&[ActionRight::HostManage])).await;
+    let session = connect(&host, &device, &record).await;
+
+    // What a device records of the host when it pairs: the keys the host's pairing identity names.
+    let declared = host.network().pairing().identity().keys;
+    assert_eq!(
+        declared.stored_envelope,
+        host.declared_keys().stored_envelope,
+        "the pairing declares the stored-envelope key that the host's store holds"
+    );
+    let (ask, answer) = answered(&session).await;
+    let under_the_declared_key = open_stored_envelope(
+        &ask.reply,
+        &declared.stored_envelope,
+        &answer.proof.nonce,
+        answer.proof.ciphertext.as_slice(),
+    )
+    .map(|plaintext| plaintext.expose().to_vec())
+    .map_err(|error| format!("{error:?}"));
+    assert_eq!(
+        under_the_declared_key,
+        Ok(proof_bytes(
+            ask.params.challenge,
+            host.endpoint_id(),
+            &answer.checkpoint
+        )),
+        "the key the pairing declares opens the box"
+    );
+    session.close();
+    host.stop().await;
+}
+
 /// Two asks get two boxes: the host seals a new box for each, with a nonce of its own, and each
 /// box holds the challenge of its own ask and no other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
