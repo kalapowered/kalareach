@@ -676,6 +676,17 @@
       ]
     },
     {
+      "name": "objc2-core-services",
+      "version": "0.3.2",
+      "texts": [
+        "objc2-8852b424193c-LICENSE.md",
+        "MIT-spdx-3.29.0-without-copyright-line"
+      ],
+      "products": [
+        "programs"
+      ]
+    },
+    {
       "name": "objc2-core-text",
       "version": "0.3.2",
       "texts": [
