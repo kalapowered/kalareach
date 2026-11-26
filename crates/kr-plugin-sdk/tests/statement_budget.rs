@@ -241,6 +241,104 @@ fn the_longest_launch() -> Value {
     })
 }
 
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory");
+    for entry in std::fs::read_dir(from).expect("lists") {
+        let entry = entry.expect("an entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copies");
+        }
+    }
+}
+
+/// Writes the bundled Gemini CLI package, which declares a bridge, with `launch` as its ACP launch
+/// and validates it.
+fn validate_gemini_with(launch: &Value) -> Vec<kr_plugin_sdk::validate::Finding> {
+    let temporary = tempfile::tempdir().expect("a temporary directory");
+    let package = temporary.path().join("package");
+    copy_tree(
+        bundled("gemini-cli", MANIFEST_FILE)
+            .parent()
+            .expect("the package directory"),
+        &package,
+    );
+    let mut manifest = read(&package.join(MANIFEST_FILE));
+    for capability in ["approval.decode", "approval.respond"] {
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the manifest requests capabilities")
+            .push(json!({
+                "capability": capability,
+                "reason": "Answer what the agent asks in ACP mode"
+            }));
+    }
+    manifest["acp_launch"] = launch.clone();
+    manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
+    std::fs::write(
+        package.join(MANIFEST_FILE),
+        serde_json::to_string_pretty(&manifest)
+            .expect("the manifest serialises")
+            .as_bytes(),
+    )
+    .expect("the manifest writes");
+    validate_package_directory(&package).report.findings
+}
+
+/// KR-REQ-11.26: a package that has a bridge is refused for its launch, not for its bridge, when
+/// its statement fits the budget without the launch and passes it with the launch; the same package
+/// with the launch the fixture declares has no such finding.
+#[test]
+fn kr_req_11_26_a_package_with_a_bridge_is_refused_for_its_launch_when_the_launch_is_the_cause() {
+    let (fixture, _) = &PACKAGES[0];
+    let declared = read(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/acp-launch-gemini-cli.json"),
+    );
+    let mut longer = declared.clone();
+    let longest = the_longest_launch();
+    for member in [
+        "required_names",
+        "passed_names",
+        "constants",
+        "grant_statement",
+    ] {
+        longer[member] = longest[member].clone();
+    }
+    let over = validate_gemini_with(&longer);
+    let length_findings: Vec<_> = over
+        .iter()
+        .filter(|finding| {
+            finding
+                .detail
+                .starts_with("the host's whole statement of this package")
+        })
+        .collect();
+    assert_eq!(
+        length_findings.len(),
+        1,
+        "the {fixture} package with the longest launch is over the budget once: {over:?}"
+    );
+    assert_eq!(
+        length_findings[0].code,
+        FindingCode::AcpLaunchInvalid,
+        "the launch is the cause: {over:?}"
+    );
+    assert!(
+        over.iter()
+            .all(|finding| finding.code != FindingCode::BridgeRecipeInvalid),
+        "no finding names the bridge: {over:?}"
+    );
+    let control = validate_gemini_with(&declared);
+    assert!(
+        control.iter().all(|finding| !finding
+            .detail
+            .starts_with("the host's whole statement of this package")),
+        "the declared launch fits the budget: {control:?}"
+    );
+}
+
 /// KR-REQ-11.26: a package with no native bridge is held to the budget by its launch's words and
 /// reading, so a launch that makes the whole statement longer than a device shows is refused for
 /// its own reason, and a short launch of the same package is not.

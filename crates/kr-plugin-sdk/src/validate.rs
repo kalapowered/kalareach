@@ -1340,14 +1340,23 @@ fn check_statement(
     connector: Option<&ConnectorManifest>,
     report: &mut Report,
 ) {
-    let length = whole_statement(manifest, connector).map_or(0, |text| text.chars().count());
+    let statement_length = |manifest: &PluginManifest| {
+        whole_statement(manifest, connector).map_or(0, |text| text.chars().count())
+    };
+    let length = statement_length(manifest);
     if length > kr_protocol::confirmation::STATEMENT_CHARS {
-        // A package with a bridge is refused as before; a package whose statement is long only by
-        // its ACP launch is refused as an invalid launch.
-        let code = if manifest.native_bridge.0.is_some() {
-            FindingCode::BridgeRecipeInvalid
-        } else {
+        // The finding follows the cause: a package whose statement fits without its ACP launch is
+        // refused as an invalid launch, whether or not it also has a bridge; any other statement
+        // is too long by the bridge's parts and is refused as before.
+        let launch_is_the_cause = manifest.acp_launch.is_some()
+            && statement_length(&PluginManifest {
+                acp_launch: None,
+                ..manifest.clone()
+            }) <= kr_protocol::confirmation::STATEMENT_CHARS;
+        let code = if launch_is_the_cause {
             FindingCode::AcpLaunchInvalid
+        } else {
+            FindingCode::BridgeRecipeInvalid
         };
         report.push(Finding::at(
             code,
