@@ -6924,15 +6924,9 @@ mod a_grants_row_whose_key_is_not_its_own {
     }
 }
 
-/// The boundary of a reading of the order counter: a writer that has to wait for the file's write
-/// lock reads the counter after it holds it, never before.
+/// The grants and shares that the cases of the order counter's boundary and of its sequences write.
 #[cfg(test)]
-mod the_boundary_of_a_reading {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use kr_protocol::ids::BootEpoch;
-
+mod fixtures {
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
@@ -6943,7 +6937,94 @@ mod the_boundary_of_a_reading {
     use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
     use kr_protocol::sharing::{InvitationPreview, SessionRole};
 
-    use super::{GrantDirectory, GrantRecord};
+    use super::GrantRecord;
+
+    pub(super) const NOW_MS: u64 = 5_000_000;
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    pub(super) fn an_id(byte: u8) -> Uuid {
+        Uuid::from_bytes([byte; 16])
+    }
+
+    /// A grant of a session: `number` names it, `parent` is the grant it stands under.
+    pub(super) fn a_grant(
+        number: u8,
+        parent: Option<GrantId>,
+        actions: &[ActionRight],
+    ) -> GrantRecord {
+        let session = SessionId::new(an_id(0xa0));
+        GrantRecord {
+            grant: Grant {
+                grant_id: GrantId::new(an_id(number)),
+                parent_grant_id: Nullable(parent),
+                issuer_device_id: DeviceId::new(an_id(0xf0)),
+                recipient_device_id: DeviceId::new(an_id(0x31)),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::These {
+                    environment_ids: [EnvironmentId::new(an_id(0xe0))].into_iter().collect(),
+                },
+                session_selector: SessionSelector::These {
+                    session_ids: [session].into_iter().collect(),
+                },
+                actions: actions.iter().copied().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::from_iter([]),
+                    named_approvals: CanonicalSet::from_iter([]),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            session_id: Some(session),
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    }
+
+    /// A share nobody has redeemed, with the invitation that carries it.
+    pub(super) fn a_share(
+        parent: GrantId,
+        number: u8,
+        invitation: u8,
+    ) -> (GrantRecord, InvitationPreview) {
+        let mut carried = a_grant(number, Some(parent), &[ActionRight::SessionView]);
+        carried.activated_at_ms = None;
+        let preview = InvitationPreview {
+            invitation_id: InvitationId::new(an_id(invitation)),
+            session_id: SessionId::new(an_id(0xa0)),
+            environment_id: EnvironmentId::new(an_id(0xe0)),
+            role: SessionRole::Viewer,
+            actions: carried.grant.actions.clone(),
+            history: carried.grant.history.clone(),
+            expires_at_ms: TimestampMs::new(NOW_MS + DAY_MS),
+            live_screen: Nullable::null(),
+            named_questions: Vec::new(),
+            named_approvals: Vec::new(),
+            notices: CanonicalSet::from_iter([]),
+            historical_attachment_keys: false,
+            single_use: true,
+        };
+        (carried, preview)
+    }
+}
+
+/// The boundary of a reading of the order counter: a writer that has to wait for the file's write
+/// lock reads the counter after it holds it, never before.
+#[cfg(test)]
+mod the_boundary_of_a_reading {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use kr_protocol::ids::BootEpoch;
+
+    use kr_protocol::ids::{DeviceId, GrantId};
+    use kr_protocol::rights::ActionRight;
+
+    use super::GrantDirectory;
+    use super::fixtures::{NOW_MS, a_grant, a_share, an_id};
     use crate::boots::BootClock;
     use crate::boots::testing::{SetClock, a_site_reads_after_the_lock};
 
@@ -6979,69 +7060,6 @@ mod the_boundary_of_a_reading {
     waits!(ISSUE_WAITS, count_the_issue_wait);
     waits!(REDEMPTION_WAITS, count_the_redemption_wait);
     waits!(TRANSFER_WAITS, count_the_transfer_wait);
-
-    const NOW_MS: u64 = 5_000_000;
-    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-
-    fn an_id(byte: u8) -> Uuid {
-        Uuid::from_bytes([byte; 16])
-    }
-
-    /// A grant of a session: `number` names it, `parent` is the grant it stands under.
-    fn a_grant(number: u8, parent: Option<GrantId>, actions: &[ActionRight]) -> GrantRecord {
-        let session = SessionId::new(an_id(0xa0));
-        GrantRecord {
-            grant: Grant {
-                grant_id: GrantId::new(an_id(number)),
-                parent_grant_id: Nullable(parent),
-                issuer_device_id: DeviceId::new(an_id(0xf0)),
-                recipient_device_id: DeviceId::new(an_id(0x31)),
-                authority_revision: AuthorityRevision::new(1),
-                environment_selector: EnvironmentSelector::These {
-                    environment_ids: [EnvironmentId::new(an_id(0xe0))].into_iter().collect(),
-                },
-                session_selector: SessionSelector::These {
-                    session_ids: [session].into_iter().collect(),
-                },
-                actions: actions.iter().copied().collect(),
-                history: HistoryScope {
-                    lower_bound_ms: Nullable::null(),
-                    include_live_screen: false,
-                    named_questions: CanonicalSet::from_iter([]),
-                    named_approvals: CanonicalSet::from_iter([]),
-                },
-                expiry: GrantExpiry::Never,
-                organisation: Nullable::null(),
-            },
-            session_id: Some(session),
-            issued_at_ms: 1_000,
-            activated_at_ms: Some(1_000),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        }
-    }
-
-    /// A share nobody has redeemed, with the invitation that carries it.
-    fn a_share(parent: GrantId, number: u8, invitation: u8) -> (GrantRecord, InvitationPreview) {
-        let mut carried = a_grant(number, Some(parent), &[ActionRight::SessionView]);
-        carried.activated_at_ms = None;
-        let preview = InvitationPreview {
-            invitation_id: InvitationId::new(an_id(invitation)),
-            session_id: SessionId::new(an_id(0xa0)),
-            environment_id: EnvironmentId::new(an_id(0xe0)),
-            role: SessionRole::Viewer,
-            actions: carried.grant.actions.clone(),
-            history: carried.grant.history.clone(),
-            expires_at_ms: TimestampMs::new(NOW_MS + DAY_MS),
-            live_screen: Nullable::null(),
-            named_questions: Vec::new(),
-            named_approvals: Vec::new(),
-            notices: CanonicalSet::from_iter([]),
-            historical_attachment_keys: false,
-            single_use: true,
-        };
-        (carried, preview)
-    }
 
     /// A store with a root grant in it, whose writes wait for the lock another writer holds and
     /// count their waits through `count`.
@@ -7248,5 +7266,291 @@ mod the_boundary_of_a_reading {
             "a healthy boot was spoiled by an older reading"
         );
         assert!(delayed.high >= 101, "{delayed:?}");
+    }
+}
+
+/// The sequences of boots, run through the grant store's own passes and read
+/// with the pure order rule.
+#[cfg(test)]
+mod a_boot_the_host_can_no_longer_tell_apart {
+    use std::sync::Arc;
+
+    use kr_protocol::ids::{BootEpoch, DeviceId};
+    use kr_protocol::rights::ActionRight;
+    use rusqlite::Connection;
+
+    use super::fixtures::{NOW_MS, a_grant, a_share, an_id};
+    use super::{GrantDirectory, GrantId};
+    use crate::attention::order::{BootOrder, BootState, Stamp, StartPoint, Withheld, admit};
+    use crate::boots::testing::SetClock;
+    use crate::boots::{BootClock, Boots, SpoilTest};
+
+    /// The registry's record of boots, as the order rule reads it.
+    struct Recorded<'a>(&'a Connection);
+
+    impl BootOrder for Recorded<'_> {
+        fn state(&self, epoch: BootEpoch) -> BootState {
+            Boots::state(self.0, epoch).expect("the record is read")
+        }
+    }
+
+    fn boot_in(clock: &Arc<SetClock>, epoch: u64) -> BootClock {
+        BootClock::new(Arc::clone(clock) as _, BootEpoch::new(epoch))
+    }
+
+    /// The start point a grant has, read from the file.
+    fn point_of(path: &std::path::Path, grant: GrantId) -> Option<StartPoint> {
+        Connection::open(path)
+            .expect("the registry opens")
+            .query_row(
+                "SELECT wall_ms, boot_epoch, boot_ms FROM grant_starts WHERE grant_id = ?1",
+                rusqlite::params![grant.get().as_bytes().as_slice()],
+                |row| {
+                    let epoch: Vec<u8> = row.get(1)?;
+                    Ok(StartPoint {
+                        wall_ms: row.get::<_, i64>(0)?.try_into().unwrap_or_default(),
+                        boot_epoch: BootEpoch::new(u64::from_be_bytes(
+                            epoch.try_into().unwrap_or_default(),
+                        )),
+                        boot_ms: row.get::<_, i64>(2)?.try_into().unwrap_or_default(),
+                    })
+                },
+            )
+            .ok()
+    }
+
+    /// A, C1, B, C2. A starts in the boot E. C1 starts in another boot, E_c, which takes
+    /// the next ordinal. B repeats E: it is not the latest boot recorded, so the ordinal test
+    /// spoils E, and a grant written in B gets no point. C2 repeats E_c at a reading at or above
+    /// C1's high: E_c stays known, and C2's pass replaces the points of E and gives B's grant one.
+    /// The new points admit what any point of C2 admits, and no more.
+    #[test]
+    fn a_boot_that_repeats_an_earlier_one_is_spoiled_and_the_start_after_it_in_a_known_boot_repoints_its_grants()
+     {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store");
+        let root = a_grant(
+            1,
+            None,
+            &[ActionRight::SessionView, ActionRight::TerminalInput],
+        );
+        store.issue(&root, || Ok(())).expect("the root");
+        let issuer = DeviceId::new(an_id(0xf0));
+        let (e, e_c) = (7, 9);
+        let clock = SetClock::at(1_000);
+
+        // A: the boot E at 1,000. Its start gives the root a point, and a share issued in it has one.
+        store
+            .start_points_at_start(&boot_in(&clock, e), NOW_MS)
+            .expect("A's start");
+        let (share_a, preview_a) = a_share(root.grant.grant_id, 2, 0x91);
+        store
+            .issue_shared(
+                &share_a,
+                &preview_a,
+                issuer,
+                NOW_MS,
+                &boot_in(&clock, e),
+                || Ok(()),
+            )
+            .expect("a share issued in A");
+        store
+            .redeem(
+                preview_a.invitation_id,
+                share_a.grant.recipient_device_id,
+                NOW_MS,
+                &boot_in(&clock, e),
+                || Ok(()),
+                None,
+            )
+            .expect("and redeemed in A");
+
+        // C1: the boot E_c at 2,000, recorded after E.
+        clock.set(2_000);
+        let observed = store
+            .start_points_at_start(&boot_in(&clock, e_c), NOW_MS)
+            .expect("C1's start");
+        assert_eq!(observed.state, BootState::Known(2), "E_c follows E");
+        assert_eq!(
+            point_of(&path, share_a.grant.grant_id).map(|point| point.boot_epoch),
+            Some(BootEpoch::new(e)),
+            "the points of E stand while E is known"
+        );
+
+        // B: E again, at a reading above its high, so only the ordinal test can find it.
+        clock.set(1_500);
+        let observed = store
+            .start_points_at_start(&boot_in(&clock, e), NOW_MS)
+            .expect("B's start");
+        assert_eq!(
+            observed.state,
+            BootState::Spoiled,
+            "B repeats a boot that is not the latest"
+        );
+        assert_eq!(
+            observed.newly_spoiled.map(|spoil| spoil.test),
+            Some(SpoilTest::NotHighestOrdinal),
+            "the ordinal test found it, and not the reading"
+        );
+        let (share_b, preview_b) = a_share(root.grant.grant_id, 3, 0x92);
+        store
+            .issue_shared(
+                &share_b,
+                &preview_b,
+                issuer,
+                NOW_MS,
+                &boot_in(&clock, e),
+                || Ok(()),
+            )
+            .expect("a share issued in B commits");
+        store
+            .redeem(
+                preview_b.invitation_id,
+                share_b.grant.recipient_device_id,
+                NOW_MS,
+                &boot_in(&clock, e),
+                || Ok(()),
+                None,
+            )
+            .expect("and so does its redemption");
+        assert!(
+            point_of(&path, share_b.grant.grant_id).is_none(),
+            "a grant written in a spoiled boot has no point"
+        );
+
+        // C2: E_c again, at a reading at or above C1's high.
+        clock.set(2_500);
+        let observed = store
+            .start_points_at_start(&boot_in(&clock, e_c), NOW_MS + 5)
+            .expect("C2's start");
+        assert_eq!(observed.state, BootState::Known(2), "E_c stays known");
+        assert!(observed.newly_spoiled.is_none());
+        let connection = Connection::open(&path).expect("the registry opens");
+        let boots = Recorded(&connection);
+        assert_eq!(boots.state(BootEpoch::new(e)), BootState::Spoiled);
+        assert_eq!(boots.state(BootEpoch::new(e_c)), BootState::Known(2));
+        let mut points = Vec::new();
+        for grant in [
+            root.grant.grant_id,
+            share_a.grant.grant_id,
+            share_b.grant.grant_id,
+        ] {
+            let point = point_of(&path, grant).expect("C2's pass gives the grant a point");
+            assert_eq!(point.boot_epoch, BootEpoch::new(e_c), "in the known boot");
+            assert_eq!(point.boot_ms, 2_500, "at C2's reading");
+            assert_eq!(point.wall_ms, NOW_MS + 5, "at C2's settled moment");
+            points.push(point);
+        }
+        let point = points[0];
+        let stamp = |boot: u64, ms: u64| Stamp {
+            boot_epoch: BootEpoch::new(boot),
+            boot_ms: ms,
+        };
+        assert_eq!(
+            admit(0, Some(&point), Some(&stamp(e_c, 2_600)), &boots),
+            Ok(())
+        );
+        for (what, stamped) in [
+            ("a tie", stamp(e_c, 2_500)),
+            (
+                "a text of C1 made after C1's start and before C2's point",
+                stamp(e_c, 2_100),
+            ),
+            (
+                "a text of the spoiled boot, however late it reads",
+                stamp(e, 9_000),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    admit(0, Some(&point), Some(&stamped), &boots),
+                    Err(Withheld::NoStartPoint | Withheld::BeforeHistoryBound)
+                ),
+                "{what} is withheld"
+            );
+        }
+    }
+
+    /// The high test run: a committed high of 60,000, a text stamped at 100,000 that no
+    /// record holds, a start that reads 1,000 and fails, a later start that reads 70,000 and a grant
+    /// given a point at 71,000. The failed start stored no spoil, the later one reads above the high
+    /// and finds nothing, and the rule serves the text stamped at 100,000: the high test cannot see a
+    /// counter that restarted and then passed its old high, and the limit is a tested fact.
+    #[test]
+    fn the_high_test_does_not_find_a_counter_that_restarted_and_passed_its_old_high() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store");
+        let root = a_grant(
+            1,
+            None,
+            &[ActionRight::SessionView, ActionRight::TerminalInput],
+        );
+        store.issue(&root, || Ok(())).expect("the root");
+        let e = 7;
+        let clock = SetClock::at(60_000);
+        store
+            .start_points_at_start(&boot_in(&clock, e), NOW_MS)
+            .expect("the start that committed the high");
+
+        // A start that reads 1,000 fails: the boot's flag is not stored.
+        clock.set(1_000);
+        let connection = Connection::open(&path).expect("the registry opens");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER a_fault BEFORE UPDATE ON boots
+                 BEGIN SELECT RAISE(ABORT, 'a fault at the boot record'); END;",
+            )
+            .expect("the fault is set");
+        assert!(
+            store
+                .start_points_at_start(&boot_in(&clock, e), NOW_MS)
+                .is_err(),
+            "the start fails"
+        );
+        connection
+            .execute_batch("DROP TRIGGER a_fault")
+            .expect("the fault is gone");
+        assert_eq!(
+            Boots::state(&connection, BootEpoch::new(e)).expect("the record"),
+            BootState::Known(1),
+            "the failed start stored no spoil"
+        );
+
+        // A later start reads 70,000: above the high, so nothing is found.
+        clock.set(70_000);
+        let observed = store
+            .start_points_at_start(&boot_in(&clock, e), NOW_MS)
+            .expect("the later start");
+        assert!(
+            observed.newly_spoiled.is_none(),
+            "the high test finds nothing"
+        );
+
+        // A grant given a point at 71,000 is served the text stamped at 100,000.
+        clock.set(71_000);
+        let (share, preview) = a_share(root.grant.grant_id, 2, 0x91);
+        store
+            .issue_shared(
+                &share,
+                &preview,
+                DeviceId::new(an_id(0xf0)),
+                NOW_MS,
+                &boot_in(&clock, e),
+                || Ok(()),
+            )
+            .expect("the share is issued");
+        let point = point_of(&path, share.grant.grant_id).expect("the point at 71,000");
+        assert_eq!(point.boot_ms, 71_000);
+        let stamp = Stamp {
+            boot_epoch: BootEpoch::new(e),
+            boot_ms: 100_000,
+        };
+        assert_eq!(
+            admit(0, Some(&point), Some(&stamp), &Recorded(&connection)),
+            Ok(()),
+            "the text stamped at 100,000 is served: the limit of the high test"
+        );
     }
 }
