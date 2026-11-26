@@ -5401,8 +5401,7 @@ mod tests {
         let run = committing(false, true, checkpoint, file).await;
         drop(guard);
         assert!(ended_paired(&run), "{:?}", run.outcome);
-        let events = logged.0.lock().expect("the record").clone();
-        events
+        logged.0.lock().expect("the record").clone()
     }
 
     /// A checkpoints file that holds the checkpoint `named` makes for `generation`, with a manifest
