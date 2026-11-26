@@ -902,6 +902,13 @@
   gap: 10px;
 }
 
+/* A row inside the footer keeps the footer's own distance between its lines, as the footer keeps it
+   between its rows: a `.row` gap is in rem and grows with the text, and the lines would stand
+   further apart than the rows do. */
+.terminal-footer .row {
+  row-gap: inherit;
+}
+
 /* ---- Change sets ----------------------------------------------------------------------------- */
 
 .review-layout {

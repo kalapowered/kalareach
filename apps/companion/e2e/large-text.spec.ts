@@ -348,3 +348,53 @@ test.describe('A word is kept whole where its holder has room for it', () => {
     expect(cutAtTheBound(ordinary, await reading(page, root)).length).toBeGreaterThan(0)
   })
 })
+
+/**
+ * The distances between the rows of the footer: the space between each row of its controls and
+ * status text and the one below, with the distance the footer itself keeps between its parts. A row
+ * is the boxes that share a stretch of the page from top to bottom.
+ */
+async function footerRows(page: Page): Promise<{ readonly own: number; readonly gaps: readonly number[] }> {
+  return page.evaluate(() => {
+    const footer = document.querySelector('.terminal-footer')
+    if (footer === null) throw new Error('no footer on the page')
+    const boxes = Array.from(
+      footer.querySelectorAll('.btn, [data-testid="terminal-presentation"], [data-testid="terminal-position"]')
+    )
+      .map((each) => each.getBoundingClientRect())
+      .filter((box) => box.width > 0 && box.height > 0)
+      .sort((a, b) => a.top - b.top)
+    const rows: { top: number; bottom: number }[] = []
+    for (const box of boxes) {
+      const last = rows[rows.length - 1]
+      if (last !== undefined && box.top < last.bottom - 0.5) last.bottom = Math.max(last.bottom, box.bottom)
+      else rows.push({ top: box.top, bottom: box.bottom })
+    }
+    const gaps: number[] = []
+    for (let at = 1; at < rows.length; at += 1) gaps.push(rows[at].top - rows[at - 1].bottom)
+    return { own: Number.parseFloat(getComputedStyle(footer).rowGap), gaps }
+  })
+}
+
+test.describe('The rows of the terminal footer stand one distance apart', () => {
+  for (const form of [NARROW_WINDOW, WIDE_WINDOW]) {
+    for (const size of [1, LARGEST]) {
+      test(`${form.name}, text ${size === 1 ? 'ordinary' : 'largest'}`, async ({ page }) => {
+        await atTheFooter(page, form, size)
+        const { own, gaps } = await footerRows(page)
+        expect(gaps.length, 'rows below the first').toBeGreaterThan(0)
+        expect(
+          gaps.map((gap) => Number(gap.toFixed(1))),
+          `each row's distance from the one above, the footer keeps ${own} px`
+        ).toEqual(gaps.map(() => own))
+      })
+    }
+  }
+
+  test('the measure finds rows that stand at another distance', async ({ page }) => {
+    await atTheFooter(page, NARROW_WINDOW, LARGEST)
+    await page.addStyleTag({ content: '.terminal-footer .row { row-gap: 3px !important }' })
+    const { own, gaps } = await footerRows(page)
+    expect(gaps.some((gap) => Math.abs(gap - own) > 0.5)).toBe(true)
+  })
+})
