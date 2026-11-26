@@ -3195,6 +3195,27 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
     }
 }
 
+/// The landing workflow's rust job builds every test program of the workspace and keeps them all in
+/// one target directory, and the symbol tables are the greater part of what those programs hold. Its
+/// profiles drop them, so that the disk the job runs on has room for the tests as the workspace
+/// grows. Taking the two settings out is a decision about that room, so they are held here, in the
+/// job's own environment ahead of its steps, where every step that builds has them.
+#[test]
+fn the_rust_job_builds_its_test_programs_without_symbol_tables() {
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let keys = header(&job(&workflow, "rust"));
+    for variable in [
+        "CARGO_PROFILE_DEV_STRIP: symbols",
+        "CARGO_PROFILE_TEST_STRIP: symbols",
+    ] {
+        assert!(
+            keys.lines().any(|line| line.trim() == variable),
+            "the rust job of the landing workflow does not set {variable} in its own environment"
+        );
+    }
+}
+
 /// The variable that names the one directory every test artefact of a run is kept in.
 const VARIABLE: &str = "KR_TEST_ARTIFACTS_DIR";
 

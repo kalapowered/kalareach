@@ -60,6 +60,12 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-24.04
+    # Test programs without symbol tables: they are the greater part of what this job's test build
+    # keeps on the disk, and a backtrace asked for in a run names no function; to get the names back,
+    # run again without these two lines or rebuild the program where it failed.
+    env:
+      CARGO_PROFILE_DEV_STRIP: symbols
+      CARGO_PROFILE_TEST_STRIP: symbols
     steps:
       # The runner arrives with toolchains, SDKs, cloud command lines and browsers this project never
       # uses, and removing them and the container images widens the margin the build has to work in.
