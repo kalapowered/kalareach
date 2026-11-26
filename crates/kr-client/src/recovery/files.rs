@@ -12,9 +12,10 @@
 //!    trusts comes out of a bundle that opens only under the key the seed, the origin and the
 //!    locator derive. Nothing is taken from an archive.
 //! 3. **One archive, one generation.** Exactly one authenticated collection entry names the archive
-//!    and the configured origin. The newest generation is fetched held to the bundle's checkpoint
-//!    for it, and a service that holds nothing as new as the checkpoint stops the restore: it does
-//!    not fall back to an older genuine generation.
+//!    and the configured origin. The newest generation is fetched held to the checkpoint for it, the
+//!    higher of the bundle's and the one a paired host gave this computer, and a service that holds
+//!    nothing as new as the checkpoint stops the restore: it does not fall back to an older genuine
+//!    generation.
 //! 4. **The publication before any object.** The descriptor is validated, its writer is a writer
 //!    the bundle names and the identifier of that writer's key, its signature verifies under that
 //!    key, the archive is the one chosen, the declared manifest length is within the bound and the
@@ -64,12 +65,13 @@ use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
 use crate::error::{ClientError, HostWord};
+use crate::pairing::checkpoint::{Held, PairedCheckpoint, SnapshotCause};
 use crate::recovery::bundle::read_bundle;
 use crate::recovery::capacity::{Sealed, Write, seal};
 use crate::recovery::checkpoint::Strongest;
 use crate::recovery::{
     ExportedArchive, ExportedObject, FreshRestore, MAX_EXPORT_BYTES, OfflineExport, RecoveryError,
-    RetrievalPolicy, SavedSettings, ServiceAccess, TrustedMaterial, advance_checkpoint,
+    RetrievalPolicy, SavedSettings, ServiceAccess, Standing, TrustedMaterial, advance_checkpoint,
     decode_member,
 };
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
@@ -392,8 +394,9 @@ pub enum PublicationRefusal {
     /// The signature does not verify under the bundle's key for the writer.
     #[error("the publication's signature does not verify under the bundle's writer key")]
     BadSignature,
-    /// The checkpoint refuses the generation; the standing says how.
-    #[error("the recovery bundle's checkpoint refuses that generation. {1}")]
+    /// The checkpoint refuses the generation; the standing says how, and the words say whose
+    /// checkpoint it is and where the generation stands against it ([`Shown::restore_refusal`]).
+    #[error("{1}")]
     Generation(RestoreGeneration, Shown),
 }
 
@@ -442,28 +445,36 @@ pub enum RestoreError {
         /// Each, with the newest generation the service holds of it.
         candidates: Vec<Candidate>,
     },
-    /// The service holds nothing as new as the generation the bundle's checkpoint records.
+    /// The service holds nothing as new as the generation the checkpoint records.
     #[error(
-        "the service holds no generation as new as the bundle's checkpoint, generation {checkpoint}"
+        "the service holds no generation as new as {checkpoint_words}, generation {checkpoint}"
     )]
     NothingAsNewAsTheCheckpoint {
-        /// The generation the bundle's checkpoint records.
+        /// The generation the checkpoint records.
         checkpoint: u64,
+        /// Where the checkpoint came from.
+        checkpoint_source: CheckpointSource,
+        /// The checkpoint as the sentence names it for its source.
+        checkpoint_words: Shown,
     },
-    /// The service holds a generation of the archive that is older than the one the bundle's
-    /// checkpoint records, and the person named no generation that accepts it.
+    /// The service holds a generation of the archive that is older than the one the checkpoint
+    /// records, and the person named no generation that accepts it.
     ///
     /// The generation is the service's own, read without the checkpoint and verified as a restore
     /// verifies one, so the person is told what is held and not what was claimed.
     #[error(
         "the service holds generation {held} of that archive, older than generation {checkpoint} \
-         that the recovery bundle verified"
+         that {checkpoint_words}"
     )]
     OlderThanTheCheckpoint {
-        /// The generation the bundle's checkpoint records.
+        /// The generation the checkpoint records.
         checkpoint: u64,
         /// The generation the service holds.
         held: u64,
+        /// Where the checkpoint came from.
+        checkpoint_source: CheckpointSource,
+        /// The checkpoint as the sentence names it for its source.
+        checkpoint_words: Shown,
     },
     /// A generation was named to be accepted past the checkpoint, and the service holds another.
     ///
@@ -471,20 +482,57 @@ pub enum RestoreError {
     /// checkpoint's generation or a newer one needs no word, and restoring it under this one would
     /// leave the person believing they had chosen it.
     #[error(
-        "generation {named} was named to be accepted past the bundle's checkpoint, and the \
-         service holds generation {held}, which needs no such word"
+        "generation {named} was named to be accepted past {checkpoint_words}, and the service \
+         holds generation {held}, which needs no such word"
     )]
     NamedGenerationNotHeld {
         /// The generation the person named.
         named: u64,
         /// The generation the service holds.
         held: u64,
+        /// Where the checkpoint came from.
+        checkpoint_source: CheckpointSource,
+        /// The checkpoint as the sentence names it for its source.
+        checkpoint_words: Shown,
     },
-    /// A generation older than the checkpoint was named for an archive whose bundle records none.
+    /// A generation older than the checkpoint was named for an archive that has no checkpoint.
+    #[error("{none_words}, so there is none to accept an older generation past")]
+    NoCheckpointToAcceptPast {
+        /// Whether the checkpoints paired hosts gave were looked at too, and held none for it.
+        pairing_consulted: bool,
+        /// Which sources held none, as the sentence names them.
+        none_words: Shown,
+    },
+    /// The checkpoints this computer kept from the hosts it paired with cannot be read.
+    ///
+    /// A restore does not go on without them: it could not tell an older backup that a service
+    /// hands back from the newest one.
     #[error(
-        "the recovery bundle records no checkpoint for that archive, so there is none to accept an older generation past"
+        "the backup checkpoints this device kept when it paired cannot be read ({file}: {why})"
     )]
-    NoCheckpointToAcceptPast,
+    PairingCheckpointsUnreadable {
+        /// The file that cannot be used.
+        file: Shown,
+        /// Why.
+        why: Shown,
+        /// The kind of reason, which says what mends it.
+        cause: SnapshotCause,
+    },
+    /// The checkpoint kept from a paired host and the bundle's name different manifests for one
+    /// generation, so neither can be trusted for it.
+    #[error(
+        "the checkpoint this device kept when it paired and the recovery bundle name different \
+         manifests for generation {generation} ({paired} and {bundle}); the restore cannot tell \
+         which is the archive that was published"
+    )]
+    PairingCheckpointDisagrees {
+        /// The generation both name.
+        generation: u64,
+        /// The first eight hexadecimal digits of the manifest hash the paired host gave.
+        paired: Shown,
+        /// The first eight hexadecimal digits of the manifest hash the bundle holds.
+        bundle: Shown,
+    },
     /// The service holds no generation of the archive at all.
     #[error("the service holds no generation of that archive")]
     NoGeneration,
@@ -558,6 +606,75 @@ pub enum RestoreError {
 
 crate::debug_as_display!(RestoreError);
 
+impl RestoreError {
+    /// The service holds no generation as new as a checkpoint that came from `source`.
+    ///
+    /// The words that name the checkpoint come from `source` here and nowhere else.
+    #[must_use]
+    pub fn nothing_as_new(checkpoint: u64, source: CheckpointSource) -> Self {
+        Self::NothingAsNewAsTheCheckpoint {
+            checkpoint,
+            checkpoint_source: source,
+            checkpoint_words: match source {
+                CheckpointSource::RecoveryBundle => Shown::said("the bundle's checkpoint"),
+                CheckpointSource::Pairing => Shown::said(
+                    "the one a host this device paired with had published when this device asked",
+                ),
+            },
+        }
+    }
+
+    /// The service holds `held`, older than a checkpoint of `checkpoint` that came from `source`.
+    #[must_use]
+    pub fn older_than_the_checkpoint(held: u64, checkpoint: u64, source: CheckpointSource) -> Self {
+        Self::OlderThanTheCheckpoint {
+            checkpoint,
+            held,
+            checkpoint_source: source,
+            checkpoint_words: match source {
+                CheckpointSource::RecoveryBundle => Shown::said("the recovery bundle verified"),
+                CheckpointSource::Pairing => Shown::said(
+                    "a host this device paired with had published when this device asked",
+                ),
+            },
+        }
+    }
+
+    /// `named` was named to be accepted past a checkpoint that came from `source`, and the
+    /// service holds `held`, which needs no such word.
+    #[must_use]
+    pub fn named_generation_not_held(named: u64, held: u64, source: CheckpointSource) -> Self {
+        Self::NamedGenerationNotHeld {
+            named,
+            held,
+            checkpoint_source: source,
+            checkpoint_words: match source {
+                CheckpointSource::RecoveryBundle => Shown::said("the bundle's checkpoint"),
+                CheckpointSource::Pairing => {
+                    Shown::said("the checkpoint a host this device paired with gave")
+                }
+            },
+        }
+    }
+
+    /// A generation was named to be accepted past a checkpoint, and no source holds one for the
+    /// archive. `pairing_consulted` says whether the checkpoints paired hosts gave were looked at.
+    #[must_use]
+    pub fn no_checkpoint_to_accept_past(pairing_consulted: bool) -> Self {
+        Self::NoCheckpointToAcceptPast {
+            pairing_consulted,
+            none_words: if pairing_consulted {
+                Shown::said(
+                    "neither the recovery bundle nor a host this device paired with gives a \
+                     checkpoint for that archive",
+                )
+            } else {
+                Shown::said("the recovery bundle records no checkpoint for that archive")
+            },
+        }
+    }
+}
+
 impl From<ClientError> for RestoreError {
     fn from(error: ClientError) -> Self {
         Self::Read(error)
@@ -571,6 +688,8 @@ pub struct Candidate {
     pub archive_id: ArchiveId,
     /// What the service holds of it.
     pub newest: CandidateState,
+    /// What the checkpoints paired hosts gave this computer say of it.
+    pub pairing: PairingStanding,
 }
 
 crate::debug_as_name!(Candidate);
@@ -578,15 +697,51 @@ crate::debug_as_name!(Candidate);
 /// What the service held of a candidate archive.
 #[derive(Clone, PartialEq, Eq)]
 pub enum CandidateState {
-    /// Nothing, or nothing as new as the bundle's checkpoint.
+    /// Nothing at all.
     Nothing,
     /// A publication that a restore would refuse, and why.
     Refused(PublicationRefusal),
     /// The newest generation, after its publication was verified as a restore does.
     Newest(CandidateGeneration),
+    /// Only a generation older than the checkpoint, which is a service that holds an older backup
+    /// back.
+    HeldBack {
+        /// The generation the service holds.
+        held: BackupGeneration,
+        /// The generation the checkpoint records.
+        checkpoint: BackupGeneration,
+        /// Where the checkpoint came from.
+        source: CheckpointSource,
+    },
+    /// The checkpoint kept from a paired host and the bundle's name different manifests for the
+    /// generation the service holds.
+    CheckpointsDisagree {
+        /// The generation both name.
+        generation: BackupGeneration,
+    },
 }
 
 crate::debug_as_name!(CandidateState);
+
+/// What the checkpoints paired hosts gave this computer say of one archive at the service, apart
+/// from the checkpoint a restore is held to.
+///
+/// It is a statement for the person to read and never a refusal, so it is not part of what a plan's
+/// digest covers: the digest covers what is restored, and the plan's standing already says which
+/// checkpoint the generation was held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingStanding {
+    /// A host this computer paired with gave a checkpoint for it.
+    Held {
+        /// The generation that checkpoint records.
+        generation: BackupGeneration,
+    },
+    /// A host this computer owns has not given one yet: it has not answered, or its answer could
+    /// not be kept.
+    Owed,
+    /// No paired host is owed an answer for it, or this computer holds none.
+    None,
+}
 
 /// The newest generation of a candidate, after its publication was verified as a restore does.
 #[derive(Clone, PartialEq, Eq)]
@@ -723,8 +878,10 @@ pub struct RestorePlan {
     pub manifest_hash: Digest256,
     /// The identifier of the writer's key.
     pub writer: KeyId,
-    /// Where the generation stands against the bundle's checkpoint.
+    /// Where the generation stands against the checkpoint the restore was held to.
     pub standing: RestoreGeneration,
+    /// What the checkpoints paired hosts gave this computer say of the archive.
+    pub pairing: PairingStanding,
     /// The bundle's revision.
     pub bundle_revision: u64,
     /// When the writer signed the publication, in UTC milliseconds.
@@ -1319,20 +1476,29 @@ impl FilesRestore {
     /// Opens the bundle, chooses the archive, verifies its newest publication and its manifest, and
     /// makes the plan. Nothing is written and nothing but the manifest object is read.
     ///
-    /// `accept_older` names the one generation older than the bundle's checkpoint that the person
-    /// accepts, for a service that was legitimately put back to an earlier state. A service that
-    /// holds that generation and nothing newer is restored from; one that holds any other older
-    /// generation is refused, and the refusal names what it holds.
+    /// The restore is held to the higher of the bundle's checkpoint for the archive and the one in
+    /// `held`, the checkpoints the hosts this computer paired with gave it. `held` is read once by
+    /// the caller and this reads nothing else: a caller with no store of paired hosts passes
+    /// [`Held::Absent`].
+    ///
+    /// `accept_older` names the one generation older than that checkpoint that the person accepts,
+    /// for a service that was legitimately put back to an earlier state. A service that holds that
+    /// generation and nothing newer is restored from; one that holds any other older generation is
+    /// refused, and the refusal names what it holds.
     ///
     /// # Errors
     ///
-    /// Returns the first reason the restore cannot go on; see [`RestoreError`].
+    /// Returns [`RestoreError::PairingCheckpointsUnreadable`] before anything is read when `held`
+    /// is unreadable, and otherwise the first reason the restore cannot go on; see
+    /// [`RestoreError`].
     pub async fn prepare(
         kit: RecoveryKit,
         source: Arc<dyn RestoreSource>,
         archive: Option<ArchiveId>,
         accept_older: Option<BackupGeneration>,
+        held: &Held,
     ) -> Result<PreparedRestore, RestoreError> {
+        refuse_unreadable(held)?;
         let Opened {
             seed,
             service,
@@ -1344,37 +1510,32 @@ impl FilesRestore {
         } = open_bundle(kit, Arc::clone(&source)).await?;
 
         // 3. One archive.
-        let archive_id = choose_archive(&material, &origin, archive, source.as_ref()).await?;
-        let checkpoint = material.checkpoint(archive_id).cloned();
-        let expectation = match (&checkpoint, accept_older) {
-            (Some(checkpoint), Some(accepted)) => GenerationExpectation::AcceptingOlder {
-                checkpoint,
-                source: CheckpointSource::RecoveryBundle,
-                accepted,
-            },
-            (Some(checkpoint), None) => GenerationExpectation::Checkpoint {
-                checkpoint,
-                source: CheckpointSource::RecoveryBundle,
-            },
-            (None, Some(_)) => return Err(RestoreError::NoCheckpointToAcceptPast),
-            (None, None) => GenerationExpectation::Unverified,
-        };
+        let archive_id = choose_archive(&material, &origin, archive, source.as_ref(), held).await?;
+        let floor = Floor::of(&material, held, &origin, archive_id);
+        let pairing = pairing_standing(held, &origin, archive_id);
+        if accept_older.is_some() && floor.holding().is_none() {
+            return Err(RestoreError::no_checkpoint_to_accept_past(!matches!(
+                held,
+                Held::Absent
+            )));
+        }
         // Held to the checkpoint, the service answers nothing when it holds nothing as new. Asked
         // again without it, it says what it does hold, which is verified like any publication
         // before it is named: the person is told what the service holds, not what it claims.
         let mut asked_without_the_checkpoint = false;
-        let publication = match source.generation(archive_id, checkpoint.as_ref()).await? {
+        let publication = match source.generation(archive_id, floor.asked()).await? {
             Some(publication) => publication,
-            None => match &checkpoint {
-                Some(checkpoint) => match source.generation(archive_id, None).await? {
-                    Some(held) => {
+            None => match floor.holding() {
+                Some((checkpoint, from)) => match source.generation(archive_id, None).await? {
+                    Some(older) => {
                         asked_without_the_checkpoint = true;
-                        held
+                        older
                     }
                     None => {
-                        return Err(RestoreError::NothingAsNewAsTheCheckpoint {
-                            checkpoint: checkpoint.backup_generation.get(),
-                        });
+                        return Err(RestoreError::nothing_as_new(
+                            checkpoint.backup_generation.get(),
+                            from,
+                        ));
                     }
                 },
                 None => return Err(RestoreError::NoGeneration),
@@ -1386,30 +1547,35 @@ impl FilesRestore {
             &publication,
             archive_id,
             &material.trusted_writers,
-            expectation,
+            &floor,
+            accept_older,
         )
         .map_err(|refusal| match refusal {
-            PublicationRefusal::Generation(
+            Refused::Disagree(disagreement) => disagreement.into(),
+            Refused::Publication(PublicationRefusal::Generation(
                 RestoreGeneration {
                     standing: GenerationStanding::Replayed { checkpoint },
                     backup_generation,
+                    source: Some(from),
                     ..
                 },
                 _,
-            ) if asked_without_the_checkpoint => RestoreError::OlderThanTheCheckpoint {
-                checkpoint: checkpoint.get(),
-                held: backup_generation.get(),
-            },
-            other => RestoreError::Publication(other),
+            )) if asked_without_the_checkpoint => RestoreError::older_than_the_checkpoint(
+                backup_generation.get(),
+                checkpoint.get(),
+                from,
+            ),
+            Refused::Publication(other) => RestoreError::Publication(other),
         })?;
         // The word covers the one older generation it names, and nothing else the service holds.
-        if let Some(named) = accept_older
+        if let (Some(named), Some((_, from))) = (accept_older, floor.holding())
             && !matches!(verified.standing, GenerationStanding::OlderAccepted { .. })
         {
-            return Err(RestoreError::NamedGenerationNotHeld {
-                named: named.get(),
-                held: verified.backup_generation.get(),
-            });
+            return Err(RestoreError::named_generation_not_held(
+                named.get(),
+                verified.backup_generation.get(),
+                from,
+            ));
         }
         let descriptor = &publication.payload.descriptor;
         let manifest_limit = stream::encrypted_len(MAX_MANIFEST_PAYLOAD_LEN) as u64;
@@ -1447,7 +1613,7 @@ impl FilesRestore {
             &material.trusted_writers,
             &ArchiveExpectation {
                 archive_id,
-                generation: expectation,
+                generation: floor.expectation(accept_older),
             },
             &descriptor_bytes,
             &encrypted_manifest,
@@ -1482,6 +1648,7 @@ impl FilesRestore {
             manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
             writer: publication.payload.writer_key_id,
             standing: verified,
+            pairing,
             bundle_revision: material.bundle_revision,
             published_at_ms: publication.payload.published_at_ms,
             members,
@@ -1503,19 +1670,31 @@ impl FilesRestore {
     }
 
     /// The archives the bundle names at the service the source reached, each with the newest
-    /// generation the service holds of it, verified as a restore verifies one. Nothing is
-    /// written, and no object is read.
+    /// generation the service holds of it, verified as a restore verifies one, and held to the
+    /// same checkpoint a restore of it is held to: the higher of the bundle's and the one in
+    /// `held`. Nothing is written, and no object is read.
     ///
     /// # Errors
     ///
-    /// Returns the first reason the bundle cannot be opened; see [`RestoreError`].
+    /// Returns [`RestoreError::PairingCheckpointsUnreadable`] before anything is read when `held`
+    /// is unreadable, and otherwise the first reason the bundle cannot be opened; see
+    /// [`RestoreError`].
     pub async fn archives(
         kit: RecoveryKit,
         source: Arc<dyn RestoreSource>,
+        held: &Held,
     ) -> Result<Vec<Candidate>, RestoreError> {
+        refuse_unreadable(held)?;
         let opened = open_bundle(kit, Arc::clone(&source)).await?;
         let named = archives_at(&opened.material, &opened.origin);
-        candidates(&opened.material, &named, source.as_ref()).await
+        candidates(
+            &opened.material,
+            &opened.origin,
+            &named,
+            held,
+            source.as_ref(),
+        )
+        .await
     }
 
     /// An export of the bundle alone, as the service holds it, after it has authenticated under
@@ -1720,43 +1899,63 @@ fn archives_at(material: &TrustedMaterial, origin: &str) -> Vec<ArchiveId> {
 }
 
 /// Each of `archives` with the newest generation the source holds of it, verified as a restore
-/// verifies one.
+/// verifies one, and what the checkpoints paired hosts gave this computer say of it.
+///
+/// An archive that has a checkpoint is asked for held to it. A service that answers nothing then
+/// holds nothing as new, and is asked again without the checkpoint, as a restore asks, so that an
+/// older generation it holds back is named and not mistaken for nothing.
 async fn candidates(
     material: &TrustedMaterial,
+    origin: &str,
     archives: &[ArchiveId],
+    held: &Held,
     source: &dyn RestoreSource,
 ) -> Result<Vec<Candidate>, RestoreError> {
     let mut candidates = Vec::with_capacity(archives.len());
     for archive_id in archives {
-        let checkpoint = material.checkpoint(*archive_id);
-        let newest = match source.generation(*archive_id, checkpoint).await? {
+        let floor = Floor::of(material, held, origin, *archive_id);
+        let publication = match source.generation(*archive_id, floor.asked()).await? {
+            Some(publication) => Some(publication),
+            None if floor.holding().is_some() => source.generation(*archive_id, None).await?,
+            None => None,
+        };
+        let newest = match publication {
             None => CandidateState::Nothing,
-            Some(publication) => {
-                let expectation =
-                    checkpoint.map_or(GenerationExpectation::Unverified, |checkpoint| {
-                        GenerationExpectation::Checkpoint {
-                            checkpoint,
-                            source: CheckpointSource::RecoveryBundle,
-                        }
-                    });
-                match verify_publication(
-                    &publication,
-                    *archive_id,
-                    &material.trusted_writers,
-                    expectation,
-                ) {
-                    Ok(_) => CandidateState::Newest(CandidateGeneration {
-                        generation: publication.payload.descriptor.backup_generation,
-                        published_at_ms: publication.payload.published_at_ms,
-                        writer: publication.payload.writer_key_id,
-                    }),
-                    Err(refusal) => CandidateState::Refused(refusal),
-                }
-            }
+            Some(publication) => match verify_publication(
+                &publication,
+                *archive_id,
+                &material.trusted_writers,
+                &floor,
+                None,
+            ) {
+                Ok(_) => CandidateState::Newest(CandidateGeneration {
+                    generation: publication.payload.descriptor.backup_generation,
+                    published_at_ms: publication.payload.published_at_ms,
+                    writer: publication.payload.writer_key_id,
+                }),
+                Err(Refused::Disagree(disagreement)) => CandidateState::CheckpointsDisagree {
+                    generation: disagreement.generation,
+                },
+                Err(Refused::Publication(PublicationRefusal::Generation(
+                    RestoreGeneration {
+                        standing: GenerationStanding::Replayed { checkpoint },
+                        backup_generation,
+                        source: Some(from),
+                        ..
+                    },
+                    _,
+                ))) => CandidateState::HeldBack {
+                    held: backup_generation,
+                    checkpoint,
+                    source: from,
+                },
+                Err(Refused::Publication(refusal)) => CandidateState::Refused(refusal),
+            },
         };
         candidates.push(Candidate {
             archive_id: *archive_id,
             newest,
+            pairing: pairing_standing(held, origin, *archive_id),
         });
     }
     Ok(candidates)
@@ -1769,6 +1968,7 @@ async fn choose_archive(
     origin: &str,
     asked: Option<ArchiveId>,
     source: &dyn RestoreSource,
+    held: &Held,
 ) -> Result<ArchiveId, RestoreError> {
     let archives = archives_at(material, origin);
     if let Some(asked) = asked {
@@ -1782,7 +1982,7 @@ async fn choose_archive(
         [] => Err(RestoreError::NoArchive),
         [only] => Ok(*only),
         several => {
-            let candidates = candidates(material, several, source).await?;
+            let candidates = candidates(material, origin, several, held, source).await?;
             Err(RestoreError::SeveralArchives {
                 count: candidates.len(),
                 candidates,
@@ -1792,13 +1992,14 @@ async fn choose_archive(
 }
 
 /// Verifies a publication the way a restore does before it reads an object, and says where the
-/// generation stands against the checkpoint.
+/// generation stands against the checkpoint the restore is held to.
 fn verify_publication(
     publication: &BackupGenerationPublication,
     archive_id: ArchiveId,
     writers: &[TrustedWriter],
-    expectation: GenerationExpectation<'_>,
-) -> Result<RestoreGeneration, PublicationRefusal> {
+    floor: &Floor,
+    accepted: Option<BackupGeneration>,
+) -> Result<RestoreGeneration, Refused> {
     let payload = &publication.payload;
     let descriptor_len =
         kr_cbor::to_canonical_vec(&payload.descriptor).map_or(usize::MAX, |bytes| bytes.len());
@@ -1807,7 +2008,7 @@ fn verify_publication(
         .validate(descriptor_len)
         .map_err(PublicationRefusal::Structure)?;
     if payload.descriptor.archive_id != archive_id {
-        return Err(PublicationRefusal::OtherArchive);
+        return Err(PublicationRefusal::OtherArchive.into());
     }
     let writer = writers
         .iter()
@@ -1818,7 +2019,7 @@ fn verify_publication(
         writer.signing_key.as_bytes(),
     );
     if own_id != writer.writer_key_id {
-        return Err(PublicationRefusal::WriterKeyMismatch);
+        return Err(PublicationRefusal::WriterKeyMismatch.into());
     }
     let input = payload
         .signing_input()
@@ -1827,10 +2028,193 @@ fn verify_publication(
         .map_err(|_| PublicationRefusal::BadSignature)?;
     kr_crypto::sign::verify(&writer.signing_key, &transcript, &publication.signature)
         .map_err(|_| PublicationRefusal::BadSignature)?;
-    let standing = RestoreGeneration::against(&payload.descriptor, expectation);
+    // Where the two checkpoints name one generation with different manifests, neither can be trusted
+    // for that generation, whatever the publication says: only it is refused.
+    if let Floor::Disagree { bundle, paired } = floor
+        && payload.descriptor.backup_generation == bundle.backup_generation
+    {
+        return Err(Refused::Disagree(Disagreement {
+            generation: bundle.backup_generation,
+            paired: paired.encrypted_manifest_hash,
+            bundle: bundle.encrypted_manifest_hash,
+        }));
+    }
+    let standing = RestoreGeneration::against(&payload.descriptor, floor.expectation(accepted));
     if !standing.is_admissible() {
-        let told = Shown::restore_standing(&standing);
-        return Err(PublicationRefusal::Generation(standing, told));
+        let words = Shown::restore_refusal(&standing);
+        return Err(PublicationRefusal::Generation(standing, words).into());
     }
     Ok(standing)
+}
+
+/* -------------------------------------------------------------------------- */
+/* What a restore is held to                                                   */
+/* -------------------------------------------------------------------------- */
+
+/// Why a publication is not one a restore goes on with.
+enum Refused {
+    /// A refusal of the publication itself, or of where it stands against the checkpoint.
+    Publication(PublicationRefusal),
+    /// The generation is the one the two checkpoints name differently.
+    Disagree(Disagreement),
+}
+
+impl From<PublicationRefusal> for Refused {
+    fn from(refusal: PublicationRefusal) -> Self {
+        Self::Publication(refusal)
+    }
+}
+
+/// Two checkpoints that name different manifests for one generation of one archive.
+struct Disagreement {
+    generation: BackupGeneration,
+    paired: Digest256,
+    bundle: Digest256,
+}
+
+impl From<Disagreement> for RestoreError {
+    fn from(disagreement: Disagreement) -> Self {
+        Self::PairingCheckpointDisagrees {
+            generation: disagreement.generation.get(),
+            paired: Shown::manifest_digits(&disagreement.paired),
+            bundle: Shown::manifest_digits(&disagreement.bundle),
+        }
+    }
+}
+
+/// What a restore of one archive is held to, from the two places a checkpoint is kept.
+///
+/// The recovery bundle holds a checkpoint for an archive, and the checkpoints the paired hosts gave
+/// this computer may hold another. The higher generation is the floor, with its source. The same
+/// generation with a different manifest in each is a disagreement, and neither is trusted for that
+/// generation.
+enum Floor {
+    /// No checkpoint is held for the archive.
+    Unheld,
+    /// The higher of the two, and where it came from. Equal checkpoints are the bundle's.
+    One {
+        checkpoint: ArchiveCheckpoint,
+        source: CheckpointSource,
+    },
+    /// The two name different manifests for one generation.
+    Disagree {
+        bundle: ArchiveCheckpoint,
+        paired: ArchiveCheckpoint,
+    },
+}
+
+impl Floor {
+    /// The floor for `archive` at `origin`: the bundle's highest checkpoint for it, and the one in
+    /// `held` for it at that service.
+    fn of(material: &TrustedMaterial, held: &Held, origin: &str, archive: ArchiveId) -> Self {
+        let paired = paired_for(held, origin, archive).map(as_archive_checkpoint);
+        match (material.checkpoint(archive), paired) {
+            (None, None) => Self::Unheld,
+            (Some(bundle), None) => Self::One {
+                checkpoint: bundle.clone(),
+                source: CheckpointSource::RecoveryBundle,
+            },
+            (None, Some(paired)) => Self::One {
+                checkpoint: paired,
+                source: CheckpointSource::Pairing,
+            },
+            (Some(bundle), Some(paired)) => match Standing::of(
+                Some((bundle.backup_generation, &bundle.encrypted_manifest_hash)),
+                (paired.backup_generation, &paired.encrypted_manifest_hash),
+            ) {
+                Standing::Raises => Self::One {
+                    checkpoint: paired,
+                    source: CheckpointSource::Pairing,
+                },
+                Standing::Same | Standing::Lower => Self::One {
+                    checkpoint: bundle.clone(),
+                    source: CheckpointSource::RecoveryBundle,
+                },
+                Standing::Disagrees => Self::Disagree {
+                    bundle: bundle.clone(),
+                    paired,
+                },
+            },
+        }
+    }
+
+    /// The checkpoint a generation is compared with and where it came from. Where the two
+    /// disagree, both name one generation, so a generation other than that one stands against it
+    /// as against either, and the bundle's is the one named.
+    fn holding(&self) -> Option<(&ArchiveCheckpoint, CheckpointSource)> {
+        match self {
+            Self::Unheld => None,
+            Self::One { checkpoint, source } => Some((checkpoint, *source)),
+            Self::Disagree { bundle, .. } => Some((bundle, CheckpointSource::RecoveryBundle)),
+        }
+    }
+
+    /// The checkpoint the service is asked to hold its answer to.
+    fn asked(&self) -> Option<&ArchiveCheckpoint> {
+        self.holding().map(|(checkpoint, _)| checkpoint)
+    }
+
+    /// What a generation is compared with, with the one older generation the person named, if any.
+    fn expectation(&self, accepted: Option<BackupGeneration>) -> GenerationExpectation<'_> {
+        match (self.holding(), accepted) {
+            (None, _) => GenerationExpectation::Unverified,
+            (Some((checkpoint, source)), None) => {
+                GenerationExpectation::Checkpoint { checkpoint, source }
+            }
+            (Some((checkpoint, source)), Some(accepted)) => GenerationExpectation::AcceptingOlder {
+                checkpoint,
+                source,
+                accepted,
+            },
+        }
+    }
+}
+
+/// The checkpoint `held` holds for `archive` at `origin`, the highest if it holds more than one.
+fn paired_for<'a>(
+    held: &'a Held,
+    origin: &str,
+    archive: ArchiveId,
+) -> Option<&'a PairedCheckpoint> {
+    let Held::Read { entries, .. } = held else {
+        return None;
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.archive_id == archive && entry.service_origin.as_str() == origin)
+        .max_by_key(|entry| entry.backup_generation)
+}
+
+/// A checkpoint a host gave, as the checkpoint a generation is compared with.
+fn as_archive_checkpoint(entry: &PairedCheckpoint) -> ArchiveCheckpoint {
+    ArchiveCheckpoint {
+        archive_id: entry.archive_id,
+        backup_generation: entry.backup_generation,
+        encrypted_manifest_hash: entry.encrypted_manifest_hash,
+        verified_at_ms: TimestampMs::new(entry.taken_at_ms),
+    }
+}
+
+/// What `held` says of `archive` at `origin`.
+fn pairing_standing(held: &Held, origin: &str, archive: ArchiveId) -> PairingStanding {
+    match (paired_for(held, origin, archive), held) {
+        (Some(entry), _) => PairingStanding::Held {
+            generation: entry.backup_generation,
+        },
+        (None, Held::Read { owed, .. }) if *owed > 0 => PairingStanding::Owed,
+        _ => PairingStanding::None,
+    }
+}
+
+/// Refuses a restore when the checkpoints paired hosts gave cannot be read, whatever the reason: an
+/// unreadable file is never read as no checkpoints.
+fn refuse_unreadable(held: &Held) -> Result<(), RestoreError> {
+    match held {
+        Held::Unreadable { file, why, cause } => Err(RestoreError::PairingCheckpointsUnreadable {
+            file: file.clone(),
+            why: why.clone(),
+            cause: *cause,
+        }),
+        Held::Absent | Held::Read { .. } => Ok(()),
+    }
 }

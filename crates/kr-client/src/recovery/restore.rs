@@ -176,7 +176,8 @@ impl TrustedMaterial {
             .find(|producer| producer.sender_key_id == sender_key_id)
     }
 
-    /// Returns the checkpoint for one archive, when the bundle carries one.
+    /// Returns the checkpoint for one archive, when the bundle carries one: the highest generation,
+    /// when it carries more than one.
     #[must_use]
     pub fn checkpoint(
         &self,
@@ -184,7 +185,8 @@ impl TrustedMaterial {
     ) -> Option<&ArchiveCheckpoint> {
         self.checkpoints
             .iter()
-            .find(|checkpoint| checkpoint.archive_id == archive_id)
+            .filter(|checkpoint| checkpoint.archive_id == archive_id)
+            .max_by_key(|checkpoint| checkpoint.backup_generation)
     }
 }
 

@@ -6784,3 +6784,127 @@ async fn the_saved_settings_and_everything_that_carries_them_hold_none_of_the_ke
         }
     }
 }
+
+/// KR-REQ-20.12: an archive the service holds only an older generation of than a checkpoint a paired
+/// host gave is listed as held back, with both generations and whose checkpoint it is, and one the
+/// service holds nothing of stays nothing. It is not offered for export, and neither is any archive
+/// while those checkpoints cannot be read; the bundle alone exports either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not_exported() {
+    use kr_client::pairing::checkpoint::{Answer, PairedCheckpoints, PairingId};
+    use kr_protocol::backup_checkpoint::HostCheckpoint;
+    use kr_protocol::ids::{BackupGeneration, DeviceId};
+    use kr_protocol::scalars::{Digest256, Uuid};
+
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, kit) = page.kit(out.path());
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
+    host.sets_up();
+    page.cover_host(&host, false).expect("the host is covered");
+    let archive = host.setups_sent()[0].0.archive_id;
+    let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
+
+    // A host gave a checkpoint at generation 2, written as the companion's own store writes it.
+    let folder = computer
+        .data
+        .path()
+        .join(companion_tauri::device::HOSTS_DIRECTORY);
+    PairedCheckpoints::open(&folder)
+        .expect("a directory")
+        .settle_checkpoint(
+            PairingId {
+                host_device_id: DeviceId::new(Uuid::from_bytes([0x40; 16])),
+                device_id: DeviceId::new(Uuid::from_bytes([0x41; 16])),
+            },
+            &Answer::Checkpoint(HostCheckpoint {
+                service_origin: computer.origin(),
+                archive_id: archive,
+                backup_generation: BackupGeneration::new(2),
+                encrypted_manifest_hash: Digest256::from_bytes([0xcd; 32]),
+            }),
+            3_000,
+        )
+        .expect_err("no list of hosts holds the pairing, so it settles none");
+
+    // The service holds nothing of the archive yet: that is nothing, not an older backup held back.
+    let listed = page
+        .call("recovery_archives", json!({}))
+        .expect("the archives");
+    assert_eq!(listed[0]["withheld"], "nothing");
+    assert_eq!(listed[0]["held_generation"], Value::Null);
+    assert_eq!(listed[0]["checkpoint_source"], Value::Null);
+
+    // It then holds generation 1, which is older than the host's 2.
+    publish_generation(
+        &computer,
+        &seed,
+        &host,
+        archive,
+        &[("host/configuration.json", b"{\"revision\":1}".to_vec())],
+    )
+    .await;
+    let listed = page
+        .call("recovery_archives", json!({}))
+        .expect("the archives");
+    assert_eq!(listed[0]["archive_id"], archive.to_string());
+    assert_eq!(listed[0]["withheld"], "held_back");
+    assert_eq!(listed[0]["generation"], Value::Null);
+    assert_eq!(listed[0]["held_generation"], 1);
+    assert_eq!(listed[0]["checkpoint_generation"], 2);
+    assert_eq!(listed[0]["checkpoint_source"], "pairing");
+    let archive_path = out.path().join("held-back.krexport");
+    page.dialog_returns(&archive_path);
+    let held_back = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": archive_path.to_string_lossy(), "archive": archive.to_string() }),
+        )
+        .expect_err("an archive held back is not exported");
+    assert_eq!(held_back["code"], "PERMISSION_DENIED");
+    assert_eq!(
+        held_back["message"],
+        "the service holds generation 1 of that archive, older than generation 2 that a host this \
+         device paired with had published when this device asked"
+    );
+    assert!(!archive_path.exists());
+
+    // A file that cannot be read refuses the list and the export of an archive, and the bundle alone
+    // still exports.
+    std::fs::write(folder.join("checkpoints.json"), b"not a file").expect("a file that is not one");
+    let unreadable = page
+        .call("recovery_archives", json!({}))
+        .expect_err("the list is refused while the checkpoints cannot be read");
+    assert_eq!(unreadable["code"], "PERMISSION_DENIED");
+    let words = unreadable["message"].as_str().expect("words");
+    assert!(
+        words
+            .starts_with("the backup checkpoints this device kept when it paired cannot be read ("),
+        "{words}"
+    );
+    assert!(words.contains("Make the file readable."), "{words}");
+    page.dialog_returns(&archive_path);
+    let refused = page
+        .call(
+            "recovery_export_offline",
+            json!({ "path": archive_path.to_string_lossy(), "archive": archive.to_string() }),
+        )
+        .expect_err("the export is refused while the checkpoints cannot be read");
+    assert!(
+        refused["message"]
+            .as_str()
+            .expect("words")
+            .starts_with("the backup checkpoints this device kept when it paired cannot be read (")
+    );
+    assert!(!archive_path.exists());
+    let bundle_path = out.path().join("bundle.krexport");
+    page.dialog_returns(&bundle_path);
+    page.call(
+        "recovery_export_offline",
+        json!({ "path": bundle_path.to_string_lossy(), "archive": null }),
+    )
+    .expect("the bundle alone is exported without reading the checkpoints");
+    assert!(bundle_path.exists());
+}

@@ -8885,6 +8885,7 @@ async fn a_setup_the_host_refuses_for_now_keeps_the_archive_the_bundle_names() {
 /// that file restores the session the host backed up, byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores() {
+    use kr_client::pairing::checkpoint::Held;
     use kr_client::recovery::{
         AccountSource, CandidateState, ExportSource, FilesRestore, HostCover, MemberRole,
         OfflineExport, cover_host_archive,
@@ -8929,7 +8930,7 @@ async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores(
     let kit = computer
         .seed
         .to_kit(vec![rig.origin()], computer.context.bundle_locator.clone());
-    let listed = FilesRestore::archives(kit.clone(), Arc::clone(&source) as _)
+    let listed = FilesRestore::archives(kit.clone(), Arc::clone(&source) as _, &Held::Absent)
         .await
         .expect("the archives are listed");
     assert_eq!(listed.len(), 1);
@@ -8943,6 +8944,7 @@ async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores(
         Arc::clone(&source) as _,
         Some(covered.archive_id),
         None,
+        &Held::Absent,
     )
     .await
     .expect("a plan")
@@ -8965,6 +8967,7 @@ async fn an_archive_the_host_made_exports_as_a_file_that_the_kit_alone_restores(
         )),
         None,
         None,
+        &Held::Absent,
     )
     .await
     .expect("a restore from the file");
@@ -9204,6 +9207,7 @@ impl kr_client::recovery::BundleWriter for RelayBundles {
 #[ignore = "runs only against a Worker on this machine named by KR_DEPLOYED_ORIGIN and KR_BACKUP_TOKENS"]
 async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_and_restored_with_only_the_kit()
  {
+    use kr_client::pairing::checkpoint::Held;
     use kr_client::recovery::{FilesRestore, MemberRole, parse_kit};
 
     let (Some(origin), Some(tokens)) = (
@@ -9277,7 +9281,7 @@ async fn a_closed_sessions_history_is_backed_up_by_the_daemon_to_a_local_worker_
     let relay = Arc::new(Relay {
         endpoint: endpoint.clone(),
     });
-    let prepared = FilesRestore::prepare(kit.clone(), relay, Some(archive), None)
+    let prepared = FilesRestore::prepare(kit.clone(), relay, Some(archive), None, &Held::Absent)
         .await
         .expect("the kit opens the bundle and the host's generation at the Worker");
     assert_eq!(prepared.plan().generation.get(), 1);

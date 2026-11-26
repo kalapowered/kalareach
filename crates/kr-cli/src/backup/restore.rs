@@ -36,12 +36,12 @@ use std::sync::Arc;
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{
-    BundleWriter, CandidateState, CheckpointRecorded, MemberRole, PreparedRestore, RestoreError,
-    RestorePlan, RestoreSource,
+    BundleWriter, Candidate, CandidateState, CheckpointRecorded, MemberRole, PreparedRestore,
+    RestoreError, RestorePlan, RestoreSource,
 };
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
-use kr_crypto::backup::GenerationStanding;
+use kr_crypto::backup::{CheckpointSource, GenerationStanding};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::{
     Change, ConfigurationDocument, DeviceConfiguration, LeftOut, Loaded, edit, load,
@@ -588,11 +588,14 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
     talk: &mut C,
     held: &mut Option<Held>,
 ) -> Result<Outcome> {
+    // This command reads no pairing checkpoint: a host has no store of paired hosts, and the
+    // checkpoint it is held to is the recovery bundle's.
     let prepared = match kr_client::recovery::FilesRestore::prepare(
         kit,
         Arc::clone(&run.source),
         run.archive,
         run.accept_older,
+        &kr_client::pairing::checkpoint::Held::Absent,
     )
     .await
     {
@@ -892,7 +895,9 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
             ErrorCode::PermissionDenied,
             shown!("{}. {}", cause.why(policy), cause.remedy(policy)),
         ),
-        RestoreError::OlderThanTheCheckpoint { checkpoint, held } => CliError::Usage(shown!(
+        RestoreError::OlderThanTheCheckpoint {
+            checkpoint, held, ..
+        } => CliError::Usage(shown!(
             "the service holds generation {} of this archive, which is older than generation {} \
              that the recovery bundle last verified, so nothing is restored: a service that \
              replays an older backup looks like this. If the service was put back to an earlier \
@@ -902,7 +907,7 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
             checkpoint,
             held
         )),
-        RestoreError::NamedGenerationNotHeld { named, held } => CliError::Usage(shown!(
+        RestoreError::NamedGenerationNotHeld { named, held, .. } => CliError::Usage(shown!(
             "--accept-older {} was given, and the service holds generation {} of this archive, \
              which the recovery bundle's checkpoint accepts without it, so nothing is restored: \
              restore without --accept-older, or name the older generation the service holds when \
@@ -910,7 +915,7 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
             named,
             held
         )),
-        RestoreError::NoCheckpointToAcceptPast => CliError::Usage(Shown::said(
+        RestoreError::NoCheckpointToAcceptPast { .. } => CliError::Usage(Shown::said(
             "--accept-older names a generation older than the one the recovery bundle last \
              verified, and this bundle records none for that archive, so there is nothing to \
              accept past",
@@ -941,26 +946,7 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
                 "the recovery bundle names {} archives at this service; choose one with --archive:",
                 count
             )];
-            for candidate in &candidates {
-                lines.push(match &candidate.newest {
-                    CandidateState::Nothing => shown!(
-                        "  {}: the service holds nothing as new as the bundle's checkpoint",
-                        candidate.archive_id.get()
-                    ),
-                    CandidateState::Refused(refusal) => shown!(
-                        "  {}: its newest publication is not one a restore opens: {}",
-                        candidate.archive_id.get(),
-                        *refusal
-                    ),
-                    CandidateState::Newest(newest) => shown!(
-                        "  {}: generation {}, published {}, signed by key {}",
-                        candidate.archive_id.get(),
-                        newest.generation.get(),
-                        crate::shown::utc_moment(newest.published_at_ms.get()),
-                        Shown::key_identifier(&newest.writer)
-                    ),
-                });
-            }
+            lines.extend(candidates.iter().map(candidate_line));
             CliError::Usage(Shown::joined(lines, "\n"))
         }
         RestoreError::Read(ClientError::Host(refusal))
@@ -1010,6 +996,59 @@ async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>
     }
 }
 
+/// The line that says what the service holds of one archive a restore is asked to choose.
+fn candidate_line(candidate: &Candidate) -> Shown {
+    let id = candidate.archive_id.get();
+    match &candidate.newest {
+        CandidateState::Nothing => shown!(
+            "  {}: the service holds nothing as new as the bundle's checkpoint",
+            id
+        ),
+        CandidateState::Refused(refusal) => shown!(
+            "  {}: its newest publication is not one a restore opens: {}",
+            id,
+            *refusal
+        ),
+        CandidateState::Newest(newest) => shown!(
+            "  {}: generation {}, published {}, signed by key {}",
+            id,
+            newest.generation.get(),
+            crate::shown::utc_moment(newest.published_at_ms.get()),
+            Shown::key_identifier(&newest.writer)
+        ),
+        CandidateState::HeldBack {
+            held,
+            checkpoint,
+            source: CheckpointSource::RecoveryBundle,
+        } => shown!(
+            "  {}: the service holds generation {}, older than generation {} that the recovery \
+             bundle verified",
+            id,
+            held.get(),
+            checkpoint.get()
+        ),
+        // This command passes no checkpoints of paired hosts (`Held::Absent` of the client's
+        // pairing module), so a checkpoint here is always the recovery bundle's and this arm is not
+        // reached; it is worded for the match to be whole.
+        CandidateState::HeldBack {
+            held,
+            checkpoint,
+            source: CheckpointSource::Pairing,
+        } => shown!(
+            "  {}: the service holds generation {}, older than generation {} that a host this \
+             device paired with had published when this device asked",
+            id,
+            held.get(),
+            checkpoint.get()
+        ),
+        CandidateState::CheckpointsDisagree { generation } => shown!(
+            "  {}: the checkpoint and the recovery bundle name different manifests for generation {}",
+            id,
+            generation.get()
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1052,6 +1091,53 @@ mod tests {
                 "{line} The recovery bundle had no room for this record and the saved settings, \
                  so the settings were removed from it. A later restore does not bring them back."
             )
+        );
+    }
+
+    /// KR-REQ-20.12: the list of archives a restore is asked to choose from says what holds an
+    /// archive back and whose checkpoint it is, and keeps its words for an archive the service
+    /// holds nothing of.
+    #[test]
+    fn the_list_of_archives_says_what_holds_one_back() {
+        use kr_client::recovery::PairingStanding;
+        use kr_protocol::scalars::Uuid;
+
+        let line = |newest: CandidateState| {
+            candidate_line(&Candidate {
+                archive_id: ArchiveId::new(Uuid::from_bytes([0x11; 16])),
+                newest,
+                pairing: PairingStanding::None,
+            })
+            .as_str()
+            .to_owned()
+        };
+        let held_back = |source: CheckpointSource| CandidateState::HeldBack {
+            held: BackupGeneration::new(3),
+            checkpoint: BackupGeneration::new(5),
+            source,
+        };
+
+        assert_eq!(
+            line(CandidateState::Nothing),
+            "  11111111-1111-1111-1111-111111111111: the service holds nothing as new as the \
+             bundle's checkpoint"
+        );
+        assert_eq!(
+            line(held_back(CheckpointSource::RecoveryBundle)),
+            "  11111111-1111-1111-1111-111111111111: the service holds generation 3, older than \
+             generation 5 that the recovery bundle verified"
+        );
+        assert_eq!(
+            line(held_back(CheckpointSource::Pairing)),
+            "  11111111-1111-1111-1111-111111111111: the service holds generation 3, older than \
+             generation 5 that a host this device paired with had published when this device asked"
+        );
+        assert_eq!(
+            line(CandidateState::CheckpointsDisagree {
+                generation: BackupGeneration::new(5)
+            }),
+            "  11111111-1111-1111-1111-111111111111: the checkpoint and the recovery bundle name \
+             different manifests for generation 5"
         );
     }
 }

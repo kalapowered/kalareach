@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::Shown;
+use kr_client::pairing::checkpoint::{Held, PairedCheckpoints, SnapshotCause};
 use kr_client::recovery::{
     AccountSource, BundleStore, CandidateState, FilesRestore, HostBackups, HostCover, Left,
     LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
@@ -51,6 +52,7 @@ use kr_client::services::account::{
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceFuture, ServiceSigner, managed_response_limits,
 };
+use kr_crypto::backup::CheckpointSource;
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -178,16 +180,63 @@ pub struct ArchiveView {
     pub published_at_ms: Option<u64>,
     /// Why the service's newest generation is not offered, when it is not.
     pub withheld: Option<WithheldView>,
+    /// The generation the service holds, when it holds only one older than a checkpoint.
+    pub held_generation: Option<u64>,
+    /// The generation of the checkpoint that holds the archive back, or the one that two
+    /// checkpoints name differently.
+    pub checkpoint_generation: Option<u64>,
+    /// Where the checkpoint that holds the archive back came from.
+    pub checkpoint_source: Option<CheckpointSourceView>,
+}
+
+impl ArchiveView {
+    /// An archive none of whose generations is offered, for the reason given.
+    fn withheld(archive: ArchiveId, why: WithheldView) -> Self {
+        Self {
+            archive_id: archive.to_string(),
+            generation: None,
+            published_at_ms: None,
+            withheld: Some(why),
+            held_generation: None,
+            checkpoint_generation: None,
+            checkpoint_source: None,
+        }
+    }
 }
 
 /// Why no generation of an archive is offered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WithheldView {
-    /// The service holds no generation of it, or none as new as the bundle's checkpoint.
+    /// The service holds no generation of it.
     Nothing,
     /// The service holds a publication that a restore would refuse.
     Refused,
+    /// The service holds only a generation older than a checkpoint, which is an older backup held
+    /// back.
+    HeldBack,
+    /// The checkpoint kept from a paired host and the recovery bundle's name different manifests
+    /// for the generation the service holds.
+    Disagree,
+}
+
+/// Where a checkpoint came from, as the page is told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointSourceView {
+    /// The recovery bundle.
+    RecoveryBundle,
+    /// A host this computer paired with.
+    Pairing,
+}
+
+impl From<CheckpointSource> for CheckpointSourceView {
+    fn from(source: CheckpointSource) -> Self {
+        match source {
+            CheckpointSource::RecoveryBundle => Self::RecoveryBundle,
+            CheckpointSource::Pairing => Self::Pairing,
+        }
+    }
 }
 
 /// What the page is told once an export has been written.
@@ -400,6 +449,10 @@ pub struct Recovery {
     steps: tokio::sync::Mutex<()>,
     /// What saving the device's settings with the bundle keeps between steps.
     saving: saving::Saving,
+    /// The backup checkpoints the hosts this computer paired with gave it. A restore of the
+    /// archives is held to them as well as to the recovery bundle's. This only reads them: the
+    /// records of the paired hosts are not written here.
+    checkpoints: PairedCheckpoints,
 }
 
 impl std::fmt::Debug for Recovery {
@@ -415,7 +468,8 @@ impl Recovery {
     ///
     /// # Errors
     ///
-    /// Returns a local failure when the directory cannot be made.
+    /// Returns a local failure when the directory cannot be made, or the directory the paired
+    /// hosts' checkpoints are kept in cannot be opened.
     pub fn open(
         data: &Path,
         secrets: Arc<dyn SecretStore>,
@@ -434,6 +488,8 @@ impl Recovery {
                     "the directory recovery keeps its records in could not be made: {error}"
                 ))
             })?;
+        let checkpoints = PairedCheckpoints::open(data.join(crate::device::HOSTS_DIRECTORY))
+            .map_err(|failure| CommandError::local_failure(failure.to_string()))?;
         Ok(Self {
             directory,
             secrets,
@@ -442,7 +498,23 @@ impl Recovery {
             clients,
             steps: tokio::sync::Mutex::new(()),
             saving: saving::Saving::new(),
+            checkpoints,
         })
+    }
+
+    /// The checkpoints the paired hosts gave this computer, read once for the operation that asks.
+    ///
+    /// The file work waits for a lock, so it runs off the runtime's threads. A file that cannot be
+    /// read is [`Held::Unreadable`], which a restore refuses on and never reads as no checkpoints.
+    async fn held_checkpoints(&self) -> Result<Held> {
+        let checkpoints = self.checkpoints.clone();
+        tauri::async_runtime::spawn_blocking(move || checkpoints.held_checkpoints())
+            .await
+            .map_err(|error| {
+                CommandError::local_failure(format!(
+                    "the backup checkpoints this device kept were not read: {error}"
+                ))
+            })
     }
 
     /// Takes this process's turn and then the lock a second companion on this machine would wait
@@ -760,7 +832,8 @@ impl Recovery {
     pub async fn archives(&self, account: &Account) -> Result<Vec<ArchiveView>> {
         let _step = self.step().await?;
         let (record, source) = self.reading(account)?;
-        let listed = FilesRestore::archives(self.kit_of(&record)?, source)
+        let held = self.held_checkpoints().await?;
+        let listed = FilesRestore::archives(self.kit_of(&record)?, source, &held)
             .await
             .map_err(said_by_restore)?;
         Ok(listed
@@ -771,18 +844,29 @@ impl Recovery {
                     generation: Some(newest.generation.get()),
                     published_at_ms: Some(newest.published_at_ms.get()),
                     withheld: None,
+                    held_generation: None,
+                    checkpoint_generation: None,
+                    checkpoint_source: None,
                 },
-                CandidateState::Nothing => ArchiveView {
-                    archive_id: candidate.archive_id.to_string(),
-                    generation: None,
-                    published_at_ms: None,
-                    withheld: Some(WithheldView::Nothing),
+                CandidateState::Nothing => {
+                    ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
+                }
+                CandidateState::Refused(_) => {
+                    ArchiveView::withheld(candidate.archive_id, WithheldView::Refused)
+                }
+                CandidateState::HeldBack {
+                    held,
+                    checkpoint,
+                    source,
+                } => ArchiveView {
+                    held_generation: Some(held.get()),
+                    checkpoint_generation: Some(checkpoint.get()),
+                    checkpoint_source: Some(source.into()),
+                    ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
                 },
-                CandidateState::Refused(_) => ArchiveView {
-                    archive_id: candidate.archive_id.to_string(),
-                    generation: None,
-                    published_at_ms: None,
-                    withheld: Some(WithheldView::Refused),
+                CandidateState::CheckpointsDisagree { generation } => ArchiveView {
+                    checkpoint_generation: Some(generation.get()),
+                    ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
                 },
             })
             .collect())
@@ -817,7 +901,8 @@ impl Recovery {
                     None,
                 ),
                 Some(archive) => {
-                    let prepared = FilesRestore::prepare(kit, source, Some(archive), None)
+                    let held = self.held_checkpoints().await?;
+                    let prepared = FilesRestore::prepare(kit, source, Some(archive), None, &held)
                         .await
                         .map_err(said_by_restore)?;
                     let generation = prepared.plan().generation.get();
@@ -1295,7 +1380,42 @@ fn said_by_restore(error: RestoreError) -> CommandError {
         too_large @ RestoreError::TooLargeToExport { .. } => {
             CommandError::too_large(too_large.to_string())
         }
+        unreadable @ RestoreError::PairingCheckpointsUnreadable { cause, .. } => {
+            CommandError::refused(format!("{unreadable}. {}", unreadable_recourse(cause)))
+        }
+        disagrees @ RestoreError::PairingCheckpointDisagrees { generation, .. } => {
+            CommandError::refused(format!(
+                "{disagrees}. Generation {generation} of this archive stays refused while the two \
+                 disagree; a newer generation is not affected. Removing `checkpoints.json` leaves \
+                 the recovery bundle's checkpoint alone to decide, and removes what this device \
+                 recorded of each host's answer."
+            ))
+        }
         other => CommandError::refused(other.to_string()),
+    }
+}
+
+/// What a person does when the checkpoints the paired hosts gave this computer cannot be read, by
+/// the cause.
+const fn unreadable_recourse(cause: SnapshotCause) -> &'static str {
+    match cause {
+        SnapshotCause::Unreadable => {
+            "Without this file, a service could give this device an older backup that only the \
+             recovery bundle's own checkpoint, where the bundle has one, would catch, so this \
+             device lists and exports no archive until the file can be read. Make the file \
+             readable. Removing it removes what this device recorded of each host's answer and \
+             the checkpoints it held; the recovery bundle's own checkpoints stay."
+        }
+        SnapshotCause::NewerVersion => {
+            "A newer version of this app wrote the file. Update the app."
+        }
+        SnapshotCause::Busy => {
+            "Another part of this app is changing the file. Try again in a moment."
+        }
+        SnapshotCause::HostsFile => {
+            "The list of hosts this device paired with cannot be read, so it cannot tell which \
+             hosts owe it a checkpoint. Make that file readable."
+        }
     }
 }
 

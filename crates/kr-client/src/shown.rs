@@ -670,6 +670,36 @@ impl Shown {
         Self::decided(standing.describe())
     }
 
+    /// Why a restore's checkpoint refuses a generation, in the sentence a restore shows: whose
+    /// checkpoint it is, and where the generation stands against it.
+    ///
+    /// The sentence is made of this program's own words and the generation numbers it names.
+    #[must_use]
+    pub fn restore_refusal(standing: &kr_crypto::backup::RestoreGeneration) -> Self {
+        let whose = match standing.source {
+            Some(kr_crypto::backup::CheckpointSource::Pairing) => {
+                "the checkpoint a host this device paired with gave refuses that generation."
+            }
+            _ => "the recovery bundle's checkpoint refuses that generation.",
+        };
+        Self::decided(format!("{whose} {}", standing.describe()))
+    }
+
+    /// A manifest hash as a restore tells two apart: the first eight hexadecimal digits.
+    ///
+    /// The hash names an encrypted manifest and is public, and it is cut short only so that a line
+    /// stays short.
+    #[must_use]
+    pub fn manifest_digits(hash: &kr_protocol::scalars::Digest256) -> Self {
+        Self::decided(
+            hash.as_bytes()
+                .iter()
+                .take(4)
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
+    }
+
     /// A key identifier as a restore names its writer: the first eight bytes, in hexadecimal.
     ///
     /// It identifies a key, which is public, and is cut short only so that a line stays short.

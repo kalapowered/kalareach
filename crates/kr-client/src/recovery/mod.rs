@@ -70,8 +70,8 @@ pub use crate::recovery::files::{
     BundleWrite, BundleWriter, BundleWritten, Candidate, CandidateGeneration, CandidateState,
     CheckpointRecorded, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES, MAX_RANGE_BYTES,
     MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole, MemberVerdict,
-    PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT, RestoreError,
-    RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
+    PairingStanding, PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT,
+    RestoreError, RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
 };
 pub use crate::recovery::host_archive::{
     ArchiveEntries, ENABLE_TTL, HostBackups, HostCover, HostCovered, Left, SessionHost,
