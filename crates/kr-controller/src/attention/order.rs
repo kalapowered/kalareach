@@ -17,8 +17,8 @@ use kr_protocol::ids::BootEpoch;
 
 /// What a worker read of the host's order counter before it made a text.
 ///
-/// Nothing in the daemon's production code builds one at this landing: the wire member that
-/// carries a stamp from the worker is read where the gate is applied.
+/// Nothing in the daemon's production code builds one yet: the wire member that carries a stamp
+/// from the worker is read where the gate is applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
     /// The boot the worker was in.
@@ -46,7 +46,7 @@ pub enum BootState {
     /// lost.
     Unknown,
     /// The host recorded the boot and found that it cannot tell it from another boot: its order
-    /// counter went back inside it, or a boot recorded later was found to share its identity.
+    /// counter went back inside it, or the identity of an earlier boot came back in a later one.
     Spoiled,
     /// The boot is recorded and told apart. The number is its place in the order the host started
     /// in boots: a later boot has a higher one.
@@ -297,9 +297,9 @@ mod tests {
         );
     }
 
-    /// For this landing: nothing but the unit tests of this file builds the daemon's
-    /// `Stamp`. A text's stamp comes from a worker, and the one function that turns the wire's
-    /// member into a `Stamp` lands with the member.
+    /// For now: nothing but the unit tests of this file builds the daemon's `Stamp`. A
+    /// text's stamp comes from a worker, and the one function that turns the wire's member into a
+    /// `Stamp` lands with the member.
     #[test]
     fn no_production_code_builds_the_daemons_stamp() {
         fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {

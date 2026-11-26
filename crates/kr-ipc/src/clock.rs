@@ -436,7 +436,7 @@ mod tests {
     /// other process takes after receiving a message is not below the reading that preceded the
     /// message, and both name one boot.
     ///
-    /// This is a premise of the order rule and kills no mutation. A finite exchange cannot show an
+    /// This is a premise of the order rule. A finite exchange cannot show an
     /// offset smaller than the time the messages take.
     #[test]
     fn two_processes_of_one_boot_read_one_order_counter_in_both_directions() {

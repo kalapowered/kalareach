@@ -318,7 +318,7 @@ async fn a_daemon_behind_a_proxy_that_asks_for_a_login_starts_says_so_and_takes_
 /// login it does not hold, records its boot once at its start and registers no network. The
 /// regular pass that raises a boot's high is a turn of the task that the registration starts, so
 /// this host has none: its high stays what its start read until a grant is given a point or the
-/// daemon starts again. The case states that limit and kills no mutation.
+/// daemon starts again. The case states that limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_daemon_whose_start_skips_the_network_records_its_boot_once_and_has_no_regular_pass() {
     let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;

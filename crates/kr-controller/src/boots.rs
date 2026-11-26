@@ -1,7 +1,7 @@
 //! The host's record of the boots it started in, and of where each device's access began.
 //!
 //! Both tables are in the registry's file, beside the grants, and each of the file's writers makes
-//! them as it opens it (see [`BOOTS_SCHEMA`]).
+//! them as it opens it.
 //!
 //! * `boots` holds one row for each boot this host has started in. A boot's row is made when the
 //!   daemon first starts in that boot, so the order of the rows is the order of the boots: a later
@@ -81,8 +81,8 @@ pub enum SpoilTest {
     /// A reading of the order counter was below the highest the host had recorded in the boot, so
     /// the counter restarted inside it.
     ReadingBelowHigh,
-    /// A boot recorded after this one was found with its identity again, so this one is not the
-    /// latest boot recorded.
+    /// The identity of a boot recorded earlier came back in the boot the host runs in: a boot was
+    /// recorded after the one that had it, so its row is not the latest.
     NotHighestOrdinal,
 }
 
@@ -100,7 +100,8 @@ pub struct Spoil {
 }
 
 impl Spoil {
-    /// Returns the line the host writes to its log when this boot's flag has been stored.
+    /// Returns the line the host writes to its log when the flag of the boot it runs in has been
+    /// stored.
     ///
     /// The line says what is lost: the text stamped in the boot is withheld for good from a device
     /// whose access has a start point, and a device whose access began in the boot is served no
@@ -109,20 +110,20 @@ impl Spoil {
     pub fn line(&self) -> String {
         let cause = match self.test {
             SpoilTest::ReadingBelowHigh => format!(
-                "its order counter read {} ms, below the {} ms recorded for that boot",
+                "its order counter read {} ms, below the {} ms recorded for it",
                 self.reading, self.high
             ),
             SpoilTest::NotHighestOrdinal => format!(
-                "a later boot is recorded after it, so it is not the latest boot recorded \
-                 (counter reading {} ms, recorded high {} ms)",
+                "the identity of an earlier boot came back: a boot was recorded after the one \
+                 that had it (counter reading {} ms, recorded high {} ms)",
                 self.reading, self.high
             ),
         };
         format!(
-            "kr-controller: the host can no longer tell boot {} from another boot, because \
-             {cause}. Attention text stamped in that boot stays withheld from every device whose \
-             access has a start point. A device whose access began in that boot is served no \
-             attention text until the host next starts in a boot it can tell apart, and is never \
+            "kr-controller: the host can no longer tell the boot it is running in, boot {}, from \
+             another boot, because {cause}. Attention text stamped in this boot stays withheld \
+             from every device whose access has a start point. A device whose access began in \
+             this boot is served no attention text until the host next starts in a boot it can tell apart, and is never \
              served the text made before its new start.",
             self.epoch
         )
@@ -160,8 +161,8 @@ impl Boots {
     /// and says what the record then holds of the boot.
     ///
     /// A row that is new takes the next ordinal and the reading as its high. A row that is there is
-    /// spoiled when the reading is below its high, or when its ordinal is not the highest: a boot
-    /// recorded after it was found with its identity again. The high becomes the greater of the two
+    /// spoiled when the reading is below its high, or when its ordinal is not the highest: the identity
+    /// of an earlier boot came back, since a boot was recorded after the one that had it. The high becomes the greater of the two
     /// readings, and a spoiled row stays spoiled.
     ///
     /// `connection` is an open transaction that holds the registry file's write lock. The counter
@@ -711,8 +712,7 @@ mod tests {
 
     /// Two boots that share an epoch. The later boot's first reading is below the earlier
     /// one's high, so the epoch is spoiled; every text stamped in it and every point in it withholds,
-    /// and so does the fifth read's example, a text stamped `(E, 100000)` against a later point
-    /// `(E, 1000)`.
+    /// and so does a text stamped `(E, 100000)` against a later point `(E, 1000)`.
     #[test]
     fn a_repeated_boot_identity_with_a_counter_that_went_back_is_spoiled_and_withholds() {
         let mut file = File::new();
@@ -727,7 +727,7 @@ mod tests {
         let record = Stored(&file.connection);
         for (name, outcome) in [
             (
-                "the fifth read's text against the later point, in the same epoch",
+                "a text stamped above the later point, in the same epoch",
                 admit(1, Some(&point(7, 1_000)), Some(&stamp(7, 100_000)), &record),
             ),
             (
@@ -882,6 +882,10 @@ mod tests {
         for line in [&by_reading, &by_order] {
             assert!(line.starts_with("kr-controller: "), "{line}");
             assert!(line.contains("123456"), "the boot: {line}");
+            assert!(
+                line.contains("the boot it is running in"),
+                "the boot is the one the daemon runs in: {line}"
+            );
             assert!(line.contains("50000 ms"), "the high: {line}");
             assert!(
                 line.contains("stays withheld from every device whose access has a start point"),
@@ -897,7 +901,9 @@ mod tests {
             "{by_reading}"
         );
         assert!(
-            by_order.contains("a later boot is recorded after it") && by_order.contains("90000 ms"),
+            by_order.contains("the identity of an earlier boot came back")
+                && by_order.contains("a boot was recorded after the one that had it")
+                && by_order.contains("90000 ms"),
             "{by_order}"
         );
     }
