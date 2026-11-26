@@ -38,8 +38,13 @@
 //! other than a declared output makes the result indeterminate, however briefly it existed. The
 //! parent itself is watched too, and so is the copy: a report that the directory was renamed,
 //! removed or changed (its mode, its owner, its attributes) is a write, because the record of a
-//! parent is the one thing the comparison leaves out. A watcher the host cannot start, or whose
-//! reports it cannot be sure it has all of, makes the result indeterminate too.
+//! parent is the one thing the comparison leaves out. On macOS the reports come on the platform's
+//! schedule, so the host also records the device and inode of each parent before the command
+//! starts and reads them again once the watcher has reported the host's own file at the end: a
+//! parent that is gone, is no longer a directory or has another device or inode is a write
+//! whatever was reported of it. A parent's mode, owner or attributes that were changed and put back
+//! are shown by the reports alone. A watcher the host cannot start, or whose reports it cannot be
+//! sure it has all of, makes the result indeterminate too.
 //!
 //! # What this does not establish
 //!
@@ -1137,6 +1142,98 @@ mod unix {
         }
     }
 
+    /// What a directory is, whatever is written in it.
+    ///
+    /// The stamp of a directory an output is in is not recorded, because making the output changes
+    /// it. Its device and inode, and that it is a directory, do not change when a name is made in
+    /// it, and they are another when the directory was removed and made again.
+    #[cfg(any(target_os = "macos", test))]
+    mod identity {
+        #[cfg(target_os = "macos")]
+        use std::path::Path;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) struct Identity {
+            device: u64,
+            inode: u64,
+            directory: bool,
+        }
+
+        impl Identity {
+            /// What is at `path` now, a link not followed.
+            #[cfg(target_os = "macos")]
+            pub(super) fn of(path: &Path) -> std::io::Result<Self> {
+                use std::os::unix::fs::MetadataExt as _;
+
+                let metadata = std::fs::symlink_metadata(path)?;
+                Ok(Self {
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    directory: metadata.is_dir(),
+                })
+            }
+
+            /// Whether `now` is another place than this one: on another device, with another
+            /// inode, or no longer a directory.
+            pub(super) fn is_another(self, now: Self) -> bool {
+                self.device != now.device
+                    || self.inode != now.inode
+                    || self.directory != now.directory
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::Identity;
+
+            fn directory(device: u64, inode: u64) -> Identity {
+                Identity {
+                    device,
+                    inode,
+                    directory: true,
+                }
+            }
+
+            /// A directory with the device and the inode it had is the place it was.
+            #[test]
+            fn a_directory_with_the_device_and_inode_it_had_is_the_same_place() {
+                assert!(!directory(1, 2).is_another(directory(1, 2)));
+            }
+
+            /// KR-REQ-14.34: a directory on another device is another place.
+            #[test]
+            fn a_directory_on_another_device_is_another_place() {
+                assert!(
+                    directory(1, 2).is_another(directory(3, 2)),
+                    "the device is not the one the directory was on"
+                );
+            }
+
+            /// KR-REQ-14.34: a directory with another inode is another place.
+            #[test]
+            fn a_directory_with_another_inode_is_another_place() {
+                assert!(
+                    directory(1, 2).is_another(directory(1, 3)),
+                    "the inode is not the one the directory had"
+                );
+            }
+
+            /// KR-REQ-14.34: what is no longer a directory is another place.
+            #[test]
+            fn what_is_no_longer_a_directory_is_another_place() {
+                let file = Identity {
+                    device: 1,
+                    inode: 2,
+                    directory: false,
+                };
+                assert!(
+                    directory(1, 2).is_another(file),
+                    "what was a directory is not one now"
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     mod names {
         use std::collections::{BTreeMap, BTreeSet};
@@ -1149,6 +1246,7 @@ mod unix {
         use kr_transfer::{AuthorisedDirectory, RelativeName};
 
         use super::budget::{self, Budget, Held};
+        use super::identity::Identity;
         use super::judged::{Heard, Places};
 
         /// What the watches of this process cost, in open files.
@@ -1213,6 +1311,35 @@ mod unix {
             beside: AuthorisedDirectory,
             beside_path: PathBuf,
             copy_path: PathBuf,
+            /// What each directory an output is in was when the watch started, by its path in the
+            /// copy.
+            identities: BTreeMap<String, Identity>,
+        }
+
+        /// The place of a directory in the copy, the empty path being the copy itself.
+        fn place_in(copy_path: &Path, relative: &str) -> PathBuf {
+            if relative.is_empty() {
+                copy_path.to_path_buf()
+            } else {
+                copy_path.join(relative)
+            }
+        }
+
+        /// What each directory an output is in is now, by its path in the copy.
+        fn identities_of(
+            copy_path: &Path,
+            parents: &BTreeMap<String, BTreeSet<String>>,
+        ) -> Result<BTreeMap<String, Identity>, String> {
+            parents
+                .keys()
+                .map(|relative| {
+                    Identity::of(&place_in(copy_path, relative))
+                        .map(|identity| (relative.clone(), identity))
+                        .map_err(|error| {
+                            format!("a directory an output is in could not be examined: {error}")
+                        })
+                })
+                .collect()
         }
 
         impl std::fmt::Debug for NameWatch {
@@ -1301,6 +1428,9 @@ mod unix {
                         Ok(watcher)
                     },
                 )?;
+                // What each directory an output is in is before the command starts, to be read
+                // again when it has ended.
+                let identities = identities_of(&copy_path, parents)?;
                 let watch = Self {
                     _watcher: watcher,
                     shared,
@@ -1308,6 +1438,7 @@ mod unix {
                     beside: reopened,
                     beside_path,
                     copy_path,
+                    identities,
                 };
                 watch.up_to_date()?;
                 watch
@@ -1362,14 +1493,49 @@ mod unix {
                 }
             }
 
+            /// The directories an output is in that are not the places they were when the watch
+            /// started: gone, no longer a directory, or on another device or with another inode.
+            /// This reads the copy and not the watcher's reports, which come on the platform's
+            /// schedule.
+            fn replaced(&self) -> Result<BTreeSet<String>, String> {
+                let mut replaced = BTreeSet::new();
+                for (relative, before) in &self.identities {
+                    match Identity::of(&place_in(&self.copy_path, relative)) {
+                        Ok(now) if !before.is_another(now) => {}
+                        Ok(_) => {
+                            replaced.insert(relative.clone());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            replaced.insert(relative.clone());
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "a directory an output is in could not be examined: {error}"
+                            ));
+                        }
+                    }
+                }
+                Ok(replaced)
+            }
+
             /// The paths written beside a declared output since the watch started, and the
-            /// directories themselves when something was done to them.
+            /// directories themselves when something was done to them or when one is not the
+            /// place it was, whether the watcher reported it or not.
             pub fn drain(&self) -> Result<Vec<String>, String> {
                 self.up_to_date()?;
+                let replaced = self.replaced()?;
                 let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 match &shared.heard.lost {
                     Some(why) => Err(why.clone()),
-                    None => Ok(shared.heard.written.iter().cloned().collect()),
+                    None => Ok(shared
+                        .heard
+                        .written
+                        .iter()
+                        .chain(&replaced)
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect()),
                 }
             }
         }
@@ -1385,7 +1551,7 @@ mod unix {
 
             use super::{
                 AuthorisedDirectory, Budget, Duration, Held, Instant, MARK, NameWatch, Places,
-                Shared, WATCHES, budget, take,
+                Shared, WATCHES, budget, identities_of, take,
             };
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
@@ -1629,6 +1795,8 @@ mod unix {
                     beside,
                     beside_path,
                     copy_path: copy.clone(),
+                    identities: identities_of(&copy, &parents_of_outputs())
+                        .expect("the directories above are examined"),
                 };
                 Place {
                     _root: root,
