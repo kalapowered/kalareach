@@ -5064,7 +5064,21 @@
     },
     "BackupCheckpointParams": {
       "additionalProperties": false,
-      "description": "Parameters of `backup.checkpoint`: none. The environment is the one the connection reaches.",
+      "description": "Parameters of `backup.checkpoint`: what the host proves its answer with.",
+      "properties": {
+        "challenge": {
+          "$ref": "#/$defs/Nonce256",
+          "description": "A fresh 256-bit value the device drew for this ask. The host's box holds it, so an answer\nthat was made for another ask is not taken for this one."
+        },
+        "reply_key": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "A fresh stored-envelope public key the device drew for this ask, whose secret half never\nleaves the device. The host seals its box to it."
+        }
+      },
+      "required": [
+        "challenge",
+        "reply_key"
+      ],
       "type": "object"
     },
     "BackupCheckpointResult": {
@@ -5081,10 +5095,15 @@
             }
           ],
           "description": "The newest generation this host's storage service accepted and the host still keeps, or\nnull when there is none."
+        },
+        "proof": {
+          "$ref": "#/$defs/SealedCheckpointProof",
+          "description": "The host's box, which shows that the host holds the stored-envelope key its pairing record\ndeclares and names the checkpoint above."
         }
       },
       "required": [
-        "checkpoint"
+        "checkpoint",
+        "proof"
       ],
       "type": "object"
     },
@@ -37389,6 +37408,26 @@
           "type": "string"
         }
       ]
+    },
+    "SealedCheckpointProof": {
+      "additionalProperties": false,
+      "description": "A box from the host's stored-envelope key to the key a device sent with its ask. Its plaintext is\n`CBOR([domain, {challenge, checkpoint, host_endpoint_id}])` as [`HostCheckpointProof`] says.",
+      "properties": {
+        "ciphertext": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The sealed bytes: at most 413 of them.",
+          "maxLength": 551
+        },
+        "nonce": {
+          "$ref": "#/$defs/Nonce192",
+          "description": "The nonce the box was made with."
+        }
+      },
+      "required": [
+        "nonce",
+        "ciphertext"
+      ],
+      "type": "object"
     },
     "SealedCollectionKeyWrap": {
       "additionalProperties": false,

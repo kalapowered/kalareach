@@ -7343,9 +7343,20 @@ export interface BackupBundlePlace2 {
   write_sequence: string
 }
 /**
- * Parameters of `backup.checkpoint`: none. The environment is the one the connection reaches.
+ * Parameters of `backup.checkpoint`: what the host proves its answer with.
  */
-export interface BackupCheckpointParams {}
+export interface BackupCheckpointParams {
+  /**
+   * A fresh 256-bit value the device drew for this ask. The host's box holds it, so an answer
+   * that was made for another ask is not taken for this one.
+   */
+  challenge: string
+  /**
+   * A fresh stored-envelope public key the device drew for this ask, whose secret half never
+   * leaves the device. The host seals its box to it.
+   */
+  reply_key: string
+}
 /**
  * What `backup.checkpoint` answers.
  */
@@ -7355,6 +7366,7 @@ export interface BackupCheckpointResult {
    * null when there is none.
    */
   checkpoint: HostCheckpoint | null
+  proof: SealedCheckpointProof
 }
 /**
  * One backup generation a host published, as the host reports it.
@@ -7377,6 +7389,20 @@ export interface HostCheckpoint {
    * The service the host's backups are kept at, as the host recorded it.
    */
   service_origin: string
+}
+/**
+ * The host's box, which shows that the host holds the stored-envelope key its pairing record
+ * declares and names the checkpoint above.
+ */
+export interface SealedCheckpointProof {
+  /**
+   * The sealed bytes: at most 413 of them.
+   */
+  ciphertext: string
+  /**
+   * The nonce the box was made with.
+   */
+  nonce: string
 }
 /**
  * Parameters of `backup.enable`: everything the daemon needs to set backups up, and nothing of the
