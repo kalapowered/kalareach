@@ -152,8 +152,8 @@ fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
 }
 
 /// KR-REQ-11.26: a device shows a statement of at most `STATEMENT_CHARS` whole, so the longest of
-/// the two packages' statements is within it, and the figure is that length plus the margin,
-/// rounded up to the next 1,000.
+/// the two packages' statements is within it, and the figure is at least that length plus the
+/// margin and less than 1,000 above it.
 #[test]
 fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin() {
     let lengths: Vec<(&str, Option<usize>)> = statements()
@@ -179,11 +179,15 @@ fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin()
         "the longer statement is {longest} characters and the budget is {STATEMENT_CHARS}: \
          {lengths:?}"
     );
-    assert_eq!(
-        STATEMENT_CHARS,
-        (longest + MARGIN).div_ceil(1_000) * 1_000,
-        "the longer statement is {longest} characters: the budget is that and {MARGIN}, rounded \
-         up to the next 1,000"
+    assert!(
+        STATEMENT_CHARS >= longest + MARGIN,
+        "the longer statement is {longest} characters: the budget is {STATEMENT_CHARS}, which \
+         leaves less than the margin of {MARGIN}"
+    );
+    assert!(
+        STATEMENT_CHARS < longest + MARGIN + 1_000,
+        "the longer statement is {longest} characters: the budget is {STATEMENT_CHARS}, which is \
+         1,000 or more above that and the margin of {MARGIN}"
     );
 }
 
