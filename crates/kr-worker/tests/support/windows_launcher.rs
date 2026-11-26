@@ -121,8 +121,13 @@ pub fn process_environment() -> Vec<(String, String)> {
 pub enum Admission {
     /// It answered `admitted`.
     Admitted,
-    /// It closed the connection without a word, which is how a launch it refuses is answered.
+    /// It closed the connection without a word, which is how it answers a connection that did not
+    /// authenticate. This launcher always presents the record's credential, as the child of the
+    /// case that plays the root shell, so it is not closed on for that reason.
     Closed,
+    /// It refused the launch in place of admitting it, and gave this reason: the answer of a backend
+    /// to a launcher whose credential authenticated and whose presentation it refuses.
+    Refused(String),
     /// It answered something else, which is given.
     Other(String),
     /// The launcher could not present itself at all, for the reason given.
@@ -250,7 +255,8 @@ impl Launcher {
                 self.seen.admission = match said["answer"].as_str().unwrap_or_default() {
                     "admitted" => Admission::Admitted,
                     "closed" => Admission::Closed,
-                    _ => Admission::Other(text(&said, "read")),
+                    _ => refusal_in(&said)
+                        .map_or_else(|| Admission::Other(text(&said, "read")), Admission::Refused),
                 };
                 self.over = self.seen.admission != Admission::Admitted;
             }
@@ -416,6 +422,18 @@ impl Drop for HeldProgram {
 
 fn text(value: &serde_json::Value, name: &str) -> String {
     value[name].as_str().unwrap_or_default().to_owned()
+}
+
+/// The reason a backend gave, where the line a launcher read in place of its admission is the frame
+/// that says the launch is not committed.
+fn refusal_in(said: &serde_json::Value) -> Option<String> {
+    let frame: serde_json::Value = serde_json::from_str(said["read"].as_str()?).ok()?;
+    let launch = &frame["kr_launch"];
+    if launch["committed"] == false {
+        launch["failed"].as_str().map(str::to_owned)
+    } else {
+        None
+    }
 }
 
 /// Plays the launcher when this program was started to, and returns at once when it was not.

@@ -1973,12 +1973,15 @@ fn a_held_program_that_no_job_took_is_ended_when_it_is_dropped() {
     );
 }
 
-/// A backend that refuses what a launcher presents closes the connection without a word, and the
-/// fixture says so: it presents an argument vector the backend did not answer and reads a closed
-/// connection, creates nothing and goes no further.
+/// A backend that refuses what a launcher presents tells the launcher why, in place of its admission,
+/// once the launcher's credential has authenticated, and the fixture says so: it presents an argument
+/// vector the backend did not answer and reads the frame that says the launch is not committed, with
+/// the reason the backend keeps in its own record, creates nothing and goes no further. The backend
+/// writes the frame before it lets the connection go, so the frame is what the launcher reads first;
+/// only a connection that did not authenticate is closed without a word.
 #[cfg(windows)]
 #[tokio::test]
-async fn the_fixture_reads_a_closed_connection_when_the_backend_refuses_its_hello() {
+async fn the_fixture_reads_the_reason_when_the_backend_refuses_its_hello() {
     use windows_launcher::{Admission, Launch, Launcher};
 
     let setup = Setup::new();
@@ -1995,7 +1998,20 @@ async fn the_fixture_reads_a_closed_connection_when_the_backend_refuses_its_hell
 
     let mut launcher = Launcher::start(&launch);
     let played = launcher.played().await;
-    assert_eq!(played.admission, Admission::Closed, "{played:?}");
+    let reason = "the argument vector presented is not the one this backend answered";
+    assert_eq!(
+        played.admission,
+        Admission::Refused(reason.to_owned()),
+        "{played:?}"
+    );
+    assert_eq!(
+        setup
+            .backends
+            .launch_failure_of(PromptGeneration::new(1))
+            .as_deref(),
+        Some(reason),
+        "the backend's own record says why"
+    );
     assert_eq!(
         played.program, None,
         "no program is created for a launcher that was refused"
