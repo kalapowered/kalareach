@@ -398,7 +398,7 @@ impl PairedCheckpoints {
     /// Settles what the host of pairing `id` answered: at most one write, under the lock, and never
     /// one that lowers or deletes a checkpoint.
     ///
-    /// A checkpoint is set against the one held for its archive at its service ([`Standing`]), and
+    /// A checkpoint is set against the one held for its archive at its service (`Standing`), and
     /// only a newer generation replaces it. The pairing's `told` entry is written when the pairing
     /// is still the host's current one and the answer is new or changed; an entry of a pairing that
     /// has gone is dropped. When the write reports an error, the file is read again: if it holds
