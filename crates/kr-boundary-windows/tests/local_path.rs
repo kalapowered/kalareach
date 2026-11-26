@@ -67,6 +67,19 @@ fn every_form_but_a_path_on_a_local_drive_is_refused() {
         r"C:x\y",
         r"\\?\C:",
         r"\\?\C:x",
+        // The verbatim spelling gets the same checks of its names: the system does no clean-up of a
+        // verbatim path, so a dot name, an empty name and a name that ends in a dot or a space are
+        // refused there too.
+        r"\\?\C:\a\.\b",
+        r"\\?\C:\a\..\b",
+        r"\\?\C:\a\..",
+        r"\\?\C:\\x",
+        r"\\?\C:\a\\b",
+        r"\\?\C:\a.",
+        r"\\?\C:\a\b ",
+        r"\\?\C:\a\b:stream",
+        r"\\?\C:/a",
+        r"\\?\c:",
         r"1:\x",
         r"CC:\x",
         r"C::\x",

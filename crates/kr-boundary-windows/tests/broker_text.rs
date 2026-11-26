@@ -272,6 +272,9 @@ fn broker_text_a_drive_letter_that_is_not_a_local_disk_is_refused_before_its_roo
         let answers = [
             hold_tree(r"Y:\x\y", &client),
             hold_tree(&on_the_share, &client),
+            // The verbatim spelling of the same path: the letter's link is read for it the same way.
+            hold_tree(r"\\?\Y:\x\y", &client),
+            hold_tree(&format!(r"\\?\{on_the_share}"), &client),
         ];
         // What the letter leads to is read first: the computer made no connection, whatever the
         // refusals say.
