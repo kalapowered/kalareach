@@ -210,6 +210,220 @@ fn header(job: &str) -> String {
         .join("\n")
 }
 
+/// The entries of a job's own `env` map, each as its line with the white space at both ends taken
+/// off, and nothing else: not the same words under `outputs:`, under a step's `env:` or in another
+/// job, not a line commented out, and not what stands deeper than the map's own entries (a map of an
+/// entry, a block scalar). The map is the one under the `env` key at the job's own indentation, four
+/// spaces, wherever it stands among the job's keys, before the steps or after them; its entries stand
+/// at the indentation of its first, and it ends at the next line that is no deeper than the key. A
+/// job with no `env` has no entries. An `env` written twice, or with its map on the key's line (flow
+/// style, an expression), is not read and panics, so that the case that asks fails and does not pass
+/// on part of the map.
+fn job_environment(job: &str) -> Vec<String> {
+    let lines: Vec<&str> = job.lines().collect();
+    let keys: Vec<usize> = (0..lines.len())
+        .filter(|&at| {
+            key_value(lines[at]).is_some_and(|(indent, key, _)| indent == 4 && key == "env")
+        })
+        .collect();
+    assert!(keys.len() <= 1, "the job has its env twice");
+    let Some(&key) = keys.first() else {
+        return Vec::new();
+    };
+    let on_the_key = key_value(lines[key]).map_or("", |(.., value)| value);
+    assert!(
+        on_the_key
+            .split(" #")
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .is_empty(),
+        "the job's env is not a block map: {}",
+        lines[key].trim()
+    );
+    let mut entries_at = None;
+    let mut entries = Vec::new();
+    for line in &lines[key + 1..] {
+        let text = line.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= 4 {
+            break;
+        }
+        let own = *entries_at.get_or_insert(indent);
+        if indent < own {
+            break;
+        }
+        if indent == own {
+            entries.push(text.to_owned());
+        }
+    }
+    entries
+}
+
+/// Two settings, each under a map of a job's keys at `indent`, as a job's `env` holds them.
+fn settings_at(indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    format!("{pad}CARGO_PROFILE_DEV_STRIP: symbols\n{pad}CARGO_PROFILE_TEST_STRIP: symbols\n")
+}
+
+/// Whether the `rust` job of a sample workflow sets `variable` in its own environment, read as the
+/// cases that hold a setting read it. The sample's `rust` job holds `keys` among its own keys and
+/// `after` after its steps; the job beside it always has both settings in its own `env`.
+fn rust_job_sets(keys: &str, step: &str, after: &str, variable: &str) -> bool {
+    let workflow = format!(
+        "jobs:\n  rust:\n    name: rust\n{keys}    steps:\n      - run: cargo test\n{step}{after}  other:\n    name: other\n    env:\n{}    steps:\n      - run: cargo test\n",
+        settings_at(6)
+    );
+    job_environment(&job(&workflow, "rust"))
+        .iter()
+        .any(|line| line == variable)
+}
+
+/// What the reader of a job's environment finds: the settings in the job's own `env` map, wherever
+/// the job's keys stand, and no line of another map that has the same words.
+#[test]
+fn the_reader_of_a_jobs_environment_reads_its_own_env_map_and_nothing_else() {
+    let dev = "CARGO_PROFILE_DEV_STRIP: symbols";
+    let test = "CARGO_PROFILE_TEST_STRIP: symbols";
+    let samples: Vec<(&str, String, String, String, [bool; 2])> = vec![
+        // The workflow that has the two lines under `outputs:` in place of `env:`.
+        (
+            "under outputs",
+            format!("    outputs:\n{}", settings_at(6)),
+            String::new(),
+            String::new(),
+            [false; 2],
+        ),
+        // The two lines in a step's own `env`.
+        (
+            "under a step's env",
+            String::new(),
+            format!("        env:\n{}", settings_at(10)),
+            String::new(),
+            [false; 2],
+        ),
+        // No `env` in the job: the job beside it has the lines and the job read does not.
+        (
+            "in another job",
+            String::new(),
+            String::new(),
+            String::new(),
+            [false; 2],
+        ),
+        // One level deeper than the map's own entries.
+        (
+            "one level deeper",
+            format!("    env:\n      OTHER:\n{}", settings_at(8)),
+            String::new(),
+            String::new(),
+            [false; 2],
+        ),
+        // The true form.
+        (
+            "in env",
+            format!("    env:\n{}", settings_at(6)),
+            String::new(),
+            String::new(),
+            [true; 2],
+        ),
+        // Only the first of the two.
+        (
+            "one of two",
+            "    env:\n      CARGO_PROFILE_DEV_STRIP: symbols\n".to_owned(),
+            String::new(),
+            String::new(),
+            [true, false],
+        ),
+        // The job's own key after its steps.
+        (
+            "in env after the steps",
+            String::new(),
+            String::new(),
+            format!("    env:\n{}", settings_at(6)),
+            [true; 2],
+        ),
+        // A blank line and an entry of another name inside the map.
+        (
+            "among other entries",
+            format!("    env:\n      FIRST: \"1\"\n\n{}", settings_at(6)),
+            String::new(),
+            String::new(),
+            [true; 2],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, keys, step, after, expected) in samples {
+        for (variable, expected) in [dev, test].into_iter().zip(expected) {
+            let found = rust_job_sets(&keys, &step, &after, variable);
+            if found != expected {
+                wrong.push(format!(
+                    "{name}: {variable}: read as set = {found}, should be {expected}"
+                ));
+            }
+        }
+    }
+    // The landing workflow as it stands, and with its rust job's `env:` written as `outputs:`.
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let moved = landing.replacen(
+        "    env:\n      CARGO_PROFILE_DEV_STRIP",
+        "    outputs:\n      CARGO_PROFILE_DEV_STRIP",
+        1,
+    );
+    assert_ne!(
+        moved, landing,
+        "the landing workflow has no rust job with its settings in env"
+    );
+    for variable in [dev, test] {
+        for (name, text, expected) in [
+            ("the landing workflow", &landing, true),
+            ("the landing workflow with outputs", &moved, false),
+        ] {
+            let found = job_environment(&job(text, "rust"))
+                .iter()
+                .any(|line| line == variable);
+            if found != expected {
+                wrong.push(format!(
+                    "{name}: {variable}: read as set = {found}, should be {expected}"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "the reader is wrong for:\n{}",
+        wrong.join("\n")
+    );
+    // A comment line stands where it will in the map, and a line commented out is no entry. The job
+    // text the cases read has its comment lines left out already; this reads them as they stand.
+    let commented = "  rust:\n    env:\n      # why\n      # CARGO_PROFILE_TEST_STRIP: symbols\n      CARGO_PROFILE_DEV_STRIP: symbols\n    # between\n    steps:\n      - run: cargo test\n";
+    assert_eq!(job_environment(commented), [dev]);
+    assert!(job_environment("  rust:\n    env: # none yet\n    steps:\n").is_empty());
+}
+
+/// A job that has `env` twice is not a workflow the runner takes, and its first map or its last
+/// would be a guess: the reader does not guess.
+#[test]
+#[should_panic(expected = "has its env twice")]
+fn the_reader_of_a_jobs_environment_refuses_an_env_written_twice() {
+    job_environment(&format!(
+        "  rust:\n    env:\n{}    env:\n      OTHER: \"1\"\n    steps:\n",
+        settings_at(6)
+    ));
+}
+
+/// A map in flow style, or an expression, on the key's line is not read, and so is not passed.
+#[test]
+#[should_panic(expected = "is not a block map")]
+fn the_reader_of_a_jobs_environment_refuses_a_flow_style_map() {
+    job_environment(
+        "  rust:\n    env: { CARGO_PROFILE_DEV_STRIP: symbols, CARGO_PROFILE_TEST_STRIP: symbols }\n    steps:\n",
+    );
+}
+
 /// A step, or a job's header, that a run skips or lets fail without failing the job: the way a step
 /// is kept in the workflow and made to do nothing. A trailing comment, the spaces inside a
 /// condition, quotes around the key and spaces before its colon do not hide it, and any
@@ -1313,12 +1527,11 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
-    // Among the job's own keys, in its environment ahead of its steps, so that every step that runs
-    // tests has it.
+    // In the job's own `env` map, so that every step that runs tests has it.
     assert!(
-        header(&job(&report, "linux"))
-            .lines()
-            .any(|line| line.trim() == variable),
+        job_environment(&job(&report, "linux"))
+            .iter()
+            .any(|line| line == variable),
         "the Linux job of the conformance workflow does not require a user service manager in its \
          own environment"
     );
@@ -2743,12 +2956,12 @@ fn macos_jobs_that_run_tests(workflow: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether job `name` of `workflow` sets the opt-in for the whole job, among its own keys and ahead of
-/// its steps, so that every step that runs tests has it.
+/// Whether job `name` of `workflow` sets the opt-in for the whole job, in its own `env` map, so that
+/// every step that runs tests has it.
 fn asks_for_the_accounts_launchd(workflow: &str, name: &str) -> bool {
-    header(&job(workflow, name))
-        .lines()
-        .any(|line| line.trim() == "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"")
+    job_environment(&job(workflow, name))
+        .iter()
+        .any(|line| line == "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"")
 }
 
 /// The tests that start a daemon through the user's service manager load jobs into the account's
@@ -2785,8 +2998,7 @@ fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
     }
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
-    // Among the job's own keys, in its environment ahead of its steps, so that every step that runs
-    // tests has it.
+    // In the job's own `env` map, so that every step that runs tests has it.
     assert!(
         asks_for_the_accounts_launchd(&report, "macos"),
         "the macOS job of the conformance workflow does not ask for the account's own launchd in \
@@ -3179,15 +3391,14 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
     let names = jobs_of(&report);
     assert!(!names.is_empty(), "the conformance workflow has no job");
     for name in &names {
-        // Among the job's own keys, in its environment ahead of its steps, so that every step that
-        // builds has it.
-        let keys = header(&job(&report, name));
+        // In the job's own `env` map, so that every step that builds has it.
+        let environment = job_environment(&job(&report, name));
         for variable in [
             "CARGO_PROFILE_DEV_DEBUG: \"0\"",
             "CARGO_PROFILE_TEST_DEBUG: \"0\"",
         ] {
             assert!(
-                keys.lines().any(|line| line.trim() == variable),
+                environment.iter().any(|line| line == variable),
                 "the {name} job of the conformance workflow does not set {variable} in its own \
                  environment"
             );
@@ -3199,18 +3410,18 @@ fn every_job_of_the_conformance_workflow_builds_without_debug_information() {
 /// one target directory, and the symbol tables are the greater part of what those programs hold. Its
 /// profiles drop them, so that the disk the job runs on has room for the tests as the workspace
 /// grows. Taking the two settings out is a decision about that room, so they are held here, in the
-/// job's own environment ahead of its steps, where every step that builds has them.
+/// job's own `env` map, where every step that builds has them.
 #[test]
 fn the_rust_job_builds_its_test_programs_without_symbol_tables() {
     let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
         .expect("the landing workflow");
-    let keys = header(&job(&workflow, "rust"));
+    let environment = job_environment(&job(&workflow, "rust"));
     for variable in [
         "CARGO_PROFILE_DEV_STRIP: symbols",
         "CARGO_PROFILE_TEST_STRIP: symbols",
     ] {
         assert!(
-            keys.lines().any(|line| line.trim() == variable),
+            environment.iter().any(|line| line == variable),
             "the rust job of the landing workflow does not set {variable} in its own environment"
         );
     }
