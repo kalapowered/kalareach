@@ -6,11 +6,13 @@
 //! answers are kept in `checkpoints.json`, beside `hosts.json`, and nothing here changes `hosts.json`
 //! or `attempt.json`.
 //!
-//! * A checkpoint belongs to an archive at a service, not to a pairing: it stays when a pairing is
-//!   replaced or a host is forgotten, and no write ever lowers one.
+//! * A checkpoint belongs to an archive at a service that one host produced, not to a pairing: the
+//!   entry names the host's endpoint and the key id of the stored-envelope key its record declared
+//!   (the producer), beside the service and the archive. It stays when a pairing is replaced or a
+//!   host is forgotten, and no write ever lowers one.
 //! * Whether a host still owes a checkpoint is derived, never written beforehand: an owner pairing
 //!   with no `told` entry owes one. The file says only that a read of that pairing completed, and
-//!   what it answered.
+//!   what it answered. Only an owner pairing is asked, so only an owner record settles an answer.
 //! * A host's answer is taken only when the host proves it: each ask carries a fresh challenge and
 //!   key, and the host's box must open under the key its pairing declares and hold this challenge,
 //!   the host's endpoint and the checkpoint named beside it. See [`read_checkpoint`].
@@ -24,7 +26,7 @@ use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_crypto::keys::StoredEnvelopeKeyPair;
+use kr_crypto::keys::{StoredEnvelopeKeyPair, key_id};
 use kr_crypto::sealed::open_stored_envelope;
 use kr_crypto::sign::SigningTranscript;
 use kr_protocol::backup_checkpoint::{
@@ -34,7 +36,8 @@ use kr_protocol::backup_checkpoint::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, DeviceId};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Digest256, EndpointKey, Nonce256};
+use kr_protocol::pairing::KeyPurpose;
+use kr_protocol::scalars::{Digest256, EndpointKey, KeyId, Nonce256};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -96,9 +99,17 @@ impl PairingId {
 
 /// The newest backup generation of one archive at one service that a host named, with the
 /// manifest it named for it.
+///
+/// An entry is kept by its key: the host's endpoint, the producer, the service and the archive. Two
+/// entries that differ in any one part are two entries.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PairedCheckpoint {
+    /// The endpoint of the host that gave the checkpoint.
+    pub host_endpoint_id: EndpointKey,
+    /// The key id of the stored-envelope key that host's record declared when it gave it: the key
+    /// that names the host as the producer of an archive.
+    pub producer: KeyId,
     /// The service the archive is at, as the host spells it.
     pub service_origin: GatewayOrigin,
     /// The archive.
@@ -291,8 +302,11 @@ pub struct Settled {
 /// checkpoint was lowered or deleted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unsettled {
-    /// The pairing is no longer the host's current one in `hosts.json`. A checkpoint the answer
-    /// raised was taken, and no `told` entry was written.
+    /// The record is not an owner pairing: a host asked for its checkpoint only on an owner
+    /// pairing, so an answer for any other takes nothing and writes nothing.
+    NotAnOwner,
+    /// The pairing is no longer the host's current owner pairing in `hosts.json`. A checkpoint the
+    /// answer raised was taken, and no `told` entry was written.
     Superseded,
     /// The answer names a new archive past the bound, or the file would pass the byte cap.
     Full,
@@ -424,37 +438,48 @@ impl PairedCheckpoints {
         })
     }
 
-    /// Settles what the host of pairing `id` answered: at most one write, under the lock, and never
-    /// one that lowers or deletes a checkpoint.
+    /// Settles what the host of the pairing `host` holds answered: at most one write, under the
+    /// lock, and never one that lowers or deletes a checkpoint.
     ///
-    /// A checkpoint is set against the one held for its archive at its service (`Standing`), and
-    /// only a newer generation replaces it. The pairing's `told` entry is written when the pairing
-    /// is still the host's current one and the answer is new or changed; an entry of a pairing that
-    /// has gone is dropped. When the write reports an error, the file is read again: if it holds
-    /// what was meant, the replacement landed and the answer is settled with `confirmed` false.
+    /// `host` is the record the answer was read through, and it alone says whose answer this is: the
+    /// entry is kept under the endpoint of `host` and the producer its declared key names, never
+    /// under what `hosts.json` holds now. A checkpoint is set against the one held for the same
+    /// endpoint, producer, service and archive (`Standing`), and only a newer generation replaces
+    /// it. The pairing's `told` entry is written when `host` is still the host's current owner
+    /// pairing in `hosts.json` and the answer is new or changed; an entry of a pairing that has gone
+    /// is dropped. When the write reports an error, the file is read again: if it holds what was
+    /// meant, the replacement landed and the answer is settled with `confirmed` false.
     ///
     /// # Errors
     ///
-    /// Returns why nothing was settled, and with [`Unsettled::Superseded`] that the pairing has
-    /// gone, after the checkpoint it named was taken.
+    /// Returns [`Unsettled::NotAnOwner`] at once, before the lock and with nothing taken, for a
+    /// record that is no owner. Otherwise returns why nothing was settled, and with
+    /// [`Unsettled::Superseded`] that the pairing is no longer the current owner pairing, after the
+    /// checkpoint it named was taken.
     pub fn settle_checkpoint(
         &self,
-        id: PairingId,
+        host: &PairedHost,
         answer: &Answer,
         now_ms: u64,
     ) -> Result<Settled, Unsettled> {
+        if !host.is_owner() {
+            return Err(Unsettled::NotAnOwner);
+        }
+        let id = PairingId::of(host);
         if matches!(answer, Answer::Checkpoint(given) if given.backup_generation.get() == 0) {
             return Err(Unsettled::Malformed);
         }
         let (_lock, snapshot) = self.snapshot()?;
         let Snapshot { file, hosts } = snapshot;
-        let current = hosts.iter().any(|host| PairingId::of(host) == id);
+        let current = hosts
+            .iter()
+            .any(|listed| PairingId::of(listed) == id && listed.is_owner());
         let intended = answer.intended();
         let mut next = file.clone();
         let mut confirmed = true;
         let outcome = match answer {
             Answer::NothingPublished => Outcome::NothingPublished,
-            Answer::Checkpoint(given) => take(&mut next.checkpoints, given, now_ms)?,
+            Answer::Checkpoint(given) => take(&mut next.checkpoints, host, given, now_ms)?,
         };
         next.told
             .retain(|told| hosts.iter().any(|host| told.is(PairingId::of(host))));
@@ -477,14 +502,16 @@ impl PairedCheckpoints {
         if next != file {
             let bytes = serde_json::to_vec(&next).map_err(|_| Unsettled::WriteFailed)?;
             // No readable file reaches this check. `parse` refuses a file of more than 1,024
-            // checkpoints or one that names an archive or a pairing twice, and `take` refuses a new
-            // archive at 1,024, so a result holds at most 1,024 checkpoints of 351 bytes or less. The
-            // settle drops each `told` entry of a pairing that no record of `hosts.json` holds, so a
-            // result holds at most one `told` entry of 231 bytes or less for each record (two
-            // identities of 36 characters, an endpoint of 43, the longest answer and a time of 20
-            // digits). That file is read up to 4 MiB, in records whose values alone take 339 bytes or
-            // more (three identities and five keys), so it holds at most 12,372 records: 1,024 x 352
-            // + 12,372 x 232 + 40 = 3,230,792 bytes. The check guards a change to those bounds.
+            // checkpoints or one that names a key or a pairing twice, and `take` refuses a new key
+            // at 1,024, so a result holds at most 1,024 checkpoints of 473 bytes or less (the
+            // longest service, an endpoint and a producer of 43 characters each, a generation and
+            // a time of 20 digits). The settle drops each `told` entry of a pairing that no record
+            // of `hosts.json` holds, so a result holds at most one `told` entry of 231 bytes or
+            // less for each record (two identities of 36 characters, an endpoint of 43, the longest
+            // answer and a time of 20 digits). That file is read up to 4 MiB, in records whose
+            // values alone take 339 bytes or more (three identities and five keys), so it holds at
+            // most 12,372 records: 1,024 x 474 + 12,372 x 232 + 40 = 3,355,720 bytes. The check
+            // guards a change to those bounds.
             if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_FILE_BYTES) {
                 return Err(Unsettled::Full);
             }
@@ -564,15 +591,21 @@ impl PairedCheckpoints {
     }
 }
 
-/// Sets `given` against the checkpoint held for its archive at its service, and takes it when it
-/// is newer. A new archive past the bound is refused.
+/// Sets `given` against the checkpoint that `host` gave for its archive at its service, and takes
+/// it when it is newer. The entry is the one with the same endpoint, producer, service and archive;
+/// an answer of another host never raises it. A new key past the bound is refused.
 fn take(
     held: &mut Vec<PairedCheckpoint>,
+    host: &PairedHost,
     given: &HostCheckpoint,
     now_ms: u64,
 ) -> Result<Outcome, Unsettled> {
+    let producer = producer_of(host);
     let key = |entry: &PairedCheckpoint| {
-        entry.service_origin == given.service_origin && entry.archive_id == given.archive_id
+        entry.host_endpoint_id == host.host_endpoint_id
+            && entry.producer == producer
+            && entry.service_origin == given.service_origin
+            && entry.archive_id == given.archive_id
     };
     let known = held.iter().any(key);
     let standing = Standing::of(
@@ -591,6 +624,8 @@ fn take(
             }
             held.retain(|entry| !key(entry));
             held.push(PairedCheckpoint {
+                host_endpoint_id: host.host_endpoint_id,
+                producer,
                 service_origin: given.service_origin.clone(),
                 archive_id: given.archive_id,
                 backup_generation: given.backup_generation,
@@ -600,6 +635,15 @@ fn take(
             Ok(if known { Outcome::Raised } else { Outcome::New })
         }
     }
+}
+
+/// The key id of the stored-envelope key `host`'s record declares: the producer an answer of that
+/// host counts for.
+fn producer_of(host: &PairedHost) -> KeyId {
+    key_id(
+        KeyPurpose::StoredEnvelope,
+        host.host_keys.stored_envelope.as_bytes(),
+    )
 }
 
 /// An operating-system lock on `checkpoints.lock`, let go when it drops.
@@ -695,14 +739,17 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
             "it holds a checkpoint of generation 0, which no host publishes",
         )));
     }
-    let mut archives = BTreeSet::new();
-    if !file
-        .checkpoints
-        .iter()
-        .all(|held| archives.insert((held.service_origin.as_str(), held.archive_id)))
-    {
+    let mut keys = BTreeSet::new();
+    if !file.checkpoints.iter().all(|held| {
+        keys.insert((
+            held.host_endpoint_id,
+            held.producer,
+            held.service_origin.as_str(),
+            held.archive_id,
+        ))
+    }) {
         return Err(unreadable(Shown::said(
-            "it names one archive of one service twice",
+            "it names one archive of one service for one host and producer twice",
         )));
     }
     let mut pairings = BTreeSet::new();
@@ -872,8 +919,11 @@ mod tests {
         host(byte, &[ActionRight::HostManage])
     }
 
+    /// An entry of a host that no record names: its endpoint and producer are fixed bytes.
     fn entry(archive: u8, generation: u64) -> PairedCheckpoint {
         PairedCheckpoint {
+            host_endpoint_id: EndpointKey::from_bytes([0xE0; 32]),
+            producer: KeyId::from_bytes([0xE1; 32]),
             service_origin: GatewayOrigin::new("https://reach.kala.to").expect("an origin"),
             archive_id: ArchiveId::new(Uuid::from_bytes([archive; 16])),
             backup_generation: BackupGeneration::new(generation),
@@ -890,6 +940,38 @@ mod tests {
             answer,
             at_ms: 1_764_000_000_000,
         }
+    }
+
+    const ORIGIN: &str = "https://reach.kala.to";
+
+    /// An entry that `host` gave: its endpoint and the producer its record declares.
+    fn entry_of(host: &PairedHost, archive: u8, generation: u64) -> PairedCheckpoint {
+        PairedCheckpoint {
+            host_endpoint_id: host.host_endpoint_id,
+            producer: producer_of(host),
+            ..entry(archive, generation)
+        }
+    }
+
+    /// `record` at another endpoint: the same declared identities and keys.
+    fn at_another_endpoint(record: &PairedHost) -> PairedHost {
+        PairedHost {
+            host_endpoint_id: DeviceKeys::generate()
+                .expect("keys")
+                .public_keys()
+                .transport,
+            ..record.clone()
+        }
+    }
+
+    /// `record` declaring another stored-envelope key, at the same endpoint.
+    fn under_another_producer(record: &PairedHost) -> PairedHost {
+        let mut other = record.clone();
+        other.host_keys.stored_envelope = DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .stored_envelope;
+        other
     }
 
     struct Rig {
@@ -1009,6 +1091,7 @@ mod tests {
             })
             .collect();
         let cases: Vec<(&str, Vec<u8>, SnapshotCause)> = vec![
+            ("a zero-byte file", Vec::new(), SnapshotCause::Unreadable),
             ("not JSON", b"{".to_vec(), SnapshotCause::Unreadable),
             (
                 "an unknown member",
@@ -1143,9 +1226,7 @@ mod tests {
         Tried {
             held: cause(&rig.checkpoints.held_checkpoints()),
             acquisition: rig.checkpoints.acquisition(record),
-            settle: rig
-                .checkpoints
-                .settle_checkpoint(id(record), &given(1, 9), NOW),
+            settle: rig.checkpoints.settle_checkpoint(record, &given(1, 9), NOW),
             after: std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
         }
     }
@@ -1261,6 +1342,8 @@ mod tests {
     /// repeat of any other member names another value.
     fn entry_of_another() -> PairedCheckpoint {
         PairedCheckpoint {
+            host_endpoint_id: EndpointKey::from_bytes([0xE2; 32]),
+            producer: KeyId::from_bytes([0xE3; 32]),
             service_origin: GatewayOrigin::new("https://reach.kala.to").expect("an origin"),
             archive_id: ArchiveId::new(Uuid::from_bytes([2; 16])),
             backup_generation: BackupGeneration::new(1),
@@ -1587,7 +1670,7 @@ mod tests {
         let first = owner(1);
         rig.hosts.record(first.clone()).expect("recorded");
         rig.checkpoints
-            .settle_checkpoint(id(&first), &given(1, 7), NOW)
+            .settle_checkpoint(&first, &given(1, 7), NOW)
             .expect("settled");
         let mut second = first.clone();
         second.host_endpoint_id = DeviceKeys::generate()
@@ -1609,7 +1692,7 @@ mod tests {
         let first = owner(1);
         rig.hosts.record(first.clone()).expect("recorded");
         rig.checkpoints
-            .settle_checkpoint(id(&first), &given(1, 7), NOW)
+            .settle_checkpoint(&first, &given(1, 7), NOW)
             .expect("settled");
         let mut second = first.clone();
         second.host_endpoint_id = DeviceKeys::generate()
@@ -1683,7 +1766,7 @@ mod tests {
             .transport;
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&second), &given(1, 7), NOW),
+                .settle_checkpoint(&second, &given(1, 7), NOW),
             Err(Unsettled::Superseded)
         );
         assert_eq!(answers(&rig), Vec::new());
@@ -1696,7 +1779,7 @@ mod tests {
         let rig = Rig::new();
         let record = owner(1);
         rig.hosts.record(record.clone()).expect("recorded");
-        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(&record, &answer, NOW);
 
         assert_eq!(settle(given(1, 7)), settled(Outcome::New));
         assert_eq!(entries(&rig), vec![(1, 7)]);
@@ -1743,8 +1826,7 @@ mod tests {
         rig.hosts.record(current.clone()).expect("recorded");
 
         assert_eq!(
-            rig.checkpoints
-                .settle_checkpoint(id(&old), &given(1, 4), NOW),
+            rig.checkpoints.settle_checkpoint(&old, &given(1, 4), NOW),
             Err(Unsettled::Superseded)
         );
         assert_eq!(entries(&rig), vec![(1, 4)], "the checkpoint was taken");
@@ -1756,7 +1838,7 @@ mod tests {
         );
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&old), &Answer::NothingPublished, NOW),
+                .settle_checkpoint(&old, &Answer::NothingPublished, NOW),
             Err(Unsettled::Superseded)
         );
         assert!(answers(&rig).is_empty());
@@ -1778,7 +1860,7 @@ mod tests {
         rig.checkpoints = rig.checkpoints.clone().with_writer(counting);
         let record = owner(1);
         rig.hosts.record(record.clone()).expect("recorded");
-        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(&record, &answer, NOW);
         WRITES.set(0);
 
         settle(given(1, 7)).expect("settled");
@@ -1833,14 +1915,14 @@ mod tests {
         let record = owner(1);
         rig.hosts.record(record.clone()).expect("recorded");
         rig.checkpoints
-            .settle_checkpoint(id(&record), &given(1, 7), NOW)
+            .settle_checkpoint(&record, &given(1, 7), NOW)
             .expect("settled");
         let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
 
         rig.checkpoints = rig.checkpoints.clone().with_writer(fails_before);
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 9), NOW),
+                .settle_checkpoint(&record, &given(1, 9), NOW),
             Err(Unsettled::WriteFailed)
         );
         assert_eq!(
@@ -1852,7 +1934,7 @@ mod tests {
         rig.checkpoints = rig.checkpoints.clone().with_writer(fails_after);
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 9), NOW),
+                .settle_checkpoint(&record, &given(1, 9), NOW),
             unconfirmed(Outcome::Raised)
         );
         assert_eq!(entries(&rig), vec![(1, 9)], "the new file stands");
@@ -1866,16 +1948,16 @@ mod tests {
         let record = owner(1);
         rig.hosts.record(record.clone()).expect("recorded");
         rig.checkpoints
-            .settle_checkpoint(id(&record), &given(1, 9), NOW)
+            .settle_checkpoint(&record, &given(1, 9), NOW)
             .expect("settled");
         // An answer of nothing published changes the pairing's entry, so that the answer after it is
         // written again. The first is settled before the writer changes: the lower answer is then
         // the first one that a write that fails after the replacement meets.
         rig.checkpoints
-            .settle_checkpoint(id(&record), &Answer::NothingPublished, NOW)
+            .settle_checkpoint(&record, &Answer::NothingPublished, NOW)
             .expect("settled");
         rig.checkpoints = rig.checkpoints.clone().with_writer(fails_after);
-        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(&record, &answer, NOW);
         let other_manifest = Answer::Checkpoint(host_checkpoint("https://reach.kala.to", 1, 9, 77));
 
         assert_eq!(settle(given(1, 8)), unconfirmed(Outcome::Lower));
@@ -1887,6 +1969,433 @@ mod tests {
         assert_eq!(entries(&rig), vec![(1, 9)], "the held entry stands");
     }
 
+    /// The entries a rig holds, as the file keeps them.
+    fn held(rig: &Rig) -> Vec<PairedCheckpoint> {
+        let Held::Read { entries, .. } = rig.checkpoints.held_checkpoints() else {
+            panic!("a readable file");
+        };
+        entries
+    }
+
+    /// The generation of the entry that `host` gave for `archive` at `origin`, when there is one.
+    fn generation_at(rig: &Rig, host: &PairedHost, origin: &str, archive: u8) -> Option<u64> {
+        held(rig)
+            .iter()
+            .find(|held| {
+                held.host_endpoint_id == host.host_endpoint_id
+                    && held.producer == producer_of(host)
+                    && held.service_origin.as_str() == origin
+                    && held.archive_id == ArchiveId::new(Uuid::from_bytes([archive; 16]))
+            })
+            .map(|held| held.backup_generation.get())
+    }
+
+    /// The member names of an entry's host and producer.
+    const NEW_MEMBERS: [&str; 2] = ["host_endpoint_id", "producer"];
+
+    /// An entry names its host's endpoint and its producer. A file with both reads back as written,
+    /// a file without either is unreadable, and the two members are written as 43 characters each.
+    #[test]
+    fn an_entry_names_its_host_and_producer_and_a_file_without_either_is_unreadable() {
+        let rig = Rig::new();
+        let host = owner(1);
+        rig.hosts.record(host.clone()).expect("recorded");
+        let written = vec![entry_of(&host, 1, 7)];
+        rig.write_file(written.clone(), Vec::new());
+        assert_eq!(held(&rig), written, "an entry reads back with both members");
+
+        let value = serde_json::to_value(&written[0]).expect("a value");
+        for member in NEW_MEMBERS {
+            assert_eq!(
+                value[member].as_str().map(str::len),
+                Some(43),
+                "{member} is 43 characters of base64url"
+            );
+        }
+        for member in NEW_MEMBERS {
+            let mut file = serde_json::to_value(CheckpointsFile {
+                version: FORMAT_VERSION,
+                checkpoints: written.clone(),
+                told: Vec::new(),
+            })
+            .expect("a value");
+            file["checkpoints"][0]
+                .as_object_mut()
+                .expect("an entry")
+                .remove(member);
+            rig.write(&file);
+            assert_eq!(
+                cause(&rig.checkpoints.held_checkpoints()),
+                Some(SnapshotCause::Unreadable),
+                "an entry without {member} is unreadable"
+            );
+        }
+        rig.write_file(Vec::new(), Vec::new());
+        assert!(held(&rig).is_empty(), "empty collections read (control)");
+    }
+
+    /// An entry is named once by its four-part key: two entries that differ in any one part read,
+    /// and two that repeat the key are refused.
+    #[test]
+    fn a_file_names_each_entry_once_by_its_four_part_key() {
+        let rig = Rig::new();
+        let host = owner(1);
+        let base = entry_of(&host, 1, 7);
+        let other_endpoint = PairedCheckpoint {
+            host_endpoint_id: EndpointKey::from_bytes([0xA1; 32]),
+            ..base.clone()
+        };
+        let other_producer = PairedCheckpoint {
+            producer: KeyId::from_bytes([0xA2; 32]),
+            ..base.clone()
+        };
+        let other_service = PairedCheckpoint {
+            service_origin: GatewayOrigin::new("https://other.example").expect("an origin"),
+            ..base.clone()
+        };
+        let other_archive = PairedCheckpoint {
+            archive_id: ArchiveId::new(Uuid::from_bytes([2; 16])),
+            ..base.clone()
+        };
+        let both_others = PairedCheckpoint {
+            host_endpoint_id: EndpointKey::from_bytes([0xA3; 32]),
+            producer: KeyId::from_bytes([0xA4; 32]),
+            ..base.clone()
+        };
+        for (name, other) in [
+            ("endpoint", other_endpoint),
+            ("producer", other_producer),
+            ("service", other_service),
+            ("archive", other_archive),
+            ("endpoint and producer together", both_others),
+        ] {
+            rig.write_file(vec![base.clone(), other.clone()], Vec::new());
+            assert_eq!(
+                held(&rig),
+                vec![base.clone(), other],
+                "two entries that differ only in the {name} read"
+            );
+        }
+        // The key repeated, with another generation, manifest and time: refused, never merged.
+        let repeated = PairedCheckpoint {
+            backup_generation: BackupGeneration::new(9),
+            encrypted_manifest_hash: Digest256::from_bytes([9; 32]),
+            taken_at_ms: 5,
+            ..base.clone()
+        };
+        rig.write_file(vec![base.clone(), repeated], Vec::new());
+        assert_eq!(
+            cause(&rig.checkpoints.held_checkpoints()),
+            Some(SnapshotCause::Unreadable),
+            "a repeated key"
+        );
+    }
+
+    /// An answer raises only the entry that names its own endpoint, producer, service and archive:
+    /// each part of the key is varied alone, and the entry of the first host stays where it was.
+    #[test]
+    fn an_answer_raises_only_the_entry_that_names_its_endpoint_producer_service_and_archive() {
+        let first = owner(1);
+        let variations = [
+            ("endpoint", at_another_endpoint(&first), ORIGIN, 1_u8),
+            ("producer", under_another_producer(&first), ORIGIN, 1),
+            ("service", first.clone(), "https://other.example", 1),
+            ("archive", first.clone(), ORIGIN, 2),
+        ];
+        for (part, other, origin, archive) in variations {
+            let rig = Rig::new();
+            rig.hosts.record(first.clone()).expect("recorded");
+            rig.checkpoints
+                .settle_checkpoint(&first, &given(1, 5), NOW)
+                .expect("settled");
+            // An answer of the other endpoint is a late one: no record of this device names it as
+            // the host's current pairing. It still raises the entry that names its own key.
+            let _ = rig.checkpoints.settle_checkpoint(
+                &other,
+                &Answer::Checkpoint(host_checkpoint(origin, archive, 9, archive)),
+                NOW,
+            );
+            assert_eq!(
+                generation_at(&rig, &first, ORIGIN, 1),
+                Some(5),
+                "{part}: the answer of the other key leaves the first entry alone"
+            );
+            assert_eq!(
+                generation_at(&rig, &other, origin, archive),
+                Some(9),
+                "{part}: and has its own entry"
+            );
+            assert_eq!(held(&rig).len(), 2, "{part}");
+        }
+    }
+
+    /// One endpoint under a second pairing raises its one entry; one endpoint with two producers
+    /// holds two.
+    #[test]
+    fn one_endpoint_under_a_second_pairing_raises_its_one_entry_and_two_producers_hold_two() {
+        let rig = Rig::new();
+        let first = owner(1);
+        rig.hosts.record(first.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(&first, &given(1, 5), NOW)
+            .expect("settled");
+        let mut second = first.clone();
+        second.device_id = DeviceId::new(Uuid::from_bytes([50; 16]));
+        rig.hosts.record(second.clone()).expect("a second pairing");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&second, &given(1, 9), NOW),
+            settled(Outcome::Raised),
+            "the one entry of the endpoint rises"
+        );
+        assert_eq!(held(&rig).len(), 1);
+        assert_eq!(generation_at(&rig, &second, ORIGIN, 1), Some(9));
+
+        let other = under_another_producer(&second);
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&other, &given(1, 3), NOW),
+            settled(Outcome::New),
+            "another producer at the same endpoint is another entry, not a lower answer"
+        );
+        assert_eq!(held(&rig).len(), 2);
+        assert_eq!(generation_at(&rig, &second, ORIGIN, 1), Some(9));
+        assert_eq!(generation_at(&rig, &other, ORIGIN, 1), Some(3));
+    }
+
+    /// A lower, an equal and another-manifest answer change no entry, and every entry is still
+    /// returned after the host is forgotten and after another pairing replaces it.
+    #[test]
+    fn a_lower_an_equal_and_another_manifest_change_no_entry_and_every_entry_outlives_a_forget() {
+        let rig = Rig::new();
+        let (first, second) = (owner(1), owner(4));
+        rig.hosts.record(first.clone()).expect("recorded");
+        rig.hosts.record(second.clone()).expect("recorded");
+        let settle = |host: &PairedHost, answer: Answer| {
+            rig.checkpoints.settle_checkpoint(host, &answer, NOW)
+        };
+        assert_eq!(settle(&first, given(1, 7)), settled(Outcome::New));
+        assert_eq!(settle(&second, given(1, 3)), settled(Outcome::New));
+        let before = held(&rig);
+        assert_eq!(before.len(), 2);
+
+        assert_eq!(settle(&first, given(1, 6)), settled(Outcome::Lower));
+        assert_eq!(settle(&first, given(1, 7)), settled(Outcome::Same));
+        let other_manifest = Answer::Checkpoint(host_checkpoint(ORIGIN, 1, 7, 77));
+        assert_eq!(settle(&first, other_manifest), settled(Outcome::Disagrees));
+        assert_eq!(settle(&second, given(1, 2)), settled(Outcome::Lower));
+        assert_eq!(held(&rig), before, "no answer changed an entry");
+
+        rig.hosts.forget(first.host_device_id).expect("forgotten");
+        assert_eq!(
+            held(&rig),
+            before,
+            "a forgotten host's entry is still returned"
+        );
+        assert_eq!(
+            settle(&second, given(1, 1)),
+            settled(Outcome::Lower),
+            "a settle after the forget"
+        );
+        assert_eq!(held(&rig), before, "and it removed no entry");
+
+        let mut replaced = at_another_endpoint(&second);
+        replaced.device_id = DeviceId::new(Uuid::from_bytes([60; 16]));
+        rig.hosts.record(replaced).expect("a new pairing");
+        assert_eq!(
+            held(&rig),
+            before,
+            "a replaced pairing's entry is still returned"
+        );
+    }
+
+    /// A record that is no owner takes nothing, whether or not the lock is held; a pairing that is
+    /// no longer the current one takes its entry and no answer; the current owner takes both; and an
+    /// owner that a viewer pairing replaced keeps its earlier entry.
+    #[test]
+    fn a_record_that_is_no_owner_takes_nothing_and_only_the_current_owner_is_told() {
+        let rig = Rig::new();
+        let viewer = host(10, &[ActionRight::SessionView]);
+        rig.hosts.record(viewer.clone()).expect("recorded");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&viewer, &given(1, 7), NOW),
+            Err(Unsettled::NotAnOwner),
+            "a viewer record is told nothing"
+        );
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&viewer, &Answer::NothingPublished, NOW),
+            Err(Unsettled::NotAnOwner)
+        );
+        assert!(
+            !rig.path(CHECKPOINTS_FILE).exists(),
+            "a viewer record writes nothing"
+        );
+        let holder = kr_ipc::paths::open_lock_file(&rig.path(LOCK_FILE)).expect("a lock file");
+        kr_flush::lock::exclusive(&holder).expect("held");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&viewer, &given(1, 7), NOW),
+            Err(Unsettled::NotAnOwner),
+            "the answer is turned away before the lock, which is held"
+        );
+        kr_flush::lock::release(&holder).expect("released");
+
+        // An owner that is not the host's current pairing: the entry is taken, no answer is told.
+        let old = owner(20);
+        let mut current = old.clone();
+        current.device_id = DeviceId::new(Uuid::from_bytes([70; 16]));
+        rig.hosts.record(current.clone()).expect("recorded");
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&old, &given(1, 4), NOW),
+            Err(Unsettled::Superseded)
+        );
+        assert_eq!(
+            entries(&rig),
+            vec![(1, 4)],
+            "the late answer raised its entry"
+        );
+        assert!(answers(&rig).is_empty(), "and told no pairing");
+
+        // The current owner gets both: the control.
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&current, &given(1, 5), NOW),
+            settled(Outcome::Raised)
+        );
+        assert_eq!(
+            answers(&rig),
+            vec![(id(&current), Intended::Checkpoint, NOW)]
+        );
+
+        // A viewer pairing of the same host replaces the owner: its earlier entry stays.
+        let mut viewing = current.clone();
+        viewing.device_id = DeviceId::new(Uuid::from_bytes([71; 16]));
+        viewing.proposed_grant = grant(&[ActionRight::SessionView]);
+        rig.hosts.record(viewing.clone()).expect("replaced");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&viewing, &given(1, 9), NOW),
+            Err(Unsettled::NotAnOwner)
+        );
+        assert_eq!(
+            entries(&rig),
+            vec![(1, 5)],
+            "the owner's earlier entry stays"
+        );
+        assert_eq!(
+            rig.checkpoints.acquisition(&viewing),
+            Ok(Acquisition::NotAnOwner)
+        );
+    }
+
+    /// Two records of one declared host at two endpoints are two pairings: each is owed and told on
+    /// its own, and a name goes to the one whose identity names it.
+    #[test]
+    fn two_records_of_one_declared_host_at_two_endpoints_are_two_pairings() {
+        let rig = Rig::new();
+        let (first, second) = (owner(1), at_another_endpoint(&owner(1)));
+        assert_eq!(first.host_device_id, second.host_device_id);
+        assert_eq!(first.device_id, second.device_id);
+        // `record` replaces a host by its declared identity, so the file is written as it stands.
+        kr_ipc::paths::write_owner_only_file(
+            &rig.path("hosts.json"),
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "hosts": [first, second],
+            }))
+            .expect("bytes"),
+        )
+        .expect("a file of two records");
+        assert_eq!(rig.checkpoints.acquisition(&first), Ok(Acquisition::Owed));
+        assert_eq!(rig.checkpoints.acquisition(&second), Ok(Acquisition::Owed));
+
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&first, &given(1, 7), NOW),
+            settled(Outcome::New)
+        );
+        assert_eq!(rig.checkpoints.acquisition(&first), Ok(Acquisition::Told));
+        assert_eq!(
+            rig.checkpoints.acquisition(&second),
+            Ok(Acquisition::Owed),
+            "the other endpoint is still owed"
+        );
+        assert_eq!(answers(&rig), vec![(id(&first), Intended::Checkpoint, NOW)]);
+        let Held::Read { owed, .. } = rig.checkpoints.held_checkpoints() else {
+            panic!("a readable file");
+        };
+        assert_eq!(owed, 1);
+
+        assert_eq!(
+            rig.hosts
+                .name_pairing(id(&second), Some("kitchen".to_owned()))
+                .expect("named"),
+            crate::pairing::paired::Naming::Named
+        );
+        let names: Vec<(EndpointKey, Option<String>)> = rig
+            .hosts
+            .list()
+            .expect("hosts")
+            .into_iter()
+            .map(|record| (record.host_endpoint_id, record.name))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (first.host_endpoint_id, None),
+                (second.host_endpoint_id, Some("kitchen".to_owned()))
+            ],
+            "the name went to the record of the endpoint it names"
+        );
+    }
+
+    /// The largest entry takes the bytes the settle's size comment counts for it, and the file
+    /// those counts make stays inside the largest file this release reads.
+    #[test]
+    fn the_largest_entry_takes_the_bytes_the_size_bound_counts() {
+        let host = owner(1);
+        let authority = format!("{}.{}", "a".repeat(63), "b".repeat(56));
+        let origin = GatewayOrigin::new(format!("https://{authority}")).expect("an origin");
+        assert_eq!(
+            origin.as_str().len(),
+            kr_protocol::service::MAX_GATEWAY_ORIGIN_LEN
+        );
+        let largest = PairedCheckpoint {
+            service_origin: origin,
+            backup_generation: BackupGeneration::new(u64::MAX),
+            taken_at_ms: u64::MAX,
+            ..entry_of(&host, 1, 1)
+        };
+        assert_eq!(
+            serde_json::to_vec(&largest).expect("serialises").len(),
+            ENTRY_BYTES - 1,
+            "the entry's text, less the comma that follows it in the list"
+        );
+        let told = Told {
+            at_ms: u64::MAX,
+            ..told(&host, Intended::NothingPublished)
+        };
+        assert_eq!(
+            serde_json::to_vec(&told).expect("serialises").len(),
+            TOLD_BYTES - 1
+        );
+        let most = u64::try_from(MAX_CHECKPOINTS).expect("a count")
+            * u64::try_from(ENTRY_BYTES).expect("a size")
+            + MOST_RECORDS * u64::try_from(TOLD_BYTES).expect("a size")
+            + FILE_BYTES;
+        assert_eq!(most, 3_355_720, "the figure of the comment");
+        assert!(most <= MAX_FILE_BYTES);
+    }
+
+    /// The bytes the size comment of the settle counts for one entry, with the comma after it.
+    const ENTRY_BYTES: usize = 474;
+    /// The bytes it counts for one `told` entry, with the comma after it.
+    const TOLD_BYTES: usize = 232;
+    /// The most records of `hosts.json` that fit in the largest file this release reads.
+    const MOST_RECORDS: u64 = 12_372;
+    /// The bytes of the file's own members.
+    const FILE_BYTES: u64 = 40;
+
     /// A new archive past the bound is refused and an archive already held still rises, and an
     /// answer of generation 0 is never written.
     #[test]
@@ -1896,7 +2405,7 @@ mod tests {
         rig.hosts.record(record.clone()).expect("recorded");
         let full: Vec<PairedCheckpoint> = (0..MAX_CHECKPOINTS)
             .map(|position| {
-                let mut held = entry(1, 1);
+                let mut held = entry_of(&record, 1, 1);
                 held.archive_id = ArchiveId::new(Uuid::from_bytes(
                     u128::try_from(position + 1).expect("a count").to_be_bytes(),
                 ));
@@ -1908,12 +2417,12 @@ mod tests {
 
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(200, 1), NOW),
+                .settle_checkpoint(&record, &given(200, 1), NOW),
             Err(Unsettled::Full)
         );
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 0), NOW),
+                .settle_checkpoint(&record, &given(1, 0), NOW),
             Err(Unsettled::Malformed)
         );
         assert_eq!(
@@ -1925,7 +2434,7 @@ mod tests {
         known.archive_id = ArchiveId::new(Uuid::from_bytes(1_u128.to_be_bytes()));
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &Answer::Checkpoint(known), NOW),
+                .settle_checkpoint(&record, &Answer::Checkpoint(known), NOW),
             settled(Outcome::Raised),
             "an archive already held still rises at the bound"
         );
@@ -1941,7 +2450,7 @@ mod tests {
         rig.write_file(Vec::new(), vec![told(&gone, Intended::Checkpoint)]);
 
         rig.checkpoints
-            .settle_checkpoint(id(&record), &Answer::NothingPublished, NOW)
+            .settle_checkpoint(&record, &Answer::NothingPublished, NOW)
             .expect("settled");
         assert_eq!(
             answers(&rig),
@@ -1957,7 +2466,7 @@ mod tests {
         rig.hosts.record(record.clone()).expect("recorded");
         let settle = || {
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 3), NOW)
+                .settle_checkpoint(&record, &given(1, 3), NOW)
         };
 
         kr_ipc::paths::write_owner_only_file(&rig.path(CHECKPOINTS_FILE), b"{").expect("a file");
@@ -1996,7 +2505,7 @@ mod tests {
         let at = |origin: &str, generation: u64| {
             Answer::Checkpoint(host_checkpoint(origin, 1, generation, 1))
         };
-        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(&record, &answer, NOW);
 
         assert_eq!(settle(at("https://one.example", 3)), settled(Outcome::New));
         assert_eq!(
@@ -2041,14 +2550,14 @@ mod tests {
 
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 3), NOW),
+                .settle_checkpoint(&record, &given(1, 3), NOW),
             Err(Unsettled::Busy)
         );
         assert!(!rig.path(CHECKPOINTS_FILE).exists(), "nothing was written");
         kr_flush::lock::release(&holder).expect("released");
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(1, 3), NOW),
+                .settle_checkpoint(&record, &given(1, 3), NOW),
             settled(Outcome::New)
         );
     }
@@ -2059,13 +2568,13 @@ mod tests {
         let rig = Rig::new();
         let record = owner(1);
         rig.hosts.record(record.clone()).expect("recorded");
-        let record_id = id(&record);
         let spawn = |archives: std::ops::Range<u8>| {
             let checkpoints = rig.hosts.checkpoints();
+            let record = record.clone();
             std::thread::spawn(move || {
                 for archive in archives {
                     checkpoints
-                        .settle_checkpoint(record_id, &given(archive, 1), NOW)
+                        .settle_checkpoint(&record, &given(archive, 1), NOW)
                         .expect("settled");
                 }
             })
@@ -2081,8 +2590,9 @@ mod tests {
                 .into_iter()
                 .map(|generation| {
                     let checkpoints = rig.hosts.checkpoints();
+                    let record = record.clone();
                     std::thread::spawn(move || {
-                        checkpoints.settle_checkpoint(record_id, &given(key, generation), NOW)
+                        checkpoints.settle_checkpoint(&record, &given(key, generation), NOW)
                     })
                 })
                 .collect();
@@ -2106,7 +2616,7 @@ mod tests {
             let record = read_hosts(Path::new(&directory)).expect("hosts").remove(0);
             for archive in 31..61_u8 {
                 checkpoints
-                    .settle_checkpoint(id(&record), &given(archive, 1), NOW)
+                    .settle_checkpoint(&record, &given(archive, 1), NOW)
                     .expect("settled");
             }
             return;
@@ -2124,7 +2634,7 @@ mod tests {
             .expect("the child starts");
         for archive in 1..31_u8 {
             rig.checkpoints
-                .settle_checkpoint(id(&record), &given(archive, 1), NOW)
+                .settle_checkpoint(&record, &given(archive, 1), NOW)
                 .expect("settled");
         }
         assert!(child.wait().expect("the child ends").success());

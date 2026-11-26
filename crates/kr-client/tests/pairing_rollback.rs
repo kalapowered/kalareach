@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use kr_client::pairing::checkpoint::{Answer, Held, PairedCheckpoints, PairingId};
+use kr_client::pairing::checkpoint::{Answer, Held, PairedCheckpoints};
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::backup_checkpoint::HostCheckpoint;
@@ -245,7 +245,7 @@ fn a_rollback_reads_the_paired_hosts_as_before_and_the_checkpoints_are_there_whe
     let checkpoints = hosts.checkpoints();
     assert!(
         checkpoints
-            .settle_checkpoint(PairingId::of(&host), &the_answer(5), 1_000)
+            .settle_checkpoint(&host, &the_answer(5), 1_000)
             .is_ok()
     );
     assert_eq!(
@@ -345,7 +345,7 @@ fn a_rollback_reads_the_paired_hosts_as_before_and_the_checkpoints_are_there_whe
     // And a later answer raises it as before: the held entries resume.
     assert!(
         checkpoints
-            .settle_checkpoint(PairingId::of(&host), &the_answer(7), 2_000)
+            .settle_checkpoint(&host, &the_answer(7), 2_000)
             .is_ok()
     );
     let Held::Read { entries, .. } = checkpoints.held_checkpoints() else {

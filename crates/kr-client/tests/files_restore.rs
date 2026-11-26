@@ -15,8 +15,9 @@ use kr_client::ClientError;
 use kr_client::Shown;
 use kr_client::error::HostWord;
 use kr_client::pairing::checkpoint::{
-    Answer, Held, PairedCheckpoint, PairedCheckpoints, PairingId, SnapshotCause, Unsettled,
+    Answer, Held, PairedCheckpoint, PairedCheckpoints, SnapshotCause, Unsettled,
 };
+use kr_client::pairing::paired::PairedHost;
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OFFLINE_EXPORT_FORMAT, OfflineExport,
@@ -2815,11 +2816,64 @@ async fn a_service_that_answers_a_read_with_nothing_stops_the_restore() {
 /* The checkpoints a paired host gave                                          */
 /* -------------------------------------------------------------------------- */
 
+/// An owner pairing that no list of hosts holds: an answer of it raises an entry and settles no
+/// pairing. Its keys are fixed, so the entry it makes is the one `given_by_a_host` builds.
+fn an_unlisted_owner() -> PairedHost {
+    use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{DeviceKeyRevision, GrantId};
+    use kr_protocol::pairing::{DevicePublicKeys, NetworkConfig, ProposedGrant};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{
+        AuthorisationKey, CanonicalSet, NotificationPreviewKey, Nullable, StoredEnvelopeKey,
+    };
+
+    let keys = DevicePublicKeys {
+        transport: EndpointKey::from_bytes([0x42; 32]),
+        authorisation: AuthorisationKey::from_bytes([0x43; 32]),
+        stored_envelope: StoredEnvelopeKey::from_bytes([0x44; 32]),
+        notification_preview: NotificationPreviewKey::from_bytes([0x45; 32]),
+    };
+    PairedHost {
+        host_device_id: DeviceId::new(id(0x40)),
+        host_key_revision: DeviceKeyRevision::new(1),
+        host_endpoint_id: keys.transport,
+        host_keys: keys,
+        network_config: NetworkConfig::empty(),
+        device_id: DeviceId::new(id(0x41)),
+        grant_id: GrantId::new(id(0x46)),
+        proposed_grant: ProposedGrant {
+            parent_grant_id: Nullable::null(),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [ActionRight::HostManage]
+                .into_iter()
+                .collect::<CanonicalSet<_>>(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: true,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        },
+        name: None,
+        paired_at_ms: 1_764_000_000_000,
+        device_key_revision: DeviceKeyRevision::new(1),
+    }
+}
+
 /// The checkpoint a host gave for the world's archive at the world's service, as `sealed` is
 /// published.
 fn given_by_a_host(sealed: &Sealed) -> PairedCheckpoint {
     let held = checkpoint_of(sealed);
+    let host = an_unlisted_owner();
     PairedCheckpoint {
+        host_endpoint_id: host.host_endpoint_id,
+        producer: kr_crypto::keys::key_id(
+            kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+            host.host_keys.stored_envelope.as_bytes(),
+        ),
         service_origin: GatewayOrigin::new(ORIGIN).expect("an origin"),
         archive_id: held.archive_id,
         backup_generation: held.backup_generation,
@@ -2864,11 +2918,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     // The file is written through the real API and read by a fresh handle, as the companion does.
     let directory = tempfile::tempdir().expect("a directory");
     let folder = directory.path().join("pairing");
-    let pairing = PairingId {
-        host_device_id: DeviceId::new(id(0x40)),
-        host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
-        device_id: DeviceId::new(id(0x41)),
-    };
+    let pairing = an_unlisted_owner();
     let given = given_by_a_host(&current);
     let answer = Answer::Checkpoint(HostCheckpoint {
         service_origin: given.service_origin.clone(),
@@ -2880,7 +2930,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     assert_eq!(
         PairedCheckpoints::open(&folder)
             .expect("a directory")
-            .settle_checkpoint(pairing, &answer, 3_000),
+            .settle_checkpoint(&pairing, &answer, 3_000),
         Err(Unsettled::Superseded)
     );
     let held = PairedCheckpoints::open(&folder)
@@ -3619,11 +3669,7 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
     let given = given_by_a_host(&current);
     checkpoints
         .settle_checkpoint(
-            PairingId {
-                host_device_id: DeviceId::new(id(0x40)),
-                host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
-                device_id: DeviceId::new(id(0x41)),
-            },
+            &an_unlisted_owner(),
             &Answer::Checkpoint(HostCheckpoint {
                 service_origin: given.service_origin,
                 archive_id: given.archive_id,

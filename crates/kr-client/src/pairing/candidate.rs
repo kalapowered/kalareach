@@ -1507,11 +1507,12 @@ impl Pairing {
     async fn settle_answer(&self, host: &PairedHost, answer: Answer) {
         let names_checkpoint = matches!(answer, Answer::Checkpoint(_));
         let checkpoints = self.hosts.checkpoints();
-        let id = PairingId::of(host);
+        let host = host.clone();
         let now_ms = self.clock.wall_clock_ms();
-        let settled =
-            tokio::task::spawn_blocking(move || checkpoints.settle_checkpoint(id, &answer, now_ms))
-                .await;
+        let settled = tokio::task::spawn_blocking(move || {
+            checkpoints.settle_checkpoint(&host, &answer, now_ms)
+        })
+        .await;
         match settled {
             Ok(Ok(Settled { outcome, confirmed })) => match outcome {
                 Outcome::Lower => tracing::warn!(
@@ -3877,6 +3878,15 @@ mod tests {
         }
     }
 
+    /// What `checkpoints.json` holds before a scripted run.
+    enum Before {
+        /// These bytes.
+        Bytes(Vec<u8>),
+        /// One entry that the run's own host gave, at this generation with a manifest of this byte.
+        /// The run makes the host's keys, so the file is made once they exist.
+        Entry { generation: u64, manifest: u8 },
+    }
+
     /// What a scripted run of the waiting loop faces.
     struct Script {
         /// How the host answers on the connection the device holds from the start.
@@ -3898,7 +3908,7 @@ mod tests {
         /// How the host answers `backup.checkpoint`.
         checkpoint: Checkpoint,
         /// What `checkpoints.json` holds before the run, when it holds anything.
-        file: Option<Vec<u8>>,
+        file: Option<Before>,
         /// How the host answers `environment.list`.
         names: Names,
         /// What the device keeps of the waiting attempt when the run starts.
@@ -4104,10 +4114,26 @@ mod tests {
                 std::fs::create_dir(watch.join("attempt.json")).expect("a folder in its place");
             }
         }
-        if let Some(bytes) = &script.file {
+        if let Some(before) = &script.file {
+            let bytes = match before {
+                Before::Bytes(bytes) => bytes.clone(),
+                // The run makes the host's keys, so the entry is made from them.
+                Before::Entry {
+                    generation,
+                    manifest,
+                } => holding(
+                    *generation,
+                    *manifest,
+                    pending.host_endpoint_id,
+                    kr_crypto::keys::key_id(
+                        kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                        pending.host_keys.stored_envelope.as_bytes(),
+                    ),
+                ),
+            };
             kr_ipc::paths::write_owner_only_file(
                 &pairing.hosts.directory().join("checkpoints.json"),
-                bytes,
+                &bytes,
             )
             .expect("a file");
         }
@@ -4865,7 +4891,7 @@ mod tests {
         told: bool,
         owner: bool,
         checkpoint: Checkpoint,
-        file: Option<Vec<u8>>,
+        file: Option<Before>,
     ) -> Script {
         let held = if told {
             Reply::CommittedFrom(tokio::time::Instant::now())
@@ -4889,7 +4915,7 @@ mod tests {
         told: bool,
         owner: bool,
         checkpoint: Checkpoint,
-        file: Option<Vec<u8>>,
+        file: Option<Before>,
     ) -> Waited {
         waited(
             committing_script(told, owner, checkpoint, file),
@@ -5064,7 +5090,8 @@ mod tests {
                     SnapshotCause::NewerVersion,
                 ),
             ] {
-                let run = committing(told, true, published(7), Some(bytes.clone())).await;
+                let run =
+                    committing(told, true, published(7), Some(Before::Bytes(bytes.clone()))).await;
                 assert!(
                     ended_paired(&run),
                     "told {told}, {name}: the attempt ends paired: {:?}",
@@ -5897,7 +5924,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_answer_of_an_earlier_pairing_does_not_stop_the_read() {
         let stale = earlier_pairings_answer();
-        let run = committing(false, true, Checkpoint::Unserved, Some(stale.clone())).await;
+        let run = committing(
+            false,
+            true,
+            Checkpoint::Unserved,
+            Some(Before::Bytes(stale.clone())),
+        )
+        .await;
         assert!(ended_paired(&run), "{:?}", run.outcome);
         assert_eq!(
             methods(&run)
@@ -5913,7 +5946,7 @@ mod tests {
             "the earlier pairing's answer is not this pairing's"
         );
 
-        let run = committing(false, true, published(7), Some(stale)).await;
+        let run = committing(false, true, published(7), Some(Before::Bytes(stale))).await;
         assert!(ended_paired(&run), "{:?}", run.outcome);
         assert_eq!(
             run.hosts.checkpoints().acquisition(&paired_host(&run)),
@@ -5968,7 +6001,7 @@ mod tests {
 
     /// Every event that a scripted owner recovery writes, for a host that answers `checkpoint` and
     /// a file that holds `file`.
-    async fn events_of(checkpoint: Checkpoint, file: Option<Vec<u8>>) -> Vec<String> {
+    async fn events_of(checkpoint: Checkpoint, file: Option<Before>) -> Vec<String> {
         let logged = Logged::default();
         // With one registered dispatcher a rebuild of the log calls' interest on another thread reads
         // that thread's default alone, which drops this thread's events: a second one ends that.
@@ -5982,10 +6015,17 @@ mod tests {
     }
 
     /// A checkpoints file that holds the checkpoint `named` makes for `generation`, with a manifest
-    /// of `manifest` bytes.
-    fn holding(generation: u64, manifest: u8) -> Vec<u8> {
+    /// of `manifest` bytes, as the host at `host_endpoint_id` with the producer `producer` gave it.
+    fn holding(
+        generation: u64,
+        manifest: u8,
+        host_endpoint_id: EndpointKey,
+        producer: kr_protocol::scalars::KeyId,
+    ) -> Vec<u8> {
         let given = named(generation);
         let held = PairedCheckpoint {
+            host_endpoint_id,
+            producer,
             service_origin: given.service_origin,
             archive_id: given.archive_id,
             backup_generation: given.backup_generation,
@@ -6039,19 +6079,25 @@ mod tests {
             (
                 "a lower generation",
                 published(7),
-                Some(holding(9, 1)),
+                Some(Before::Entry {
+                    generation: 9,
+                    manifest: 1,
+                }),
                 vec!["named a lower backup generation than this device holds"],
             ),
             (
                 "another manifest",
                 published(7),
-                Some(holding(7, 2)),
+                Some(Before::Entry {
+                    generation: 7,
+                    manifest: 2,
+                }),
                 vec!["named another manifest than this device holds"],
             ),
             (
                 "a file that cannot be read",
                 published(7),
-                Some(b"{".to_vec()),
+                Some(Before::Bytes(b"{".to_vec())),
                 vec![
                     "could not be saved, and the pairing stands",
                     "cause=Unreadable(Unreadable)",

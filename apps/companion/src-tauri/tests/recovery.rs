@@ -6794,10 +6794,14 @@ async fn the_saved_settings_and_everything_that_carries_them_hold_none_of_the_ke
 /// while those checkpoints cannot be read; the bundle alone exports either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not_exported() {
-    use kr_client::pairing::checkpoint::{Answer, PairedCheckpoints, PairingId};
+    use kr_client::pairing::checkpoint::{Answer, PairedCheckpoints};
+    use kr_client::pairing::paired::PairedHost;
     use kr_protocol::backup_checkpoint::HostCheckpoint;
-    use kr_protocol::ids::{BackupGeneration, DeviceId};
-    use kr_protocol::scalars::{Digest256, EndpointKey, Uuid};
+    use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{BackupGeneration, DeviceId, DeviceKeyRevision, GrantId};
+    use kr_protocol::pairing::{NetworkConfig, ProposedGrant};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, Uuid};
 
     let computer = Computer::new().await;
     let page = computer.page().await;
@@ -6810,7 +6814,11 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     let archive = host.setups_sent()[0].0.archive_id;
     let seed = RecoverySeed::from_kit(&kit).expect("the kit's seed");
 
-    // A host gave a checkpoint at generation 2, written as the companion's own store writes it.
+    // A host gave a checkpoint at generation 2, written as the companion's own store writes it. An
+    // owner pairing that no list of hosts holds raises the entry and settles no pairing.
+    let host_keys = kr_crypto::keys::DeviceKeys::generate()
+        .expect("keys")
+        .public_keys();
     let folder = computer
         .data
         .path()
@@ -6818,10 +6826,33 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     PairedCheckpoints::open(&folder)
         .expect("a directory")
         .settle_checkpoint(
-            PairingId {
+            &PairedHost {
                 host_device_id: DeviceId::new(Uuid::from_bytes([0x40; 16])),
-                host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
+                host_key_revision: DeviceKeyRevision::new(1),
+                host_endpoint_id: host_keys.transport,
+                host_keys,
+                network_config: NetworkConfig::empty(),
                 device_id: DeviceId::new(Uuid::from_bytes([0x41; 16])),
+                grant_id: GrantId::new(Uuid::from_bytes([0x46; 16])),
+                proposed_grant: ProposedGrant {
+                    parent_grant_id: Nullable::null(),
+                    environment_selector: EnvironmentSelector::Any,
+                    session_selector: SessionSelector::Any,
+                    actions: [ActionRight::HostManage]
+                        .into_iter()
+                        .collect::<CanonicalSet<_>>(),
+                    history: HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: true,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
+                    expiry: GrantExpiry::Never,
+                    organisation: Nullable::null(),
+                },
+                name: None,
+                paired_at_ms: 1_764_000_000_000,
+                device_key_revision: DeviceKeyRevision::new(1),
             },
             &Answer::Checkpoint(HostCheckpoint {
                 service_origin: computer.origin(),
