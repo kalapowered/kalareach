@@ -1027,9 +1027,9 @@ const FUNNELS: [(&str, &str, Way, &str); 9] = [
     ),
     (
         "tests/e2e/m1b/src/host.rs",
-        "Host::start_daemon_once_ready_by",
+        "Host::start_once",
         Way::First,
-        "spawns the daemon for `Host::start_daemon_once`, with the readiness the caller names",
+        "spawns the daemon for the host start and the restart, ready where the caller says",
     ),
     (
         "tests/e2e/agents/src/stage.rs",
