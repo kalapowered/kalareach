@@ -45,12 +45,13 @@
 //! each parent before the command starts, and reads them again at the end, once the watcher has
 //! reported the host's own file. A parent that is gone, is no longer a directory, has another
 //! device or inode, or has an extended attribute added, removed or changed in value is a write
-//! whatever was reported of it. A report that a parent was created, or that its extended
-//! attributes changed, is no write by itself, because what the host read at the start decides
-//! both: a directory that has the inode it had was not made in the run, and attributes equal to
-//! the ones read at the start were not left changed. Every other report of a parent is a write: a
-//! removal, a rename, a change of its mode or owner, any other change of its metadata, or a change
-//! of its content. A parent keeps its device and inode when a suite changes its mode or owner,
+//! whatever was reported of it. A report that a folder was created at a parent's path, or that
+//! its extended attributes changed, is no write by itself, because what the host read at the
+//! start decides both: a directory that has the inode it had was not made in the run, and
+//! attributes equal to the ones read at the start were not left changed. Every other report of a
+//! parent is a write: a removal, a rename, a change of its mode or owner, any other change of its
+//! metadata, a change of its content, or a creation of another kind, a mount among them. A parent
+//! keeps its device and inode when a suite changes its mode or owner,
 //! whether it puts them back or not, and when a suite moves it away and back, so only the
 //! watcher's reports show such a change; an extended attribute that a suite changes and puts back
 //! is not seen at all. The record of the directory above a parent shows a move away and back too,
@@ -713,11 +714,13 @@ mod unix {
         /// What a report says was done to the paths it names, as far as judging a parent needs it.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub(super) enum Done {
-            /// Something was created.
-            Created,
+            /// A folder was created.
+            CreatedFolder,
             /// Extended attributes were changed.
             Attributes,
-            /// Anything else.
+            /// Anything else: a creation of another kind (a file, a link, a mount, a kind the
+            /// platform does not say), a removal, a rename, a change of mode, owner or other
+            /// metadata, a change of content.
             Other,
         }
 
@@ -739,10 +742,11 @@ mod unix {
             /// A directory a declared output is in, and the copy itself, are judged by what is
             /// reported about the directory: FSEvents says nothing of a directory when a name is
             /// made in it, so a report that names the directory is a rename, a removal or a change
-            /// of its mode, owner or metadata, whichever name the command gave it meanwhile. A
-            /// creation of such a directory and a change of its extended attributes are no write
-            /// by themselves: what the host read of the directory at the start decides both. A
-            /// name in such a directory is judged by whether it is a declared output.
+            /// of its mode, owner or metadata, whichever name the command gave it meanwhile. The
+            /// creation of a folder at such a directory's path and a change of its extended
+            /// attributes are no write by themselves: what the host read of the directory at the
+            /// start decides both. Every other creation, a mount among them, is a write. A name
+            /// in such a directory is judged by whether it is a declared output.
             fn written(&self, path: &Path, done: Done) -> Option<String> {
                 let relative = path.strip_prefix(&self.copy).ok().map(|rest| {
                     rest.components()
@@ -892,13 +896,14 @@ mod unix {
                 );
             }
 
-            /// KR-REQ-14.34: a creation of a directory an output is in, and a change of its
-            /// extended attributes, are no write by themselves, the copy's own directory among
-            /// them when an output is at its root; every other report that names it is a write.
+            /// KR-REQ-14.34: the creation of a folder at the path of a directory an output is in,
+            /// and a change of its extended attributes, are no write by themselves, the copy's own
+            /// directory among them when an output is at its root; every other report that names
+            /// it is a write.
             #[test]
             fn a_creation_or_attribute_report_of_a_parent_is_no_write_and_any_other_is() {
                 for parent in ["/work/run/copy", "/work/run/copy/sub"] {
-                    for done in [Done::Created, Done::Attributes] {
+                    for done in [Done::CreatedFolder, Done::Attributes] {
                         let heard = heard_done(false, done, &[parent]);
                         assert!(heard.written.is_empty(), "{parent} {done:?} is no write");
                     }
@@ -914,7 +919,7 @@ mod unix {
             fn a_creation_of_a_name_that_is_no_parent_is_a_write() {
                 let heard = heard_done(
                     false,
-                    Done::Created,
+                    Done::CreatedFolder,
                     &["/work/run/copy/other", "/work/run/copy/sub/x"],
                 );
                 assert_eq!(
@@ -1433,7 +1438,7 @@ mod unix {
         use std::sync::{Arc, Mutex, PoisonError, mpsc};
         use std::time::{Duration, Instant};
 
-        use notify::event::{EventKind, MetadataKind, ModifyKind};
+        use notify::event::{CreateKind, EventKind, MetadataKind, ModifyKind};
         use notify::{Event, RecursiveMode, Watcher as _};
 
         use kr_transfer::{AuthorisedDirectory, RelativeName};
@@ -1469,10 +1474,12 @@ mod unix {
             awaited: Option<PathBuf>,
         }
 
-        /// What a report of the watcher says was done to the paths it names.
+        /// What a report of the watcher says was done to the paths it names. Only the creation of
+        /// a folder has a variant of its own: the library reports a mount as a creation of kind
+        /// other, and that is a write.
         fn done_by(kind: &EventKind) -> Done {
             match kind {
-                EventKind::Create(_) => Done::Created,
+                EventKind::Create(CreateKind::Folder) => Done::CreatedFolder,
                 EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)) => Done::Attributes,
                 _ => Done::Other,
             }
@@ -2514,9 +2521,33 @@ mod unix {
                 );
             }
 
-            /// KR-REQ-14.34: every report of a directory an output is in but a creation or a
-            /// change of its extended attributes is a write, with the directory as recorded: a
-            /// removal.
+            /// KR-REQ-14.34: the library reports a mount as a creation of kind other with the
+            /// note "mount". A tree mounted over a directory an output is in and unmounted before
+            /// the end leaves the record as it was, so the report is the one trace of it: it is a
+            /// write, with no report of the unmount.
+            #[test]
+            fn a_mount_report_of_a_parent_is_a_write_though_its_record_is_held() {
+                let place = a_place();
+                let parent = place.copy.join("target");
+                let mount = report(EventKind::Create(CreateKind::Other), &parent).set_info("mount");
+                let written = written_with(&place, vec![mount], || {}, Vec::new());
+                assert_eq!(written, vec!["target".to_owned()]);
+            }
+
+            /// KR-REQ-14.34: only the creation of a folder is the host's own making of a directory
+            /// an output is in. A creation of any other kind at its path is a write: a file, a
+            /// kind the library does not say, a kind the platform does not say.
+            #[test]
+            fn a_creation_report_of_another_kind_than_a_folder_at_a_parent_is_a_write() {
+                for kind in [CreateKind::File, CreateKind::Other, CreateKind::Any] {
+                    let written = written_for(vec![EventKind::Create(kind)]);
+                    assert_eq!(written, vec!["target".to_owned()], "{kind:?}");
+                }
+            }
+
+            /// KR-REQ-14.34: every report of a directory an output is in but a creation of a
+            /// folder or a change of its extended attributes is a write, with the directory as
+            /// recorded: a removal.
             #[test]
             fn a_removal_report_of_a_parent_is_a_write() {
                 let written = written_for(vec![EventKind::Remove(RemoveKind::Folder)]);
