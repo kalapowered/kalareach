@@ -200,6 +200,33 @@ async function expectTravel(page: Page, seconds: number, what: string): Promise<
   expect(Math.abs(ran - seconds), `${what}: it ran for ${ran} s, and the ruled time is ${seconds} s`).toBeLessThanOrEqual(TOLERANCE_SECONDS)
 }
 
+/**
+ * The page's scroll position once it has stopped: two reads in a row, a frame apart, agree. WebKit
+ * scrolls smoothly, so a read straight after a wheel can fall in the middle of the scroll. The wait
+ * is bounded, and a page still moving at the bound fails with the last two values it read.
+ */
+function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
+  return page.evaluate(async (bound) => {
+    const frame = (): Promise<void> =>
+      new Promise((resolve) => {
+        requestAnimationFrame(() => {
+          resolve()
+        })
+      })
+    const started = performance.now()
+    let before = window.scrollY
+    for (;;) {
+      await frame()
+      const now = window.scrollY
+      if (now === before) return now
+      if (performance.now() - started > bound) {
+        throw new Error(`the page was still scrolling after ${bound} ms: it read ${before}, then ${now}`)
+      }
+      before = now
+    }
+  }, boundMilliseconds)
+}
+
 /** Whether the focus is inside the drawer. */
 function focusInDrawer(page: Page): Promise<boolean> {
   return page.evaluate(() => document.activeElement?.closest('aside.sidebar') != null)
@@ -525,7 +552,7 @@ test.describe('the drawer on a page that scrolls', () => {
       await page.mouse.wheel(0, 300)
       // The wheel moves the page when nothing is open, so a page that does not move later has been held.
       await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(100)
-      const scrolled = await page.evaluate(() => window.scrollY)
+      const scrolled = await settledScroll(page)
       // The top bar stays at the top of the window as the page scrolls: the control is where it was.
       expect(await rectangleOf(menuOf(page)), 'the control is where it was after the page scrolled').toEqual(atTop)
       expect((await rectangleOf(page.locator('.topbar'))).y, 'the top bar is at the top of the window').toBe(0)
