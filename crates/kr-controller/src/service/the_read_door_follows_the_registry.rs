@@ -6,13 +6,15 @@
 //! uses. These cases send every such method over a real local connection, so a read whose registry
 //! row leaves out the local socket needs no guard of its own at the switch.
 
+use kr_ipc::client::LocalClient;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::EffectClass;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Request};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::RequestId;
-use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::method::{LocalHold, Method, MethodName, MethodVersion, local_hold};
 
+use super::Controller;
 use super::stopped_on_the_local_socket::{Serving, serving};
 
 /// The reads whose registry row leaves out the local socket. The walk over the table finds every
@@ -39,18 +41,29 @@ fn is_listed_for_the_local_socket(method: Method) -> bool {
     method.entry().ingress.contains(&ActorIngress::LocalIpc)
 }
 
+/// A read of `method` at `version` with no parameters.
+fn a_request(method: MethodName, version: MethodVersion) -> Request {
+    Request {
+        request_id: RequestId::new(900),
+        method,
+        method_version: version,
+        params: ParamsValue::empty(),
+    }
+}
+
 /// Sends `method` at `version` with no parameters as a read on a connection of its own, and returns
 /// what the daemon answered.
 async fn asked(daemon: &Serving, method: Method, version: MethodVersion) -> Outcome {
-    let mut client = daemon.client().await;
-    let request_id = RequestId::new(900);
+    asked_on(&mut daemon.client().await, method.into(), version).await
+}
+
+/// Sends `method` at `version` with no parameters as a read on `client`, and returns what the
+/// daemon answered.
+async fn asked_on(client: &mut LocalClient, method: MethodName, version: MethodVersion) -> Outcome {
+    let request = a_request(method, version);
+    let request_id = request.request_id;
     client
-        .send(&ControlFrame::Request(Request {
-            request_id,
-            method: method.into(),
-            method_version: version,
-            params: ParamsValue::empty(),
-        }))
+        .send(&ControlFrame::Request(request))
         .await
         .expect("the request is written");
     loop {
@@ -144,13 +157,15 @@ async fn a_read_the_registry_lists_for_the_local_socket_is_not_refused_by_the_do
 
 /// KR-REQ-20.12: a read at a version the registry does not implement is refused at the read door,
 /// as a write is, in both arms of the door: the one that serves a read from its handler, and the
-/// one that releases an answer under a privacy fence.
+/// one that releases an answer under a privacy fence. The reads the catalogue answers are refused
+/// by the door with the write door's code too, and not by the catalogue's own check of the version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listed_read_at_another_version_is_refused_as_a_write_is() {
     let daemon = serving().await;
     // `host.info` is answered by the daemon's own handler; `history.page` is released under a
-    // privacy fence.
-    for method in [Method::HostInfo, Method::HistoryPage] {
+    // privacy fence; `plugin.list` is answered by the catalogue, which refuses another version
+    // itself with `UnsupportedSchema`.
+    for method in [Method::HostInfo, Method::HistoryPage, Method::PluginList] {
         let answer = asked(&daemon, method, MethodVersion(2)).await;
         assert!(
             matches!(
@@ -173,4 +188,77 @@ async fn a_listed_read_at_another_version_is_refused_as_a_write_is() {
         ),
         "host.info at version 1 is not refused for its version: {answer:?}"
     );
+}
+
+/// KR-REQ-20.12: a name the registry does not hold is left to the read switch, which refuses it
+/// with its own words, as the write door refuses an unknown name before it asks the registry. The
+/// door's sentence says a method is not reachable from a local caller, which is not what is wrong
+/// with a name that no method has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_the_registry_does_not_hold_keeps_the_read_switchs_refusal() {
+    let daemon = serving().await;
+    let name = MethodName::new("host.not_in_the_registry").expect("a well-formed name");
+    assert!(name.method().is_none(), "the registry holds no such method");
+
+    let answer = asked_on(&mut daemon.client().await, name, MethodVersion::V1).await;
+    assert!(
+        matches!(
+            &answer,
+            Outcome::Error(error)
+                if error.code == ErrorCode::PermissionDenied
+                    && error.message == "the method is not in the registry"
+        ),
+        "a name the registry does not hold is refused with the read switch's words: {answer:?}"
+    );
+}
+
+/// KR-REQ-20.12: the local owner's lease is asked before the registry, as the write door asks
+/// them. On a host that is exclusively organisation-managed whose owner holds no lease, a held
+/// read that the registry would also refuse, for its version, is answered with the lease's
+/// refusal, in both arms of the door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_local_owners_lease_is_asked_before_the_registry() {
+    let daemon = serving().await;
+    let mut client = daemon.client().await;
+    daemon
+        .controller()
+        .policy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_exclusively_managed(true);
+
+    // `session.read` is served by the door's plain arm and `history.page` by the arm that releases
+    // an answer under a privacy fence; both are held to the lease and listed for the local socket.
+    for (method, released) in [(Method::SessionRead, false), (Method::HistoryPage, true)] {
+        assert_eq!(
+            local_hold(method),
+            LocalHold::Held,
+            "{} is held to the local owner's lease",
+            method.as_str()
+        );
+        assert!(
+            is_listed_for_the_local_socket(method),
+            "{} is listed for the local socket, so the version is all the registry would refuse",
+            method.as_str()
+        );
+        assert_eq!(
+            Controller::releases(&a_request(method.into(), MethodVersion(2))),
+            released,
+            "{} is served by the arm this case means it to meet",
+            method.as_str()
+        );
+
+        let answer = asked_on(&mut client, method.into(), MethodVersion(2)).await;
+        assert!(
+            matches!(
+                &answer,
+                Outcome::Error(error)
+                    if error.code == ErrorCode::PermissionDenied
+                        && error.message.contains("membership lease is not live")
+            ),
+            "{} at version 2 is refused for the lease before it is refused for its version: \
+             {answer:?}",
+            method.as_str()
+        );
+    }
 }

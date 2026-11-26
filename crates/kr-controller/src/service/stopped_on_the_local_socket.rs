@@ -101,6 +101,11 @@ impl Serving {
             .expect("reaches the daemon")
     }
 
+    /// The daemon's controller, for a case that sets what the daemon holds before it asks.
+    pub(super) fn controller(&self) -> &Arc<Controller> {
+        &self.controller
+    }
+
     /// Whether the daemon has been told to stop for a stop requested on its local socket.
     async fn is_told_to_stop(&self) -> bool {
         tokio::time::timeout(Duration::ZERO, self.controller.stop_requested())

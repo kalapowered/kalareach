@@ -38,9 +38,12 @@ fn carries_no_freshness() -> ControllerError {
 
 /// What the registry says of `name` at `version` for a caller on the local socket.
 ///
-/// The one decision both doors of the local socket take before a parameter is read, so they cannot
+/// The one decision both doors of the local socket take before a handler is asked, so they cannot
 /// disagree: an unlisted name and an ingress that may not reach the method are refused as not
 /// reachable from a local caller, and a version this build does not implement is refused as such.
+/// Both doors ask the local owner's lease before this decision. The read door has also read the
+/// parameters of `action.read` by then, only to tell whether its answer goes out under a privacy
+/// fence.
 ///
 /// # Errors
 ///
