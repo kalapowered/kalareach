@@ -65,7 +65,7 @@ use tokio::sync::{oneshot, watch};
 
 use super::BoxFuture;
 use super::checkpoint::{
-    Answer, Intended, Outcome, PairingId, ReadCause, Unsettled, read_checkpoint,
+    Answer, Outcome, PairingId, ReadCause, Settled, Unsettled, read_checkpoint,
 };
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
@@ -1475,8 +1475,9 @@ impl Pairing {
 
     /// Keeps what the host answered for the pairing `host` holds, on a blocking thread, since the
     /// file's lock can take two seconds. A failure is logged and never fails the pairing: the host
-    /// stays owed, or, after an earlier answer of nothing, not owed and still asked.
+    /// stays owed, unless an earlier answer of this pairing is on file.
     async fn settle_answer(&self, host: &PairedHost, answer: Answer) {
+        let names_checkpoint = matches!(answer, Answer::Checkpoint(_));
         let checkpoints = self.hosts.checkpoints();
         let id = PairingId::of(host);
         let now_ms = self.clock.wall_clock_ms();
@@ -1484,33 +1485,34 @@ impl Pairing {
             tokio::task::spawn_blocking(move || checkpoints.settle_checkpoint(id, &answer, now_ms))
                 .await;
         match settled {
-            Ok(Ok(settled)) => match settled.outcome {
+            Ok(Ok(Settled { outcome, confirmed })) => match outcome {
                 Outcome::Lower => tracing::warn!(
                     "a host named a lower backup generation than this device holds, and the held checkpoint stands"
                 ),
                 Outcome::Disagrees => tracing::warn!(
                     "a host named another manifest than this device holds for the same backup generation, and the held checkpoint stands"
                 ),
-                Outcome::Uncertain if settled.intended == Intended::NothingPublished => {
-                    tracing::warn!(
-                        "the host's answer that it has no backup checkpoint was saved, and the directory could not be confirmed to hold it"
-                    );
-                }
-                Outcome::Uncertain => tracing::warn!(
-                    "the host's backup checkpoint was saved, and the directory could not be confirmed to hold it"
+                Outcome::NothingPublished if !confirmed => tracing::warn!(
+                    "the host's answer that it has no backup checkpoint was saved, and the directory could not be confirmed to hold it"
+                ),
+                Outcome::New | Outcome::Raised | Outcome::Same if !confirmed => tracing::warn!(
+                    "the host's answer was saved, and the directory could not be confirmed to hold it"
                 ),
                 Outcome::New | Outcome::Raised | Outcome::Same | Outcome::NothingPublished => {}
             },
+            Ok(Err(Unsettled::Superseded)) if names_checkpoint => tracing::warn!(
+                "the host's backup checkpoint came for a pairing that is no longer the host's current one, and a newer checkpoint can have been saved"
+            ),
             Ok(Err(Unsettled::Superseded)) => tracing::warn!(
-                "the host's backup checkpoint came for a pairing that has been replaced, and a newer checkpoint can have been saved"
+                "the host's answer that it has no backup checkpoint came for a pairing that is no longer the host's current one, and it was not saved"
             ),
             Ok(Err(cause)) => tracing::warn!(
                 cause = ?cause,
-                "the host's backup checkpoint could not be saved, and the pairing stands"
+                "the host's answer could not be saved, and the pairing stands"
             ),
-            Err(_) => tracing::warn!(
-                "the host's backup checkpoint could not be saved, and the pairing stands"
-            ),
+            Err(_) => {
+                tracing::warn!("the host's answer could not be saved, and the pairing stands")
+            }
         }
     }
 

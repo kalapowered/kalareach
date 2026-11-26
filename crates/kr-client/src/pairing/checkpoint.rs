@@ -252,9 +252,6 @@ pub enum Outcome {
     Disagrees,
     /// The host had accepted no generation.
     NothingPublished,
-    /// The file was replaced, and the directory could not be confirmed to hold it. The file is
-    /// either the old one or the new one, whole.
-    Uncertain,
 }
 
 /// An answer that is part of the file now: the pairing's `told` entry names it.
@@ -262,8 +259,10 @@ pub enum Outcome {
 pub struct Settled {
     /// How the answer stood against the file.
     pub outcome: Outcome,
-    /// What the answer said, which an uncertain outcome does not otherwise tell.
-    pub intended: Intended,
+    /// Whether the directory is known to hold the file. It is not when the file was replaced and
+    /// the flush of the directory after it failed: the file is then the old one or the new one,
+    /// whole.
+    pub confirmed: bool,
 }
 
 /// An answer that is not part of the file. The pairing's state is as it was, and no held
@@ -408,7 +407,7 @@ impl PairedCheckpoints {
     /// only a newer generation replaces it. The pairing's `told` entry is written when the pairing
     /// is still the host's current one and the answer is new or changed; an entry of a pairing that
     /// has gone is dropped. When the write reports an error, the file is read again: if it holds
-    /// what was meant, the replacement landed and the outcome is [`Outcome::Uncertain`].
+    /// what was meant, the replacement landed and the answer is settled with `confirmed` false.
     ///
     /// # Errors
     ///
@@ -428,7 +427,8 @@ impl PairedCheckpoints {
         let current = hosts.iter().any(|host| PairingId::of(host) == id);
         let intended = answer.intended();
         let mut next = file.clone();
-        let mut outcome = match answer {
+        let mut confirmed = true;
+        let outcome = match answer {
             Answer::NothingPublished => Outcome::NothingPublished,
             Answer::Checkpoint(given) => take(&mut next.checkpoints, given, now_ms)?,
         };
@@ -461,13 +461,13 @@ impl PairedCheckpoints {
             let path = self.directory.join(CHECKPOINTS_FILE);
             if (self.write)(&path, &bytes).is_err() {
                 match self.read_file() {
-                    Ok(read) if read == next => outcome = Outcome::Uncertain,
+                    Ok(read) if read == next => confirmed = false,
                     _ => return Err(Unsettled::WriteFailed),
                 }
             }
         }
         if current {
-            Ok(Settled { outcome, intended })
+            Ok(Settled { outcome, confirmed })
         } else {
             Err(Unsettled::Superseded)
         }
@@ -1466,8 +1466,19 @@ mod tests {
             .collect()
     }
 
-    fn settled(outcome: Outcome, intended: Intended) -> Result<Settled, Unsettled> {
-        Ok(Settled { outcome, intended })
+    fn settled(outcome: Outcome) -> Result<Settled, Unsettled> {
+        Ok(Settled {
+            outcome,
+            confirmed: true,
+        })
+    }
+
+    /// A settle whose write landed and could not be confirmed.
+    fn unconfirmed(outcome: Outcome) -> Result<Settled, Unsettled> {
+        Ok(Settled {
+            outcome,
+            confirmed: false,
+        })
     }
 
     /// Each outcome of a settle is its own, a held checkpoint never goes down, and the checkpoints
@@ -1479,34 +1490,19 @@ mod tests {
         rig.hosts.record(record.clone()).expect("recorded");
         let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
 
-        assert_eq!(
-            settle(given(1, 7)),
-            settled(Outcome::New, Intended::Checkpoint)
-        );
+        assert_eq!(settle(given(1, 7)), settled(Outcome::New));
         assert_eq!(entries(&rig), vec![(1, 7)]);
         assert_eq!(
             answers(&rig),
             vec![(id(&record), Intended::Checkpoint, NOW)]
         );
-        assert_eq!(
-            settle(given(1, 7)),
-            settled(Outcome::Same, Intended::Checkpoint)
-        );
-        assert_eq!(
-            settle(given(1, 9)),
-            settled(Outcome::Raised, Intended::Checkpoint)
-        );
+        assert_eq!(settle(given(1, 7)), settled(Outcome::Same));
+        assert_eq!(settle(given(1, 9)), settled(Outcome::Raised));
         assert_eq!(entries(&rig), vec![(1, 9)]);
-        assert_eq!(
-            settle(given(1, 8)),
-            settled(Outcome::Lower, Intended::Checkpoint)
-        );
+        assert_eq!(settle(given(1, 8)), settled(Outcome::Lower));
         assert_eq!(entries(&rig), vec![(1, 9)], "a lower answer lowers nothing");
         let other_manifest = Answer::Checkpoint(host_checkpoint("https://reach.kala.to", 1, 9, 77));
-        assert_eq!(
-            settle(other_manifest),
-            settled(Outcome::Disagrees, Intended::Checkpoint)
-        );
+        assert_eq!(settle(other_manifest), settled(Outcome::Disagrees));
         assert_eq!(entries(&rig), vec![(1, 9)], "the held entry stands");
         assert_eq!(
             rig.checkpoints.acquisition(&record),
@@ -1515,7 +1511,7 @@ mod tests {
         );
         assert_eq!(
             settle(Answer::NothingPublished),
-            settled(Outcome::NothingPublished, Intended::NothingPublished)
+            settled(Outcome::NothingPublished)
         );
         assert_eq!(
             entries(&rig),
@@ -1649,9 +1645,38 @@ mod tests {
         assert_eq!(
             rig.checkpoints
                 .settle_checkpoint(id(&record), &given(1, 9), NOW),
-            settled(Outcome::Uncertain, Intended::Checkpoint)
+            unconfirmed(Outcome::Raised)
         );
         assert_eq!(entries(&rig), vec![(1, 9)], "the new file stands");
+    }
+
+    /// A write that lands and is not confirmed leaves the answer its own standing: a lower answer
+    /// and a disagreeing answer are told as such, and the held checkpoint stands.
+    #[test]
+    fn an_unconfirmed_write_keeps_the_standing_of_a_lower_and_a_disagreeing_answer() {
+        let mut rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(id(&record), &given(1, 9), NOW)
+            .expect("settled");
+        rig.checkpoints = rig.checkpoints.clone().with_writer(fails_after);
+        let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
+        let other_manifest = Answer::Checkpoint(host_checkpoint("https://reach.kala.to", 1, 9, 77));
+
+        // Each answer of nothing published changes the pairing's entry, so that the answer after it
+        // is written again.
+        assert_eq!(
+            settle(Answer::NothingPublished),
+            unconfirmed(Outcome::NothingPublished)
+        );
+        assert_eq!(settle(given(1, 8)), unconfirmed(Outcome::Lower));
+        assert_eq!(
+            settle(Answer::NothingPublished),
+            unconfirmed(Outcome::NothingPublished)
+        );
+        assert_eq!(settle(other_manifest), unconfirmed(Outcome::Disagrees));
+        assert_eq!(entries(&rig), vec![(1, 9)], "the held entry stands");
     }
 
     /// A new archive past the bound is refused and an archive already held still rises, and an
@@ -1693,7 +1718,7 @@ mod tests {
         assert_eq!(
             rig.checkpoints
                 .settle_checkpoint(id(&record), &Answer::Checkpoint(known), NOW),
-            settled(Outcome::Raised, Intended::Checkpoint),
+            settled(Outcome::Raised),
             "an archive already held still rises at the bound"
         );
     }
@@ -1765,18 +1790,15 @@ mod tests {
         };
         let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
 
-        assert_eq!(
-            settle(at("https://one.example", 3)),
-            settled(Outcome::New, Intended::Checkpoint)
-        );
+        assert_eq!(settle(at("https://one.example", 3)), settled(Outcome::New));
         assert_eq!(
             settle(at("https://two.example", 5)),
-            settled(Outcome::New, Intended::Checkpoint),
+            settled(Outcome::New),
             "another service is another entry"
         );
         assert_eq!(
             settle(at("https://one.example", 4)),
-            settled(Outcome::Raised, Intended::Checkpoint)
+            settled(Outcome::Raised)
         );
         let Held::Read { entries, .. } = rig.checkpoints.held_checkpoints() else {
             panic!("a readable file");
@@ -1819,7 +1841,7 @@ mod tests {
         assert_eq!(
             rig.checkpoints
                 .settle_checkpoint(id(&record), &given(1, 3), NOW),
-            settled(Outcome::New, Intended::Checkpoint)
+            settled(Outcome::New)
         );
     }
 
