@@ -4293,7 +4293,7 @@ async fn a_plugin_host_of_the_third_protocol_alone_is_met_on_it_and_the_next_hos
 async fn a_host_that_replaces_a_crashed_one_answers_a_restore_with_a_position_as_not_set_today() {
     assert!(
         !kr_protocol::retained::replay_writer_open(),
-        "this build's host writes consumed positions: build the half of U4h that sets the record"
+        "this build's host writes consumed positions: build the half that sets the record"
     );
     let updated = Updated::prepare(Setup {
         plugin: true,
@@ -4363,7 +4363,7 @@ async fn a_host_the_next_daemon_adopts_answers_a_restore_with_a_position_as_not_
  {
     assert!(
         !kr_protocol::retained::replay_writer_open(),
-        "this build's host writes consumed positions: build the half of U5h that sets the record"
+        "this build's host writes consumed positions: build the half that sets the record"
     );
     let mut updated = Updated::prepare(Setup {
         plugin: true,
@@ -4439,7 +4439,7 @@ async fn a_worker_recovers_on_the_fourth_protocol_across_a_kill_and_the_host_nam
  {
     assert!(
         !kr_protocol::retained::replay_writer_open(),
-        "this build's host writes consumed positions: build the half of U6h that reads them"
+        "this build's host writes consumed positions: build the half that reads them"
     );
     let updated = Updated::prepare(Setup {
         plugin: true,
