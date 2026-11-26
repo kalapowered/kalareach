@@ -65,7 +65,7 @@ pub const MAX_CONSTANTS: usize = 16;
 pub const MAX_VALUE_BYTES: usize = 256;
 
 /// Names of loader and runtime variables that no beginning in
-/// [`FLOOR_FIRST_WORDS`](crate::launch_variables::FLOOR_FIRST_WORDS) reaches. No declaration
+/// [`FLOOR_FIRST_WORDS`] reaches. No declaration
 /// passes or sets one.
 pub const LOADER_NAMES: [&str; 3] = ["ENV", "LOCPATH", "_JAVA_OPTIONS"];
 
@@ -380,7 +380,7 @@ impl AcpLaunch {
 ///
 /// The floor: no declaration passes or sets a loader or runtime name, whatever the name is. A name
 /// is one when, written in upper case, it begins with a word of
-/// [`FLOOR_FIRST_WORDS`](crate::launch_variables::FLOOR_FIRST_WORDS) other than `KR`, or is one of
+/// [`FLOOR_FIRST_WORDS`] other than `KR`, or is one of
 /// [`LOADER_NAMES`]. A beginning, not a first word, so `PYTHONSTARTUP` and `PERL5OPT` are held
 /// too. [`DATA_NAMES`] begin like them and load nothing: they may be passed. A constant is also
 /// refused when it is one the host copies ([`COPIED_NAMES`], [`DATA_NAMES`]) or one of the
