@@ -6609,6 +6609,20 @@ fn the_pass_at_a_start_gives_each_active_grant_without_a_point_the_start() {
             .issue(&record((*carried).clone()), || Ok(()))
             .expect("an active grant an earlier release wrote");
     }
+    // A share with no history cursor that was redeemed after the settled reading.
+    let redeemed_later = Grant {
+        grant_id: grant_id(0x44),
+        ..grant(0x44, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    directory
+        .issue(
+            &GrantRecord {
+                activated_at_ms: Some(8_000_000),
+                ..record(redeemed_later.clone())
+            },
+            || Ok(()),
+        )
+        .expect("a share redeemed late");
     directory
         .issue(&proposal(proposed.clone()), || Ok(()))
         .expect("a proposal");
@@ -6638,7 +6652,13 @@ fn the_pass_at_a_start_gives_each_active_grant_without_a_point_the_start() {
     assert_eq!(
         start_of(&database, root),
         Some((5_000_000, 7, 9_000)),
-        "a grant with no history bound is given the settled reading"
+        "a share with no history bound reaches from its redemption, at 1,000, which is below the \
+         settled reading, so it takes the settled reading"
+    );
+    assert_eq!(
+        start_of(&database, redeemed_later.grant_id),
+        Some((8_000_000, 7, 9_000)),
+        "a share redeemed after the settled reading starts at its redemption, not before it"
     );
     assert_eq!(
         start_of(&database, proposed.grant_id),
@@ -6740,6 +6760,115 @@ fn a_pass_that_fails_writes_and_deletes_nothing_and_the_next_pass_completes() {
         .start_points_at_start(&boot, 1_000)
         .expect("the next pass completes");
     assert_eq!(start_of(&database, grant_id(1)), Some((1_000, 7, 100)));
+}
+
+/// A device row of the table the pass at a start reads, with the columns it reads and no more: the
+/// device's grant, with a history cursor or none, the moment its pairing was committed and the
+/// moment it was revoked.
+fn a_device_row(
+    database: &std::path::Path,
+    byte: u8,
+    paired_at_ms: i64,
+    cursor_ms: Option<u64>,
+    revoked_at_ms: Option<i64>,
+) -> GrantId {
+    let mut paired = Grant {
+        grant_id: grant_id(byte),
+        ..grant(byte, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    if let Some(cursor) = cursor_ms {
+        paired.history.lower_bound_ms = Nullable::some(TimestampMs::new(cursor));
+    }
+    let connection = rusqlite::Connection::open(database).expect("the store opens");
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS network_devices (
+                 grant_id BLOB PRIMARY KEY NOT NULL,
+                 grant BLOB NOT NULL,
+                 paired_at_ms INTEGER NOT NULL,
+                 revoked_at_ms INTEGER
+             );",
+        )
+        .expect("the device table");
+    connection
+        .execute(
+            "INSERT INTO network_devices (grant_id, grant, paired_at_ms, revoked_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                paired.grant_id.get().as_bytes().as_slice(),
+                kr_cbor::to_canonical_vec(&paired).expect("the grant encodes"),
+                paired_at_ms,
+                revoked_at_ms,
+            ],
+        )
+        .expect("a device row");
+    paired.grant_id
+}
+
+/// KR-REQ-23.45: a device whose grant has no history cursor reaches from the moment its
+/// pairing was committed, as every reader of the device decides, so the pass at a start never
+/// gives it a point below that moment, even when the settled reading is below it. A cursor the
+/// device's grant holds is the bound as it stands.
+#[test]
+fn the_pass_at_a_start_does_not_place_a_device_before_its_own_pairing() {
+    let (_temp, database, directory, _root) = a_store_with_a_root();
+    let clock = SetClock::at(9_000);
+    let boot = boot_in(&clock, 7);
+    let paired_later = a_device_row(&database, 0x61, 7_000_000, None, None);
+    let paired_earlier = a_device_row(&database, 0x62, 3_000_000, None, None);
+    let with_a_cursor = a_device_row(&database, 0x63, 7_000_000, Some(6_000_000), None);
+    directory
+        .start_points_at_start(&boot, 5_000_000)
+        .expect("the pass");
+    assert_eq!(
+        start_of(&database, paired_later),
+        Some((7_000_000, 7, 9_000)),
+        "a pairing later than the settled reading is the point's own moment, not later than it"
+    );
+    assert_eq!(
+        start_of(&database, paired_earlier),
+        Some((5_000_000, 7, 9_000)),
+        "a pairing before the settled reading takes the settled reading"
+    );
+    assert_eq!(
+        start_of(&database, with_a_cursor),
+        Some((6_000_000, 7, 9_000)),
+        "a history cursor is the bound, whatever the pairing moment"
+    );
+}
+
+/// KR-REQ-23.45: the pass at a start gives a revoked grant no point, a share or a device,
+/// and gives the grants that stand theirs.
+#[test]
+fn the_pass_at_a_start_gives_a_revoked_grant_no_point() {
+    let (_temp, database, directory, root) = a_store_with_a_root();
+    let clock = SetClock::at(9_000);
+    let boot = boot_in(&clock, 7);
+    let revoked_share = Grant {
+        grant_id: grant_id(0x45),
+        ..grant(0x45, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    directory
+        .issue(&record(revoked_share.clone()), || Ok(()))
+        .expect("a share");
+    sql(
+        &database,
+        &format!(
+            "UPDATE grants SET revoked_at_ms = 2000 WHERE grant_id = x'{}'",
+            "45".repeat(16)
+        ),
+    );
+    let revoked_device = a_device_row(&database, 0x64, 1_000, None, Some(2_000));
+    let live_device = a_device_row(&database, 0x65, 1_000, None, None);
+    directory
+        .start_points_at_start(&boot, 5_000_000)
+        .expect("the pass");
+    assert_eq!(start_of(&database, revoked_share.grant_id), None);
+    assert_eq!(start_of(&database, revoked_device), None);
+    assert!(
+        start_of(&database, root).is_some() && start_of(&database, live_device).is_some(),
+        "the grants that stand have theirs"
+    );
 }
 
 /// KR-REQ-23.45: a daemon whose configuration does not put it on the network has no

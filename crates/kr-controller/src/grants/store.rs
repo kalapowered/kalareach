@@ -972,9 +972,12 @@ impl GrantDirectory {
     /// for the boot; when the boot is one the host can no longer tell apart it stops there, and the
     /// spoil is all that is written; otherwise it deletes the points whose boot is spoiled, which is
     /// the one case where a grant's first point does not stand, and gives each active grant and
-    /// each unrevoked device without a point the reading, with the wall moment `max(settled_ms, the
-    /// grant's own bound)`: the grant began before this call, whatever the clock reads, and a bound
-    /// later than the clock would otherwise be later than its own start.
+    /// each device that is not revoked, and has no point, the reading, with the wall moment
+    /// `max(settled_ms, the grant's own bound)`: the grant began before this call, whatever the
+    /// clock reads, and a bound later than the clock would otherwise be later than its own start.
+    /// The bound is the one the grant's readers decide from: a grant with no history cursor reaches
+    /// from the moment its invitation was redeemed, and a device's from the moment its pairing was
+    /// committed. A revoked grant gets no point.
     ///
     /// # Errors
     ///
@@ -1008,11 +1011,19 @@ impl GrantDirectory {
                     .collect::<rusqlite::Result<_>>()
                     .map_err(ControllerError::registry)?
             };
-            let mut without: Vec<(Vec<u8>, Grant)> = Vec::new();
+            // Each grant without a point, with the bound its readers decide from: a share's
+            // reader already gives a grant with no history cursor the moment it was redeemed.
+            let mut without: Vec<(Vec<u8>, u64)> = Vec::new();
             for record in scan_all(connection)?.readable {
                 let key = record.grant.grant_id.get().as_bytes().to_vec();
-                if record.is_active() && !held.contains(&key) {
-                    without.push((key, record.grant));
+                if record.is_active() && record.revoked_at_ms.is_none() && !held.contains(&key) {
+                    let bound = record
+                        .grant
+                        .history
+                        .lower_bound_ms
+                        .0
+                        .map_or(0, TimestampMs::get);
+                    without.push((key, bound));
                 }
             }
             let has_devices: bool = connection
@@ -1026,15 +1037,16 @@ impl GrantDirectory {
             if has_devices {
                 let mut statement = connection
                     .prepare(
-                        "SELECT grant_id, grant FROM network_devices WHERE revoked_at_ms IS NULL",
+                        "SELECT grant_id, grant, paired_at_ms FROM network_devices
+                          WHERE revoked_at_ms IS NULL",
                     )
                     .map_err(ControllerError::registry)?;
-                let devices: Vec<(Vec<u8>, Vec<u8>)> = statement
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                let devices: Vec<(Vec<u8>, Vec<u8>, i64)> = statement
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
                     .map_err(ControllerError::registry)?
                     .collect::<rusqlite::Result<_>>()
                     .map_err(ControllerError::registry)?;
-                for (key, encoded) in devices {
+                for (key, encoded, paired_at_ms) in devices {
                     if held.contains(&key) || without.iter().any(|(held, _)| *held == key) {
                         continue;
                     }
@@ -1042,12 +1054,20 @@ impl GrantDirectory {
                     if let Ok(grant) =
                         kr_cbor::from_canonical_slice::<Grant>(&encoded, &kr_cbor::Limits::DEFAULT)
                     {
-                        without.push((key, grant));
+                        // The device's readers give a grant with no history cursor the moment
+                        // the pairing was committed, so the point's moment is not below it.
+                        let paired_at_ms = u64::try_from(paired_at_ms).unwrap_or_default();
+                        let bound = grant
+                            .history
+                            .from_start(paired_at_ms)
+                            .lower_bound_ms
+                            .0
+                            .map_or(0, TimestampMs::get);
+                        without.push((key, bound));
                     }
                 }
             }
-            for (key, grant) in without {
-                let bound = grant.history.lower_bound_ms.0.map_or(0, TimestampMs::get);
+            for (key, bound) in without {
                 crate::attention::order::StartPoint {
                     wall_ms: settled_ms.max(bound),
                     ..point

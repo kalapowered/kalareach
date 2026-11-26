@@ -328,17 +328,28 @@ async fn a_pairing_takes_the_point_of_its_commit_and_the_next_start_gives_a_gran
         "the commit's own moment"
     );
     assert!(first.2 > 0, "and the counter read at it: {first:?}");
-    rusqlite::Connection::open(&path)
-        .expect("the registry opens")
+    // The pairing's moment is later than anything the host's clock reads at the next start, as it
+    // is when a clock reads behind the pairing: the grant has no history cursor, so it reaches from
+    // the pairing, and the point must not lie before that.
+    let later = paired.paired_at_ms.get() + 3_600_000;
+    let connection = rusqlite::Connection::open(&path).expect("the registry opens");
+    connection
         .execute("DELETE FROM grant_starts", [])
         .expect("the point goes, as it is for a grant an earlier release wrote");
+    connection
+        .execute(
+            "UPDATE network_devices SET paired_at_ms = ?1 WHERE grant_id = ?2",
+            rusqlite::params![i64::try_from(later).expect("a moment"), grant],
+        )
+        .expect("the pairing moves ahead of the clock");
+    drop(connection);
     let host = host.restart().await;
     let Some(again) = point_of(&path, &grant) else {
         panic!("the pass at the start gave the grant no point");
     };
-    assert!(
-        again.0 >= paired.paired_at_ms.get(),
-        "the start's settled moment: {again:?}"
+    assert_eq!(
+        again.0, later,
+        "the point is the pairing's moment, which is later than the settled reading: {again:?}"
     );
     assert_eq!(again.1, first.1, "in the same boot");
     assert!(
