@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use companion_platform::PlatformError;
 use companion_platform::scan::{Scan, Sources};
+use companion_tauri::connection::CONNECT_WITHIN;
 use companion_tauri::device::{Device, Parts};
 use companion_tauri::owner::{Owner, RequestView};
 use companion_tauri::pairing::Source;
@@ -26,6 +27,7 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::DeviceKeyRevision;
+use kr_transport::reconnect::BACKOFF_MAX;
 
 use crate::net_support::pairing::{self as calls, Signer};
 use crate::net_support::{Host, proposal};
@@ -37,6 +39,19 @@ use serde_json::json;
 
 /// How long a test waits for a step before it fails as stuck.
 pub const WATCHDOG: Duration = Duration::from_secs(60);
+
+/// How long one reconnect round can take by the product's own bounds: the longest delay the client
+/// library draws before a try, and the longest a try may run (it dials within [`CONNECT_WITHIN`] and
+/// is told who the host is within as long again).
+pub const RECONNECT_ROUND: Duration = BACKOFF_MAX.saturating_add(CONNECT_WITHIN.saturating_mul(2));
+
+/// How long a test waits for a step that comes after `rounds` reconnect rounds: each round at its
+/// bound, then the ordinary watchdog for the step itself.
+pub const fn through_rounds(rounds: u32) -> Duration {
+    RECONNECT_ROUND
+        .saturating_mul(rounds)
+        .saturating_add(WATCHDOG)
+}
 
 pub fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().expect("loopback")
@@ -685,6 +700,8 @@ pub struct Companion {
     pub connection: Arc<Capture>,
     /// Every state each channel a command was given was sent.
     pub channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>>,
+    /// What a test does to this phone's connections to a paired host, when it was given the means.
+    pub control: Option<Arc<LinkControl>>,
 }
 
 /// The inbox an `attention_read` answer carries: the answer is the owner's key and the host's result,
@@ -928,7 +945,17 @@ impl Companion {
             standing,
             connection,
             channels,
+            control: None,
         }
+    }
+
+    /// What the connection control saw of the tries to a paired host since `since`, in words for a
+    /// wait that ran out: when each was asked for, against the wait's start.
+    pub fn tries_since(&self, since: std::time::Instant) -> String {
+        self.control.as_ref().map_or_else(
+            || "this phone's connections are not governed, so no try was recorded".to_owned(),
+            |control| control.tries_since(since),
+        )
     }
 
     /// The pairing and confirmations events the page was sent, and every answer. An event may be
@@ -1326,6 +1353,8 @@ pub async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[Action
 pub struct LinkControl {
     /// How many connections to a paired host were asked for.
     asked: std::sync::atomic::AtomicUsize,
+    /// When each of them was asked for.
+    asked_at: Mutex<Vec<std::time::Instant>>,
     /// How many of them each host was asked for.
     asked_of: Mutex<std::collections::BTreeMap<kr_protocol::scalars::EndpointKey, usize>>,
     /// The pool that the connections of the device this governs stand on.
@@ -1593,6 +1622,32 @@ impl LinkControl {
     /// How many connections have been asked for, held ones included.
     pub fn asked(&self) -> usize {
         self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// When the connections asked for since `since` were asked for, with the last one before it,
+    /// each against `since`: a try that stalled shows as a long gap after it, and a try that never
+    /// came as no entry.
+    pub fn tries_since(&self, since: std::time::Instant) -> String {
+        let asked_at = self.asked_at.lock().expect("the record");
+        let from = asked_at.iter().rposition(|at| *at < since).unwrap_or(0);
+        let seen: Vec<String> = asked_at[from..]
+            .iter()
+            .map(|at| {
+                if *at >= since {
+                    format!("+{:.2?}", at.duration_since(since))
+                } else {
+                    format!("-{:.2?}", since.duration_since(*at))
+                }
+            })
+            .collect();
+        if seen.is_empty() {
+            "no try was asked for".to_owned()
+        } else {
+            format!(
+                "tries asked for, against the wait's start: [{}]",
+                seen.join(", ")
+            )
+        }
     }
 
     /// The relays in the device's one endpoint's relay map now, as the pool the connections stand
@@ -2252,6 +2307,11 @@ impl ControlledLink {
     ) -> Result<Arc<dyn kr_client::transport::ControlTransport>, kr_client::pairing::link::LinkError>
     {
         self.control
+            .asked_at
+            .lock()
+            .expect("the record")
+            .push(std::time::Instant::now());
+        self.control
             .asked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self
@@ -2899,12 +2959,13 @@ pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Pho
     let paste = StubIntake::holding("", false);
     let mut governed = parts(Arc::clone(&secrets), Arc::clone(&room));
     govern(&mut governed, control);
-    let companion = Companion::start(
+    let mut companion = Companion::start(
         data.path(),
         governed,
         Arc::new(NoOwner),
         Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
     );
+    companion.control = Some(Arc::clone(control));
     Phone {
         companion,
         paste,

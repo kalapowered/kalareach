@@ -13,7 +13,7 @@ mod net_support;
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use companion_tauri::connection::{Connection, Unopened};
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
@@ -37,7 +37,8 @@ use net_support::worker::{Adopted, Upstream, offer, revoke};
 use net_support::{Host, proposal};
 use serde_json::{Value, json};
 use support::{
-    Companion, LinkControl, Phone, WATCHDOG, pair_under, unpaired_phone, unpaired_phone_controlled,
+    Companion, LinkControl, Phone, RECONNECT_ROUND, WATCHDOG, pair_under, through_rounds,
+    unpaired_phone, unpaired_phone_controlled,
 };
 
 /// A pairing grant over every session whose history reaches back to the start, holding `rights`.
@@ -55,9 +56,12 @@ async fn phone_under(adopted: &Adopted, grant: kr_protocol::pairing::ProposedGra
     phone
 }
 
-/// Waits until the phone's main connection is up.
+/// Waits until the phone's main connection is up. It waits through two reconnect rounds: a try that
+/// stalls to its bound and fails, and the next one, which makes the connection.
 async fn connected(companion: &Companion) {
-    tokio::time::timeout(WATCHDOG, async {
+    let wait = through_rounds(2);
+    let began = Instant::now();
+    tokio::time::timeout(wait, async {
         loop {
             let state = companion
                 .call("connection_state", json!({}))
@@ -69,7 +73,12 @@ async fn connected(companion: &Companion) {
         }
     })
     .await
-    .expect("the connection comes up");
+    .unwrap_or_else(|_| {
+        panic!(
+            "the connection comes up within {wait:?}; {}",
+            companion.tries_since(began)
+        )
+    });
 }
 
 /// Calls a command that opens, leaves or reads about a session, as the page does.
@@ -3096,15 +3105,24 @@ fn told_of(companion: &Companion, opening: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Waits until the host has been asked for `count` connections since `before`.
+/// Waits until the host has been asked for `count` connections since `before`. It waits through
+/// `count` reconnect rounds: each try comes after a delay of its own.
 async fn asked_since(control: &LinkControl, before: usize, count: usize) {
-    tokio::time::timeout(WATCHDOG, async {
+    let wait = through_rounds(u32::try_from(count).expect("a few tries"));
+    let began = Instant::now();
+    tokio::time::timeout(wait, async {
         while control.asked() - before < count {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("the host was asked {} times", control.asked() - before));
+    .unwrap_or_else(|_| {
+        panic!(
+            "the host was asked {} times of {count} within {wait:?}; {}",
+            control.asked() - before,
+            control.tries_since(began)
+        )
+    });
 }
 
 /// KR-REQ-19.08: a refusal of the connection at its admission that repeats does not end a session's
@@ -3816,9 +3834,12 @@ fn connection_reason(companion: &Companion) -> (bool, Option<String>) {
     )
 }
 
-/// Waits until the main connection is down with a reason that `holds`.
+/// Waits until the main connection is down with a reason that `holds`. It waits through two
+/// reconnect rounds: a try that stalls to its bound, and the next one, which tells the reason.
 async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bool) -> String {
-    tokio::time::timeout(WATCHDOG, async {
+    let wait = through_rounds(2);
+    let began = Instant::now();
+    tokio::time::timeout(wait, async {
         loop {
             if let (false, Some(reason)) = connection_reason(companion)
                 && holds(&reason)
@@ -3829,7 +3850,12 @@ async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bo
         }
     })
     .await
-    .expect("the connection's reason is told")
+    .unwrap_or_else(|_| {
+        panic!(
+            "the connection's reason is told within {wait:?}; {}",
+            companion.tries_since(began)
+        )
+    })
 }
 
 /// Waits until the page is told a standing of `opening` that `holds`, among those it was told after
@@ -3859,6 +3885,41 @@ async fn told_after(
 /// The words the host's refusal of a connection at its admission gives in these cases.
 fn is_the_hosts(reason: &str) -> bool {
     reason.contains("the host refused the connection")
+}
+
+/// KR-REQ-19.08: a wait that passes reconnect rounds is longer than those rounds. A round is the
+/// longest delay the client library draws before a try and the longest a try may run, and the
+/// ordinary watchdog is shorter than two of them: a try that stalls to its bound and fails, and
+/// then the next one, ran the main connection's waits out on a slow runner.
+#[test]
+fn kr_req_19_08_a_wait_through_reconnect_rounds_outlasts_them() {
+    // The library's own schedule, walked to its top: the longest delay is where the ceiling stops.
+    let mut ladder = kr_transport::reconnect::Backoff::default();
+    let mut longest = ladder.ceiling();
+    loop {
+        let _ = ladder.next_delay();
+        if ladder.ceiling() == longest {
+            break;
+        }
+        longest = ladder.ceiling();
+    }
+    // A try dials within `CONNECT_WITHIN` and is told who the host is within as long again.
+    let round = longest + companion_tauri::connection::CONNECT_WITHIN * 2;
+    assert_eq!(
+        RECONNECT_ROUND, round,
+        "a round is the longest delay and one try at its bound"
+    );
+    for rounds in 1..=3 {
+        assert!(
+            through_rounds(rounds) >= round * rounds + WATCHDOG,
+            "{rounds} rounds of {round:?} and the watchdog {WATCHDOG:?} need more than {:?}",
+            through_rounds(rounds)
+        );
+    }
+    assert!(
+        WATCHDOG < round * 2,
+        "the watchdog alone is shorter than two rounds of {round:?}"
+    );
 }
 
 /// KR-REQ-19.08: what a person reads while the main connection is not made is what the last try
