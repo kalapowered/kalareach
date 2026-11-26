@@ -21,7 +21,11 @@
 # Two environment variables let a wrapper run this against a release instead of a build of this
 # checkout. KR_E2E_PROGRAMS names a directory that holds kr-controller, kr-worker and kr, which are
 # used as they are and not built. KR_E2E_STATE names the directory the daemon keeps its state in,
-# which then outlives the run, so that a later run finds what this one recorded.
+# which then outlives the run, so that a later run finds what this one recorded. The folder must be
+# one that this run's wrapper owns: KR_E2E_STATE_OWNER names the wrapper's run, and the folder is
+# new, empty or marked with that name, inside a subfolder of the temporary directory
+# (scripts/lib/e2e-state-folder.sh); anything else ends the script before it makes or starts
+# anything.
 #
 # Nothing the person at this machine owns is touched: the graphical application is a new instance
 # started in the background, and this script ends only the processes it started itself.
@@ -34,6 +38,10 @@ cd "$root"
 . "$root/scripts/lib/owned-processes.sh"
 # shellcheck source=scripts/lib/account-launchd.sh
 . "$root/scripts/lib/account-launchd.sh"
+# shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+# Before anything is made or started: a state folder that this run does not own ends the script.
+e2e_state_folder_check
 require_account_launchd "$(uname -s)"
 
 log="${1:-}"

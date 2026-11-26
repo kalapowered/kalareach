@@ -64,6 +64,13 @@ fi
 
 started="$(date '+%Y-%m-%d %H:%M:%S')"
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-update.XXXXXX")"
+# The folder as the system reads it through its links, with no empty component in the name (the
+# system's TMPDIR can end in a slash): the state folders below it must pass the rule of
+# scripts/lib/e2e-state-folder.sh, which reads a path that way.
+work="$(cd -P "$work" && pwd -P)"
+# The name of this run, which both demonstrations take as the owner of their state folders, on the
+# first run and on the second.
+state_owner="${work##*/}"
 # An installed release is read-only, so its directories are opened to removal first.
 cleanup() {
   if [ -n "$logs" ]; then
@@ -107,9 +114,10 @@ echo "current: $(host_kr --json host versions | python3 -c 'import json,sys; pri
 demonstrate() {
   local label="$1"
   local programs="$work/store/current/bin"
-  KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-desktop" bash "$root/scripts/e2e-desktop.sh" "$work/logs/desktop-$label.log" > /dev/null 2>&1 \
+  KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-desktop" KR_E2E_STATE_OWNER="$state_owner" bash "$root/scripts/e2e-desktop.sh" "$work/logs/desktop-$label.log" > /dev/null 2>&1 \
     || fail "the desktop demonstration did not pass on the $label release; see $work/logs/desktop-$label.log"
   KR_E2E_PROGRAMS="$programs" KR_E2E_STATE="$work/state-permissions" KR_TEST_ARTIFACTS_DIR="$work/artifacts" \
+    KR_E2E_STATE_OWNER="$state_owner" \
     bash "$root/scripts/e2e-permissions.sh" "$work/logs/permissions-$label.log" > /dev/null 2>&1 \
     || fail "the permission demonstration did not pass on the $label release; see $work/logs/permissions-$label.log"
   cp "$work/artifacts/permissions/doctor.json" "$work/logs/doctor-$label.json" 2> /dev/null \
