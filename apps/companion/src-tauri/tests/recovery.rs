@@ -6797,7 +6797,7 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     use kr_client::pairing::checkpoint::{Answer, PairedCheckpoints, PairingId};
     use kr_protocol::backup_checkpoint::HostCheckpoint;
     use kr_protocol::ids::{BackupGeneration, DeviceId};
-    use kr_protocol::scalars::{Digest256, Uuid};
+    use kr_protocol::scalars::{Digest256, EndpointKey, Uuid};
 
     let computer = Computer::new().await;
     let page = computer.page().await;
@@ -6820,6 +6820,7 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
         .settle_checkpoint(
             PairingId {
                 host_device_id: DeviceId::new(Uuid::from_bytes([0x40; 16])),
+                host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
                 device_id: DeviceId::new(Uuid::from_bytes([0x41; 16])),
             },
             &Answer::Checkpoint(HostCheckpoint {

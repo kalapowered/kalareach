@@ -34,7 +34,7 @@ use kr_protocol::backup_checkpoint::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, DeviceId};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::{Digest256, Nonce256};
+use kr_protocol::scalars::{Digest256, EndpointKey, Nonce256};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -66,13 +66,18 @@ const LOCK_STEP: Duration = Duration::from_millis(20);
 /// How long an operation waits for the lock before it gives up.
 const LOCK_WITHIN: Duration = Duration::from_secs(2);
 
-/// One pairing: the host, and the identity the host gave this device in that pairing.
+/// One pairing: the host, the endpoint it is reached at, and the identity the host gave this device
+/// in that pairing.
 ///
 /// A device that pairs with a host again is given a new identity, so the new pairing is another one.
+/// The host's identity is what the host declared, so two hosts can declare one: the endpoint tells
+/// them apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PairingId {
     /// The host's device identity.
     pub host_device_id: DeviceId,
+    /// The host's endpoint.
+    pub host_endpoint_id: EndpointKey,
     /// The identity the host gave this device.
     pub device_id: DeviceId,
 }
@@ -83,6 +88,7 @@ impl PairingId {
     pub const fn of(host: &PairedHost) -> Self {
         Self {
             host_device_id: host.host_device_id,
+            host_endpoint_id: host.host_endpoint_id,
             device_id: host.device_id,
         }
     }
@@ -130,6 +136,7 @@ pub enum Intended {
 #[serde(deny_unknown_fields)]
 struct Told {
     host_device_id: DeviceId,
+    host_endpoint_id: EndpointKey,
     device_id: DeviceId,
     answer: Intended,
     /// When the answer last changed, in UTC milliseconds.
@@ -138,7 +145,9 @@ struct Told {
 
 impl Told {
     fn is(&self, id: PairingId) -> bool {
-        self.host_device_id == id.host_device_id && self.device_id == id.device_id
+        self.host_device_id == id.host_device_id
+            && self.host_endpoint_id == id.host_endpoint_id
+            && self.device_id == id.device_id
     }
 }
 
@@ -458,6 +467,7 @@ impl PairedCheckpoints {
                 }
                 None => next.told.push(Told {
                     host_device_id: id.host_device_id,
+                    host_endpoint_id: id.host_endpoint_id,
                     device_id: id.device_id,
                     answer: intended,
                     at_ms: now_ms,
@@ -470,10 +480,11 @@ impl PairedCheckpoints {
             // checkpoints or one that names an archive or a pairing twice, and `take` refuses a new
             // archive at 1,024, so a result holds at most 1,024 checkpoints of 351 bytes or less. The
             // settle drops each `told` entry of a pairing that no record of `hosts.json` holds, so a
-            // result holds at most one `told` entry of 166 bytes or less for each record. That file is
-            // read up to 4 MiB, in records whose values alone take 339 bytes or more (three identities
-            // and five keys), so it holds at most 12,372 records: 1,024 x 352 + 12,372 x 167 + 40 =
-            // 2,426,612 bytes. The check guards a change to those bounds.
+            // result holds at most one `told` entry of 231 bytes or less for each record (two
+            // identities of 36 characters, an endpoint of 43, the longest answer and a time of 20
+            // digits). That file is read up to 4 MiB, in records whose values alone take 339 bytes or
+            // more (three identities and five keys), so it holds at most 12,372 records: 1,024 x 352
+            // + 12,372 x 232 + 40 = 3,230,792 bytes. The check guards a change to those bounds.
             if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_FILE_BYTES) {
                 return Err(Unsettled::Full);
             }
@@ -698,7 +709,7 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
     if !file
         .told
         .iter()
-        .all(|told| pairings.insert((told.host_device_id, told.device_id)))
+        .all(|told| pairings.insert((told.host_device_id, told.host_endpoint_id, told.device_id)))
     {
         return Err(unreadable(Shown::said("it names one pairing twice")));
     }
@@ -874,6 +885,7 @@ mod tests {
     fn told(host: &PairedHost, answer: Intended) -> Told {
         Told {
             host_device_id: host.host_device_id,
+            host_endpoint_id: host.host_endpoint_id,
             device_id: host.device_id,
             answer,
             at_ms: 1_764_000_000_000,
@@ -1261,6 +1273,10 @@ mod tests {
     fn told_of_another() -> Told {
         Told {
             host_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            host_endpoint_id: DeviceKeys::generate()
+                .expect("keys")
+                .public_keys()
+                .transport,
             device_id: DeviceId::new(Uuid::from_bytes([10; 16])),
             answer: Intended::NothingPublished,
             at_ms: 5,
@@ -1538,6 +1554,7 @@ mod tests {
                 (
                     PairingId {
                         host_device_id: told.host_device_id,
+                        host_endpoint_id: told.host_endpoint_id,
                         device_id: told.device_id,
                     },
                     told.answer,
@@ -1560,6 +1577,116 @@ mod tests {
             outcome,
             confirmed: false,
         })
+    }
+
+    /// A record of the same declared identities at another endpoint is another pairing: the owner
+    /// that stands at the first endpoint is not the one a record at the second names.
+    #[test]
+    fn a_record_at_another_endpoint_is_not_the_pairing_that_was_told() {
+        let rig = Rig::new();
+        let first = owner(1);
+        rig.hosts.record(first.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(id(&first), &given(1, 7), NOW)
+            .expect("settled");
+        let mut second = first.clone();
+        second.host_endpoint_id = DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .transport;
+        assert_eq!(rig.checkpoints.acquisition(&first), Ok(Acquisition::Told));
+        assert_eq!(
+            rig.checkpoints.acquisition(&second),
+            Ok(Acquisition::NotAnOwner)
+        );
+    }
+
+    /// A pairing that another one at a second endpoint replaced is not told what the first one
+    /// answered: the `told` entry belongs to the endpoint it was written for.
+    #[test]
+    fn a_pairing_at_another_endpoint_is_not_told_what_the_replaced_one_answered() {
+        let rig = Rig::new();
+        let first = owner(1);
+        rig.hosts.record(first.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(id(&first), &given(1, 7), NOW)
+            .expect("settled");
+        let mut second = first.clone();
+        second.host_endpoint_id = DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .transport;
+        rig.hosts.record(second.clone()).expect("replaced");
+        assert_eq!(rig.checkpoints.acquisition(&second), Ok(Acquisition::Owed));
+    }
+
+    /// A file that names one declared pairing at two endpoints names two pairings, and is read.
+    #[test]
+    fn a_file_that_names_one_declared_pairing_at_two_endpoints_is_read() {
+        let rig = Rig::new();
+        let first = owner(1);
+        let mut second = first.clone();
+        second.host_endpoint_id = DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .transport;
+        rig.write_file(
+            Vec::new(),
+            vec![
+                told(&first, Intended::Checkpoint),
+                told(&second, Intended::Checkpoint),
+            ],
+        );
+        assert_eq!(cause(&rig.checkpoints.held_checkpoints()), None);
+    }
+
+    /// A file that names one pairing twice, by all three parts of its identity, is unreadable.
+    #[test]
+    fn a_file_that_names_one_pairing_twice_is_unreadable() {
+        let rig = Rig::new();
+        let first = owner(1);
+        rig.write_file(
+            Vec::new(),
+            vec![
+                told(&first, Intended::Checkpoint),
+                told(&first, Intended::NothingPublished),
+            ],
+        );
+        assert_eq!(
+            cause(&rig.checkpoints.held_checkpoints()),
+            Some(SnapshotCause::Unreadable)
+        );
+    }
+
+    /// The largest `told` entry takes the bytes that the size comment of the settle counts for it.
+    #[test]
+    fn the_largest_told_entry_takes_the_bytes_the_size_bound_counts() {
+        let record = owner(1);
+        let entry = Told {
+            at_ms: u64::MAX,
+            ..told(&record, Intended::NothingPublished)
+        };
+        assert_eq!(serde_json::to_vec(&entry).expect("serialises").len(), 231);
+    }
+
+    /// An answer for the pairing at another endpoint is told to none of the pairings that stand:
+    /// it is superseded and writes no `told` entry.
+    #[test]
+    fn an_answer_of_the_pairing_at_another_endpoint_is_told_to_none() {
+        let rig = Rig::new();
+        let first = owner(1);
+        rig.hosts.record(first.clone()).expect("recorded");
+        let mut second = first.clone();
+        second.host_endpoint_id = DeviceKeys::generate()
+            .expect("keys")
+            .public_keys()
+            .transport;
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(id(&second), &given(1, 7), NOW),
+            Err(Unsettled::Superseded)
+        );
+        assert_eq!(answers(&rig), Vec::new());
     }
 
     /// Each outcome of a settle is its own, a held checkpoint never goes down, and the checkpoints

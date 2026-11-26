@@ -43,7 +43,7 @@ use kr_protocol::archive::{
 use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
-use kr_protocol::scalars::{Bytes, Digest256, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, Digest256, EndpointKey, TimestampMs, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
 
 const ORIGIN: &str = "https://reach.kala.to";
@@ -2866,6 +2866,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     let folder = directory.path().join("pairing");
     let pairing = PairingId {
         host_device_id: DeviceId::new(id(0x40)),
+        host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
         device_id: DeviceId::new(id(0x41)),
     };
     let given = given_by_a_host(&current);
@@ -3620,6 +3621,7 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
         .settle_checkpoint(
             PairingId {
                 host_device_id: DeviceId::new(id(0x40)),
+                host_endpoint_id: EndpointKey::from_bytes([0x42; 32]),
                 device_id: DeviceId::new(id(0x41)),
             },
             &Answer::Checkpoint(HostCheckpoint {

@@ -70,7 +70,7 @@ use super::checkpoint::{
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
-use super::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
+use super::paired::{AttemptMode, FirstWrite, PairedHost, PairedHosts, PendingAttempt};
 use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
@@ -1390,7 +1390,23 @@ impl Pairing {
                         paired_at_ms: self.clock.wall_clock_ms(),
                         device_key_revision: DeviceKeyRevision::new(1),
                     };
-                    self.hosts.record(host.clone())?;
+                    // The first write of this arm: it records only while the attempt file still
+                    // names this invitation, so a newer pairing's attempt that finished first keeps
+                    // its record.
+                    match self
+                        .hosts
+                        .record_first(host.clone(), pending.invitation_id)?
+                    {
+                        FirstWrite::Recorded => {}
+                        FirstWrite::AttemptGone => {
+                            session.close();
+                            return Err(self.removed(pending));
+                        }
+                        FirstWrite::NewerAttempt => {
+                            session.close();
+                            return Err(Self::newer_pairing_started());
+                        }
+                    }
                     host
                 }
             };
@@ -1422,11 +1438,19 @@ impl Pairing {
             }) {
                 host.name = Some(label);
             }
-            self.hosts.record(host.clone())?;
+            // The name goes to the record of this pairing and to no other: the reads above took
+            // time, and the person can have removed the pairing, or another one of the host can have
+            // replaced it, in that time.
+            let named = self
+                .hosts
+                .name_pairing(PairingId::of(&host), host.name.clone())?;
             if let Some(answer) = answer {
                 self.settle_answer(&host, answer).await;
             }
-            self.hosts.clear_attempt()?;
+            if !named {
+                return Err(self.removed(pending));
+            }
+            self.hosts.clear_attempt_of(pending.invitation_id)?;
             progress.send_replace(AttemptState::Paired {
                 host: HostView::of(&host),
             });
@@ -1533,6 +1557,26 @@ impl Pairing {
                 (!until.is_zero()).then(|| step.min(until))
             }
         }
+    }
+
+    /// Ends the attempt as one whose pairing is gone: the person removed it, or another pairing of
+    /// the host replaced it, before it finished. The attempt file is cleared only while it still
+    /// names this invitation.
+    fn removed(&self, pending: &PendingAttempt) -> PairingFailure {
+        let _ = self.hosts.clear_attempt_of(pending.invitation_id);
+        PairingFailure::new(
+            FailureKind::PairingRemoved,
+            "the pairing was removed, or replaced by another, before the attempt finished",
+        )
+    }
+
+    /// Ends the attempt as one that a newer pairing's attempt overtook: the attempt file names
+    /// another invitation, so it is left as it is, and nothing of this attempt was recorded.
+    fn newer_pairing_started() -> PairingFailure {
+        PairingFailure::new(
+            FailureKind::NewerPairingStarted,
+            "a newer pairing was started on this device before the attempt finished",
+        )
     }
 
     /// Ends the attempt as one whose outcome the device cannot know, having cleared it.
@@ -3171,7 +3215,7 @@ mod tests {
     /// What the device keeps of the waiting attempt when a run starts.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Attempt {
-        /// Nothing is kept.
+        /// Nothing is kept: the file was cleared, or never written.
         Absent,
         /// The attempt is kept in `attempt.json`, as it is while it waits.
         Kept,
@@ -3207,6 +3251,10 @@ mod tests {
         attempt: bool,
         /// How many `told` entries `checkpoints.json` held.
         told: usize,
+        /// The bytes of `hosts.json`, when the file stood.
+        hosts_file: Option<Vec<u8>>,
+        /// The bytes of `attempt.json`, when the file stood.
+        attempt_file: Option<Vec<u8>>,
     }
 
     impl Seen {
@@ -3221,6 +3269,95 @@ mod tests {
                 hosts: read_hosts(directory).map_or(0, |hosts| hosts.len()),
                 attempt: directory.join("attempt.json").exists(),
                 told,
+                hosts_file: std::fs::read(directory.join("hosts.json")).ok(),
+                attempt_file: std::fs::read(directory.join("attempt.json")).ok(),
+            }
+        }
+    }
+
+    /// What happens to the device's own store while the host's answer to a request is on its way.
+    /// Each is applied at that request, before the host answers, so the store changes at a fixed
+    /// step of the completion and never by a wait.
+    #[derive(Clone, Copy, Debug)]
+    enum Meanwhile {
+        /// The person removes the host's pairing.
+        Forget,
+        /// A newer pairing with the same host is recorded: the same host and endpoint, another
+        /// identity for this device.
+        Newer,
+        /// The host raises the revision of this device's keys on the record.
+        Raise,
+        /// Another window's attempt takes the place of this one in `attempt.json`.
+        Other,
+        /// Another window's attempt records its pairing with the same host and takes the place of
+        /// this one in `attempt.json`.
+        Another,
+        /// A folder takes the place of `attempt.json`, so that the attempt can be neither read
+        /// nor cleared.
+        Stick,
+    }
+
+    /// The pairing another window's attempt makes with the host of `pending`.
+    fn newer_pairing(pending: &PendingAttempt) -> PairedHost {
+        PairedHost {
+            host_device_id: pending.host_device_id,
+            host_key_revision: pending.host_key_revision,
+            host_keys: pending.host_keys,
+            host_endpoint_id: pending.host_endpoint_id,
+            network_config: pending.network_config.clone(),
+            device_id: DeviceId::new(Uuid::from_bytes([77; 16])),
+            grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([78; 16])),
+            proposed_grant: pending.proposed_grant.clone(),
+            name: Some("a newer pairing".to_owned()),
+            paired_at_ms: 1,
+            device_key_revision: DeviceKeyRevision::new(1),
+        }
+    }
+
+    /// The attempt another window keeps in place of `pending`: another invitation.
+    fn another_attempt(pending: &PendingAttempt) -> PendingAttempt {
+        PendingAttempt {
+            invitation_id: InvitationId::new(Uuid::from_bytes([9; 16])),
+            ..pending.clone()
+        }
+    }
+
+    /// Does `what` to the store in `directory`, as another holder of it would.
+    fn happen(what: Meanwhile, directory: &Path) {
+        let hosts = PairedHosts::open(directory).expect("the store");
+        let pending = hosts
+            .waiting_attempt()
+            .expect("the attempt is readable")
+            .expect("an attempt is kept");
+        match what {
+            Meanwhile::Forget => hosts.forget(pending.host_device_id).expect("forgotten"),
+            Meanwhile::Newer => hosts.record(newer_pairing(&pending)).expect("recorded"),
+            Meanwhile::Raise => {
+                let host = read_hosts(directory)
+                    .expect("the records are read")
+                    .into_iter()
+                    .next()
+                    .expect("a record stands");
+                hosts
+                    .raise_revision(
+                        host.host_device_id,
+                        host.device_id,
+                        DeviceKeyRevision::new(2),
+                    )
+                    .expect("raised");
+            }
+            Meanwhile::Other => hosts
+                .keep_attempt(&another_attempt(&pending))
+                .expect("kept"),
+            Meanwhile::Another => {
+                hosts.record(newer_pairing(&pending)).expect("recorded");
+                hosts
+                    .keep_attempt(&another_attempt(&pending))
+                    .expect("kept");
+            }
+            Meanwhile::Stick => {
+                std::fs::remove_file(directory.join("attempt.json")).expect("the attempt file");
+                std::fs::create_dir(directory.join("attempt.json")).expect("a folder in its place");
             }
         }
     }
@@ -3262,6 +3399,8 @@ mod tests {
         /// The host's stored-envelope key pair and the endpoint its record names.
         host_pair: Arc<StoredEnvelopeKeyPair>,
         host_endpoint: EndpointKey,
+        /// What happens to the store when the first connection's host is asked a method.
+        meanwhile: Vec<(&'static str, Meanwhile)>,
     }
 
     impl PairedSession {
@@ -3321,6 +3460,13 @@ mod tests {
                 .lock()
                 .expect("the log")
                 .push((self.connection, request.method.as_str().to_owned()));
+            if self.connection == 1 {
+                for (method, what) in &self.meanwhile {
+                    if *method == request.method.as_str() {
+                        happen(*what, &self.watch);
+                    }
+                }
+            }
             self.seen
                 .lock()
                 .expect("the log")
@@ -3557,6 +3703,7 @@ mod tests {
         /// the device is made of.
         host_pair: Arc<StoredEnvelopeKeyPair>,
         host_endpoint: EndpointKey,
+        meanwhile: Vec<(&'static str, Meanwhile)>,
     }
 
     impl HostLink for Dropping {
@@ -3671,6 +3818,7 @@ mod tests {
                 seen: Arc::clone(&self.seen),
                 host_pair: Arc::clone(&self.host_pair),
                 host_endpoint: self.host_endpoint,
+                meanwhile: self.meanwhile.clone(),
             };
             Box::pin(async move {
                 Ok(Arc::new(transport) as Arc<dyn crate::transport::ControlTransport>)
@@ -3746,6 +3894,9 @@ mod tests {
         again: Option<Earlier>,
         /// How the run begins.
         start: Start,
+        /// What happens to the store when the first connection as the paired device is asked a
+        /// method, before the host answers.
+        meanwhile: Vec<(&'static str, Meanwhile)>,
     }
 
     impl Script {
@@ -3762,9 +3913,10 @@ mod tests {
                 checkpoint: Checkpoint::Unserved,
                 file: None,
                 names: Names::Unserved,
-                attempt: Attempt::Absent,
+                attempt: Attempt::Kept,
                 again: None,
                 start: Start::Waiting,
+                meanwhile: Vec::new(),
             }
         }
     }
@@ -3925,6 +4077,7 @@ mod tests {
                 seen: Arc::clone(&seen),
                 host_pair: Arc::new(host.stored_envelope.clone()),
                 host_endpoint: host_endpoint_id,
+                meanwhile: script.meanwhile.clone(),
             }),
             hosts: Arc::new(PairedHosts::open(&watch).expect("a store")),
         };
@@ -4608,9 +4761,10 @@ mod tests {
                 checkpoint: Checkpoint::Unserved,
                 file: None,
                 names: Names::Unserved,
-                attempt: Attempt::Absent,
+                attempt: Attempt::Kept,
                 again: None,
                 start: Start::Waiting,
+                meanwhile: Vec::new(),
             },
             Duration::from_secs(120),
         )
@@ -4956,6 +5110,268 @@ mod tests {
         }
     }
 
+    /// The three ways a completion reaches its end: a commitment the host named, one the device
+    /// derived for itself, and an attempt taken up again from its record.
+    #[derive(Clone, Copy, Debug)]
+    enum Arm {
+        Told,
+        Derived,
+        Resumed,
+    }
+
+    const ARMS: [Arm; 3] = [Arm::Told, Arm::Derived, Arm::Resumed];
+
+    /// The owner's question for the checkpoint: the last request of a completion, after the record
+    /// and the host's name were read, and before the name is kept and the attempt ends.
+    const READ: &str = "backup.checkpoint";
+
+    /// The question that proves the commitment: the first request of a derived completion, before
+    /// the record of the device's pairing is written.
+    const PROOF: &str = "pair.status";
+
+    /// Runs an owner device's completion of `arm`, with the attempt kept, in which `meanwhile`
+    /// happens to the store at its stops.
+    async fn completed(arm: Arm, meanwhile: &[(&'static str, Meanwhile)]) -> Waited {
+        let mut script = committing_script(!matches!(arm, Arm::Derived), true, published(7), None);
+        script.names = Names::Label("a real host");
+        script.attempt = Attempt::Kept;
+        script.meanwhile = meanwhile.to_vec();
+        if matches!(arm, Arm::Resumed) {
+            script.start = Start::Resumed { recorded: true };
+        }
+        waited(script, Duration::from_secs(60)).await
+    }
+
+    /// What the store held when the host was asked `method`, after what happened at that stop.
+    fn seen_at<'a>(run: &'a Waited, method: &str) -> &'a Seen {
+        run.seen
+            .iter()
+            .find(|seen| seen.method == method)
+            .expect("the request was made")
+    }
+
+    /// The bytes of a record file the run left, when the file stands.
+    fn stored(run: &Waited, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(run.hosts.directory().join(name)).ok()
+    }
+
+    /// KR-REQ-20.12: a pairing that the person removes while its completion is on its way is not
+    /// recorded again by the completion: `hosts.json` ends as the removal left it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pairing_removed_before_its_completion_ends_is_not_brought_back() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Forget)]).await;
+            assert_eq!(
+                stored(&run, "hosts.json"),
+                seen_at(&run, READ).hosts_file,
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: a newer pairing with the same host, recorded while a completion is on its way,
+    /// is left byte for byte as it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_pairing_recorded_before_a_completion_ends_is_left_as_it_was() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Newer)]).await;
+            assert_eq!(
+                stored(&run, "hosts.json"),
+                seen_at(&run, READ).hosts_file,
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: a revision of this device's keys that the host raised while a completion is on
+    /// its way stays raised.
+    #[tokio::test(start_paused = true)]
+    async fn a_revision_raised_before_a_completion_ends_stays_raised() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Raise)]).await;
+            assert_eq!(
+                recorded(&run)[0].device_key_revision,
+                DeviceKeyRevision::new(2),
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: the attempt of a pairing that was removed, and of one that another pairing of
+    /// the host replaced, ends as one whose pairing is gone, never as a paired one.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_whose_pairing_is_gone_ends_as_removed() {
+        for arm in ARMS {
+            for gone in [Meanwhile::Forget, Meanwhile::Newer] {
+                let run = completed(arm, &[(READ, gone)]).await;
+                assert_eq!(
+                    failure_kind(&run),
+                    Some(FailureKind::PairingRemoved),
+                    "{arm:?} {gone:?}: {:?}",
+                    run.outcome
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-20.12: what the host answered for a pairing that is gone is still kept as its
+    /// checkpoint, since it protects the host's own archive.
+    #[tokio::test(start_paused = true)]
+    async fn the_checkpoint_of_a_removed_pairing_is_still_kept() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Forget)]).await;
+            assert!(
+                matches!(run.hosts.checkpoints().held_checkpoints(),
+                    Held::Read { ref entries, owed: 0 } if entries.len() == 1
+                        && entries[0].backup_generation.get() == 7),
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: a pairing that is gone is told nothing: no `told` entry is written for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_removed_pairing_is_given_no_told_entry() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Forget)]).await;
+            assert_eq!(Seen::of(run.hosts.directory(), "end").told, 0, "{arm:?}");
+        }
+    }
+
+    /// The control of the absences above: a completion that nothing interrupts names the host in
+    /// its record, and ends paired.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_that_nothing_interrupts_names_the_host_in_its_record() {
+        for arm in ARMS {
+            let run = completed(arm, &[]).await;
+            assert_eq!(
+                recorded(&run)
+                    .iter()
+                    .map(|host| host.name.clone())
+                    .collect::<Vec<_>>(),
+                vec![Some("a real host".to_owned())],
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// The control: a completion that nothing interrupts tells the pairing what the host answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_that_nothing_interrupts_tells_the_pairing() {
+        for arm in ARMS {
+            let run = completed(arm, &[]).await;
+            assert_eq!(Seen::of(run.hosts.directory(), "end").told, 1, "{arm:?}");
+        }
+    }
+
+    /// The control: a revision raised while a completion is on its way leaves the pairing in place,
+    /// so the attempt still ends paired.
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_revision_does_not_end_a_completion_as_removed() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Raise)]).await;
+            assert!(ended_paired(&run), "{arm:?}: {:?}", run.outcome);
+        }
+    }
+
+    /// KR-REQ-20.12: a derived completion does not replace the record that another window's attempt
+    /// wrote for the same host before it: that record stays byte for byte.
+    #[tokio::test(start_paused = true)]
+    async fn a_derived_completion_does_not_replace_another_windows_record() {
+        let run = completed(Arm::Derived, &[(PROOF, Meanwhile::Another)]).await;
+        assert_eq!(stored(&run, "hosts.json"), seen_at(&run, PROOF).hosts_file);
+    }
+
+    /// KR-REQ-20.12: a derived completion whose attempt another window replaced with a newer
+    /// pairing's attempt ends as one that a newer pairing was started before, and not as one whose
+    /// pairing is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_derived_completion_whose_attempt_a_newer_pairing_replaced_ends_as_newer_started() {
+        let run = completed(Arm::Derived, &[(PROOF, Meanwhile::Another)]).await;
+        assert_eq!(
+            failure_kind(&run),
+            Some(FailureKind::NewerPairingStarted),
+            "{:?}",
+            run.outcome
+        );
+    }
+
+    /// KR-REQ-20.12: a derived completion whose attempt file is gone records no pairing at all, and
+    /// ends as one whose pairing is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_derived_completion_whose_attempt_file_is_gone_records_nothing() {
+        let mut script = committing_script(false, true, published(7), None);
+        script.attempt = Attempt::Absent;
+        let run = waited(script, Duration::from_secs(60)).await;
+        assert_eq!(
+            (failure_kind(&run), stored(&run, "hosts.json")),
+            (Some(FailureKind::PairingRemoved), None)
+        );
+    }
+
+    /// KR-REQ-20.12: a derived completion whose attempt file cannot be read cannot tell that the
+    /// attempt stands, so it records no pairing and ends as a store that failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_derived_completion_whose_attempt_cannot_be_read_records_nothing() {
+        let mut script = committing_script(false, true, published(7), None);
+        script.attempt = Attempt::Stuck;
+        let run = waited(script, Duration::from_secs(60)).await;
+        assert_eq!(
+            (failure_kind(&run), stored(&run, "hosts.json")),
+            (Some(FailureKind::StoreFailed), None)
+        );
+    }
+
+    /// The control: a derived completion whose attempt stands records its own pairing.
+    #[tokio::test(start_paused = true)]
+    async fn a_derived_completion_whose_attempt_stands_records_its_pairing() {
+        let run = completed(Arm::Derived, &[]).await;
+        assert_eq!(recorded(&run)[0].device_id, run.derived);
+    }
+
+    /// KR-REQ-20.12: an attempt that ends because its pairing is gone leaves the file of another
+    /// window's attempt as that window kept it.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_ended_as_removed_leaves_another_attempts_file_as_it_was() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Forget), (READ, Meanwhile::Other)]).await;
+            assert_eq!(
+                stored(&run, "attempt.json"),
+                seen_at(&run, READ).attempt_file,
+                "{arm:?}"
+            );
+        }
+        let run = completed(Arm::Derived, &[(PROOF, Meanwhile::Another)]).await;
+        assert_eq!(
+            stored(&run, "attempt.json"),
+            seen_at(&run, PROOF).attempt_file,
+            "derived, at the proof"
+        );
+    }
+
+    /// KR-REQ-20.12: a completion that ends paired leaves the file of another window's attempt, which
+    /// replaced its own meanwhile, as that window kept it.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_that_ends_paired_leaves_a_replaced_attempt_file_as_it_was() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Other)]).await;
+            assert_eq!(
+                stored(&run, "attempt.json"),
+                seen_at(&run, READ).attempt_file,
+                "{arm:?}"
+            );
+        }
+    }
+
+    /// The control: a completion that ends paired removes the attempt file that is still its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_that_ends_paired_removes_its_own_attempt_file() {
+        for arm in ARMS {
+            let run = completed(arm, &[]).await;
+            assert_eq!(stored(&run, "attempt.json"), None, "{arm:?}");
+        }
+    }
+
     /// The records of paired hosts a run left.
     fn recorded(run: &Waited) -> Vec<PairedHost> {
         read_hosts(run.hosts.directory()).expect("the records are read")
@@ -5066,7 +5482,8 @@ mod tests {
     {
         for told in [false, true] {
             let mut script = committing_script(told, true, published(7), None);
-            script.attempt = Attempt::Stuck;
+            script.attempt = Attempt::Kept;
+            script.meanwhile = vec![(READ, Meanwhile::Stick)];
             let first = waited(script, Duration::from_secs(60)).await;
             assert_eq!(
                 failure_kind(&first),
@@ -5193,7 +5610,8 @@ mod tests {
     async fn a_resumed_attempt_whose_answer_was_kept_changes_nothing_and_is_cleared() {
         for told in [false, true] {
             let mut script = committing_script(told, true, published(7), None);
-            script.attempt = Attempt::Stuck;
+            script.attempt = Attempt::Kept;
+            script.meanwhile = vec![(READ, Meanwhile::Stick)];
             let first = waited(script, Duration::from_secs(60)).await;
             assert_eq!(
                 failure_kind(&first),
@@ -5303,9 +5721,10 @@ mod tests {
                 checkpoint: published(7),
                 file: None,
                 names: Names::Silent,
-                attempt: Attempt::Absent,
+                attempt: Attempt::Kept,
                 again: None,
                 start: Start::Waiting,
+                meanwhile: Vec::new(),
             },
             Duration::from_secs(120),
         )
@@ -5359,9 +5778,10 @@ mod tests {
                 checkpoint: Checkpoint::Silent,
                 file: None,
                 names: Names::Label("a real host"),
-                attempt: Attempt::Absent,
+                attempt: Attempt::Kept,
                 again: None,
                 start: Start::Waiting,
+                meanwhile: Vec::new(),
             },
             Duration::from_secs(120),
         )
@@ -5431,6 +5851,7 @@ mod tests {
             "checkpoints": [],
             "told": [{
                 "host_device_id": DeviceId::new(Uuid::from_bytes([1; 16])),
+                "host_endpoint_id": kr_protocol::scalars::EndpointKey::from_bytes([5; 32]),
                 "device_id": DeviceId::new(Uuid::from_bytes([9; 16])),
                 "answer": "checkpoint",
                 "at_ms": 5

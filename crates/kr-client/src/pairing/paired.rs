@@ -22,7 +22,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{EndpointKey, Nullable};
 use serde::{Deserialize, Serialize};
 
-use super::checkpoint::PairedCheckpoints;
+use super::checkpoint::{PairedCheckpoints, PairingId};
 use super::failure::{FailureKind, PairingFailure};
 use crate::shown::Shown;
 
@@ -245,6 +245,26 @@ struct AttemptFile {
     attempt: PendingAttempt,
 }
 
+/// What the first write of a completion did, and why it wrote nothing when it did not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstWrite {
+    /// The waiting attempt names the completion's invitation, and the host is recorded.
+    Recorded,
+    /// No waiting attempt is kept: nothing of this attempt stands.
+    AttemptGone,
+    /// The waiting attempt names another invitation, which a newer pairing started: that pairing's
+    /// record and attempt file were left as they were.
+    NewerAttempt,
+}
+
+/// How the waiting attempt that is kept stands toward one invitation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptStanding {
+    Names,
+    NamesAnother,
+    Absent,
+}
+
 /// The paired-host records and the waiting attempt, in one directory of the application's own.
 pub struct PairedHosts {
     directory: PathBuf,
@@ -336,6 +356,65 @@ impl PairedHosts {
     /// Returns [`FailureKind::StoreFailed`] when the records cannot be read or written.
     pub fn record(&self, host: PairedHost) -> Result<(), PairingFailure> {
         let _writing = self.lock();
+        self.record_locked(host)
+    }
+
+    /// Records the paired host that the attempt of `invitation_id` made, replacing an earlier record
+    /// of the same host, only while the waiting attempt that is kept still names that invitation.
+    ///
+    /// Another window's attempt that finished first records its own pairing and takes the attempt
+    /// file, and this one must not replace that record. Says whether the host was recorded, and why
+    /// not when it was not: nothing was written then.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FailureKind::StoreFailed`] when the records or the attempt cannot be read or written.
+    pub fn record_first(
+        &self,
+        host: PairedHost,
+        invitation_id: InvitationId,
+    ) -> Result<FirstWrite, PairingFailure> {
+        let _writing = self.lock();
+        match self.attempt_standing(invitation_id)? {
+            AttemptStanding::Names => {
+                self.record_locked(host)?;
+                Ok(FirstWrite::Recorded)
+            }
+            AttemptStanding::Absent => Ok(FirstWrite::AttemptGone),
+            AttemptStanding::NamesAnother => Ok(FirstWrite::NewerAttempt),
+        }
+    }
+
+    /// Sets the name of the recorded pairing `id`, and nothing else of the record.
+    ///
+    /// The pairing is found by all three parts of its identity, the host's endpoint among them, so
+    /// the record of a pairing that was removed, or replaced by another one of the host, is not
+    /// written again. Returns whether the pairing is recorded; when it is not, nothing was written.
+    /// A name that is `None` or already the record's changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FailureKind::StoreFailed`] when the records cannot be read or written.
+    pub fn name_pairing(
+        &self,
+        id: PairingId,
+        name: Option<String>,
+    ) -> Result<bool, PairingFailure> {
+        let _writing = self.lock();
+        let mut hosts = self.list()?;
+        let Some(host) = hosts.iter_mut().find(|host| PairingId::of(host) == id) else {
+            return Ok(false);
+        };
+        let Some(name) = name.filter(|name| host.name.as_ref() != Some(name)) else {
+            return Ok(true);
+        };
+        host.name = Some(name);
+        self.write_hosts(hosts)?;
+        Ok(true)
+    }
+
+    /// The write of [`Self::record`], with the lock held.
+    fn record_locked(&self, host: PairedHost) -> Result<(), PairingFailure> {
         let mut hosts = self.list()?;
         hosts.retain(|existing| {
             existing.host_device_id != host.host_device_id
@@ -343,6 +422,18 @@ impl PairedHosts {
         });
         hosts.push(host);
         self.write_hosts(hosts)
+    }
+
+    /// How the waiting attempt that is kept stands toward `invitation_id`.
+    fn attempt_standing(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<AttemptStanding, PairingFailure> {
+        Ok(match self.waiting_attempt()? {
+            None => AttemptStanding::Absent,
+            Some(attempt) if attempt.invitation_id == invitation_id => AttemptStanding::Names,
+            Some(_) => AttemptStanding::NamesAnother,
+        })
     }
 
     /// Records that the host holds `revision` of this device's keys, for the pairing that gave this
@@ -444,6 +535,25 @@ impl PairedHosts {
     /// Returns [`FailureKind::StoreFailed`] when it cannot be removed.
     pub fn clear_attempt(&self) -> Result<(), PairingFailure> {
         let _writing = self.lock();
+        self.remove_attempt()
+    }
+
+    /// Forgets the waiting attempt only while it names `invitation_id`: the attempt file that
+    /// another window's attempt took the place of is left as it is. Nothing is written otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FailureKind::StoreFailed`] when the attempt cannot be read or removed.
+    pub fn clear_attempt_of(&self, invitation_id: InvitationId) -> Result<(), PairingFailure> {
+        let _writing = self.lock();
+        if self.attempt_standing(invitation_id)? != AttemptStanding::Names {
+            return Ok(());
+        }
+        self.remove_attempt()
+    }
+
+    /// The removal of the attempt file, whose name is fixed, with the lock held.
+    fn remove_attempt(&self) -> Result<(), PairingFailure> {
         let path = self.directory.join(ATTEMPT_FILE);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -689,6 +799,181 @@ mod tests {
         assert_eq!(held(&store), 3);
         let reopened = PairedHosts::open(directory.path().join("pairing")).expect("a store");
         assert_eq!(held(&reopened), 3, "it is kept");
+    }
+
+    /// The attempt that made `paired`, under the invitation numbered `invitation`.
+    fn attempt_of(paired: &PairedHost, invitation: u8) -> PendingAttempt {
+        PendingAttempt {
+            mode: AttemptMode::Direct,
+            invitation_id: InvitationId::new(Uuid::from_bytes([invitation; 16])),
+            host_device_id: paired.host_device_id,
+            host_key_revision: paired.host_key_revision,
+            host_keys: paired.host_keys,
+            host_endpoint_id: paired.host_endpoint_id,
+            network_config: NetworkConfig::empty(),
+            proposed_grant: grant(&[ActionRight::SessionView]),
+            verification_value: "f3c146fd".to_owned(),
+            value_confirmed: true,
+            expires_at_ms: None,
+            recover_until_ms: 1,
+            tries_left: None,
+        }
+    }
+
+    /// A store in a folder of its own, and the folder that holds it.
+    fn store_in_a_folder() -> (tempfile::TempDir, PairedHosts) {
+        let directory = tempfile::tempdir().expect("a directory on the internal disk");
+        let store = PairedHosts::open(directory.path().join("pairing")).expect("a store");
+        (directory, store)
+    }
+
+    /// The bytes of a file of the store, when it stands.
+    fn file_of(store: &PairedHosts, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(store.directory().join(name)).ok()
+    }
+
+    /// A name is written on the record of the pairing it is made for, and nothing else of the
+    /// record changes.
+    #[test]
+    fn a_name_is_set_on_the_record_and_nothing_else_of_it_changes() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        store
+            .raise_revision(
+                paired.host_device_id,
+                paired.device_id,
+                DeviceKeyRevision::new(3),
+            )
+            .expect("raised");
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
+            Ok(true)
+        );
+        assert_eq!(
+            store.list().expect("readable"),
+            vec![PairedHost {
+                name: Some("kitchen-pc".to_owned()),
+                device_key_revision: DeviceKeyRevision::new(3),
+                ..paired
+            }]
+        );
+    }
+
+    /// A name for a pairing that was removed writes nothing, and says so.
+    #[test]
+    fn a_name_for_a_pairing_that_is_not_recorded_writes_nothing() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        store.forget(paired.host_device_id).expect("forgotten");
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
+            Ok(false)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// A name for the pairing at another endpoint of the same declared identities writes nothing:
+    /// the record that stands is another pairing.
+    #[test]
+    fn a_name_for_the_pairing_at_another_endpoint_writes_nothing() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        let other = PairedHost {
+            host_endpoint_id: host(2, &[ActionRight::SessionView]).host_endpoint_id,
+            ..paired.clone()
+        };
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(
+            store.name_pairing(PairingId::of(&other), Some("kitchen-pc".to_owned())),
+            Ok(false)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// A name that is absent, or is the record's own, writes nothing and still finds the pairing.
+    #[test]
+    fn an_absent_name_and_the_records_own_name_write_nothing() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(store.name_pairing(PairingId::of(&paired), None), Ok(true));
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), paired.name.clone()),
+            Ok(true)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// The first write of an attempt records the host while the attempt file names its invitation.
+    #[test]
+    fn the_first_write_records_the_host_while_the_attempt_names_its_invitation() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.keep_attempt(&attempt_of(&paired, 4)).expect("kept");
+        assert_eq!(
+            store.record_first(paired.clone(), InvitationId::new(Uuid::from_bytes([4; 16]))),
+            Ok(FirstWrite::Recorded)
+        );
+        assert_eq!(store.list().expect("readable"), vec![paired]);
+    }
+
+    /// The first write of an attempt whose file another attempt took the place of writes nothing.
+    #[test]
+    fn the_first_write_writes_nothing_when_the_attempt_file_names_another_invitation() {
+        let (_directory, store) = store_in_a_folder();
+        let newer = host(1, &[ActionRight::SessionView]);
+        store.record(newer.clone()).expect("recorded");
+        store.keep_attempt(&attempt_of(&newer, 9)).expect("kept");
+        let before = file_of(&store, HOSTS_FILE);
+        let ours = host(1, &[ActionRight::SessionView]);
+        assert_eq!(
+            store.record_first(ours, InvitationId::new(Uuid::from_bytes([4; 16]))),
+            Ok(FirstWrite::NewerAttempt)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// The first write of an attempt whose file was cleared writes nothing.
+    #[test]
+    fn the_first_write_writes_nothing_when_no_attempt_is_kept() {
+        let (_directory, store) = store_in_a_folder();
+        let ours = host(1, &[ActionRight::SessionView]);
+        assert_eq!(
+            store.record_first(ours, InvitationId::new(Uuid::from_bytes([4; 16]))),
+            Ok(FirstWrite::AttemptGone)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), None);
+    }
+
+    /// The attempt file is removed while it names the invitation the clearing was started for.
+    #[test]
+    fn an_attempt_is_cleared_while_it_names_the_invitation() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.keep_attempt(&attempt_of(&paired, 4)).expect("kept");
+        store
+            .clear_attempt_of(InvitationId::new(Uuid::from_bytes([4; 16])))
+            .expect("cleared");
+        assert_eq!(file_of(&store, ATTEMPT_FILE), None);
+    }
+
+    /// The attempt file of another invitation is left as it is, byte for byte.
+    #[test]
+    fn an_attempt_that_names_another_invitation_is_left_as_it_is() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.keep_attempt(&attempt_of(&paired, 9)).expect("kept");
+        let before = file_of(&store, ATTEMPT_FILE);
+        assert!(before.is_some());
+        store
+            .clear_attempt_of(InvitationId::new(Uuid::from_bytes([4; 16])))
+            .expect("nothing to clear");
+        assert_eq!(file_of(&store, ATTEMPT_FILE), before);
     }
 
     /// A record's credentials name the pairing the record holds, and an attempt's, which has

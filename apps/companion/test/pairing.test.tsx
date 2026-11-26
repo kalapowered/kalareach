@@ -185,6 +185,32 @@ describe('pairing with a host', () => {
     )
   })
 
+  it('says that the pairing was removed before it finished, in the ruled words', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, ended('pairing_removed', null))
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      'The pairing was removed from this computer before it finished, so this computer is not paired with the host. Pair again to use it.'
+    )
+  })
+
+  it('ends the page with Done after the pairing was removed', () => {
+    expect(failureWords({ kind: 'pairing_removed' }, 'reach.kala.to').action).toBe('done')
+  })
+
+  it('says that a newer pairing was started before this one finished, in the ruled words', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, ended('newer_pairing_started', null))
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      'A newer pairing was started on this computer before this one finished, so this one was not saved. Finish the newer pairing, or pair again.'
+    )
+  })
+
+  it('ends the page with Done after a newer pairing was started', () => {
+    expect(failureWords({ kind: 'newer_pairing_started' }, 'reach.kala.to').action).toBe('done')
+  })
+
   // The tries line counts tries of the code that was charged. After an ending at which the invitation
   // can no longer be used, the code is spent, so no line says how many tries are left on it: not after
   // an ending that starts again, and not after one at which the host consumed or ended the invitation.

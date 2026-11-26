@@ -831,6 +831,8 @@ export type FailureKind =
   | 'reader_failed'
   | 'store_failed'
   | 'approval_unknown'
+  | 'pairing_removed'
+  | 'newer_pairing_started'
 
 /** A kind of failure that carries no wait: every kind except the two of the managed relay service. */
 export type WaitlessKind = Exclude<FailureKind, 'relay_capacity' | 'relay_fault'>

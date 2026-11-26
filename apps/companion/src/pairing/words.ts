@@ -239,6 +239,18 @@ function codeWords(
           'The host may have approved this device while KalaReach could not ask, but KalaReach cannot confirm that. Ask the owner to check the host.',
         action: 'done'
       }
+    case 'pairing_removed':
+      return {
+        sentence:
+          'The pairing was removed from this computer before it finished, so this computer is not paired with the host. Pair again to use it.',
+        action: 'done'
+      }
+    case 'newer_pairing_started':
+      return {
+        sentence:
+          'A newer pairing was started on this computer before this one finished, so this one was not saved. Finish the newer pairing, or pair again.',
+        action: 'done'
+      }
     case 'did_not_finish':
     default:
       // A kind this build does not know, from a newer native side, says no more than this.
