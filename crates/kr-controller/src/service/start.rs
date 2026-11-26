@@ -1097,6 +1097,8 @@ impl Controller {
             Arc::clone(&secret_store),
             setup.environment_id,
         );
+        // Kept for the controller, whose `backup.checkpoint` proves this host's key with it.
+        let proof_key = device_keys.stored_envelope.clone();
         let delivery = Arc::new(crate::push::DeliveryModule::open(
             &setup.paths,
             device_keys.notification_preview,
@@ -1479,6 +1481,7 @@ impl Controller {
             arrivals: Arc::default(),
             lifetimes,
             owner,
+            stored_envelope: proof_key,
             policy,
             local_owner_standing,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),

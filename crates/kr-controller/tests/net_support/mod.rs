@@ -560,6 +560,29 @@ impl Host {
         host
     }
 
+    /// The public keys of the device keys this host's own secret store holds for it, which the
+    /// daemon loaded when it started: the stored-envelope key among them is the one that opens
+    /// what the host seals. (This suite's network keeps its own keys in a store of its own, so the
+    /// pairing identity's keys are not these.)
+    #[must_use]
+    pub fn declared_keys(&self) -> kr_protocol::pairing::DevicePublicKeys {
+        let secrets =
+            open_store_in(&self.temp.environment().secrets_dir()).expect("the host's secret store");
+        kr_crypto::store::load_device_keys(
+            secrets.store.as_ref(),
+            &net::device_key_scope(self.environment_id),
+        )
+        .expect("the host's keys can be read")
+        .expect("the host stored its keys when it started")
+        .public_keys()
+    }
+
+    /// The endpoint a paired device dials this host at, and the one its record of the host names.
+    #[must_use]
+    pub fn endpoint_id(&self) -> kr_protocol::scalars::EndpointKey {
+        self.network.endpoint_id()
+    }
+
     /// Where this daemon's runtime root is, which is where an operator puts what the host reads
     /// at run time.
     #[must_use]

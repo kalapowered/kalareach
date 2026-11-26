@@ -1146,6 +1146,11 @@ pub struct Controller {
     /// The owner confirmations this host asks for, has answered and has spent, whether or not it
     /// is on a network.
     owner: Arc<net::owner::OwnerAuthority>,
+    /// This host's own stored-envelope key pair, whose public half its paired devices hold as its
+    /// declared key. `backup.checkpoint` seals its proof with it. It is held here, apart from the
+    /// storage arm that also holds it, because a host with no storage service answers that method
+    /// too.
+    stored_envelope: kr_crypto::keys::StoredEnvelopeKeyPair,
     /// What is true of this host rather than of one grant: the revision in force, the organisation
     /// leases it holds and the optional bounded offline-validity policy its owner chose.
     ///

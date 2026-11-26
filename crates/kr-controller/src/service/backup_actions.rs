@@ -2,11 +2,17 @@
 //! storage service, and the owner's setup of what the host backs up.
 
 use kr_protocol::backup_bundle::BackupBundleWriteParams;
-use kr_protocol::backup_checkpoint::{BackupCheckpointParams, BackupCheckpointResult};
+use kr_protocol::backup_checkpoint::{
+    BackupCheckpointParams, BackupCheckpointResult, HOST_CHECKPOINT_PROOF_DOMAIN,
+    HostCheckpointProof, SealedCheckpointProof,
+};
 use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
 use kr_protocol::backup_setup::{BackupEnableParams, BackupEnableResult, BackupStatusParams};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
-use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::{Bytes, Nullable};
+
+use kr_crypto::sealed::seal_stored_envelope;
+use kr_crypto::sign::SigningTranscript;
 
 use crate::backup::setup::SetupAdmission;
 use crate::error::{ControllerError, Result};
@@ -111,28 +117,55 @@ impl Controller {
     }
 
     /// Answers `backup.checkpoint`: the newest generation of the current setup that the storage
-    /// service accepted and this host still keeps.
+    /// service accepted and this host still keeps, and a box that proves which host answered.
     ///
     /// The host reads its own records and asks no service, so the answer does not wait for the
     /// service and privacy mode does not hold it: the record names a generation and the hash of
     /// its manifest and carries no content. A host with no storage service configured answers from
     /// its store as any other does.
     ///
+    /// The box goes from this host's own stored-envelope key to the key the ask carried, and holds
+    /// the challenge the ask carried, the endpoint this host's own identity serves and the answer.
+    /// The endpoint is never a value of the ask: a host that is asked on behalf of another host
+    /// names its own. The box is made after the blocking read has joined.
+    ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] for parameters that are not empty, and
-    /// [`ControllerError::RegistryUnavailable`] when the records cannot be read as a checkpoint:
-    /// a host that could not read them does not say it has published nothing.
+    /// Returns [`ControllerError::InvalidArgument`] for parameters that lack the challenge or the
+    /// reply key or carry another member, [`ControllerError::RegistryUnavailable`] when the records
+    /// cannot be read as a checkpoint (a host that could not read them does not say it has
+    /// published nothing), and [`ControllerError::Storage`] when the box cannot be made.
     pub(super) async fn backup_checkpoint(&self, params: &ParamsValue) -> Result<ParamsValue> {
-        let _: BackupCheckpointParams = parse(params)?;
+        let ask: BackupCheckpointParams = parse(params)?;
         let backup = std::sync::Arc::clone(&self.backup);
         let checkpoint = tokio::task::spawn_blocking(move || backup.latest_published())
             .await
             .map_err(|_| ControllerError::RegistryUnavailable {
                 detail: "the thread that reads the recorded backups did not finish".to_owned(),
             })??;
+        let checkpoint = Nullable(checkpoint);
+        let unsealed = |error: kr_crypto::CryptoError| ControllerError::Storage {
+            operation: "seal the proof of the backup checkpoint",
+            detail: error.to_string(),
+        };
+        let plaintext = SigningTranscript::from_object(
+            HOST_CHECKPOINT_PROOF_DOMAIN,
+            &HostCheckpointProof {
+                challenge: ask.challenge,
+                host_endpoint_id: self.owner_authority().endpoint(),
+                checkpoint: checkpoint.clone(),
+            },
+        )
+        .map_err(unsealed)?;
+        let (nonce, ciphertext) =
+            seal_stored_envelope(&self.stored_envelope, &ask.reply_key, plaintext.as_bytes())
+                .map_err(unsealed)?;
         ParamsValue::from_typed(&BackupCheckpointResult {
-            checkpoint: Nullable(checkpoint),
+            checkpoint,
+            proof: SealedCheckpointProof {
+                nonce,
+                ciphertext: Bytes::new(ciphertext),
+            },
         })
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -296,6 +329,8 @@ impl SetupAdmission for Unchecked {
 mod tests {
     use std::sync::Arc;
 
+    use kr_crypto::keys::StoredEnvelopeKeyPair;
+    use kr_crypto::sign::SigningTranscript;
     use kr_protocol::envelope::{ControlFrame, Outcome, Request, Response};
     use kr_protocol::ids::{ActorId, ConnectionId, RequestId};
     use kr_protocol::method::{Method, MethodVersion};
@@ -305,14 +340,31 @@ mod tests {
     use super::*;
     use crate::authority::AdmittedMutation;
 
-    /// One read of `backup.checkpoint`, as the daemon's read switch is asked for it.
-    fn checkpoint_request() -> Request {
+    /// One ask of `backup.checkpoint`, as a device makes it: a fresh challenge and the public half
+    /// of a fresh key pair, whose secret half opens the box that answers.
+    fn fresh_ask() -> (BackupCheckpointParams, StoredEnvelopeKeyPair) {
+        let reply = StoredEnvelopeKeyPair::generate().expect("a key pair");
+        let ask = BackupCheckpointParams {
+            challenge: kr_transport::random::fresh_nonce().expect("a challenge"),
+            reply_key: *reply.public(),
+        };
+        (ask, reply)
+    }
+
+    /// One read of `backup.checkpoint` with these parameters, as the daemon's read switch is asked
+    /// for it.
+    fn request_with(params: &impl serde::Serialize) -> Request {
         Request {
             request_id: RequestId::new(1),
             method: Method::BackupCheckpoint.into(),
             method_version: MethodVersion::V1,
-            params: ParamsValue::from_typed(&BackupCheckpointParams {}).expect("encodes"),
+            params: ParamsValue::from_typed(params).expect("encodes"),
         }
+    }
+
+    /// One read of `backup.checkpoint` with a complete ask.
+    fn checkpoint_request() -> Request {
+        request_with(&fresh_ask().0)
     }
 
     /// The checkpoint is read under a decision that holds `host.manage`, and by no caller that has
@@ -360,11 +412,113 @@ mod tests {
             _ => None,
         };
         assert_eq!(
-            result,
-            Some(BackupCheckpointResult {
-                checkpoint: Nullable::null()
-            }),
+            result.map(|answered| answered.checkpoint),
+            Some(Nullable::null()),
             "a host with no setup has no checkpoint: {answer:?}"
+        );
+    }
+
+    /// The box of an answer opens, with the secret half of the key the ask carried, under this
+    /// host's own stored-envelope key, and holds the challenge of the ask, the endpoint this
+    /// host's own identity serves and the answer. This daemon has no storage service, and answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_box_of_an_answer_holds_the_challenge_the_hosts_own_endpoint_and_the_answer() {
+        let (_temp, controller) = daemon().await;
+        let caller = ActorId::new("device:test").expect("a principal");
+        let (ask, reply) = fresh_ask();
+        let answer = controller
+            .read_method(&caller, &request_with(&ask), true)
+            .await;
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Ok(value),
+            ..
+        }) = &answer
+        else {
+            panic!("the checkpoint is answered: {answer:?}");
+        };
+        let result: BackupCheckpointResult = value.to_typed().expect("an answer");
+        let opened = kr_crypto::sealed::open_stored_envelope(
+            &reply,
+            controller.stored_envelope.public(),
+            &result.proof.nonce,
+            result.proof.ciphertext.as_slice(),
+        )
+        .expect("the box opens under the host's own key");
+        let expected = SigningTranscript::from_object(
+            HOST_CHECKPOINT_PROOF_DOMAIN,
+            &HostCheckpointProof {
+                challenge: ask.challenge,
+                host_endpoint_id: controller.owner_authority().endpoint(),
+                checkpoint: Nullable::null(),
+            },
+        )
+        .expect("the bytes");
+        assert_eq!(opened.expose(), expected.as_bytes());
+    }
+
+    /// An ask that lacks the challenge or the reply key, one that adds a member (an endpoint, which
+    /// a host takes from its own identity and never from an ask), and one with no members are each
+    /// refused as an invalid argument. The complete ask is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ask_with_a_member_missing_or_added_is_an_invalid_argument() {
+        #[derive(serde::Serialize)]
+        struct NoMembers {}
+        #[derive(serde::Serialize)]
+        struct OnlyTheChallenge {
+            challenge: kr_protocol::scalars::Nonce256,
+        }
+        #[derive(serde::Serialize)]
+        struct WithAnEndpoint {
+            challenge: kr_protocol::scalars::Nonce256,
+            reply_key: kr_protocol::scalars::StoredEnvelopeKey,
+            host_endpoint_id: kr_protocol::scalars::EndpointKey,
+        }
+
+        let (_temp, controller) = daemon().await;
+        let caller = ActorId::new("device:test").expect("a principal");
+        let (ask, _) = fresh_ask();
+        let refused = |answer: &ControlFrame| {
+            matches!(
+                answer,
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Error(error),
+                    ..
+                }) if error.code == kr_protocol::error::ErrorCode::InvalidArgument
+            )
+        };
+        let requests = [
+            ("no members", request_with(&NoMembers {})),
+            (
+                "only the challenge",
+                request_with(&OnlyTheChallenge {
+                    challenge: ask.challenge,
+                }),
+            ),
+            (
+                "an endpoint beside both",
+                request_with(&WithAnEndpoint {
+                    challenge: ask.challenge,
+                    reply_key: ask.reply_key,
+                    host_endpoint_id: kr_protocol::scalars::EndpointKey::from_bytes([9; 32]),
+                }),
+            ),
+        ];
+        for (name, request) in requests {
+            let answer = controller.read_method(&caller, &request, true).await;
+            assert!(refused(&answer), "{name}: {answer:?}");
+        }
+        let answer = controller
+            .read_method(&caller, &request_with(&ask), true)
+            .await;
+        assert!(
+            matches!(
+                &answer,
+                ControlFrame::Response(Response {
+                    outcome: Outcome::Ok(_),
+                    ..
+                })
+            ),
+            "the complete ask is answered: {answer:?}"
         );
     }
 

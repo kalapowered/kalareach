@@ -22,9 +22,12 @@ use std::collections::BTreeSet;
 use backup_seed::SeededBackups;
 use kr_client::session::Session;
 use kr_controller::grants::GrantRecord;
-use kr_crypto::keys::DeviceKeys;
+use kr_crypto::keys::{DeviceKeys, StoredEnvelopeKeyPair};
+use kr_crypto::sealed::open_stored_envelope;
+use kr_crypto::sign::SigningTranscript;
 use kr_protocol::backup_checkpoint::{
-    BackupCheckpointParams, BackupCheckpointResult, HostCheckpoint,
+    BackupCheckpointParams, BackupCheckpointResult, HOST_CHECKPOINT_PROOF_DOMAIN, HostCheckpoint,
+    HostCheckpointProof,
 };
 use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
 use kr_protocol::error::{ErrorCode, ProtocolError};
@@ -32,7 +35,7 @@ use kr_protocol::grant::{Grant, GrantExpiry, SessionSelector};
 use kr_protocol::ids::{DeviceId, GrantId, SessionId, TransferId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::scalars::{EndpointKey, Nonce256, Nullable, U64};
 use kr_protocol::sharing::{GrantListParams, GrantListResult};
 use kr_protocol::transfer::{
     DownloadBeginParams, DownloadBeginResult, DownloadChunkParams, DownloadChunkResult,
@@ -369,15 +372,77 @@ async fn kr_req_10_50_a_device_that_holds_the_screen_and_history_but_not_files_r
     host.stop().await;
 }
 
+/// One ask of `backup.checkpoint`, as a device makes it: a fresh challenge and the public half of
+/// a fresh key pair, whose secret half opens the box that answers.
+struct Ask {
+    params: BackupCheckpointParams,
+    reply: StoredEnvelopeKeyPair,
+}
+
+fn fresh_ask() -> Ask {
+    let reply = StoredEnvelopeKeyPair::generate().expect("a key pair");
+    Ask {
+        params: BackupCheckpointParams {
+            challenge: kr_transport::random::fresh_nonce().expect("a challenge"),
+            reply_key: *reply.public(),
+        },
+        reply,
+    }
+}
+
+/// The bytes a host's box must hold for this challenge, endpoint and answer, which a device
+/// writes from what it knows.
+fn proof_bytes(
+    challenge: Nonce256,
+    endpoint: EndpointKey,
+    checkpoint: &Nullable<HostCheckpoint>,
+) -> Vec<u8> {
+    SigningTranscript::from_object(
+        HOST_CHECKPOINT_PROOF_DOMAIN,
+        &HostCheckpointProof {
+            challenge,
+            host_endpoint_id: endpoint,
+            checkpoint: checkpoint.clone(),
+        },
+    )
+    .expect("the bytes")
+    .as_bytes()
+    .to_vec()
+}
+
+/// What `host` has opened of an answer's box with the secret half of the ask's key, under the key
+/// a paired device's record of the host declares, or why it did not open.
+fn opened(host: &Host, ask: &Ask, answer: &BackupCheckpointResult) -> Result<Vec<u8>, String> {
+    open_stored_envelope(
+        &ask.reply,
+        &host.declared_keys().stored_envelope,
+        &answer.proof.nonce,
+        answer.proof.ciphertext.as_slice(),
+    )
+    .map(|plaintext| plaintext.expose().to_vec())
+    .map_err(|error| format!("{error:?}"))
+}
+
 /// What a device reads of the host's backups with `backup.checkpoint`: the checkpoint the host
-/// answered, or the words of what came back in its place. A case asserts on the whole, so a read
-/// the host does not serve fails the case's own assertion.
-async fn read_checkpoint(session: &Session) -> Result<Nullable<HostCheckpoint>, String> {
-    session
-        .read(Method::BackupCheckpoint, &BackupCheckpointParams {})
+/// answered, only when the host's box proves it, or the words of what came back in its place. A
+/// case asserts on the whole, so a read the host does not serve, or a box that does not hold the
+/// challenge, the host's endpoint and this answer, fails the case's own assertion.
+async fn read_checkpoint(
+    session: &Session,
+    host: &Host,
+) -> Result<Nullable<HostCheckpoint>, String> {
+    let ask = fresh_ask();
+    let answer: BackupCheckpointResult = session
+        .read(Method::BackupCheckpoint, &ask.params)
         .await
-        .map(|answer: BackupCheckpointResult| answer.checkpoint)
-        .map_err(|error| format!("{error:?}"))
+        .map_err(|error| format!("{error:?}"))?;
+    let plaintext = opened(host, &ask, &answer)?;
+    if plaintext != proof_bytes(ask.params.challenge, host.endpoint_id(), &answer.checkpoint) {
+        return Err(
+            "the box does not hold the challenge, the host's endpoint and the answer".into(),
+        );
+    }
+    Ok(answer.checkpoint)
 }
 
 /// An owner device, over a real paired connection, is told the newest generation the host's
@@ -395,26 +460,26 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     let session = connect(&host, &device, &record).await;
 
     assert_eq!(
-        read_checkpoint(&session).await,
+        read_checkpoint(&session, &host).await,
         Ok(Nullable::null()),
         "a host with no setup"
     );
     let service = host.controller().backup();
     let seeded = SeededBackups::set_up(service);
     assert_eq!(
-        read_checkpoint(&session).await,
+        read_checkpoint(&session, &host).await,
         Ok(Nullable::null()),
         "a setup and no generation"
     );
     let first = seeded.publish(service, 1);
     assert_eq!(
-        read_checkpoint(&session).await,
+        read_checkpoint(&session, &host).await,
         Ok(Nullable::some(first)),
         "the first generation the service accepted"
     );
     let second = seeded.publish(service, 2);
     assert_eq!(
-        read_checkpoint(&session).await,
+        read_checkpoint(&session, &host).await,
         Ok(Nullable::some(second)),
         "a newer generation, read from a host already running"
     );
@@ -430,7 +495,7 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     .await;
     let viewing = connect(&host, &viewer, &viewer_record).await;
     let refusal = viewing
-        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &fresh_ask().params)
         .await;
     assert!(
         matches!(
@@ -446,7 +511,7 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
     // door's decision through the registry refuses before the handler is asked.
     let mut local = host.client().await;
     let answered = local
-        .request(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .request(Method::BackupCheckpoint, &fresh_ask().params)
         .await;
     assert!(
         matches!(
@@ -468,7 +533,7 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
         )
         .expect("the row is damaged");
     let damaged = session
-        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .read::<_, BackupCheckpointResult>(Method::BackupCheckpoint, &fresh_ask().params)
         .await;
     assert!(
         matches!(
@@ -477,6 +542,187 @@ async fn an_owner_device_is_told_the_newest_generation_the_host_published_and_no
                 if error.code == ErrorCode::StorageUnavailable
         ),
         "a newest row the host cannot read back is a refusal, never null: {damaged:?}"
+    );
+    session.close();
+    host.stop().await;
+}
+
+/// What the answer of one fresh ask carries, with the ask it answered.
+async fn answered(session: &Session) -> (Ask, BackupCheckpointResult) {
+    let ask = fresh_ask();
+    let answer = session
+        .read(Method::BackupCheckpoint, &ask.params)
+        .await
+        .expect("the host answers");
+    (ask, answer)
+}
+
+/// The answer to `backup.checkpoint` carries a box from the host's own stored-envelope key, which
+/// a paired device's record of the host declares. It opens with the secret half of the key the
+/// ask carried and holds exactly the challenge of that ask, the endpoint the host is dialled at
+/// and the answer beside it: for a host with no generation the answer is null and the box says so,
+/// and for one that has published a generation the box names it. This host has no storage service,
+/// and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_box_of_an_answer_holds_the_challenge_the_hosts_endpoint_and_the_answer() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(&[ActionRight::HostManage])).await;
+    let session = connect(&host, &device, &record).await;
+
+    let (ask, answer) = answered(&session).await;
+    assert_eq!(
+        answer.checkpoint,
+        Nullable::null(),
+        "a host with no generation"
+    );
+    assert_eq!(
+        opened(&host, &ask, &answer),
+        Ok(proof_bytes(
+            ask.params.challenge,
+            host.endpoint_id(),
+            &Nullable::null()
+        )),
+        "the box of a null answer"
+    );
+
+    let service = host.controller().backup();
+    let seeded = SeededBackups::set_up(service);
+    let published = Nullable::some(seeded.publish(service, 1));
+    let (ask, answer) = answered(&session).await;
+    assert_eq!(answer.checkpoint, published, "a host with a generation");
+    assert_eq!(
+        opened(&host, &ask, &answer),
+        Ok(proof_bytes(
+            ask.params.challenge,
+            host.endpoint_id(),
+            &published
+        )),
+        "the box of an answer that names the generation"
+    );
+
+    // The box opens under the declared key and under no other: a stranger's key does not.
+    let stranger = StoredEnvelopeKeyPair::generate().expect("a key pair");
+    let under_another = open_stored_envelope(
+        &ask.reply,
+        stranger.public(),
+        &answer.proof.nonce,
+        answer.proof.ciphertext.as_slice(),
+    );
+    assert!(
+        under_another.is_err(),
+        "the box does not open under another key"
+    );
+    session.close();
+    host.stop().await;
+}
+
+/// Two asks get two boxes: the host seals a new box for each, with a nonce of its own, and each
+/// box holds the challenge of its own ask and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_asks_get_two_boxes_that_each_hold_their_own_challenge() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(&[ActionRight::HostManage])).await;
+    let session = connect(&host, &device, &record).await;
+
+    let (first_ask, first) = answered(&session).await;
+    let (second_ask, second) = answered(&session).await;
+    assert_ne!(first_ask.params.challenge, second_ask.params.challenge);
+    assert_ne!(
+        first.proof.nonce, second.proof.nonce,
+        "a nonce for each box"
+    );
+    assert_ne!(
+        first.proof.ciphertext, second.proof.ciphertext,
+        "a box for each ask"
+    );
+    for (ask, answer) in [(&first_ask, &first), (&second_ask, &second)] {
+        assert_eq!(
+            opened(&host, ask, answer),
+            Ok(proof_bytes(
+                ask.params.challenge,
+                host.endpoint_id(),
+                &Nullable::null()
+            ))
+        );
+    }
+    // A box does not open with the other ask's key.
+    assert!(opened(&host, &second_ask, &first).is_err());
+    session.close();
+    host.stop().await;
+}
+
+/// An ask that lacks the challenge or the reply key, and one that adds a member (an endpoint, which
+/// a host takes from its own identity and never from an ask), are each refused as an invalid
+/// argument over a real connection. The complete ask on the same connection is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ask_without_its_members_or_with_an_endpoint_is_an_invalid_argument() {
+    #[derive(serde::Serialize)]
+    struct NoMembers {}
+    #[derive(serde::Serialize)]
+    struct OnlyTheChallenge {
+        challenge: Nonce256,
+    }
+    #[derive(serde::Serialize)]
+    struct WithAnEndpoint {
+        challenge: Nonce256,
+        reply_key: kr_protocol::scalars::StoredEnvelopeKey,
+        host_endpoint_id: EndpointKey,
+    }
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(&host, &device, &owner, proposal(&[ActionRight::HostManage])).await;
+    let session = connect(&host, &device, &record).await;
+
+    let ask = fresh_ask();
+    let refusals = [
+        (
+            "no members",
+            refused::<_, BackupCheckpointResult>(&session, Method::BackupCheckpoint, &NoMembers {})
+                .await,
+        ),
+        (
+            "only the challenge",
+            refused::<_, BackupCheckpointResult>(
+                &session,
+                Method::BackupCheckpoint,
+                &OnlyTheChallenge {
+                    challenge: ask.params.challenge,
+                },
+            )
+            .await,
+        ),
+        (
+            "an endpoint beside both members",
+            refused::<_, BackupCheckpointResult>(
+                &session,
+                Method::BackupCheckpoint,
+                &WithAnEndpoint {
+                    challenge: ask.params.challenge,
+                    reply_key: ask.params.reply_key,
+                    host_endpoint_id: EndpointKey::from_bytes([9; 32]),
+                },
+            )
+            .await,
+        ),
+    ];
+    for (name, refusal) in refusals {
+        assert_eq!(
+            refusal.code,
+            ErrorCode::InvalidArgument,
+            "{name}: {refusal:?}"
+        );
+    }
+    let (_, answer) = answered(&session).await;
+    assert_eq!(
+        answer.checkpoint,
+        Nullable::null(),
+        "the complete ask is answered"
     );
     session.close();
     host.stop().await;

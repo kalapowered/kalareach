@@ -668,8 +668,9 @@ impl OwnerAuthority {
         }))
     }
 
-    /// Returns the endpoint a challenge names as the host's.
-    fn endpoint(&self) -> EndpointKey {
+    /// Returns the endpoint a challenge names as the host's: the one the host's own identity
+    /// serves, which a proof of this host's key names too.
+    pub(crate) fn endpoint(&self) -> EndpointKey {
         *self
             .host_endpoint_id
             .lock()
