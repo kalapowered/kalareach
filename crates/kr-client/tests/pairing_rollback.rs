@@ -10,18 +10,35 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use kr_client::pairing::checkpoint::{Answer, Held, PairedCheckpoints};
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
-use kr_crypto::keys::DeviceKeys;
+use kr_client::recovery::{
+    FilesRestore, PublicationRefusal, RestoreError, RestoreSource, SourceService, SourceSignIn,
+    fresh_locator,
+};
+use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition, SyncRevision};
+use kr_crypto::backup::GenerationStanding;
+use kr_crypto::kdf::RecoverySeed;
+use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
+use kr_crypto::sign::{SigningTranscript, sign};
+use kr_protocol::archive::{
+    ARCHIVE_DESCRIPTOR_VERSION, ArchiveCheckpoint, ArchiveDescriptor, BACKUP_PUBLICATION_DOMAIN,
+    BackupGenerationPublication, BackupGenerationPublicationPayload, CollectionLocator,
+    EncryptedObjectRef, KeyWrapContext, KeyWrapFormat, KeyWrapPurpose,
+    RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext, SealedKeyWrap, TrustedWriter,
+};
 use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::ids::{
-    ArchiveId, BackupGeneration, DeviceId, DeviceKeyRevision, GrantId, InvitationId,
+    ArchiveId, BackupGeneration, BackupObjectId, DeviceId, DeviceKeyRevision, GrantId, InvitationId,
 };
 use kr_protocol::pairing::{DevicePublicKeys, NetworkConfig, ProposedGrant};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Digest256, EndpointKey, Nullable, Uuid};
+use kr_protocol::scalars::{
+    Bytes, CanonicalSet, Digest256, EndpointKey, KeyId, Nonce192, Nullable, TimestampMs, U64, Uuid,
+};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -427,4 +444,239 @@ fn a_forget_by_the_older_release_leaves_every_entry() {
             "only the hosts that remain are listed"
         );
     }
+}
+
+/// A service that serves one bundle and the one publication it was given, and no object: a restore
+/// that is refused at the generation never asks for one.
+#[derive(Debug)]
+struct Serving {
+    locator: String,
+    bundle: Vec<u8>,
+    publication: BackupGenerationPublication,
+}
+
+impl RestoreSource for Serving {
+    fn service(&self) -> ServiceFuture<'_, SourceService> {
+        Box::pin(async {
+            Ok(SourceService {
+                origin: ORIGIN.to_owned(),
+                managed_origin: ORIGIN.to_owned(),
+                sign_in: SourceSignIn::Usable,
+            })
+        })
+    }
+
+    fn bundle<'a>(&'a self, locator: &'a str) -> ServiceFuture<'a, SyncFetched> {
+        Box::pin(async move {
+            Ok(if locator == self.locator {
+                SyncFetched::Held {
+                    position: SyncPosition::at(
+                        1,
+                        SyncRevision::new(Uuid::from_bytes([0x71; 16])),
+                        None,
+                    ),
+                    ciphertext: self.bundle.clone(),
+                }
+            } else {
+                SyncFetched::Absent { recovery: None }
+            })
+        })
+    }
+
+    fn generation<'a>(
+        &'a self,
+        _archive_id: ArchiveId,
+        _checkpoint: Option<&'a ArchiveCheckpoint>,
+    ) -> ServiceFuture<'a, Option<BackupGenerationPublication>> {
+        Box::pin(async move { Ok(Some(self.publication.clone())) })
+    }
+
+    fn object(
+        &self,
+        _archive_id: ArchiveId,
+        _object: BackupObjectId,
+        _offset: u64,
+        _length: u64,
+    ) -> ServiceFuture<'_, Vec<u8>> {
+        panic!("a restore refused at its generation reads no object")
+    }
+}
+
+const ORIGIN: &str = "https://reach.kala.to";
+
+/// A restore of the archive `the_answer` names, at generation `generation`, from a service that
+/// holds one publication whose manifest key a producer with the key identifier `producer` wrapped,
+/// held to what `held` says.
+async fn restore_from(generation: u64, producer: KeyId, held: &Held) -> Result<(), RestoreError> {
+    let seed = RecoverySeed::generate().expect("a seed");
+    let locator = fresh_locator().expect("a locator");
+    let writer = AuthorisationKeyPair::generate().expect("a writer key");
+    let archive_id = ArchiveId::new(Uuid::from_bytes([0x33; 16]));
+    let manifest = EncryptedObjectRef {
+        object_id: BackupObjectId::new(Uuid::from_bytes([0xf0; 16])),
+        encrypted_object_hash: Digest256::from_bytes([0x45; 32]),
+        encrypted_len: U64::new(400),
+    };
+    let descriptor = ArchiveDescriptor {
+        version: U64::new(ARCHIVE_DESCRIPTOR_VERSION),
+        archive_id,
+        backup_generation: BackupGeneration::new(generation),
+        encrypted_manifest: manifest.clone(),
+        manifest_key_wraps: vec![SealedKeyWrap {
+            context: KeyWrapContext {
+                format: KeyWrapFormat::V1,
+                purpose: KeyWrapPurpose::ManifestKey,
+                archive_id,
+                backup_generation: BackupGeneration::new(generation),
+                object_id: manifest.object_id,
+                encrypted_object_hash: manifest.encrypted_object_hash,
+                sender_key_id: producer,
+                recipient_key_id: KeyId::from_bytes([0x72; 32]),
+            },
+            nonce: Nonce192::from_bytes([0x73; 24]),
+            ciphertext: Bytes::new(vec![0x74; 48]),
+        }],
+    };
+    let payload = BackupGenerationPublicationPayload {
+        descriptor,
+        writer_key_id: writer.key_id(),
+        published_at_ms: TimestampMs::new(5_000),
+    };
+    let signature = sign(
+        &writer,
+        &SigningTranscript::from_canonical_bytes(
+            BACKUP_PUBLICATION_DOMAIN,
+            payload.signing_input().expect("an input"),
+        )
+        .expect("a transcript"),
+    )
+    .expect("a signature");
+    let bundle = RecoveryBundle {
+        schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
+        collections: vec![CollectionLocator {
+            service_origin: ORIGIN.to_owned(),
+            locator: "collection-1".to_owned(),
+            archive_id,
+        }],
+        trusted_writers: [TrustedWriter {
+            writer_key_id: writer.key_id(),
+            signing_key: *writer.public(),
+            enrolled_at_ms: TimestampMs::new(1_000),
+        }]
+        .into_iter()
+        .collect(),
+        trusted_producers: BTreeSet::new().into_iter().collect(),
+        checkpoints: Vec::new().into_iter().collect(),
+        revision: U64::new(3),
+        written_at_ms: TimestampMs::new(2_000),
+        device_settings: None,
+    };
+    let key = seed
+        .bundle_key_for(&RecoveryContext {
+            service_origin: ORIGIN.to_owned(),
+            bundle_locator: locator.clone(),
+        })
+        .expect("a bundle key");
+    let serving = Serving {
+        locator: locator.clone(),
+        bundle: kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle).expect("a bundle"),
+        publication: BackupGenerationPublication {
+            payload: payload.clone(),
+            signature,
+        },
+    };
+    FilesRestore::prepare(
+        seed.to_kit(vec![ORIGIN.to_owned()], locator),
+        Arc::new(serving),
+        None,
+        None,
+        held,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// KR-REQ-20.12: a host forgotten by the older release leaves its entry, and this release, back
+/// again, applies the kept entry to a restore: the older generation of that host's own archive is
+/// refused as held back by it. An entry of another producer holds nothing of the same archive.
+#[tokio::test]
+async fn a_restore_after_the_older_releases_forget_is_still_held_by_the_kept_entry() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let folder = directory.path().join("pairing");
+    let hosts = PairedHosts::open(&folder).expect("a store");
+    let (first, second) = (owner(0x10), owner(0x20));
+    hosts.record(first.clone()).expect("a paired host");
+    hosts.record(second.clone()).expect("a paired host");
+    let checkpoints = hosts.checkpoints();
+    checkpoints
+        .settle_checkpoint(&first, &the_answer(5), 1_000)
+        .expect("the first host's answer");
+    let producer = |host: &PairedHost| {
+        kr_crypto::keys::key_id(
+            kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+            host.host_keys.stored_envelope.as_bytes(),
+        )
+    };
+    let held = |folder: &Path| {
+        PairedCheckpoints::open(folder)
+            .expect("opened")
+            .held_checkpoints()
+    };
+
+    // The entry holds the first host's own archive back while the host is paired.
+    let before = restore_from(3, producer(&first), &held(&folder)).await;
+    assert!(
+        matches!(
+            &before,
+            Err(RestoreError::Publication(PublicationRefusal::Generation(standing, _)))
+                if standing.standing
+                    == GenerationStanding::Replayed { checkpoint: BackupGeneration::new(5) }
+        ),
+        "{before:?}"
+    );
+
+    // The older release forgets that host by rewriting the file of hosts without it.
+    let Ok(frozen) =
+        serde_json::from_slice::<FrozenHostsFile>(&bytes(&folder, "hosts.json").expect("hosts"))
+    else {
+        panic!("the older release reads the file of hosts")
+    };
+    let remaining: Vec<FrozenHost> = frozen
+        .hosts
+        .into_iter()
+        .filter(|host| host.host_device_id != first.host_device_id)
+        .collect();
+    kr_ipc::paths::write_owner_only_file(
+        &folder.join("hosts.json"),
+        &serde_json::to_vec(&FrozenHostsFile {
+            version: 1,
+            hosts: remaining,
+        })
+        .expect("the file of hosts"),
+    )
+    .expect("written by the older release");
+    let Held::Read { listed, .. } = held(&folder) else {
+        panic!("the checkpoints are read again")
+    };
+    assert_eq!(listed.len(), 1, "only the second host is still listed");
+
+    // This release applies the kept entry to a restore: the same refusal, though the host is gone.
+    let after = restore_from(3, producer(&first), &held(&folder)).await;
+    assert!(
+        matches!(
+            &after,
+            Err(RestoreError::Publication(PublicationRefusal::Generation(standing, _)))
+                if standing.standing
+                    == GenerationStanding::Replayed { checkpoint: BackupGeneration::new(5) }
+        ),
+        "{after:?}"
+    );
+
+    // Control: an archive of the host that is still listed has no entry, so nothing holds it back,
+    // and the restore goes on to the wrap, which names no key of this kit.
+    let other = restore_from(3, producer(&second), &held(&folder)).await;
+    assert!(
+        matches!(other, Err(RestoreError::NoWrap)),
+        "an archive of another producer is held by no entry: {other:?}"
+    );
 }

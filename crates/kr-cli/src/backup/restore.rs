@@ -1028,21 +1028,30 @@ fn candidate_line(candidate: &Candidate) -> Shown {
             checkpoint.get()
         ),
         // This command passes no checkpoints of paired hosts (`Held::Absent` of the client's
-        // pairing module), so a checkpoint here is always the recovery bundle's and this arm is not
-        // reached; it is worded for the match to be whole.
+        // pairing module), so a checkpoint here is always the recovery bundle's and the arms for a
+        // host's checkpoint are not reached; they say that this command does not use what a host
+        // reported, for the match to be whole.
         CandidateState::HeldBack {
             held,
             checkpoint,
-            source: CheckpointSource::Pairing,
+            source: CheckpointSource::Pairing(_),
         } => shown!(
-            "  {}: the service holds generation {}, older than generation {} that a host this \
-             device paired with named when this device asked",
+            "  {}: the service holds generation {}, older than generation {} that a host reported \
+             when this device asked, which this command does not use: it restores under the \
+             recovery bundle's own record only",
             id,
             held.get(),
             checkpoint.get()
         ),
-        CandidateState::CheckpointsDisagree { generation } => shown!(
+        CandidateState::CheckpointsDisagree { generation, .. } => shown!(
             "  {}: the checkpoint and the recovery bundle name different manifests for generation {}",
+            id,
+            generation.get()
+        ),
+        CandidateState::HostNamesAnother { generation, .. } => shown!(
+            "  {}: the service offers generation {}, but a host reported another backup as that \
+             generation when this device asked, which this command does not use: it restores \
+             under the recovery bundle's own record only",
             id,
             generation.get()
         ),
@@ -1143,6 +1152,7 @@ mod tests {
             source,
         };
 
+        let host = kr_protocol::scalars::EndpointKey::from_bytes([0x42; 32]);
         assert_eq!(
             line(CandidateState::Nothing),
             "  11111111-1111-1111-1111-111111111111: the service holds nothing as new as the \
@@ -1154,16 +1164,27 @@ mod tests {
              generation 5 that the recovery bundle verified"
         );
         assert_eq!(
-            line(held_back(CheckpointSource::Pairing)),
+            line(held_back(CheckpointSource::Pairing(host))),
             "  11111111-1111-1111-1111-111111111111: the service holds generation 3, older than \
-             generation 5 that a host this device paired with named when this device asked"
+             generation 5 that a host reported when this device asked, which this command does \
+             not use: it restores under the recovery bundle's own record only"
         );
         assert_eq!(
             line(CandidateState::CheckpointsDisagree {
-                generation: BackupGeneration::new(5)
+                generation: BackupGeneration::new(5),
+                host,
             }),
             "  11111111-1111-1111-1111-111111111111: the checkpoint and the recovery bundle name \
              different manifests for generation 5"
+        );
+        assert_eq!(
+            line(CandidateState::HostNamesAnother {
+                generation: BackupGeneration::new(5),
+                host,
+            }),
+            "  11111111-1111-1111-1111-111111111111: the service offers generation 5, but a host \
+             reported another backup as that generation when this device asked, which this \
+             command does not use: it restores under the recovery bundle's own record only"
         );
     }
 }

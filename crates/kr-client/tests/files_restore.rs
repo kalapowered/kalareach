@@ -9,7 +9,7 @@
 //! restore is the one `kr backup restore` calls.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use kr_client::ClientError;
 use kr_client::Shown;
@@ -17,7 +17,7 @@ use kr_client::error::HostWord;
 use kr_client::pairing::checkpoint::{
     Answer, Held, PairedCheckpoint, PairedCheckpoints, SnapshotCause, Unsettled,
 };
-use kr_client::pairing::paired::PairedHost;
+use kr_client::pairing::paired::{PairedHost, PairedHosts};
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OFFLINE_EXPORT_FORMAT, OfflineExport,
@@ -44,7 +44,7 @@ use kr_protocol::archive::{
 use kr_protocol::backup_checkpoint::HostCheckpoint;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
-use kr_protocol::scalars::{Bytes, Digest256, EndpointKey, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Bytes, Digest256, EndpointKey, KeyId, TimestampMs, U64, Uuid};
 use kr_protocol::service::GatewayOrigin;
 
 const ORIGIN: &str = "https://reach.kala.to";
@@ -61,6 +61,13 @@ fn archive() -> ArchiveId {
 /* -------------------------------------------------------------------------- */
 /* What the test seals                                                         */
 /* -------------------------------------------------------------------------- */
+
+/// The producer key every world seals with. It is fixed for the process so that the owner of an
+/// entry can declare it: an entry counts for an archive only when its producer is the archive's.
+fn world_producer() -> &'static StoredEnvelopeKeyPair {
+    static PRODUCER: OnceLock<StoredEnvelopeKeyPair> = OnceLock::new();
+    PRODUCER.get_or_init(|| StoredEnvelopeKeyPair::generate().expect("a producer key"))
+}
 
 /// The owner's side: a seed, the keys of the writer and the producer, and the collection.
 struct World {
@@ -83,7 +90,7 @@ impl World {
             seed: RecoverySeed::generate().expect("a seed"),
             locator: fresh_locator().expect("a locator"),
             writer: AuthorisationKeyPair::generate().expect("a writer key"),
-            producer: StoredEnvelopeKeyPair::generate().expect("a producer key"),
+            producer: world_producer().clone(),
         }
     }
 
@@ -462,6 +469,14 @@ impl Scripted {
             .expect("a bundle")
     }
 
+    /// Every ask for a generation, with the complete checkpoint it was held to, in order.
+    fn generation_asks(&self) -> Vec<String> {
+        self.asked()
+            .into_iter()
+            .filter(|call| call.starts_with("generation "))
+            .collect()
+    }
+
     fn object_reads(&self) -> usize {
         self.asked()
             .iter()
@@ -506,11 +521,14 @@ impl RestoreSource for Scripted {
         self.asked.lock().expect("asked").push(format!(
             "generation {} {}",
             archive_id,
-            if checkpoint.is_some() {
-                "held to a checkpoint"
-            } else {
-                "unheld"
-            }
+            checkpoint.map_or_else(
+                || "unheld".to_owned(),
+                |checkpoint| format!(
+                    "held to generation {} manifest {}",
+                    checkpoint.backup_generation.get(),
+                    hex(&checkpoint.encrypted_manifest_hash)
+                )
+            )
         ));
         Box::pin(async move {
             let held = self
@@ -882,7 +900,7 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         source
             .asked()
             .iter()
-            .any(|call| call.contains("held to a checkpoint"))
+            .any(|call| call.contains("held to generation"))
     );
 
     // A word that names an older generation does not cover the checkpoint's own: the service holds
@@ -941,11 +959,7 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape())));
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("stopped"),
-        RestoreError::NothingAsNewAsTheCheckpoint {
-            checkpoint: 5,
-            checkpoint_source: CheckpointSource::RecoveryBundle,
-            ..
-        }
+        RestoreError::NothingAsNewAsTheCheckpoint { checkpoint: 5, .. }
     ));
     assert_eq!(source.object_reads(), 0);
 
@@ -962,7 +976,6 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         RestoreError::OlderThanTheCheckpoint {
             checkpoint: 5,
             held: 3,
-            checkpoint_source: CheckpointSource::RecoveryBundle,
             ..
         }
     ));
@@ -992,7 +1005,6 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         RestoreError::OlderThanTheCheckpoint {
             checkpoint: 5,
             held: 3,
-            checkpoint_source: CheckpointSource::RecoveryBundle,
             ..
         }
     ));
@@ -2823,14 +2835,12 @@ fn an_unlisted_owner() -> PairedHost {
     use kr_protocol::ids::{DeviceKeyRevision, GrantId};
     use kr_protocol::pairing::{DevicePublicKeys, NetworkConfig, ProposedGrant};
     use kr_protocol::rights::ActionRight;
-    use kr_protocol::scalars::{
-        AuthorisationKey, CanonicalSet, NotificationPreviewKey, Nullable, StoredEnvelopeKey,
-    };
+    use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, NotificationPreviewKey, Nullable};
 
     let keys = DevicePublicKeys {
         transport: EndpointKey::from_bytes([0x42; 32]),
         authorisation: AuthorisationKey::from_bytes([0x43; 32]),
-        stored_envelope: StoredEnvelopeKey::from_bytes([0x44; 32]),
+        stored_envelope: *world_producer().public(),
         notification_preview: NotificationPreviewKey::from_bytes([0x45; 32]),
     };
     PairedHost {
@@ -2861,6 +2871,11 @@ fn an_unlisted_owner() -> PairedHost {
         paired_at_ms: 1_764_000_000_000,
         device_key_revision: DeviceKeyRevision::new(1),
     }
+}
+
+/// The endpoint of the host `an_unlisted_owner` is, which a checkpoint it gave names.
+fn owner_endpoint() -> EndpointKey {
+    an_unlisted_owner().host_endpoint_id
 }
 
 /// The checkpoint a host gave for the world's archive at the world's service, as `sealed` is
@@ -2951,40 +2966,35 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     let Err(error) = restore_held(&world, &source, None, &held).await else {
         panic!("the older generation is refused")
     };
-    assert!(matches!(
-        error,
-        RestoreError::OlderThanTheCheckpoint {
-            checkpoint: 5,
-            held: 3,
-            checkpoint_source: CheckpointSource::Pairing,
-            ..
-        }
-    ));
+    // A host's checkpoint holds an older generation back in one variant, whichever ask found it,
+    // and it names the host by its endpoint.
+    assert!(
+        matches!(
+            &error,
+            RestoreError::Publication(PublicationRefusal::Generation(standing, _))
+                if standing.standing
+                    == GenerationStanding::Replayed { checkpoint: BackupGeneration::new(5) }
+                    && standing.backup_generation.get() == 3
+                    && standing.source == Some(CheckpointSource::Pairing(owner_endpoint()))
+        ),
+        "{error}"
+    );
     assert_eq!(
         error.to_string(),
-        "the service holds generation 3 of that archive, older than generation 5 that a host this \
-         device paired with named when this device asked"
+        "the checkpoint a host this device paired with gave refuses that generation. The service \
+         offered backup generation 3. It is older than generation 5, the newest that a host this \
+         device paired with named when this device asked, so it is not being restored. No \
+         restore can show that the service is not holding a newer backup back."
     );
     assert_eq!(source.object_reads(), 0, "a replay costs no download");
 
-    // The service holds nothing at all.
+    // The service holds nothing at all: the bundle holds no checkpoint, so nothing was asked held
+    // to one and the service holds no generation of the archive.
     let source = Arc::new(Scripted::serving(&world, bundle()));
     let Err(error) = restore_held(&world, &source, None, &held).await else {
         panic!("a service that holds nothing stops the restore")
     };
-    assert!(matches!(
-        error,
-        RestoreError::NothingAsNewAsTheCheckpoint {
-            checkpoint: 5,
-            checkpoint_source: CheckpointSource::Pairing,
-            ..
-        }
-    ));
-    assert_eq!(
-        error.to_string(),
-        "the service holds no generation as new as the one a host this device paired with \
-         named when this device asked, generation 5"
-    );
+    assert!(matches!(error, RestoreError::NoGeneration), "{error}");
 
     // A service that serves what it holds whatever it was asked to hold it to.
     let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&older));
@@ -2994,7 +3004,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     assert!(matches!(
         &error,
         RestoreError::Publication(PublicationRefusal::Generation(standing, _))
-            if standing.source == Some(CheckpointSource::Pairing)
+            if standing.source == Some(CheckpointSource::Pairing(owner_endpoint()))
     ));
     assert!(
         error.to_string().starts_with(
@@ -3010,7 +3020,10 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     };
     let plan = prepared.plan();
     assert_eq!(plan.generation.get(), 5);
-    assert_eq!(plan.standing.source, Some(CheckpointSource::Pairing));
+    assert_eq!(
+        plan.standing.source,
+        Some(CheckpointSource::Pairing(owner_endpoint()))
+    );
     assert!(matches!(
         plan.standing.standing,
         GenerationStanding::AtCheckpoint
@@ -3067,15 +3080,10 @@ async fn the_effective_checkpoint_is_the_higher_of_the_two_and_only_the_bundles_
     let Err(error) = restore_held(&world, &source, None, &held).await else {
         panic!("generation 4 is older than the file's checkpoint")
     };
-    assert!(matches!(
-        error,
-        RestoreError::OlderThanTheCheckpoint {
-            checkpoint: 5,
-            held: 4,
-            checkpoint_source: CheckpointSource::Pairing,
-            ..
-        }
-    ));
+    // The first ask, held to the bundle's 3, is answered with 4, and the refusal follows its
+    // verification: the file's entry holds it back as one variant, whichever ask found it.
+    assert!(replayed_under(&error, 5), "{error}");
+    assert_eq!(source.generation_asks().len(), 1);
 
     // A held entry above the bundle's, a restore of the generation it names, and the record. What
     // the file holds for another archive, or for the same archive at another service, holds nothing
@@ -3165,7 +3173,6 @@ async fn the_effective_checkpoint_is_the_higher_of_the_two_and_only_the_bundles_
             RestoreError::OlderThanTheCheckpoint {
                 checkpoint: 9,
                 held: 7,
-                checkpoint_source: CheckpointSource::RecoveryBundle,
                 ..
             }
         ));
@@ -3184,15 +3191,7 @@ async fn the_effective_checkpoint_is_the_higher_of_the_two_and_only_the_bundles_
         let Err(error) = restore_held(&world, &source, None, &held_with(entries)).await else {
             panic!("generation 4 is older than the highest entry in the file, 5")
         };
-        assert!(matches!(
-            error,
-            RestoreError::OlderThanTheCheckpoint {
-                checkpoint: 5,
-                held: 4,
-                checkpoint_source: CheckpointSource::Pairing,
-                ..
-            }
-        ));
+        assert!(replayed_under(&error, 5), "{error}");
     }
 
     // A checkpoint in the file that equals the bundle's is the bundle's, and one below it holds
@@ -3218,7 +3217,6 @@ async fn the_effective_checkpoint_is_the_higher_of_the_two_and_only_the_bundles_
             RestoreError::OlderThanTheCheckpoint {
                 checkpoint: 5,
                 held: 4,
-                checkpoint_source: CheckpointSource::RecoveryBundle,
                 ..
             }
         ));
@@ -3295,10 +3293,17 @@ async fn a_disagreement_between_the_two_checkpoints_refuses_only_the_generation_
         RestoreError::OlderThanTheCheckpoint {
             checkpoint: 5,
             held: 4,
-            checkpoint_source: CheckpointSource::RecoveryBundle,
             ..
         }
     ));
+}
+
+/// A hash in full, as the scripted source records the checkpoint a request was held to.
+fn hex(hash: &Digest256) -> String {
+    hash.as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The first eight hexadecimal digits of a manifest hash, as a refusal shows them.
@@ -3372,7 +3377,6 @@ async fn two_bundle_checkpoints_for_one_generation_that_name_different_manifests
         RestoreError::OlderThanTheCheckpoint {
             checkpoint: 5,
             held: 4,
-            checkpoint_source: CheckpointSource::RecoveryBundle,
             ..
         }
     ));
@@ -3645,7 +3649,8 @@ async fn an_accepted_older_generation_is_held_to_the_bundles_own_checkpoint_for_
     let Err(error) = restore_held(&world, &serving(&five), None, &held).await else {
         panic!("an older generation that is not named is a replay")
     };
-    assert!(matches!(error, RestoreError::OlderThanTheCheckpoint { .. }));
+    // The host's entry holds it, in the one variant whichever ask found it.
+    assert!(replayed_under(&error, 9), "{error}");
 }
 
 /// KR-REQ-20.12: accepting an older generation reads the effective checkpoint and writes no file;
@@ -3692,7 +3697,7 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
     assert_eq!(prepared.plan().generation.get(), 3);
     assert_eq!(
         prepared.plan().standing.source,
-        Some(CheckpointSource::Pairing)
+        Some(CheckpointSource::Pairing(owner_endpoint()))
     );
     assert!(matches!(
         prepared.plan().standing.standing,
@@ -3719,7 +3724,7 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
         RestoreError::NamedGenerationNotHeld {
             named: 3,
             held: 5,
-            checkpoint_source: CheckpointSource::Pairing,
+            checkpoint_source: CheckpointSource::Pairing(_),
             ..
         }
     ));
@@ -3768,26 +3773,18 @@ async fn an_older_generation_can_be_accepted_past_a_pairing_checkpoint_in_the_li
 #[test]
 fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     let bundle = CheckpointSource::RecoveryBundle;
-    let pairing = CheckpointSource::Pairing;
+    let pairing = CheckpointSource::Pairing(owner_endpoint());
 
+    // A restore asks the service held to the bundle's checkpoint alone, so these two refusals are
+    // the bundle's and name nothing else.
     assert_eq!(
-        RestoreError::nothing_as_new(5, bundle).to_string(),
+        RestoreError::nothing_as_new(5).to_string(),
         "the service holds no generation as new as the bundle's checkpoint, generation 5"
     );
     assert_eq!(
-        RestoreError::nothing_as_new(5, pairing).to_string(),
-        "the service holds no generation as new as the one a host this device paired with \
-         named when this device asked, generation 5"
-    );
-    assert_eq!(
-        RestoreError::older_than_the_checkpoint(3, 5, bundle).to_string(),
+        RestoreError::older_than_the_checkpoint(3, 5).to_string(),
         "the service holds generation 3 of that archive, older than generation 5 that the \
          recovery bundle verified"
-    );
-    assert_eq!(
-        RestoreError::older_than_the_checkpoint(3, 5, pairing).to_string(),
-        "the service holds generation 3 of that archive, older than generation 5 that a host \
-         this device paired with named when this device asked"
     );
     assert_eq!(
         RestoreError::named_generation_not_held(3, 5, bundle).to_string(),
@@ -3843,6 +3840,14 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
          offered backup generation 3. It is older than generation 5, the newest that a host this \
          device paired with named when this device asked, so it is not being restored. No \
          restore can show that the service is not holding a newer backup back."
+    );
+    // The words say whose kind of checkpoint it is and never which host: two hosts read alike, so
+    // that the plan's digest, which covers the words, does not tell them apart.
+    assert_eq!(
+        refusal(pairing),
+        refusal(CheckpointSource::Pairing(EndpointKey::from_bytes(
+            [0x99; 32]
+        )))
     );
 }
 
@@ -3905,7 +3910,7 @@ async fn the_list_says_what_holds_an_archive_back_and_what_the_paired_hosts_say_
     let held = held_with(vec![given_by_a_host(&current)]);
     let listed = list(&world, &source, &held).await;
     assert!(
-        listed[0].newest == held_back(3, 5, CheckpointSource::Pairing),
+        listed[0].newest == held_back(3, 5, CheckpointSource::Pairing(owner_endpoint())),
         "a host's checkpoint holds it back"
     );
     assert_eq!(
@@ -3942,7 +3947,8 @@ async fn the_list_says_what_holds_an_archive_back_and_what_the_paired_hosts_say_
     assert!(
         list(&world, &source, &disagreeing).await[0].newest
             == CandidateState::CheckpointsDisagree {
-                generation: BackupGeneration::new(5)
+                generation: BackupGeneration::new(5),
+                host: owner_endpoint(),
             }
     );
     let source = Arc::new(Scripted::serving(&world, bundle_at_five()).publishing(&newer));
@@ -4015,6 +4021,1115 @@ async fn the_list_says_what_holds_an_archive_back_and_what_the_paired_hosts_say_
             .find(|candidate| candidate.archive_id == archive_id)
             .map(|candidate| candidate.newest.clone())
     };
-    assert!(state(archive()) == Some(held_back(3, 5, CheckpointSource::Pairing)));
+    assert!(state(archive()) == Some(held_back(3, 5, CheckpointSource::Pairing(owner_endpoint()))));
     assert!(matches!(state(second), Some(CandidateState::Nothing)));
+}
+
+/* -------------------------------------------------------------------------- */
+/* A host's checkpoint counts only for the archive that host produces          */
+/* -------------------------------------------------------------------------- */
+
+/// The key id a producer other than the world's has.
+fn another_producer() -> KeyId {
+    StoredEnvelopeKeyPair::generate().expect("a key").key_id()
+}
+
+/// The entry of another host (by `endpoint`) that names `producer`, at `generation`, for the
+/// archive `sealed` is.
+fn entry_of(endpoint: u8, producer: KeyId, generation: u64, sealed: &Sealed) -> PairedCheckpoint {
+    PairedCheckpoint {
+        host_endpoint_id: EndpointKey::from_bytes([endpoint; 32]),
+        producer,
+        backup_generation: BackupGeneration::new(generation),
+        ..given_by_a_host(sealed)
+    }
+}
+
+/// `sealed` with its manifest key wrapped once more by each of `senders`, each for a recipient of
+/// its own, and signed again by the writer: a publication of one archive that names several
+/// producers. The wrap for the recovery recipient stays first and opens as it did.
+fn with_senders(world: &World, sealed: &Sealed, senders: &[KeyId]) -> Sealed {
+    let mut descriptor = sealed.publication.payload.descriptor.clone();
+    let first = descriptor.manifest_key_wraps[0].clone();
+    for (at, sender) in senders.iter().enumerate() {
+        let mut wrap = first.clone();
+        wrap.context.sender_key_id = *sender;
+        wrap.context.recipient_key_id =
+            KeyId::from_bytes([0x71 + u8::try_from(at).expect("few"); 32]);
+        descriptor.manifest_key_wraps.push(wrap);
+    }
+    Sealed {
+        publication: publish(&descriptor, &world.writer),
+        objects: sealed.objects.clone(),
+        manifest_object: sealed.manifest_object,
+    }
+}
+
+/// `sealed` with no manifest key wrap at all, signed again by the writer.
+fn without_wraps(world: &World, sealed: &Sealed) -> Sealed {
+    let mut descriptor = sealed.publication.payload.descriptor.clone();
+    descriptor.manifest_key_wraps.clear();
+    Sealed {
+        publication: publish(&descriptor, &world.writer),
+        objects: sealed.objects.clone(),
+        manifest_object: sealed.manifest_object,
+    }
+}
+
+/// Whether the restore was refused as a replay of a generation older than `checkpoint`.
+fn replayed_under(error: &RestoreError, checkpoint: u64) -> bool {
+    matches!(
+        error,
+        RestoreError::Publication(PublicationRefusal::Generation(standing, _))
+            if standing.standing
+                == GenerationStanding::Replayed {
+                    checkpoint: BackupGeneration::new(checkpoint)
+                }
+    )
+}
+
+/// KR-REQ-20.12: an entry holds the archive of the producer it names and no other. A host
+/// whose entry sits at the highest generation there is holds nothing of this host's archive.
+#[tokio::test]
+async fn an_entry_holds_only_the_archive_of_the_producer_it_names() {
+    let world = World::new();
+    let members = honest_members();
+    let older = world.seal(3, &members);
+    let current = world.seal(5, &members);
+    let newer = world.seal(6, &members);
+    let own = given_by_a_host(&current);
+    let elsewhere = entry_of(0x52, another_producer(), u64::MAX, &current);
+    let bundle = || world.bundle(&Shape::default());
+
+    // This host's own entry holds back its older generation, with no object read, and the one ask
+    // carries the bundle's checkpoint alone: the bundle holds none, so it is unheld.
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&older));
+    let error = restore_held(&world, &source, None, &held_with(vec![own.clone()]))
+        .await
+        .expect_err("the host's own entry holds the older generation back");
+    assert!(replayed_under(&error, 5), "{error}");
+    assert_eq!(source.object_reads(), 0);
+    assert_eq!(
+        source.generation_asks(),
+        vec![format!("generation {} unheld", archive())]
+    );
+
+    // Another host's entry, at the highest generation there is, holds nothing of this archive: the
+    // older generation and the newer one are both offered.
+    for offered in [&older, &newer] {
+        let source = Arc::new(Scripted::serving(&world, bundle()).publishing(offered));
+        let held = held_with(vec![elsewhere.clone()]);
+        let prepared = restore_held(&world, &source, None, &held)
+            .await
+            .expect("an entry of another producer holds nothing");
+        assert!(matches!(
+            prepared.plan().standing.standing,
+            GenerationStanding::NoCheckpoint
+        ));
+        assert_eq!(prepared.plan().pairing, PairingStanding::None);
+    }
+
+    // Control: the same entry with this host's producer holds the newer generation too.
+    let named = PairedCheckpoint {
+        producer: world_producer().key_id(),
+        ..elsewhere.clone()
+    };
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&newer));
+    let error = restore_held(&world, &source, None, &held_with(vec![named]))
+        .await
+        .expect_err("the entry that names this producer holds");
+    assert!(replayed_under(&error, u64::MAX), "{error}");
+
+    // Both entries together: only this host's counts.
+    let source = Arc::new(Scripted::serving(&world, bundle()).publishing(&newer));
+    let prepared = restore_held(&world, &source, None, &held_with(vec![elsewhere, own]))
+        .await
+        .expect("the newer generation is ahead of this host's entry");
+    assert!(matches!(
+        prepared.plan().standing.standing,
+        GenerationStanding::Ahead { checkpoint } if checkpoint.get() == 5
+    ));
+    assert_eq!(
+        prepared.plan().pairing,
+        PairingStanding::Held {
+            generation: BackupGeneration::new(5)
+        }
+    );
+}
+
+/// KR-REQ-20.12: a publication names no producer when it names two, or none, so no entry
+/// counts for it; and listing it is not restoring it.
+#[tokio::test]
+async fn a_publication_that_names_two_producers_or_none_is_held_by_no_entry() {
+    let world = World::new();
+    let members = honest_members();
+    let older = world.seal(3, &members);
+    let own_id = world_producer().key_id();
+    let other_id = another_producer();
+    let two = with_senders(&world, &older, &[other_id]);
+    let three = with_senders(&world, &older, &[other_id, another_producer()]);
+    let none = without_wraps(&world, &older);
+    let entry = |producer: KeyId| entry_of(0x52, producer, 9, &older);
+
+    // Two senders: the entry of either holds nothing, so the older generation restores.
+    for held_by in [own_id, other_id] {
+        let source =
+            Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&two));
+        let held = held_with(vec![entry(held_by)]);
+        let prepared = restore_held(&world, &source, None, &held)
+            .await
+            .expect("two producers are no producer");
+        assert_eq!(prepared.plan().generation.get(), 3);
+        assert_eq!(prepared.plan().pairing, PairingStanding::None);
+    }
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&three));
+    assert!(
+        restore_held(&world, &source, None, &held_with(vec![entry(own_id)]))
+            .await
+            .is_ok(),
+        "three producers are no producer"
+    );
+
+    // No wrap: no producer. The archive is listed at its generation whatever the entry says, and
+    // the restore refuses for want of a wrap and not as a replay.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&none));
+    let held = held_with(vec![entry(own_id)]);
+    assert!(matches!(
+        list(&world, &source, &held).await[0].newest,
+        CandidateState::Newest(_)
+    ));
+    assert!(matches!(
+        restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("no wrap"),
+        RestoreError::NoWrap
+    ));
+
+    // Control: one wrap of this producer lets its entry hold the same generation.
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&older));
+    let error = restore_held(&world, &source, None, &held_with(vec![entry(own_id)]))
+        .await
+        .expect_err("one producer, named by the entry");
+    assert!(replayed_under(&error, 9), "{error}");
+}
+
+/// KR-REQ-20.12: a host that is forgotten keeps its entry, and the entry still holds its
+/// archive: forgetting changes no floor. Through the files, as a restart would read them.
+#[tokio::test]
+async fn a_forgotten_hosts_entry_still_holds_its_archive_back() {
+    let world = World::new();
+    let members = honest_members();
+    let older = world.seal(3, &members);
+    let current = world.seal(5, &members);
+    let directory = tempfile::tempdir().expect("a directory");
+    let folder = directory.path().join("pairing");
+    let hosts = PairedHosts::open(&folder).expect("a store");
+    let owner = an_unlisted_owner();
+    hosts.record(owner.clone()).expect("a paired host");
+    let given = given_by_a_host(&current);
+    let answer = Answer::Checkpoint(HostCheckpoint {
+        service_origin: given.service_origin.clone(),
+        archive_id: given.archive_id,
+        backup_generation: given.backup_generation,
+        encrypted_manifest_hash: given.encrypted_manifest_hash,
+    });
+    hosts
+        .checkpoints()
+        .settle_checkpoint(&owner, &answer, 3_000)
+        .expect("the host's answer");
+    let source =
+        || Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&older));
+
+    let listed = hosts.checkpoints().held_checkpoints();
+    let error = restore_held(&world, &source(), None, &listed)
+        .await
+        .expect_err("a listed host holds");
+    assert!(replayed_under(&error, 5), "{error}");
+
+    hosts.forget(owner.host_device_id).expect("forgotten");
+    let after = PairedCheckpoints::open(&folder)
+        .expect("opened again")
+        .held_checkpoints();
+    let Held::Read {
+        entries, listed, ..
+    } = &after
+    else {
+        panic!("the checkpoints are read")
+    };
+    assert_eq!(entries.len(), 1);
+    assert!(listed.is_empty(), "the host is no longer listed");
+    let error = restore_held(&world, &source(), None, &after)
+        .await
+        .expect_err("a forgotten host's entry holds");
+    assert!(replayed_under(&error, 5), "{error}");
+}
+
+/// KR-REQ-20.12: the service is asked held to the bundle's checkpoint alone, in full, however
+/// high an entry is, and an entry above the bundle's is applied after the publication is verified.
+#[tokio::test]
+async fn the_service_is_asked_held_to_the_bundles_checkpoint_alone() {
+    let world = World::new();
+    let members = honest_members();
+    let current = world.seal(5, &members);
+    let nine = world.seal(9, &members);
+    let at_five = world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&current)),
+        ..Shape::default()
+    });
+    let own_nine = given_by_a_host(&nine);
+    let held = held_with(vec![own_nine.clone()]);
+
+    // The bundle holds 5 and a host's entry holds 9; the service holds 5. The first ask succeeds
+    // and the refusal follows its verification: no second ask, and no ask held to 9.
+    let source = Arc::new(
+        Scripted::serving(&world, at_five.clone())
+            .publishing(&current)
+            .honouring_the_hold(),
+    );
+    let error = restore_held(&world, &source, None, &held)
+        .await
+        .expect_err("held back by the entry");
+    assert!(replayed_under(&error, 9), "{error}");
+    assert_eq!(
+        source.generation_asks(),
+        vec![format!(
+            "generation {} held to generation 5 manifest {}",
+            archive(),
+            hex(&checkpoint_of(&current).encrypted_manifest_hash)
+        )]
+    );
+    assert_eq!(source.object_reads(), 0);
+
+    // The service holds nothing as new as the bundle's checkpoint: the second ask is unheld and
+    // the older generation it names is judged by the entry.
+    let older = world.seal(3, &members);
+    let source = Arc::new(
+        Scripted::serving(&world, at_five)
+            .publishing(&older)
+            .honouring_the_hold(),
+    );
+    let error = restore_held(&world, &source, None, &held)
+        .await
+        .expect_err("held back by the entry");
+    assert!(replayed_under(&error, 9), "{error}");
+    assert_eq!(source.generation_asks().len(), 2);
+    assert!(source.generation_asks()[0].contains("held to generation 5 manifest"));
+    assert!(source.generation_asks()[1].ends_with("unheld"));
+}
+
+/* -------------------------------------------------------------------------- */
+/* The same publication, judged by a restore and by the list                   */
+/* -------------------------------------------------------------------------- */
+
+/// A source as a phrase: the bundle, or the host by the first byte of its endpoint.
+fn who(source: CheckpointSource) -> String {
+    match source {
+        CheckpointSource::RecoveryBundle => "bundle".to_owned(),
+        CheckpointSource::Pairing(host) => format!("host {:02x}", host.as_bytes()[0]),
+    }
+}
+
+/// What a restore says of the publication the service serves, as one phrase. A generation that the
+/// bundle's checkpoint holds back is `OlderThanTheCheckpoint` when it was found by the second ask,
+/// and the same phrase here.
+fn said_of_restore(result: Result<kr_client::recovery::PreparedRestore, RestoreError>) -> String {
+    match result {
+        Ok(prepared) => format!("offered {}", prepared.plan().generation.get()),
+        Err(RestoreError::Publication(PublicationRefusal::Generation(standing, _))) => {
+            let source = who(standing.source.expect("a checkpoint refused it"));
+            match standing.standing {
+                GenerationStanding::Replayed { checkpoint } => {
+                    format!("replayed under {} by {source}", checkpoint.get())
+                }
+                GenerationStanding::Substituted { checkpoint } => {
+                    format!("other manifest at {} by {source}", checkpoint.get())
+                }
+                other => format!("refused: {other:?}"),
+            }
+        }
+        Err(RestoreError::OlderThanTheCheckpoint { checkpoint, .. }) => {
+            format!("replayed under {checkpoint} by bundle")
+        }
+        Err(RestoreError::PairingCheckpointDisagrees {
+            generation, host, ..
+        }) => format!(
+            "disagrees at {generation} with {}",
+            who(CheckpointSource::Pairing(host))
+        ),
+        Err(RestoreError::BundleCheckpointsDisagree { generation, .. }) => {
+            format!("bundle disagrees at {generation}")
+        }
+        Err(RestoreError::NoGeneration | RestoreError::NothingAsNewAsTheCheckpoint { .. }) => {
+            "nothing".to_owned()
+        }
+        Err(other) => format!("{other}"),
+    }
+}
+
+/// What the list says of the same publication, as the same phrase.
+fn said_of_candidate(candidate: &kr_client::recovery::Candidate) -> String {
+    match &candidate.newest {
+        CandidateState::Newest(newest) => format!("offered {}", newest.generation.get()),
+        CandidateState::HeldBack {
+            checkpoint, source, ..
+        } => format!("replayed under {} by {}", checkpoint.get(), who(*source)),
+        CandidateState::HostNamesAnother { generation, host } => format!(
+            "other manifest at {} by {}",
+            generation.get(),
+            who(CheckpointSource::Pairing(*host))
+        ),
+        CandidateState::CheckpointsDisagree { generation, host } => format!(
+            "disagrees at {} with {}",
+            generation.get(),
+            who(CheckpointSource::Pairing(*host))
+        ),
+        CandidateState::BundleCheckpointsDisagree { generation } => {
+            format!("bundle disagrees at {}", generation.get())
+        }
+        CandidateState::Nothing => "nothing".to_owned(),
+        CandidateState::Refused(refusal) => format!("refused: {refusal}"),
+    }
+}
+
+/// One scenario: the checkpoints the bundle records, the entries the computer holds, and what the
+/// service serves. Both routes, a restore and a list, are held to say the same.
+struct Scenario<'a> {
+    bundle: Vec<&'a Sealed>,
+    entries: Vec<PairedCheckpoint>,
+    served: Option<&'a Sealed>,
+    accept: Option<u64>,
+}
+
+impl Scenario<'_> {
+    async fn said(&self, world: &World) -> (String, String) {
+        let checkpoints: Vec<ArchiveCheckpoint> = self
+            .bundle
+            .iter()
+            .map(|sealed| checkpoint_of(sealed))
+            .collect();
+        let shape = Shape {
+            checkpoint: checkpoints.first().cloned(),
+            more_checkpoints: checkpoints.iter().skip(1).cloned().collect(),
+            ..Shape::default()
+        };
+        let mut script = Scripted::serving(world, world.bundle(&shape)).honouring_the_hold();
+        if let Some(served) = self.served {
+            script = script.publishing(served);
+        }
+        let source = Arc::new(script);
+        let held = held_with(self.entries.clone());
+        let restored = said_of_restore(restore_held(world, &source, self.accept, &held).await);
+        let listed = said_of_candidate(&list(world, &source, &held).await[0]);
+        (restored, listed)
+    }
+
+    /// Asserts that both routes say `expected`.
+    async fn says(&self, world: &World, name: &str, expected: &str) {
+        let (restored, listed) = self.said(world).await;
+        assert_eq!(restored, expected, "{name}: a restore");
+        assert_eq!(listed, expected, "{name}: the list");
+    }
+}
+
+/// A scenario with no entry.
+fn alone<'a>(bundle: Vec<&'a Sealed>, served: &'a Sealed) -> Scenario<'a> {
+    Scenario {
+        bundle,
+        entries: Vec::new(),
+        served: Some(served),
+        accept: None,
+    }
+}
+
+/// A scenario with one entry.
+fn held_by<'a>(
+    bundle: Vec<&'a Sealed>,
+    entry: PairedCheckpoint,
+    served: &'a Sealed,
+) -> Scenario<'a> {
+    Scenario {
+        bundle,
+        entries: vec![entry],
+        served: Some(served),
+        accept: None,
+    }
+}
+
+/// KR-REQ-20.12: every row of the rule, through a restore and the list alike. B is the
+/// bundle's checkpoint and E the best entry of the publication's producer. Each absence has its
+/// positive control beside it.
+#[tokio::test]
+async fn each_row_of_the_rule_holds_through_a_restore_and_the_list_alike() {
+    let world = World::new();
+    let members = honest_members();
+    let other_members = [("host/configuration.json", b"{}".to_vec())];
+    let third_members = [("host/configuration.json", b"{\"third\":1}".to_vec())];
+    let three = world.seal(3, &members);
+    let five = world.seal(5, &members);
+    let five_other = world.seal(5, &other_members);
+    let five_third = world.seal(5, &third_members);
+    let six = world.seal(6, &members);
+    let nine = world.seal(9, &members);
+    let own = given_by_a_host;
+    let elsewhere = entry_of(0x52, another_producer(), 9, &five);
+    let (none, with) = (alone, held_by);
+
+    // Row 1: no checkpoint of the bundle, no entry of this producer: no floor. Another producer's
+    // entry is no entry. Control: this producer's entry holds the same generation.
+    none(Vec::new(), &three)
+        .says(&world, "1 none", "offered 3")
+        .await;
+    with(Vec::new(), elsewhere.clone(), &three)
+        .says(&world, "1 another producer's entry", "offered 3")
+        .await;
+    with(Vec::new(), own(&five), &three)
+        .says(&world, "1 control", "replayed under 5 by host 42")
+        .await;
+
+    // Row 2: no bundle checkpoint, an entry E. A generation below E is held back; another
+    // manifest at E's generation is its own state; E's own manifest and a newer generation are offered.
+    let e5 = || own(&five);
+    with(Vec::new(), e5(), &three)
+        .says(&world, "2 below", "replayed under 5 by host 42")
+        .await;
+    with(Vec::new(), e5(), &five_other)
+        .says(&world, "2 other manifest", "other manifest at 5 by host 42")
+        .await;
+    with(Vec::new(), e5(), &five)
+        .says(&world, "2 the same", "offered 5")
+        .await;
+    with(Vec::new(), e5(), &six)
+        .says(&world, "2 above", "offered 6")
+        .await;
+
+    // Row 3: a bundle checkpoint and no entry of this producer: the bundle's rule as it was.
+    none(vec![&five], &three)
+        .says(&world, "3 below", "replayed under 5 by bundle")
+        .await;
+    none(vec![&five], &five)
+        .says(&world, "3 the same", "offered 5")
+        .await;
+    with(vec![&five], elsewhere.clone(), &three)
+        .says(
+            &world,
+            "3 another producer's entry",
+            "replayed under 5 by bundle",
+        )
+        .await;
+
+    // Row 4: E above B: the floor is E, from the host. A split of the bundle's own is dropped.
+    let e9 = || own(&nine);
+    with(vec![&five], e9(), &six)
+        .says(&world, "4 below E", "replayed under 9 by host 42")
+        .await;
+    with(vec![&five], e9(), &three)
+        .says(&world, "4 below B", "replayed under 9 by host 42")
+        .await;
+    with(vec![&five], e9(), &nine)
+        .says(&world, "4 at E", "offered 9")
+        .await;
+    with(vec![&five, &five_other], e9(), &six)
+        .says(&world, "4 with a split", "replayed under 9 by host 42")
+        .await;
+    none(vec![&five, &five_other], &five)
+        .says(&world, "4 the split alone", "bundle disagrees at 5")
+        .await;
+
+    // Row 5: E equals B with the same manifest: the bundle's.
+    with(vec![&five], own(&five), &three)
+        .says(&world, "5 below", "replayed under 5 by bundle")
+        .await;
+    with(vec![&five], own(&five), &five)
+        .says(&world, "5 at", "offered 5")
+        .await;
+
+    // Row 6: E equals B with another manifest: that generation is a disagreement, the others
+    // stand against B; the bundle's own split wins over the host's.
+    for served in [&five, &five_other] {
+        with(vec![&five], own(&five_other), served)
+            .says(&world, "6 at the generation", "disagrees at 5 with host 42")
+            .await;
+    }
+    with(vec![&five], own(&five_other), &six)
+        .says(&world, "6 above", "offered 6")
+        .await;
+    with(vec![&five], own(&five_other), &three)
+        .says(&world, "6 below", "replayed under 5 by bundle")
+        .await;
+    with(vec![&five, &five_other], own(&five_third), &five)
+        .says(
+            &world,
+            "6 the bundle's own split wins",
+            "bundle disagrees at 5",
+        )
+        .await;
+
+    // Row 7: E below B: B, and E is ignored.
+    with(vec![&nine], own(&five), &six)
+        .says(&world, "7 below B", "replayed under 9 by bundle")
+        .await;
+    with(vec![&nine], own(&five), &nine)
+        .says(&world, "7 at B", "offered 9")
+        .await;
+}
+
+/// KR-REQ-20.12: of two entries of one producer at one generation, the smaller manifest hash
+/// holds, and at one hash the smaller endpoint is the holder named, whatever order the entries are
+/// kept in.
+#[tokio::test]
+async fn a_tie_of_two_entries_is_decided_by_the_hash_and_then_the_endpoint_in_either_order() {
+    let world = World::new();
+    let members = honest_members();
+    let one = world.seal(5, &members);
+    let two = world.seal(5, &[("host/configuration.json", b"{}".to_vec())]);
+    let three = world.seal(3, &members);
+    let (small, large) = if checkpoint_of(&one).encrypted_manifest_hash.as_bytes()
+        < checkpoint_of(&two).encrypted_manifest_hash.as_bytes()
+    {
+        (&one, &two)
+    } else {
+        (&two, &one)
+    };
+    let at =
+        |endpoint: u8, sealed: &Sealed| entry_of(endpoint, world_producer().key_id(), 5, sealed);
+
+    // Two manifests, two hosts: the smaller hash holds, and its host is the one named.
+    for entries in [
+        vec![at(0x42, small), at(0x52, large)],
+        vec![at(0x52, large), at(0x42, small)],
+        vec![at(0x52, small), at(0x42, large)],
+        vec![at(0x42, large), at(0x52, small)],
+    ] {
+        let holder = entries
+            .iter()
+            .find(|entry| {
+                entry.encrypted_manifest_hash == checkpoint_of(small).encrypted_manifest_hash
+            })
+            .map(|entry| entry.host_endpoint_id.as_bytes()[0])
+            .expect("the entry of the smaller hash");
+        let scenario = |served| Scenario {
+            bundle: Vec::new(),
+            entries: entries.clone(),
+            served: Some(served),
+            accept: None,
+        };
+        scenario(small)
+            .says(&world, "the smaller hash is offered", "offered 5")
+            .await;
+        scenario(large)
+            .says(
+                &world,
+                "the larger hash is another manifest",
+                &format!("other manifest at 5 by host {holder:02x}"),
+            )
+            .await;
+        scenario(&three)
+            .says(
+                &world,
+                "an older generation is held back",
+                &format!("replayed under 5 by host {holder:02x}"),
+            )
+            .await;
+    }
+
+    // One manifest, two hosts: the smaller endpoint is the holder named.
+    for entries in [
+        vec![at(0x42, small), at(0x52, small)],
+        vec![at(0x52, small), at(0x42, small)],
+    ] {
+        Scenario {
+            bundle: Vec::new(),
+            entries,
+            served: Some(&three),
+            accept: None,
+        }
+        .says(
+            &world,
+            "the smaller endpoint",
+            "replayed under 5 by host 42",
+        )
+        .await;
+    }
+}
+
+/// A publication of `sealed` whose signature does not hold: the payload changed after it was
+/// signed.
+fn badly_signed(sealed: &Sealed) -> Sealed {
+    let mut publication = sealed.publication.clone();
+    publication.payload.published_at_ms = TimestampMs::new(6_000);
+    Sealed {
+        publication,
+        objects: sealed.objects.clone(),
+        manifest_object: sealed.manifest_object,
+    }
+}
+
+/// KR-REQ-20.12: a publication that fails its signature gets no host, whatever an entry
+/// says: it fails as a signature, nothing is held against it, and no host is named.
+#[tokio::test]
+async fn a_bad_signature_with_a_matching_high_entry_fails_as_a_signature_and_names_no_host() {
+    let world = World::new();
+    let members = honest_members();
+    let older = world.seal(3, &members);
+    let nine = world.seal(9, &members);
+    let held = held_with(vec![given_by_a_host(&nine)]);
+    let forged = badly_signed(&older);
+    let source = Arc::new(
+        Scripted::serving(&world, world.bundle(&Shape::default()))
+            .publishing(&forged)
+            .honouring_the_hold(),
+    );
+
+    assert!(matches!(
+        restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("a bad signature"),
+        RestoreError::Publication(PublicationRefusal::BadSignature)
+    ));
+    let listed = list(&world, &source, &held).await;
+    assert!(
+        matches!(
+            listed[0].newest,
+            CandidateState::Refused(PublicationRefusal::BadSignature)
+        ),
+        "the list says the signature failed"
+    );
+    assert_eq!(
+        listed[0].pairing,
+        PairingStanding::None,
+        "an unverified publication names no producer, so no host's entry is named"
+    );
+    assert_eq!(source.object_reads(), 0);
+
+    // Control: the same publication, signed, is held back by the same entry, and its host is named.
+    let source = Arc::new(
+        Scripted::serving(&world, world.bundle(&Shape::default()))
+            .publishing(&older)
+            .honouring_the_hold(),
+    );
+    assert!(replayed_under(
+        &restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("held back"),
+        9
+    ));
+    assert_eq!(
+        list(&world, &source, &held).await[0].pairing,
+        PairingStanding::Held {
+            generation: BackupGeneration::new(9)
+        }
+    );
+}
+
+/// KR-REQ-20.12: a service that holds no publication is nothing, with and without a bundle
+/// checkpoint; only the bundle's checkpoint is named, and no entry is.
+#[tokio::test]
+async fn a_service_that_holds_no_publication_is_nothing_with_and_without_the_bundles_checkpoint() {
+    let world = World::new();
+    let members = honest_members();
+    let five = world.seal(5, &members);
+    let held = held_with(vec![given_by_a_host(&five)]);
+
+    // No checkpoint of the bundle: one ask, unheld, and the restore finds no generation at all.
+    let source = Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())));
+    assert!(matches!(
+        restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("nothing"),
+        RestoreError::NoGeneration
+    ));
+    assert_eq!(
+        source.generation_asks(),
+        vec![format!("generation {} unheld", archive())]
+    );
+    let listed = list(&world, &source, &held).await;
+    assert!(matches!(listed[0].newest, CandidateState::Nothing));
+    assert_eq!(
+        listed[0].pairing,
+        PairingStanding::None,
+        "a service that holds nothing names no producer"
+    );
+
+    // A checkpoint of the bundle: asked held to it, then once more without, and the refusal is the
+    // bundle's.
+    let at_five = || {
+        world.bundle(&Shape {
+            checkpoint: Some(checkpoint_of(&five)),
+            ..Shape::default()
+        })
+    };
+    let source = Arc::new(Scripted::serving(&world, at_five()));
+    assert!(matches!(
+        restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("nothing"),
+        RestoreError::NothingAsNewAsTheCheckpoint { checkpoint: 5 }
+    ));
+    assert_eq!(source.generation_asks().len(), 2);
+    assert!(source.generation_asks()[0].contains("held to generation 5"));
+    assert!(source.generation_asks()[1].ends_with("unheld"));
+    assert!(matches!(
+        list(&world, &source, &held).await[0].newest,
+        CandidateState::Nothing
+    ));
+
+    // Owed, with no publication: still owed.
+    let owed = Held::Read {
+        entries: Vec::new(),
+        owed: 1,
+        listed: Vec::new(),
+    };
+    assert_eq!(
+        list(&world, &source, &owed).await[0].pairing,
+        PairingStanding::Owed
+    );
+}
+
+/// KR-REQ-20.12: the generation a person names to accept is read after the producer is, so
+/// an entry that counts for the archive makes room for it and one that does not leaves none.
+#[tokio::test]
+async fn an_accepted_older_generation_is_judged_after_the_producer_is_read() {
+    let world = World::new();
+    let members = honest_members();
+    let three = world.seal(3, &members);
+    let five = world.seal(5, &members);
+    let two_senders = with_senders(&world, &three, &[another_producer()]);
+    let held = held_with(vec![given_by_a_host(&five)]);
+    let serving = |sealed: &Sealed| {
+        Arc::new(
+            Scripted::serving(&world, world.bundle(&Shape::default()))
+                .publishing(sealed)
+                .honouring_the_hold(),
+        )
+    };
+
+    // One producer, which the entry names: the entry's checkpoint is there to accept past.
+    let prepared = restore_held(&world, &serving(&three), Some(3), &held)
+        .await
+        .expect("the named generation is accepted past the host's checkpoint");
+    assert!(matches!(
+        prepared.plan().standing.standing,
+        GenerationStanding::OlderAccepted { .. }
+    ));
+
+    // Two producers: no producer, so the entry is no checkpoint, and there is none to accept past.
+    let error = restore_held(&world, &serving(&two_senders), Some(3), &held)
+        .await
+        .expect_err("no checkpoint counts for this archive");
+    assert!(
+        matches!(
+            error,
+            RestoreError::NoCheckpointToAcceptPast {
+                pairing_consulted: true,
+                ..
+            }
+        ),
+        "{error}"
+    );
+
+    // A service that holds nothing: the answer is the service's, before any word is weighed.
+    let empty = Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())));
+    assert!(matches!(
+        restore_held(&world, &empty, Some(3), &held)
+            .await
+            .expect_err("nothing"),
+        RestoreError::NoGeneration
+    ));
+}
+
+/* -------------------------------------------------------------------------- */
+/* What the form does not stop                                                 */
+/* -------------------------------------------------------------------------- */
+
+/// KR-REQ-20.12: a host that is wrong about its own archive holds it back for ever and
+/// nothing lowers the entry: a later, lower answer of the same host changes nothing, and the
+/// restore stays refused, while a restore from the bundle's record alone is the way that exists.
+#[tokio::test]
+async fn an_archive_held_back_by_a_host_that_was_wrong_keeps_its_entry_and_no_call_lowers_it() {
+    let world = World::new();
+    let members = honest_members();
+    let five = world.seal(5, &members);
+    let six = world.seal(6, &members);
+    let nine = world.seal(9, &members);
+    let directory = tempfile::tempdir().expect("a directory");
+    let folder = directory.path().join("pairing");
+    let hosts = PairedHosts::open(&folder).expect("a store");
+    let owner = an_unlisted_owner();
+    hosts.record(owner.clone()).expect("a paired host");
+    let answer = |sealed: &Sealed| {
+        let given = given_by_a_host(sealed);
+        Answer::Checkpoint(HostCheckpoint {
+            service_origin: given.service_origin,
+            archive_id: given.archive_id,
+            backup_generation: given.backup_generation,
+            encrypted_manifest_hash: given.encrypted_manifest_hash,
+        })
+    };
+    let serving = |sealed: &Sealed| {
+        Arc::new(
+            Scripted::serving(&world, world.bundle(&Shape::default()))
+                .publishing(sealed)
+                .honouring_the_hold(),
+        )
+    };
+    let checkpoints = hosts.checkpoints();
+    checkpoints
+        .settle_checkpoint(&owner, &answer(&nine), 3_000)
+        .expect("the host names a generation the service never held");
+
+    // The service holds 6: held back by the host's 9.
+    let held = checkpoints.held_checkpoints();
+    let error = restore_held(&world, &serving(&six), None, &held)
+        .await
+        .expect_err("held back");
+    assert!(replayed_under(&error, 9), "{error}");
+
+    // The host later says 5, which is what the service holds: no call lowers the entry.
+    checkpoints
+        .settle_checkpoint(&owner, &answer(&five), 4_000)
+        .expect("a lower answer is taken as no change");
+    let Held::Read { entries, .. } = checkpoints.held_checkpoints() else {
+        panic!("the checkpoints are read")
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].backup_generation.get(), 9);
+    let error = restore_held(
+        &world,
+        &serving(&six),
+        None,
+        &checkpoints.held_checkpoints(),
+    )
+    .await
+    .expect_err("still held back");
+    assert!(replayed_under(&error, 9), "{error}");
+
+    // The way that exists: the same restore held to the bundle's own record alone goes on.
+    let prepared = restore_held(&world, &serving(&six), None, &Held::Absent)
+        .await
+        .expect("a restore under the bundle's own record");
+    assert_eq!(prepared.plan().generation.get(), 6);
+}
+
+/// KR-REQ-20.12: a writer the kit trusts can serve its own signed publication that names
+/// no producer; no entry counts for it, so it is offered above the bundle's checkpoint, and the
+/// restore refuses it for want of a wrap: listing is not restoring.
+#[tokio::test]
+async fn a_trusted_writers_publication_with_no_producer_is_listed_above_the_floor_and_not_restored()
+{
+    let world = World::new();
+    let members = honest_members();
+    let five = world.seal(5, &members);
+    let six = world.seal(6, &members);
+    let bare = without_wraps(&world, &six);
+    let held = held_with(vec![given_by_a_host(&world.seal(9, &members))]);
+    let bundle = world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&five)),
+        ..Shape::default()
+    });
+    let source = Arc::new(
+        Scripted::serving(&world, bundle)
+            .publishing(&bare)
+            .honouring_the_hold(),
+    );
+
+    assert!(matches!(
+        list(&world, &source, &held).await[0].newest,
+        CandidateState::Newest(ref newest) if newest.generation.get() == 6
+    ));
+    assert!(matches!(
+        restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("no wrap"),
+        RestoreError::NoWrap
+    ));
+    assert_eq!(source.object_reads(), 0, "nothing was read");
+}
+
+/// KR-REQ-20.12: an archive whose producer this device holds no entry of is held to the
+/// bundle's floor alone: with no entries at all, with the entries of other hosts, and with no
+/// snapshot, it is offered.
+#[tokio::test]
+async fn an_archive_of_a_producer_no_entry_names_is_offered_under_the_bundles_floor_alone() {
+    let world = World::new();
+    let members = honest_members();
+    let three = world.seal(3, &members);
+    let nine = world.seal(9, &members);
+    let others = [
+        held_with(Vec::new()),
+        held_with(vec![entry_of(0x52, another_producer(), 9, &nine)]),
+        Held::Absent,
+    ];
+    for held in &others {
+        let source =
+            Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&three));
+        let prepared = restore_held(&world, &source, None, held)
+            .await
+            .expect("no entry counts for this producer, so the older generation is offered");
+        assert_eq!(prepared.plan().generation.get(), 3);
+        assert!(matches!(
+            list(&world, &source, held).await[0].newest,
+            CandidateState::Newest(_)
+        ));
+    }
+
+    // A host that is no longer listed still holds its own archive: forgetting changes no floor.
+    let forgotten = Held::Read {
+        entries: vec![given_by_a_host(&nine)],
+        owed: 0,
+        listed: Vec::new(),
+    };
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&three));
+    assert!(replayed_under(
+        &restore_held(&world, &source, None, &forgotten)
+            .await
+            .expect_err("held back"),
+        9
+    ));
+}
+
+/// KR-REQ-20.12: which host holds a generation is data on the state and never in the words or the
+/// digest: two hosts that gave the same checkpoint make the same sentence and the same plan digest.
+#[tokio::test]
+async fn the_host_that_holds_is_data_and_changes_no_word_and_no_digest() {
+    let world = World::new();
+    let members = honest_members();
+    let five = world.seal(5, &members);
+    let six = world.seal(6, &members);
+    let three = world.seal(3, &members);
+    let by = |endpoint: u8| entry_of(endpoint, world_producer().key_id(), 5, &five);
+
+    let mut digests = Vec::new();
+    let mut words = Vec::new();
+    let mut holders = Vec::new();
+    for endpoint in [0x42, 0x52] {
+        let held = held_with(vec![by(endpoint)]);
+        // The plan of a newer generation, ahead of the host's checkpoint.
+        let source =
+            Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&six));
+        let prepared = restore_held(&world, &source, None, &held)
+            .await
+            .expect("ahead of the host's checkpoint");
+        digests.push(
+            prepared
+                .plan()
+                .digest("env", b"/restore/a", "")
+                .expect("a digest"),
+        );
+        words.push(prepared.plan().standing.describe());
+        holders.push(prepared.plan().standing.source);
+        // The refusal of an older generation reads alike for both, and names the host as data.
+        let source =
+            Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&three));
+        let error = restore_held(&world, &source, None, &held)
+            .await
+            .expect_err("held back");
+        words.push(error.to_string());
+        let RestoreError::Publication(PublicationRefusal::Generation(standing, _)) = &error else {
+            panic!("{error}")
+        };
+        holders.push(standing.source);
+    }
+    assert_eq!(
+        digests[0], digests[1],
+        "the plan digest does not name the host"
+    );
+    assert_eq!(
+        words[0], words[2],
+        "the standing reads alike for either host"
+    );
+    assert_eq!(
+        words[1], words[3],
+        "the refusal reads alike for either host"
+    );
+    assert_eq!(
+        holders,
+        vec![
+            Some(CheckpointSource::Pairing(EndpointKey::from_bytes(
+                [0x42; 32]
+            ))),
+            Some(CheckpointSource::Pairing(EndpointKey::from_bytes(
+                [0x42; 32]
+            ))),
+            Some(CheckpointSource::Pairing(EndpointKey::from_bytes(
+                [0x52; 32]
+            ))),
+            Some(CheckpointSource::Pairing(EndpointKey::from_bytes(
+                [0x52; 32]
+            ))),
+        ],
+        "the host is data on the standing and on the refusal"
+    );
+}
+
+/// KR-REQ-20.12: one endpoint that answered under two producers holds one entry for each,
+/// through the store, and a restore of each producer's archive is held by its own entry alone.
+#[tokio::test]
+async fn one_endpoint_under_two_producers_holds_each_archive_by_its_own_entry() {
+    let members = honest_members();
+    let first = World::new();
+    let second = World {
+        producer: StoredEnvelopeKeyPair::generate().expect("a producer key"),
+        ..World::new()
+    };
+    let (first_five, first_three, first_six) = (
+        first.seal(5, &members),
+        first.seal(3, &members),
+        first.seal(6, &members),
+    );
+    let (second_nine, second_three) = (second.seal(9, &members), second.seal(3, &members));
+
+    // The same endpoint, paired twice: the second record declares the second producer's key.
+    let (owner_first, mut owner_second) = (an_unlisted_owner(), an_unlisted_owner());
+    owner_second.host_keys.stored_envelope = *second.producer.public();
+    let answer = |sealed: &Sealed| {
+        let given = given_by_a_host(sealed);
+        Answer::Checkpoint(HostCheckpoint {
+            service_origin: given.service_origin,
+            archive_id: given.archive_id,
+            backup_generation: given.backup_generation,
+            encrypted_manifest_hash: given.encrypted_manifest_hash,
+        })
+    };
+    let directory = tempfile::tempdir().expect("a directory");
+    let checkpoints = PairedCheckpoints::open(directory.path().join("pairing")).expect("a store");
+    checkpoints
+        .settle_checkpoint(&owner_first, &answer(&first_five), 3_000)
+        .expect_err("no list holds the pairing, so it settles none");
+    checkpoints
+        .settle_checkpoint(&owner_second, &answer(&second_nine), 4_000)
+        .expect_err("no list holds the pairing, so it settles none");
+    let held = checkpoints.held_checkpoints();
+    let Held::Read { entries, .. } = &held else {
+        panic!("the checkpoints are read")
+    };
+    assert_eq!(
+        entries.len(),
+        2,
+        "one entry for each producer of the endpoint"
+    );
+
+    let serving = |world: &World, sealed: &Sealed| {
+        Arc::new(
+            Scripted::serving(world, world.bundle(&Shape::default()))
+                .publishing(sealed)
+                .honouring_the_hold(),
+        )
+    };
+    // The first producer's archive is held by its own entry, 5, and not by the second's, 9.
+    let error = restore_held(&first, &serving(&first, &first_three), None, &held)
+        .await
+        .expect_err("held back by the first producer's entry");
+    assert!(replayed_under(&error, 5), "{error}");
+    restore_held(&first, &serving(&first, &first_six), None, &held)
+        .await
+        .expect("generation 6 is ahead of the first producer's entry, whatever the second holds");
+    // The second producer's archive is held by its own entry, 9.
+    let error = restore_held(&second, &serving(&second, &second_three), None, &held)
+        .await
+        .expect_err("held back by the second producer's entry");
+    assert!(replayed_under(&error, 9), "{error}");
 }

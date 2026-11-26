@@ -677,7 +677,7 @@ impl Shown {
     #[must_use]
     pub fn restore_refusal(standing: &kr_crypto::backup::RestoreGeneration) -> Self {
         let whose = match standing.source {
-            Some(kr_crypto::backup::CheckpointSource::Pairing) => {
+            Some(kr_crypto::backup::CheckpointSource::Pairing(_)) => {
                 "the checkpoint a host this device paired with gave refuses that generation."
             }
             _ => "the recovery bundle's checkpoint refuses that generation.",

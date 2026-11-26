@@ -19,7 +19,7 @@ use kr_protocol::archive::{
     ManifestPayload, TrustedWriter,
 };
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
-use kr_protocol::scalars::{Digest256, StoredEnvelopeKey, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Digest256, EndpointKey, StoredEnvelopeKey, TimestampMs, U64, Uuid};
 
 const RECORD_LEN: usize = kr_protocol::archive::SECRETSTREAM_RECORD_LEN;
 
@@ -1464,6 +1464,11 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
     ));
 }
 
+/// The endpoint of the host whose checkpoint a restore is held to, in the cases that name one.
+fn a_host() -> EndpointKey {
+    EndpointKey::from_bytes([0x42; 32])
+}
+
 /// KR-REQ-24.16: the one older generation a person names is still held to the bundle's own checkpoint
 /// for it, though the checkpoint it passes is a higher one: another manifest for it is a
 /// substitution that names the bundle, and the manifest the bundle verified is admitted.
@@ -1481,7 +1486,7 @@ fn a_named_older_generation_is_held_to_the_bundles_checkpoint_for_it() {
     )];
     let naming = GenerationExpectation::AcceptingOlder {
         checkpoint: &higher,
-        source: CheckpointSource::Pairing,
+        source: CheckpointSource::Pairing(a_host()),
         accepted: BackupGeneration::new(5),
         known: &known,
     };
@@ -1509,7 +1514,7 @@ fn a_named_older_generation_is_held_to_the_bundles_checkpoint_for_it() {
     // With nothing known for the generation, the name alone admits it, as before.
     let unknown = GenerationExpectation::AcceptingOlder {
         checkpoint: &higher,
-        source: CheckpointSource::Pairing,
+        source: CheckpointSource::Pairing(a_host()),
         accepted: BackupGeneration::new(5),
         known: &[],
     };
@@ -1775,9 +1780,16 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
     let restoring = "Restoring backup generation";
     let offered = "The service offered backup generation";
     let bundle = CheckpointSource::RecoveryBundle;
-    let pairing = CheckpointSource::Pairing;
+    let pairing = CheckpointSource::Pairing(a_host());
 
     let at = |source| RestoreGeneration::against(&seven.descriptor, held_to(source)).describe();
+    // Which host a checkpoint came from is data and never words: two hosts read alike.
+    assert_eq!(
+        at(pairing),
+        at(CheckpointSource::Pairing(EndpointKey::from_bytes(
+            [0x99; 32]
+        )))
+    );
     assert_eq!(
         at(bundle),
         said(
@@ -1938,7 +1950,10 @@ fn a_restore_records_a_source_exactly_when_it_was_given_a_checkpoint() {
         None,
         "no checkpoint, no source"
     );
-    for source in [CheckpointSource::RecoveryBundle, CheckpointSource::Pairing] {
+    for source in [
+        CheckpointSource::RecoveryBundle,
+        CheckpointSource::Pairing(a_host()),
+    ] {
         for (name, expectation) in [
             (
                 "a checkpoint",

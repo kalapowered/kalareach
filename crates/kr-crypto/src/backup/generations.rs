@@ -12,6 +12,7 @@
 
 use kr_protocol::archive::{ArchiveCheckpoint, ArchiveDescriptor};
 use kr_protocol::ids::{ArchiveId, BackupGeneration};
+use kr_protocol::scalars::EndpointKey;
 
 /// Where the checkpoint a restore compares against came from.
 ///
@@ -21,8 +22,9 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration};
 pub enum CheckpointSource {
     /// The latest generation the owner's recovery bundle verified.
     RecoveryBundle,
-    /// The newest generation a host this device paired with named when this device asked.
-    Pairing,
+    /// The newest generation a host this device paired with named when this device asked, and the
+    /// endpoint of that host.
+    Pairing(EndpointKey),
 }
 
 /// What a restore compares the generation it is offered against.
@@ -231,7 +233,7 @@ impl RestoreGeneration {
     #[must_use]
     pub fn describe(&self) -> String {
         let generation = self.backup_generation.get();
-        let pairing = self.source == Some(CheckpointSource::Pairing);
+        let pairing = matches!(self.source, Some(CheckpointSource::Pairing(_)));
         let standing = match self.standing {
             GenerationStanding::AtCheckpoint if pairing => {
                 "It is the generation a host this device paired with named when this device \

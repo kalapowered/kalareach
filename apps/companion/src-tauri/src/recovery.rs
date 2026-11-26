@@ -43,8 +43,8 @@ use kr_client::Shown;
 use kr_client::pairing::checkpoint::{Held, PairedCheckpoints, SnapshotCause};
 use kr_client::recovery::{
     AccountSource, BundleStore, Candidate, CandidateState, FilesRestore, HostBackups, HostCover,
-    Left, LocalSettings, LostWrite, PublicationRefusal, RecoveryError, RestoreError, RestoreSource,
-    cover_host_archive, fresh_locator, qr_payload, render_kit,
+    Left, LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
+    fresh_locator, qr_payload, render_kit,
 };
 use kr_client::services::account::{
     AccountMark, AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE, SignedInAccount,
@@ -52,7 +52,7 @@ use kr_client::services::account::{
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceFuture, ServiceSigner, managed_response_limits,
 };
-use kr_crypto::backup::{CheckpointSource, GenerationStanding, RestoreGeneration};
+use kr_crypto::backup::CheckpointSource;
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -242,7 +242,7 @@ impl From<CheckpointSource> for CheckpointSourceView {
     fn from(source: CheckpointSource) -> Self {
         match source {
             CheckpointSource::RecoveryBundle => Self::RecoveryBundle,
-            CheckpointSource::Pairing => Self::Pairing,
+            CheckpointSource::Pairing(_) => Self::Pairing,
         }
     }
 }
@@ -1361,15 +1361,8 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
         CandidateState::Nothing => {
             ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
         }
-        CandidateState::Refused(PublicationRefusal::Generation(
-            RestoreGeneration {
-                standing: GenerationStanding::Substituted { checkpoint },
-                source: Some(CheckpointSource::Pairing),
-                ..
-            },
-            _,
-        )) => ArchiveView {
-            checkpoint_generation: Some(checkpoint.get().to_string()),
+        CandidateState::HostNamesAnother { generation, .. } => ArchiveView {
+            checkpoint_generation: Some(generation.get().to_string()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::HostContradicts)
         },
         CandidateState::Refused(_) => {
@@ -1385,7 +1378,7 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
             checkpoint_source: Some(source.into()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
         },
-        CandidateState::CheckpointsDisagree { generation } => ArchiveView {
+        CandidateState::CheckpointsDisagree { generation, .. } => ArchiveView {
             checkpoint_generation: Some(generation.get().to_string()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
         },
@@ -1563,9 +1556,10 @@ pub(crate) fn now() -> TimestampMs {
 
 #[cfg(test)]
 mod tests {
-    use kr_client::recovery::PairingStanding;
+    use kr_client::recovery::{PairingStanding, PublicationRefusal};
+    use kr_crypto::backup::{GenerationStanding, RestoreGeneration};
     use kr_protocol::ids::BackupGeneration;
-    use kr_protocol::scalars::{Digest256, Uuid};
+    use kr_protocol::scalars::{Digest256, EndpointKey, Uuid};
 
     use super::*;
 
@@ -1591,6 +1585,7 @@ mod tests {
 
         let with_a_host = listed(CandidateState::CheckpointsDisagree {
             generation: BackupGeneration::new(8),
+            host: EndpointKey::from_bytes([0x42; 32]),
         });
         assert_eq!(with_a_host.withheld, Some(WithheldView::Disagree));
         assert_eq!(with_a_host.checkpoint_generation.as_deref(), Some("8"));
@@ -1604,13 +1599,14 @@ mod tests {
         let held_back = serde_json::to_value(listed(CandidateState::HeldBack {
             held: BackupGeneration::new(above - 1),
             checkpoint: BackupGeneration::new(above),
-            source: CheckpointSource::Pairing,
+            source: CheckpointSource::Pairing(EndpointKey::from_bytes([0x42; 32])),
         }))
         .expect("the view as the page receives it");
         assert_eq!(held_back["held_generation"], "9007199254740992");
         assert_eq!(held_back["checkpoint_generation"], "9007199254740993");
         let disagreeing = serde_json::to_value(listed(CandidateState::CheckpointsDisagree {
             generation: BackupGeneration::new(above),
+            host: EndpointKey::from_bytes([0x42; 32]),
         }))
         .expect("the view as the page receives it");
         assert_eq!(disagreeing["checkpoint_generation"], "9007199254740993");
@@ -1644,6 +1640,7 @@ mod tests {
             generation: 8,
             paired: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
             bundle: Shown::manifest_digits(&Digest256::from_bytes([0x22; 32])),
+            host: EndpointKey::from_bytes([0x42; 32]),
         });
         assert_eq!(
             said.message,
@@ -1675,7 +1672,11 @@ mod tests {
             )))
             .expect("the view as the page receives it")
         };
-        let by_a_host = refusal(CheckpointSource::Pairing);
+        let by_a_host = serde_json::to_value(listed(CandidateState::HostNamesAnother {
+            generation: BackupGeneration::new(9),
+            host: EndpointKey::from_bytes([0x42; 32]),
+        }))
+        .expect("the view as the page receives it");
         assert_eq!(by_a_host["withheld"], "host_contradicts");
         assert_eq!(by_a_host["checkpoint_generation"], "9");
         assert_eq!(by_a_host["generation"], serde_json::Value::Null);
