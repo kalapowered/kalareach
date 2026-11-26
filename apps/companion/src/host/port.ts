@@ -588,7 +588,16 @@ export interface RecoveryArchive {
   /** When the writer signed that generation, in UTC milliseconds. */
   readonly published_at_ms: number | null
   /** Why no generation is offered, when none is. */
-  readonly withheld: 'nothing' | 'refused' | null
+  readonly withheld: 'nothing' | 'refused' | 'held_back' | 'disagree' | null
+  /** The generation the service holds, when it holds only one older than a checkpoint. */
+  readonly held_generation: number | null
+  /**
+   * The generation of the checkpoint that holds the archive back, or the one that two checkpoints
+   * name differently.
+   */
+  readonly checkpoint_generation: number | null
+  /** Where the checkpoint that holds the archive back came from. */
+  readonly checkpoint_source: 'recovery_bundle' | 'pairing' | null
 }
 
 /** Where an offline copy was written, and what is in it. */

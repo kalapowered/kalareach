@@ -15,7 +15,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
-import type { RecoveryView } from '../src/host/port'
+import type { RecoveryArchive, RecoveryView } from '../src/host/port'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from './purchase-words'
 import { readAloud, shown } from './live-regions'
@@ -437,13 +437,19 @@ describe('recovery', () => {
           archive_id: '0a1b2c3d-0000-4000-8000-000000000001',
           generation: 4,
           published_at_ms: Date.UTC(2026, 9, 12),
-          withheld: null
+          withheld: null,
+          held_generation: null,
+          checkpoint_generation: null,
+          checkpoint_source: null
         },
         {
           archive_id: '0a1b2c3d-0000-4000-8000-000000000002',
           generation: null,
           published_at_ms: null,
-          withheld: 'nothing'
+          withheld: 'nothing',
+          held_generation: null,
+          checkpoint_generation: null,
+          checkpoint_source: null
         }
       ])
     })
@@ -490,6 +496,64 @@ describe('recovery', () => {
     expect(chosen).toContain('kalareach-recovery-bundle.krexport')
     await person.click(within(recovery).getByTestId('recovery-copies-close'))
     expect(within(recovery).queryByTestId('recovery-copies')).toBeNull()
+  })
+
+  it('says why the service holds back an archive, by what holds it back, and offers no copy of it', async () => {
+    const { person, controls, sheet } = await openSheet()
+    const withheld = (suffix: string, fields: Partial<RecoveryArchive>): RecoveryArchive => ({
+      archive_id: `0a1b2c3d-0000-4000-8000-00000000000${suffix}`,
+      generation: null,
+      published_at_ms: null,
+      withheld: 'nothing',
+      held_generation: null,
+      checkpoint_generation: null,
+      checkpoint_source: null,
+      ...fields
+    })
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.setArchives([
+        withheld('1', {
+          withheld: 'held_back',
+          held_generation: 3,
+          checkpoint_generation: 5,
+          checkpoint_source: 'pairing'
+        }),
+        withheld('2', {
+          withheld: 'held_back',
+          held_generation: 4,
+          checkpoint_generation: 6,
+          checkpoint_source: 'recovery_bundle'
+        }),
+        withheld('3', { withheld: 'disagree', checkpoint_generation: 7 }),
+        withheld('4', { withheld: 'refused' }),
+        withheld('5', { withheld: 'nothing' })
+      ])
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+    const copies = await within(recovery).findByTestId('recovery-copies')
+
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: the service holds generation 3, older than generation 5 that a host this device paired with had published when this device asked, so it is not offered.'
+    )
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: the service holds generation 4, older than generation 6 that the recovery bundle verified, so it is not offered.'
+    )
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation 7, so it is not offered.'
+    )
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: what the service holds is not an archive this kit trusts.'
+    )
+    expect(copies).toHaveTextContent('Archive 0a1b2c3d: the service holds no generation of it.')
+    for (const suffix of ['1', '2', '3', '4', '5']) {
+      expect(
+        within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-00000000000${suffix}`),
+        `an archive that is not offered has no copy (${suffix})`
+      ).toBeDisabled()
+    }
   })
 
   it('says that a bundle stays where it was made when another sync service is chosen', async () => {

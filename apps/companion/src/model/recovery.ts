@@ -204,9 +204,24 @@ export function exportFileName(archive: RecoveryArchive | null): string {
 export function describeArchive(archive: RecoveryArchive): string {
   const name = `Archive ${archive.archive_id.slice(0, 8)}`
   if (archive.generation === null || archive.published_at_ms === null) {
-    return archive.withheld === 'refused'
-      ? `${name}: what the service holds is not an archive this kit trusts.`
-      : `${name}: the service holds no generation of it.`
+    if (archive.withheld === 'refused') {
+      return `${name}: what the service holds is not an archive this kit trusts.`
+    }
+    if (
+      archive.withheld === 'held_back' &&
+      archive.held_generation !== null &&
+      archive.checkpoint_generation !== null
+    ) {
+      const checkpoint =
+        archive.checkpoint_source === 'pairing'
+          ? 'a host this device paired with had published when this device asked'
+          : 'the recovery bundle verified'
+      return `${name}: the service holds generation ${archive.held_generation}, older than generation ${archive.checkpoint_generation} that ${checkpoint}, so it is not offered.`
+    }
+    if (archive.withheld === 'disagree' && archive.checkpoint_generation !== null) {
+      return `${name}: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
+    }
+    return `${name}: the service holds no generation of it.`
   }
   const day = new Date(archive.published_at_ms).toISOString().slice(0, 10)
   return `${name}, generation ${archive.generation}, backed up ${day}.`
