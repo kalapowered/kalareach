@@ -1496,10 +1496,11 @@ jobs:
       # What a package's launch probe reads of its application's mode. The declared diagnostic is run
       # in the launch's own directory with no input and no shell, a nonzero exit is not a failure, and
       # one that prints too much, never finishes or cannot start records no mode and is ended with
-      # everything it started.
+      # everything it started. The cases print how long each stand-in took to start what it starts, and
+      # how many variables the probe was given, so that the log shows them for a case that passes.
       - name: Test what a launch reads of its application's mode
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p kr-worker --test launch_probe
+        run: cargo test --locked -p kr-worker --test launch_probe -- --nocapture
 
       # The backends an integrated invocation is given before it runs, on this platform: a launch's
       # endpoint and credential exist before the answer, a bypass creates nothing, and each session
