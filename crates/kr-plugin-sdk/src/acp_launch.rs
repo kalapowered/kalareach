@@ -461,13 +461,6 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
                  start files it runs, and no ACP launch sets it"
             ));
         }
-        if let Some(part) = SET_ONLY_PARTS.iter().find(|part| upper.contains(**part)) {
-            return Some(format!(
-                "has {part} in its name, in upper or lower case; a variable named so tells many \
-                 tools where to send their network traffic, and no ACP launch sets one; a launch \
-                 may pass the name, which keeps the person's own value"
-            ));
-        }
     }
     if let Some(listed) = LOADER_NAMES.iter().find(|listed| **listed == upper) {
         return Some(format!(
@@ -475,16 +468,30 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
              library reads or runs, and no ACP launch passes or sets it"
         ));
     }
-    LOADER_BEGINNINGS
+    if let Some(word) = LOADER_BEGINNINGS
         .iter()
         .find(|word| upper.starts_with(**word))
-        .map(|word| {
-            format!(
-                "begins with {word}; a name that begins so can decide what code or command a \
-                 loader, a runtime or a library loads or runs, or which certificates or proxy a \
-                 tool uses, and no ACP launch passes or sets this name"
-            )
-        })
+    {
+        return Some(format!(
+            "begins with {word}; a name that begins so can decide what code or command a \
+             loader, a runtime or a library loads or runs, or which certificates or proxy a \
+             tool uses, and no ACP launch passes or sets this name"
+        ));
+    }
+    // Last, so that the sentence below is told only of a name a launch may pass.
+    if role == Role::Set {
+        return SET_ONLY_PARTS
+            .iter()
+            .find(|part| upper.contains(**part))
+            .map(|part| {
+                format!(
+                    "has {part} in its name, in upper or lower case; a variable named so tells \
+                     many tools where to send their network traffic, and no ACP launch sets one; \
+                     a launch may pass the name, which keeps the person's own value"
+                )
+            });
+    }
+    None
 }
 
 /// Returns why a constant's value is not one a declaration may set, where it is not: a value is

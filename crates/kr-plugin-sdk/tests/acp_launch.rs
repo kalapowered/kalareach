@@ -1479,11 +1479,7 @@ fn kr_req_11_26_a_name_that_only_begins_like_a_node_data_name_is_refused() {
             "a passed {name} is refused: {findings:?}"
         );
         let findings = findings_of(&with_constant(name, "x"));
-        let reason = if name.contains("PROXY") {
-            format!("constant: the name \"{name}\" {PROXY_REASON}")
-        } else {
-            format!("constant: the name \"{name}\" {said}")
-        };
+        let reason = format!("constant: the name \"{name}\" {said}");
         assert!(
             has(&findings, FindingCode::AcpLaunchInvalid, &reason),
             "a constant {name} is refused: {findings:?}"
@@ -1544,19 +1540,43 @@ const PROXY_NAMES: [&str; 14] = [
 
 /// KR-REQ-11.26: a constant whose name has `PROXY` in it, in upper, lower or mixed case, anywhere in
 /// the name, is refused in a sentence of its own: a proxy's host can be written as one word or as a
-/// number, which the value rule admits, so the name closes the route. A name of a loader family
-/// that has it is told this sentence too.
+/// number, which the value rule admits, so the name closes the route.
 #[test]
 fn kr_req_11_26_a_constant_with_proxy_in_its_name_is_refused() {
-    for name in PROXY_NAMES
-        .into_iter()
-        .chain(["GIT_PROXY_COMMAND", "NPM_CONFIG_PROXY"])
-    {
+    for name in PROXY_NAMES {
         let findings = findings_of(&with_constant(name, "x"));
         let reason = format!("constant: the name \"{name}\" {PROXY_REASON}");
         assert!(
             has(&findings, FindingCode::AcpLaunchInvalid, &reason),
             "a constant {name} is refused in its own sentence: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a name that has `PROXY` in it and also begins with a word of the floor is refused
+/// whole, passed and as a constant, and is told the reason for its beginning: the sentence of the
+/// proxy rule says a launch may pass the name, and this one it may not.
+#[test]
+fn kr_req_11_26_a_name_with_proxy_in_it_that_begins_like_a_loader_name_is_told_its_beginning() {
+    for (name, word) in [
+        ("GIT_PROXY_COMMAND", "GIT"),
+        ("NPM_CONFIG_PROXY", "NPM"),
+        ("LD_PROXY", "LD"),
+    ] {
+        let said = format!("begins with {word}{BEGINNING_REASON}");
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = format!("constant: the name \"{name}\" {said}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is told its beginning: {findings:?}"
+        );
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names {said}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a passed {name} is told its beginning: {findings:?}"
         );
     }
 }
@@ -1703,7 +1723,7 @@ fn kr_req_11_26_the_guide_holds_the_lists_of_the_contract() {
     let constants = guide_bullet("- `constants` are");
     let refused = constants
         .split_once("The name of a constant is refused when it is ")
-        .and_then(|(_, rest)| rest.split_once(". A declaration may pass every one"))
+        .and_then(|(_, rest)| rest.split_once(". A declaration may pass these names"))
         .expect("the constants' sentence lists what a constant's name may not be")
         .0;
     let mut stated = contract_list("copied_names");
@@ -1727,6 +1747,7 @@ fn kr_req_11_26_the_guide_states_the_value_alphabet_and_the_proxy_rule() {
         "`.`, `-`, `/`, `:`, the space, `=`, `$`, `;`, `|` and a letter outside ASCII",
         "when it has `PROXY` in it in upper or lower case",
         "a passed name keeps the person's own value",
+        "`GIT_PROXY_COMMAND` has `PROXY` in it and begins with `GIT`",
     ] {
         assert!(
             constants.contains(said),
