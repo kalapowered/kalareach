@@ -70,3 +70,29 @@ fn data_that_is_cut_short_or_lies_about_its_lengths_is_not_read_past_its_end() {
     assert!(!is_volume_mount(&odd));
     assert!(!is_volume_mount(&[]));
 }
+
+/// The reparse data of a mount point whose path buffer begins with `lead`: the target's name starts
+/// after those bytes, and the offset field says where.
+fn mount_point_after(lead: &str, target: &str) -> Vec<u8> {
+    let lead: Vec<u8> = lead.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let by = u16::try_from(lead.len()).unwrap();
+    let mut data = mount_point(target, target);
+    // The path buffer starts after the eight bytes of the data's header and the eight of the four fields.
+    data.splice(16..16, lead);
+    // The data's length, the target's offset and the print name's offset each grow by the lead.
+    for at in [4, 8, 12] {
+        let field = u16::from_le_bytes([data[at], data[at + 1]]) + by;
+        data[at..at + 2].copy_from_slice(&field.to_le_bytes());
+    }
+    data
+}
+
+#[test]
+fn a_target_that_starts_after_other_bytes_is_read_at_the_offset_the_data_gives() {
+    // A volume's name that sits after other characters is found: only a reader that goes to the
+    // offset sees it.
+    assert!(is_volume_mount(&mount_point_after(r"X:\", VOLUME)));
+    // A folder's name that sits after a volume's name is a junction: the first bytes of the path
+    // buffer are not the target.
+    assert!(!is_volume_mount(&mount_point_after(VOLUME, r"\??\C:\real")));
+}
