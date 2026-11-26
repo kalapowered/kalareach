@@ -24,7 +24,9 @@ use kr_protocol::projection::{AgentInstanceEvent, AgentInstanceSummary};
 use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::Broker;
-use kr_worker::broker::adoption::{ADOPTED_REFUSAL, Adoptions, Foreground};
+use kr_worker::broker::adoption::{
+    ADOPTED_REFUSAL, Adoptions, Foreground, arguments_of, parse_kern_procargs2,
+};
 use kr_worker::broker::binder::Recognition;
 use kr_worker::broker::catalogue::{Admissions, testing};
 use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources, fixture};
@@ -52,6 +54,141 @@ fn the_stand_in_program() {
                 .expect("says it is running");
         }
         std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
+    }
+}
+
+/// The variable that gives a placed copy of this binary, run as the exec helper, its hops: one line
+/// for each, of the file to wait for, the program to execute, what that program is and the tag it is
+/// given, separated by tabs. The helper waits for the first line's file to exist, executes that
+/// program and hands the lines after it on to it.
+const HOPS: &str = "KR_ADOPTION_HOPS";
+
+/// The variable that makes the exec helper execute from a thread other than its main one.
+const HOP_FROM_A_THREAD: &str = "KR_ADOPTION_HOP_FROM_A_THREAD";
+
+/// The variable that names a folder the exec helper writes a file named by its own tag to, once it
+/// is running.
+const HOP_MARKS: &str = "KR_ADOPTION_HOP_MARKS";
+
+/// The exec helper program's body. Run by the test harness with nothing set, it does nothing.
+///
+/// Each hop executes another program with this process's identifier, which is what a program that
+/// replaces itself does: `helper` starts this body again, `stand-in` starts the stand-in program
+/// and `sleep` starts the system's own `sleep`.
+#[test]
+fn the_exec_helper_program() {
+    let Ok(hops) = std::env::var(HOPS) else {
+        return;
+    };
+    let own_tag = std::env::args().next_back().expect("a tag");
+    if let Some(marks) = std::env::var_os(HOP_MARKS) {
+        std::fs::write(Path::new(&marks).join(own_tag), b"").expect("says it is running");
+    }
+    let (this, later) = hops.split_once('\n').unwrap_or((hops.as_str(), ""));
+    let fields: Vec<&str> = this.split('\t').collect();
+    let [go, target, kind, tag] = fields[..] else {
+        panic!("a hop names a file, a program, what it is and a tag: {this:?}");
+    };
+    let began = std::time::Instant::now();
+    while !Path::new(go).exists() {
+        assert!(began.elapsed() < LIVENESS, "{go} was never written");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut command = Command::new(target);
+    match kind {
+        "helper" => command.args([
+            "--exact",
+            "the_exec_helper_program",
+            "--test-threads",
+            "1",
+            tag,
+        ]),
+        "stand-in" => command.args([
+            "--exact",
+            "the_stand_in_program",
+            "--test-threads",
+            "1",
+            tag,
+        ]),
+        "sleep" => command.arg0("sleep").arg("60"),
+        other => panic!("a hop is to a helper, a stand-in or a sleep, not to {other}"),
+    };
+    command.env(HOPS, later);
+    let target = target.to_owned();
+    let mut execute = move || {
+        let error = command.exec();
+        panic!("the helper could not execute {target}: {error}");
+    };
+    if std::env::var_os(HOP_FROM_A_THREAD).is_some() {
+        std::thread::spawn(execute);
+        std::thread::sleep(Duration::from_secs(60));
+    } else {
+        execute();
+    }
+}
+
+/// The program that rewrites its own argument area, as a program that sets its own process title
+/// does, and then runs as the stand-in does.
+#[test]
+fn the_retitling_program() {
+    let Ok(seconds) = std::env::var(STAND_IN) else {
+        return;
+    };
+    retitle(b"retitled");
+    if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
+        std::fs::write(running, b"").expect("says it is running");
+    }
+    std::thread::sleep(Duration::from_secs(seconds.parse().unwrap_or(60)));
+}
+
+/// Overwrites this process's whole argument area with `title` and then zeros.
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "a program that sets its own process title writes into the memory the kernel reads \
+              the arguments from, and no safe form of that write exists; the area is this \
+              process's own and its bounds are read from the kernel"
+)]
+fn retitle(title: &[u8]) {
+    let status = std::fs::read_to_string("/proc/self/stat").expect("this process's status");
+    let fields: Vec<&str> = status[status.rfind(')').expect("a command name") + 1..]
+        .split_whitespace()
+        .collect();
+    // The line's 48th and 49th fields, with the first two before the command name's end and the
+    // third at the start of this list.
+    let start: usize = fields[45].parse().expect("where the arguments start");
+    let end: usize = fields[46].parse().expect("where the arguments end");
+    // SAFETY: the kernel names the bounds of this process's own argument area, which is writable
+    // memory of this process, and nothing else uses it once the harness has read its arguments.
+    let area = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, end - start) };
+    area.fill(0);
+    area[..title.len()].copy_from_slice(title);
+}
+
+/// Overwrites this process's whole argument area with `title` and then zeros.
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "a program that sets its own process title writes into the memory the kernel reads \
+              the arguments from, and no safe form of that write exists; the area is this \
+              process's own and its bounds are the argument vector's"
+)]
+fn retitle(title: &[u8]) {
+    // SAFETY: the vector the system hands every process points into one writable area of this
+    // process's own, from the first argument to the end of the last, and nothing else uses it once
+    // the harness has read its arguments.
+    unsafe {
+        let count = usize::try_from(*libc::_NSGetArgc()).expect("an argument count");
+        let vector = *libc::_NSGetArgv();
+        let start = (*vector).cast::<u8>();
+        let last = *vector.add(count - 1);
+        let end = last.add(libc::strlen(last) + 1).cast::<u8>();
+        let area = std::slice::from_raw_parts_mut(
+            start,
+            usize::try_from(end.offset_from(start)).expect("a length"),
+        );
+        area.fill(0);
+        area[..title.len()].copy_from_slice(title);
     }
 }
 
@@ -175,6 +312,87 @@ impl Setup {
         self.spawn_in_a_group(command)
     }
 
+    /// Places another copy of the test program as `claude` in a folder of its own beside the first
+    /// one's, and returns its path: another image, recognised as the first is.
+    fn another_program(&self, folder: &str) -> PathBuf {
+        let directory = self.host.root().join(folder);
+        std::fs::create_dir_all(&directory).expect("a folder for the program");
+        let program = directory.join(fixture::COMMAND);
+        kr_ipc::testing::place_program(
+            &std::env::current_exe().expect("this test's own binary"),
+            &program,
+        );
+        program
+    }
+
+    /// Where the stand-in says it is running, once it runs.
+    fn running(&self) -> PathBuf {
+        self.host.root().join("running")
+    }
+
+    /// Starts the placed program as the exec helper, with `hops`: it executes each in turn, once
+    /// the file the hop names exists, and the last of them starts the stand-in. A thread other than
+    /// its main one executes the first when `from_a_thread` is set.
+    fn start_hopping(&self, hops: &[Hop<'_>], from_a_thread: bool) -> Started {
+        let lines: Vec<String> = hops
+            .iter()
+            .map(|hop| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    hop.go.display(),
+                    hop.target.display(),
+                    hop.kind,
+                    hop.tag
+                )
+            })
+            .collect();
+        let marks = self.marks();
+        std::fs::create_dir_all(&marks).expect("a folder for the marks");
+        let mut command = Command::new(&self.program);
+        command
+            .args(hop_arguments("the_exec_helper_program", "hop-a"))
+            .env(HOPS, lines.join("\n"))
+            .env(HOP_MARKS, &marks)
+            .env(STAND_IN, "60")
+            .env(STAND_IN_RUNNING, self.running())
+            .current_dir(self.host.root());
+        if from_a_thread {
+            command.env(HOP_FROM_A_THREAD, "1");
+        }
+        self.spawn_in_a_group(command)
+    }
+
+    /// Where the exec helper marks that it runs under a tag.
+    fn marks(&self) -> PathBuf {
+        self.host.root().join("marks")
+    }
+
+    /// Lets the exec helper go on to its next hop, and waits until the stand-in it ends in runs.
+    fn hop_to_the_stand_in(&self, go: &Path) {
+        std::fs::write(go, b"").expect("lets the helper execute");
+        until("the stand-in runs", || self.running().exists());
+    }
+
+    /// Looks at `foreground`, and at each stop the look reaches, in turn, runs the action given
+    /// with it before letting the look go on. Returns what the look adopted.
+    fn look_with_stops(
+        &self,
+        foreground: &Foreground,
+        stops: Vec<(Stop, Box<dyn FnOnce() + '_>)>,
+    ) -> Vec<AgentInstanceSummary> {
+        std::thread::scope(|scope| {
+            let looking = scope.spawn(|| self.adoptions.look(foreground));
+            for ((arrived, release), during) in stops {
+                arrived
+                    .recv_timeout(LIVENESS)
+                    .expect("the look reaches the stop");
+                during();
+                release.send(()).expect("the look is let go");
+            }
+            looking.join().expect("the look ends")
+        })
+    }
+
     fn spawn_in_a_group(&self, mut command: Command) -> Started {
         let child = command
             .process_group(0)
@@ -226,6 +444,103 @@ impl Started {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The two ends of one armed pause, as the adoptions hand them out.
+type Stop = (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>);
+
+/// A stop with the action to run while the look waits at it.
+fn at<'a>(stop: Stop, action: impl FnOnce() + 'a) -> (Stop, Box<dyn FnOnce() + 'a>) {
+    (stop, Box::new(action))
+}
+
+/// One hop of the exec helper.
+struct Hop<'a> {
+    /// The file the helper waits for.
+    go: &'a Path,
+    /// The program it executes.
+    target: &'a Path,
+    /// What that program is: `helper`, `stand-in` or `sleep`.
+    kind: &'a str,
+    /// The tag it is given as its last argument.
+    tag: &'a str,
+}
+
+impl<'a> Hop<'a> {
+    fn new(go: &'a Path, target: &'a Path, kind: &'a str, tag: &'a str) -> Self {
+        Self {
+            go,
+            target,
+            kind,
+            tag,
+        }
+    }
+}
+
+/// The arguments the exec helper and the stand-in are started with, for the test `body`.
+fn hop_arguments(body: &str, tag: &str) -> Vec<String> {
+    ["--exact", body, "--test-threads", "1", tag]
+        .map(str::to_owned)
+        .to_vec()
+}
+
+/// Waits until `condition` holds, for as long as [`LIVENESS`].
+fn until(what: &str, mut condition: impl FnMut() -> bool) {
+    let began = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            began.elapsed() < LIVENESS,
+            "{what} did not happen within {LIVENESS:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// The path the kernel reports for `path`: the file it names, as a program running it is read.
+fn canonical(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .expect("a file that exists")
+        .display()
+        .to_string()
+}
+
+/// The digest of the file at `path`.
+fn digest_of(path: &Path) -> Digest256 {
+    use sha2::Digest as _;
+    Digest256::from_bytes(sha2::Sha256::digest(std::fs::read(path).expect("a file")).into())
+}
+
+/// Whether the program the process `pid` runs is no longer the one at `from`, and the process has
+/// its arguments: the system has finished starting the program it executed.
+fn taken_over(pid: u32, from: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|image| image != Path::new(from))
+            && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|read| !read.is_empty())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        libproc::proc_pid::pidpath(i32::try_from(pid).expect("a process identifier"))
+            .is_ok_and(|image| image != from)
+    }
+}
+
+/// Puts another file in the place of the program at `program`, as a package manager upgrading it
+/// does: a copy of the test program with one byte added, so its digest differs, renamed over it.
+fn replace_with_other_bytes(program: &Path) {
+    use std::io::Write as _;
+    let beside = program.with_file_name("replacement");
+    kr_ipc::testing::place_program(
+        &std::env::current_exe().expect("this test's own binary"),
+        &beside,
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&beside)
+        .expect("the replacement opens")
+        .write_all(&[0])
+        .expect("a byte is added");
+    std::fs::rename(&beside, program).expect("the replacement takes the program's place");
 }
 
 /// KR-REQ-12.07: a program the root shell ran that the integration did not launch is recorded as
@@ -1815,4 +2130,615 @@ async fn kr_req_12_07_a_command_the_integration_reports_starting_asks_the_watch_
         .expect("the watch ends with the session's adoptions")
         .expect("joined");
     typing.close().await;
+}
+
+/// KR-REQ-12.07: a program that executes another between the reading of its image and the reading
+/// of its arguments is not adopted from that pair. Nothing is adopted on that look, and the next
+/// look adopts the program it finds, by its own image and its own arguments.
+#[test]
+fn kr_req_12_07_an_exec_between_the_image_and_the_arguments_is_refused() {
+    let setup = Setup::new();
+    let other = setup.another_program("other");
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(&[Hop::new(&go, &other, "stand-in", "hop-b")], false);
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program that changed between its image and its arguments is not adopted: {told:?}"
+    );
+
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    let instance = told[0].application_instance_id;
+    let profile = setup.broker.profile_of(instance).expect("its profile");
+    assert_eq!(
+        profile.binary.resolved_path,
+        canonical(&other),
+        "it is adopted by the image it runs"
+    );
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_stand_in_program", "hop-b")[..]),
+        "and by the arguments it runs with"
+    );
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[0].package_digest)
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07: the same when the program executes another path to the same file: its image is
+/// the same file and the same digest, and only the path it is read as differs. Linux names the path
+/// the program was executed by; macOS names the file's own, so there a link reads as the same image.
+#[cfg(target_os = "linux")]
+#[test]
+fn kr_req_12_07_an_exec_to_another_path_of_the_same_file_is_refused() {
+    let setup = Setup::new();
+    let directory = setup.host.root().join("link");
+    std::fs::create_dir_all(&directory).expect("a folder for the link");
+    let link = directory.join(fixture::COMMAND);
+    std::fs::hard_link(&setup.program, &link).expect("a second path to the program's file");
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(&[Hop::new(&go, &link, "stand-in", "hop-b")], false);
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program executed by another path is not adopted by the path it was read as: {told:?}"
+    );
+
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(profile.binary.resolved_path, canonical(&link));
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_stand_in_program", "hop-b")[..])
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07, the stated limit: a program that executes another and then executes its own image
+/// again between the reads is adopted as the image it is and the arguments it had in between. The
+/// look reads no count of executions, so nothing tells the chain from one program. The case pins
+/// what is recorded; a change that refuses the chain turns it red, and it is then rewritten.
+#[test]
+fn kr_req_12_07_an_exec_chain_back_to_the_same_image_is_the_stated_limit() {
+    let setup = Setup::new();
+    let other = setup.another_program("other");
+    let (first, second) = (
+        setup.host.root().join("go-1"),
+        setup.host.root().join("go-2"),
+    );
+    let started = setup.start_hopping(
+        &[
+            Hop::new(&first, &other, "helper", "hop-b"),
+            Hop::new(&second, &setup.program, "stand-in", "hop-a2"),
+        ],
+        false,
+    );
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![
+            at(setup.adoptions.pause_before_arguments(), || {
+                std::fs::write(&first, b"").expect("lets the helper execute");
+                until("the second program runs", || {
+                    setup.marks().join("hop-b").exists()
+                });
+            }),
+            at(setup.adoptions.pause_after_arguments(), || {
+                setup.hop_to_the_stand_in(&second);
+            }),
+        ],
+    );
+    assert_eq!(told.len(), 1, "the chain is adopted: {told:?}");
+    let instance = told[0].application_instance_id;
+    let profile = setup.broker.profile_of(instance).expect("its profile");
+    assert_eq!(
+        profile.binary.resolved_path,
+        canonical(&setup.program),
+        "the image it runs at the end"
+    );
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_exec_helper_program", "hop-b")[..]),
+        "and the arguments the program in between had"
+    );
+    assert_eq!(
+        told[0].refusal.as_ref().map(String::as_str),
+        Some(ADOPTED_REFUSAL),
+        "a program adopted that way is refused its bridges"
+    );
+    assert!(
+        !setup.broker.holds_process(&started.process),
+        "and has no process record"
+    );
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[0].package_digest)
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07: what is recorded is what the look read inside its bracket. A program that
+/// executes another once everything has been read, or whose file is replaced then, is recorded as
+/// the image, the digest and the arguments the look read.
+#[test]
+fn kr_req_12_07_an_exec_or_a_replacement_after_the_last_read_changes_nothing_recorded() {
+    // The program executes the system's `sleep` after the last read.
+    let setup = Setup::new();
+    let image = canonical(&setup.program);
+    let original = digest_of(&setup.program);
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(
+        &[Hop::new(&go, Path::new("/bin/sleep"), "sleep", "hop-s")],
+        false,
+    );
+    let pid = started.child.id();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_after_bracket(), || {
+            std::fs::write(&go, b"").expect("lets the helper execute");
+            until("the program has taken over", || taken_over(pid, &image));
+        })],
+    );
+    assert_eq!(told.len(), 1, "the program is adopted: {told:?}");
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(
+        profile.binary.resolved_path, image,
+        "as the image it was read as"
+    );
+    assert_eq!(
+        profile.binary.digest, original,
+        "with the digest of the image that was read, not of the program that took its place"
+    );
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_exec_helper_program", "hop-a")[..]),
+        "and the arguments that were read"
+    );
+    started.end();
+
+    // The program's file is replaced after the last read.
+    let setup = Setup::new();
+    let original = digest_of(&setup.program);
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_after_bracket(), || {
+            replace_with_other_bytes(&setup.program);
+        })],
+    );
+    assert_eq!(told.len(), 1, "the program is adopted: {told:?}");
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(
+        profile.binary.digest, original,
+        "the digest is of the file the look opened, not of the file the path names now"
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07: a program whose file is replaced while the look is reading it is not adopted on
+/// that look. Linux reports the replaced image's path with a suffix that says it is deleted, which
+/// no package recognises, so the program stays unrecognised as it does when its file was replaced
+/// before the look. macOS names the path, so the next look adopts the program by what the path names
+/// then, which is a stated limit. A program that is replaced and executes the replacement is refused
+/// by the file it runs, as its path is the same.
+#[test]
+fn kr_req_12_07_a_replacement_inside_the_bracket_is_refused() {
+    let setup = Setup::new();
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            replace_with_other_bytes(&setup.program);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program whose file was replaced meanwhile is not adopted: {told:?}"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            setup.adoptions.look(&foreground).is_empty(),
+            "the program a replaced path no longer names stays unrecognised"
+        );
+        assert_eq!(setup.adoptions.adopted(&started.process), None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let replacement = digest_of(&setup.program);
+        let told = setup.adopt(&foreground);
+        assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+        let profile = setup
+            .broker
+            .profile_of(told[0].application_instance_id)
+            .expect("its profile");
+        assert_eq!(
+            profile.binary.digest, replacement,
+            "by the file its path names then"
+        );
+    }
+    started.end();
+
+    // The path is replaced and the program executes the replacement: the path is the same and the
+    // file is not.
+    let setup = Setup::new();
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(
+        &[Hop::new(&go, &setup.program, "stand-in", "hop-a2")],
+        false,
+    );
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            kr_ipc::testing::place_program(
+                &std::env::current_exe().expect("this test's own binary"),
+                &setup.program,
+            );
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program that runs another file at the same path is not adopted: {told:?}"
+    );
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(profile.binary.resolved_path, canonical(&setup.program));
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_stand_in_program", "hop-a2")[..])
+    );
+    started.end();
+}
+
+/// KR-REQ-12.07, the stated limit: an exec from a thread other than the program's main one keeps
+/// the process's identifier and start identity, so it is the same case as any exec: the look that
+/// read the image before it and the arguments after it adopts nothing, and the next look adopts the
+/// program that runs.
+#[test]
+fn kr_req_12_07_an_exec_from_another_thread_is_one_exec() {
+    let setup = Setup::new();
+    let other = setup.another_program("other");
+    let go = setup.host.root().join("go");
+    let started = setup.start_hopping(&[Hop::new(&go, &other, "stand-in", "hop-b")], true);
+    let foreground = Setup::foreground(&started, Vec::new());
+
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_before_arguments(), || {
+            setup.hop_to_the_stand_in(&go);
+        })],
+    );
+    assert!(
+        told.is_empty(),
+        "a program that changed between its image and its arguments is not adopted: {told:?}"
+    );
+    assert!(
+        kr_ipc::identity::process_start_identity(started.child.id())
+            .is_ok_and(|now| now.matches(&started.process)),
+        "the thread's exec keeps the process's identity"
+    );
+
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the next look adopts it: {told:?}");
+    assert_eq!(
+        setup.adoptions.adopted(&started.process),
+        Some(told[0].application_instance_id),
+        "under the identity it had before"
+    );
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(profile.binary.resolved_path, canonical(&other));
+    assert_eq!(
+        profile.arguments.get(1..),
+        Some(&hop_arguments("the_stand_in_program", "hop-b")[..])
+    );
+    started.end();
+}
+
+/// Real `KERN_PROCARGS2` records of `yes` children on macOS 27.2.1, read as the kernel returned
+/// them: the argument count, the path the program was executed by, as many zero bytes as pad that
+/// path to a multiple of eight (one to eight, an empty first argument adding one), the arguments,
+/// and the environment where the kernel returned it.
+mod procargs2 {
+    pub const PLAIN: &[u8] =
+        b"\x03\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00x\x00";
+    pub const EMPTY_ARGV0: &[u8] =
+        b"\x03\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00\x00/opt/agent/cli.js\x00x\x00E=e\x00";
+    pub const EMPTY_ARGV1: &[u8] =
+        b"\x03\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00\x00/opt/agent/cli.js\x00";
+    pub const EMPTY_AFTER: &[u8] =
+        b"\x04\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00\x00x\x00";
+    pub const TWO_EMPTY: &[u8] =
+        b"\x04\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00\x00\x00/opt/agent/cli.js\x00";
+    pub const ONE_ARGUMENT: &[u8] = b"\x01\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00";
+    pub const INVALID_UTF8: &[u8] =
+        b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/\xff\xfe.js\x00";
+    pub const PADDED_BY_EIGHT: &[u8] =
+        b"\x02\x00\x00\x00/usr/bin/././yes\x00\x00\x00\x00\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00";
+    pub const PADDED_BY_ONE: &[u8] =
+        b"\x02\x00\x00\x00/usr/bin//./yes\x00yes\x00/opt/agent/cli.js\x00";
+}
+
+/// KR-REQ-12.07: the macOS argument record is read by position. The second argument is the exact
+/// bytes the kernel holds when the record proves its position, and none where an empty first or
+/// second argument, a record the kernel does not lay out as observed or an argument that is not an
+/// absolute path leaves it in doubt. The vector is exact wherever the record is.
+#[test]
+fn kr_req_12_07_the_macos_argument_record_is_read_by_position() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let strings = |vector: &[&str]| {
+        vector
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let script = |path: &str| Some(OsString::from(path));
+
+    let read = parse_kern_procargs2(procargs2::PLAIN).expect("a plain record");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "x"]));
+    assert_eq!(read.script_argument, script("/opt/agent/cli.js"));
+
+    let read = parse_kern_procargs2(procargs2::EMPTY_ARGV0).expect("an empty first argument");
+    assert_eq!(read.vector, strings(&["", "/opt/agent/cli.js", "x"]));
+    assert_eq!(
+        read.script_argument, None,
+        "an empty first argument leaves the position in doubt"
+    );
+
+    let read = parse_kern_procargs2(procargs2::EMPTY_ARGV1).expect("an empty second argument");
+    assert_eq!(read.vector, strings(&["yes", "", "/opt/agent/cli.js"]));
+    assert_eq!(
+        read.script_argument, None,
+        "an empty second argument is no script, and the third is not the second"
+    );
+
+    let read =
+        parse_kern_procargs2(procargs2::EMPTY_AFTER).expect("an empty argument after the second");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "", "x"]));
+    assert_eq!(
+        read.script_argument,
+        script("/opt/agent/cli.js"),
+        "the arguments are read one after another"
+    );
+
+    let read = parse_kern_procargs2(procargs2::TWO_EMPTY).expect("two empty arguments");
+    assert_eq!(read.vector, strings(&["yes", "", "", "/opt/agent/cli.js"]));
+    assert_eq!(read.script_argument, None);
+
+    let read = parse_kern_procargs2(procargs2::ONE_ARGUMENT).expect("one argument");
+    assert_eq!(read.vector, strings(&["yes"]));
+    assert_eq!(read.script_argument, None, "one argument has no second");
+
+    let read = parse_kern_procargs2(procargs2::INVALID_UTF8).expect("an argument that is not text");
+    assert_eq!(
+        read.vector,
+        strings(&["yes", "/opt/agent/\u{fffd}\u{fffd}.js"]),
+        "the vector is text"
+    );
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from_vec(b"/opt/agent/\xff\xfe.js".to_vec())),
+        "and the second argument is the exact bytes"
+    );
+
+    for (which, record) in [
+        ("eight zero bytes", procargs2::PADDED_BY_EIGHT),
+        ("one zero byte", procargs2::PADDED_BY_ONE),
+    ] {
+        let read = parse_kern_procargs2(record).expect("a padded record");
+        assert_eq!(
+            read.vector,
+            strings(&["yes", "/opt/agent/cli.js"]),
+            "{which}"
+        );
+        assert_eq!(
+            read.script_argument,
+            script("/opt/agent/cli.js"),
+            "padded by {which}"
+        );
+    }
+
+    // Records the kernel is not seen to lay out leave the position in doubt: the vector is what
+    // the reader gave before, the non-empty strings after the path, and the second argument is none.
+    let short_padding = b"\x02\x00\x00\x00/usr/bin/yes\x00yes\x00/opt/agent/cli.js\x00".as_slice();
+    let read = parse_kern_procargs2(short_padding).expect("a record padded by less");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js"]));
+    assert_eq!(
+        read.script_argument, None,
+        "a path padded by less than the layout observed"
+    );
+    let too_few =
+        b"\x05\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00/opt/agent/cli.js\x00x\x00".as_slice();
+    let read = parse_kern_procargs2(too_few).expect("a record with fewer arguments than it counts");
+    assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "x"]));
+    assert_eq!(read.script_argument, None, "fewer arguments than the count");
+    let relative =
+        b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00opt/agent/cli.js\x00".as_slice();
+    assert_eq!(
+        parse_kern_procargs2(relative)
+            .expect("a relative path")
+            .script_argument,
+        None,
+        "a relative path"
+    );
+    let option = b"\x02\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00yes\x00-\x00".as_slice();
+    assert_eq!(
+        parse_kern_procargs2(option)
+            .expect("an option")
+            .script_argument,
+        None,
+        "an option"
+    );
+    assert!(
+        parse_kern_procargs2(b"\x02\x00").is_none(),
+        "no room for the count"
+    );
+    assert!(
+        parse_kern_procargs2(b"\x00\x00\x00\x00/usr/bin/yes\x00\x00\x00\x00").is_none(),
+        "no arguments at all"
+    );
+}
+
+/// Starts `/usr/bin/yes` with exactly `arguments` as its vector, its output held by a pipe nobody
+/// reads, so that it runs until it is ended whatever it is given.
+fn start_yes(arguments: &[&[u8]]) -> Child {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut command = Command::new("/usr/bin/yes");
+    command.arg0(std::ffi::OsStr::from_bytes(arguments[0]));
+    for argument in &arguments[1..] {
+        command.arg(std::ffi::OsStr::from_bytes(argument));
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = command.spawn().expect("yes starts");
+    #[cfg(target_os = "linux")]
+    let child = started_for_good(child);
+    child
+}
+
+/// KR-REQ-12.07: the reader gives the second argument of a real process exactly, on each platform,
+/// and gives none where it cannot know the position or the argument is not an absolute path. The
+/// vector it gives is exact too.
+#[test]
+fn kr_req_12_07_the_reader_gives_the_second_argument_of_a_real_process_exactly() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let read_of = |arguments: &[&[u8]]| {
+        let mut child = start_yes(arguments);
+        let read = arguments_of(child.id()).expect("the arguments of a running process");
+        let _ = child.kill();
+        let _ = child.wait();
+        read
+    };
+    let lossy = |argument: &[u8]| String::from_utf8_lossy(argument).into_owned();
+
+    // Spaces and characters outside ASCII are in the path and nothing shifts.
+    let path = "/opt/agent/my cli \u{fc}.js".as_bytes();
+    let read = read_of(&[b"yes", path, b"y"]);
+    assert_eq!(read.vector, [lossy(b"yes"), lossy(path), lossy(b"y")]);
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from_vec(path.to_vec()))
+    );
+
+    // An empty first argument: Linux counts every argument, macOS leaves the position in doubt.
+    let read = read_of(&[b"", b"/opt/agent/cli.js", b"y"]);
+    assert_eq!(
+        read.vector,
+        ["", "/opt/agent/cli.js", "y"],
+        "nothing is dropped or moved"
+    );
+    assert_eq!(
+        read.script_argument,
+        cfg!(target_os = "linux").then(|| OsString::from("/opt/agent/cli.js")),
+        "the second argument, where the platform's reading proves it"
+    );
+
+    // An empty second argument is no script, and the third argument is not the second.
+    let read = read_of(&[b"yes", b"", b"/opt/agent/cli.js"]);
+    assert_eq!(read.vector, ["yes", "", "/opt/agent/cli.js"]);
+    assert_eq!(read.script_argument, None);
+
+    // An empty argument after the second leaves the second as it is.
+    let read = read_of(&[b"yes", b"/opt/agent/cli.js", b"", b"y"]);
+    assert_eq!(read.vector, ["yes", "/opt/agent/cli.js", "", "y"]);
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from("/opt/agent/cli.js"))
+    );
+
+    // A pathname that is not text is the exact bytes, never a copy with replacement characters.
+    let path = b"/opt/agent/\xff\xfe.js".as_slice();
+    let read = read_of(&[b"yes", path]);
+    assert_eq!(read.vector, [lossy(b"yes"), lossy(path)]);
+    assert_eq!(
+        read.script_argument,
+        Some(OsString::from_vec(path.to_vec()))
+    );
+
+    // One argument has no second, and a second that is not an absolute path is no script.
+    assert_eq!(read_of(&[b"yes"]).script_argument, None, "one argument");
+    assert_eq!(
+        read_of(&[b"yes", b"opt/agent/cli.js"]).script_argument,
+        None,
+        "a relative path"
+    );
+    assert_eq!(
+        read_of(&[b"yes", b"-"]).script_argument,
+        None,
+        "an option's start"
+    );
+}
+
+/// KR-REQ-12.07: a program that rewrites its own argument area, as one that sets its process title
+/// does, claims nothing: whatever the area held before, the reader gives no second argument. (An
+/// area rewritten into another valid vector is read as the vector it now is, which is the stated
+/// limit of a rewritten area.)
+#[test]
+fn kr_req_12_07_a_program_that_rewrote_its_argument_area_claims_nothing() {
+    let setup = Setup::new();
+    let mut command = Command::new(&setup.program);
+    command
+        .args(hop_arguments("the_retitling_program", "hop-a"))
+        .env(STAND_IN, "60")
+        .env(STAND_IN_RUNNING, setup.running())
+        .current_dir(setup.host.root());
+    let started = setup.spawn_in_a_group(command);
+    until("the program has rewritten its arguments", || {
+        setup.running().exists()
+    });
+
+    let read = arguments_of(started.child.id()).expect("the arguments of a running process");
+    assert_eq!(
+        read.vector.first().map(String::as_str),
+        Some("retitled"),
+        "the area holds what the program wrote"
+    );
+    assert_eq!(read.script_argument, None, "and claims no script");
+    started.end();
 }
