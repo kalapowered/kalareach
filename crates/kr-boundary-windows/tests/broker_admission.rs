@@ -501,12 +501,22 @@ fn broker_admission_the_probe_token_of_each_class_is_asked() {
                 "{label}"
             );
         } else {
-            // The writer rule refuses it: no principal besides the person, the system and the
-            // administrators may write under the Git folder, because a group's members can change
-            // after the admission, so who belongs to the group today does not decide.
+            // The writer rule refuses it: it reads the list's entries and not the group's members.
+            // The probe tokens stand only for the boundary accounts, and another ordinary account
+            // can hold a grant of its own through the group; a change of the group's members needs
+            // an administrator, and administrators are trusted.
             let refusal =
                 outcome.expect_err("a group that no boundary account belongs to is a writer");
             assert_eq!(refusal.rule, RULE_WRITER, "{label}");
+
+            // The control: the same entry on a file of the working tree refuses nothing. No probe
+            // token belongs to the group, and the writer rule is the Git folder's.
+            let project = Project::make_private(&scratch, "nobody-work", &person.sid);
+            let work = project.root.join("work.txt");
+            fs::write(&work, b"x").unwrap();
+            grant(&work, group, "(M)");
+            admit_project(&person, &siblings, &project)
+                .expect("a group that no boundary account belongs to refuses no working-tree file");
         }
     }
 }
