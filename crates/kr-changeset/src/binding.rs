@@ -35,47 +35,63 @@
 //! **parent**. A parent's own record cannot tell the output from anything else written beside it,
 //! so a parent is watched by name instead, from before the command starts to after it has ended:
 //! the platform reports each name created, removed, renamed or changed in it, and a name other than
-//! a declared output makes the result indeterminate, however briefly it existed. The parent itself
-//! is watched too, and so is the copy: a report that the directory was renamed, removed or changed
-//! (its mode, its owner, or any of its metadata but its extended attributes) is a write, because
-//! the record of a parent is the one thing the comparison leaves out. On macOS a report of any path
-//! can come after the host's own file or not at all, and the file-event service can report the
-//! host's own set-up of the copy a second time, after the watcher is up to date. So the host also
-//! records what it reads at the start: of each parent, its device, inode and extended attributes
-//! (names and values, as the listing call returns them), and of every other entry of the copy, and
-//! of the copy's own directory when that is no parent, the stamp that the comparison holds (kind,
-//! device, inode, size and the times of modification and change). It reads each parent again and
-//! takes the stamp of every other entry again at the end, once the watcher has reported the host's
-//! own file, and compares them. A parent that is gone, is no longer a directory, has another device
-//! or inode, or has an extended attribute added, removed or changed in value is a write whatever
-//! was reported of it, and so is an entry whose stamp differs. On macOS a report that a recorded
-//! folder or file was created, with the kind that fits what it is, or that its extended attributes
-//! changed, is no write by itself, because what the host recorded decides both: an entry with the
-//! inode it had was not made in the run, and a change of an attribute moves the time of change that
-//! the stamp holds (measured on APFS for a file, a folder and a link, an attribute put back
-//! included), while a parent's attributes are compared themselves. A name that the host did not
-//! record is a write whatever the kind of the report, however briefly it existed, if the watcher
-//! reports it before the end of the wait. Every other report of a recorded path is a write: a
-//! removal, a rename, a change of its mode or owner, any other change of its metadata, a change of
-//! its content, and a creation of another kind, a mount among them. On Linux the watcher is another
-//! module, and a parent's attribute report is a write there. The record of a parent leaves out its
-//! mode, owner, flags, access list and times, and a parent keeps its device and inode when a suite
-//! changes any of them, whether it puts them back or not, and when a suite moves it away and back,
-//! so only the watcher's reports show such a change, and a report that comes late or not at all
-//! leaves it unseen. An extended attribute of a parent that a suite changes and puts back is not
-//! seen when the listing call returns it: that call returns the attributes that the system lets a
-//! process list, so any it keeps back, such as the compression attributes, are not compared, and a
-//! change of Finder information is another kind of report, a write. The host reads a parent by its
-//! path and does not follow a link in the last part of it, and a link in an earlier part is
-//! followed. The record of the directory above a parent shows a move away and back too, except for
-//! the copy itself and for a parent in a directory that is also a parent. A parent whose full path
-//! takes 1,024 bytes or more, which macOS does not allow for a path, cannot be read, nor can a
-//! parent with more than 64 extended attributes, names that take more than 8,192 bytes or a value
-//! of more than 4,096 bytes, and every result of that suite is indeterminate. A name takes at most
-//! 127 bytes and its end, so 64 names fit in 8,192 bytes, and the buffer's range error, which the
-//! call gives, can come before the count's refusal; both end in the same words. A watcher the host
-//! cannot start, or whose reports it cannot be sure it has all of, makes the result indeterminate
-//! too.
+//! a declared output makes the result indeterminate, however briefly it existed, as far as the
+//! watcher reports it before the end of the wait described below. The parent itself is watched too,
+//! and so is the copy: a report that the directory was renamed, removed or changed (its mode, its
+//! owner, or any of its metadata but its extended attributes) is a write, because the record of a
+//! parent is the one thing the comparison leaves out. On macOS a report of any path can come after
+//! the host's own file or not at all, and the file-event service can report the host's own set-up
+//! of the copy a second time, after the watcher is up to date. So the host also records what it
+//! reads at the start: of each parent, its device, inode and extended attributes (names and values,
+//! as the listing call returns them), and of every other entry of the copy, and of the copy's own
+//! directory when that is no parent, the stamp that the comparison holds (kind, device, inode, size
+//! and the times of modification and change). It reads each parent again and takes the stamp of
+//! every other entry again at the end, once the watcher has reported the host's own file, and
+//! compares them. A parent that is gone, is no longer a directory, has another device or inode, or
+//! has an extended attribute added, removed or changed in value is a write whatever was reported of
+//! it, and so is an entry whose stamp differs. On macOS a report that a recorded folder or file was
+//! created, with the kind that fits what it is, or that its extended attributes changed, is no
+//! write by itself, because the record decides both: an entry whose whole stamp is the one recorded
+//! (its inode and size as well as its times of modification and change) was not made or changed in
+//! the run, as far as a stamp shows, and a change of an attribute moves the time of change that the
+//! stamp holds (measured on APFS for a file, a folder and a link, an attribute put back included),
+//! while a parent's attributes are compared themselves. The record does not show by itself that no
+//! other entry stood at the path in between, but a recorded entry that is renamed away and back, or
+//! away and back over another entry that took its place, ends with a later time of change, because
+//! a rename moves the time of change of the renamed entry. That was measured on two APFS volumes:
+//! at each of 60 renames of files and folders on each, and in each of 10 swaps of a file with a
+//! clone of another file on each. So the stamp shows such a swap whether or not the renames are
+//! reported. The library reports a clone and a hard link of a file as the creation of a file, a
+//! clone with the note "is: clone", and not as another kind, so the stamp decides each as it
+//! decides any creation of a file. A name that the host did not record is a write whatever the kind
+//! of the report, however briefly it existed, if the watcher reports it before the end of the wait.
+//! Of the paths whose reports the host reads (a parent, the copy's own directory and a name
+//! directly in a parent that is no declared output), every other report of a recorded path is a
+//! write: a removal, a rename, a change of its mode or owner, any other change of its metadata, a
+//! change of its content, and a creation of another kind, a mount among them; the reports of an
+//! entry in any other directory are not read, and its stamp decides. A file made with content gives
+//! three reports, its creation, a change of its attributes and its content, and the third is a
+//! write at once, so a second delivery of those reports for a recorded file directly in a parent,
+//! if the file-event service makes one after the host's start, still makes the result indeterminate
+//! where nothing was written; a second delivery for a folder directly in a parent, for a parent and
+//! for the copy's own directory does not. On Linux the watcher is another module, and a parent's
+//! attribute report is a write there. The record of a parent leaves out its mode, owner, flags,
+//! access list and times, and a parent keeps its device and inode when a suite changes any of them,
+//! whether it puts them back or not, and when a suite moves it away and back, so only the watcher's
+//! reports show such a change, and a report that comes late or not at all leaves it unseen. An
+//! extended attribute of a parent that a suite changes and puts back is not seen when the listing
+//! call returns it: that call returns the attributes that the system lets a process list, so any it
+//! keeps back, such as the compression attributes, are not compared, and a change of Finder
+//! information is another kind of report, a write. The host reads a parent by its path and does not
+//! follow a link in the last part of it, and a link in an earlier part is followed. The record of
+//! the directory above a parent shows a move away and back too, except for the copy itself and for
+//! a parent in a directory that is also a parent. A parent whose full path takes 1,024 bytes or
+//! more, which macOS does not allow for a path, cannot be read, nor can a parent with more than 64
+//! extended attributes, names that take more than 8,192 bytes or a value of more than 4,096 bytes,
+//! and every result of that suite is indeterminate. A name takes at most 127 bytes and its end, so
+//! 64 names fit in 8,192 bytes, and the buffer's range error, which the call gives, can come before
+//! the count's refusal; both end in the same words. A watcher the host cannot start, or whose
+//! reports it cannot be sure it has all of, makes the result indeterminate too.
 //!
 //! # What this does not establish
 //!
@@ -308,8 +324,9 @@ mod unix {
                 open_copy(service, id)
                     .and_then(|(_, copy)| stamp_tree(&copy, &skipped, &self.declared))
             };
-            // The watch takes the record of the end once it is up to date, so that the record
-            // holds every change that it has reported.
+            // The watch takes the record of the end once it is up to date. Each entry is read once,
+            // so a change made after its read is not in the record, and a report of it can come
+            // after the wait.
             let (end, reported) = match &self.names {
                 Some(names) => names.drain(&self.stamps, take_end),
                 None => (take_end(), Ok(Vec::new())),
@@ -737,8 +754,9 @@ mod unix {
 
         use super::{Kind, Stamp};
 
-        /// How many written paths the watcher keeps. A run that has written this many beside its
-        /// outputs has been told enough for a result to name a few of them.
+        /// How many paths the watcher keeps, the written ones and, apart, the ones left to the end.
+        /// A run that has written this many beside its outputs has been told enough for a result to
+        /// name a few of them; past this many paths left to the end, each further one is a write.
         const KEPT: usize = 64;
 
         /// What the platform said of the run, judged as each report arrived.
@@ -765,9 +783,9 @@ mod unix {
             CreatedFile,
             /// Extended attributes were changed.
             Attributes,
-            /// Anything else: a creation of another kind (a link, a mount, a kind the platform
-            /// does not say), a removal, a rename, a change of mode, owner or other metadata, a
-            /// change of content.
+            /// Anything else: a creation of another kind (a symbolic link, a mount, a kind the
+            /// platform does not say), a removal, a rename, a change of mode, owner or other
+            /// metadata, a change of content.
             Other,
         }
 
@@ -846,11 +864,14 @@ mod unix {
             /// report that a folder was created, of a recorded directory, or that a file was
             /// created, of a recorded file, and a report that extended attributes changed, are no
             /// write by themselves: the end of the run decides them by the record, which is a
-            /// parent's device, inode and attributes and any other entry's stamp. Every other
-            /// report of a recorded path is a write, a mount among them, and so is every report of
-            /// a name the host did not record, whatever its kind. A name in such a directory is
-            /// judged only if it is no declared output, and a path in any other directory is judged
-            /// nothing, since the stamp decides it.
+            /// parent's device, inode and attributes and any other entry's stamp. Of the paths
+            /// judged here, every other report of a recorded path is a write, a mount among them,
+            /// and so is every report of a name the host did not record, whatever its kind; a
+            /// file's report of its content is one of them, so the second delivery of the making of
+            /// a recorded file directly in a parent, which is its creation, its attributes and its
+            /// content, is a write at its third report. A name in such a directory is judged only
+            /// if it is no declared output, and a path in any other directory is judged nothing,
+            /// since the stamp decides it.
             fn judge(&self, path: &Path, done: Done) -> Judged {
                 let Some(relative) = path.strip_prefix(&self.copy).ok().map(|rest| {
                     rest.components()
@@ -1065,7 +1086,7 @@ mod unix {
             }
 
             /// KR-REQ-14.34: the kinds heard at a name are kept, so that a file and a folder
-            /// both reported at it are no write for either kind.
+            /// both reported at it are a write, since the recorded kind fits only one of them.
             #[test]
             fn the_kinds_heard_at_a_name_are_kept_for_the_end() {
                 let file = stamp(Kind::File);
@@ -1631,10 +1652,12 @@ mod unix {
     /// end.
     ///
     /// The stamp of such a directory is not recorded, because making the output changes it. Its
-    /// device and inode, that it is a directory, and its extended attributes did not change in the
-    /// traced runs when the host made a name in it; if the system changed one of them, the result
-    /// would be indeterminate. The first three are another when the directory was removed and made
-    /// again, and the attributes are another when one is added, removed or given another value.
+    /// device and inode, and that it is a directory, did not change in the traced runs when the
+    /// host made a name in it; its extended attributes were read by name in 37 of the 88 traced
+    /// runs and by value in 12, and were the same each time; if the system changed one of them, the
+    /// result would be indeterminate. The first three are another when the directory was removed
+    /// and made again, and the attributes are another when one is added, removed or given another
+    /// value.
     #[cfg(any(target_os = "macos", test))]
     mod record {
         use std::collections::BTreeMap;
@@ -1884,8 +1907,9 @@ mod unix {
         }
 
         /// What a report of the watcher says was done to the paths it names. Only the creation of
-        /// a folder or of a file has a variant of its own: the library reports a mount as a
-        /// creation of kind other, and that is a write.
+        /// a folder or of a file has a variant of its own: the library reports a mount and a
+        /// symbolic link as a creation of kind other, and that is a write, and a clone and a hard
+        /// link of a file as the creation of a file, which the stamp decides.
         fn done_by(kind: &EventKind) -> Done {
             match kind {
                 EventKind::Create(CreateKind::Folder) => Done::CreatedFolder,
@@ -2169,10 +2193,11 @@ mod unix {
             /// the run with `take_end`, and says which paths were written beside a declared
             /// output since the watch started, and which directories themselves, when something
             /// was done to them or when one is not what it was, whether the watcher reported it
-            /// or not. The record is taken after the wait, so that it holds every change the
-            /// watcher has reported, and it is given back beside the paths: with `start`, the
-            /// record of the start, it decides the creations and attribute changes that were
-            /// reported of recorded entries.
+            /// or not. The record is taken after the wait, so that it shows a change that the
+            /// watcher had reported when the wait ended. Each entry is read once, so a change made
+            /// after its read is not in it, and a report of that change can come later. The record
+            /// is given back beside the paths: with `start`, the record of the start, it decides
+            /// the creations and attribute changes that were reported of recorded entries.
             pub fn drain(
                 &self,
                 start: &Stamps,
@@ -3108,7 +3133,9 @@ mod unix {
             }
 
             /// KR-REQ-14.34: the same for a report that its extended attributes changed, and for
-            /// the pair of reports that the host's own making of an entry gives, delivered twice.
+            /// the creation and attribute reports that the host's own making of an entry gives,
+            /// delivered twice. A file made with content gives a third report, of its content,
+            /// which is a write at once and is not delivered here.
             #[test]
             fn an_attribute_report_of_a_recorded_name_with_its_stamp_held_is_no_write() {
                 for (name, kind) in RECORDED {
