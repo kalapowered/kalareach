@@ -315,9 +315,21 @@ const KEPT: &[Row] = &[
         removal: NAMES_ONLY_REMOVAL,
     },
     Row {
+        file: "tests/e2e/m1b/src/compare.rs",
+        reason: "its case table names a program's file in a compared tree (a string that labels a row) \
+                 and changes that file; it starts no program",
+        removal: "none while the file starts no program; the row goes when it does",
+    },
+    Row {
         file: "tests/e2e/m1b/src/run.rs",
         reason: NAMES_ONLY,
         removal: NAMES_ONLY_REMOVAL,
+    },
+    Row {
+        file: "tests/e2e/m1b/src/worker.rs",
+        reason: "the string is the bytes of a file that a case writes as a program's changed file; the \
+                 file starts no program",
+        removal: "none while the file starts no program; the row goes when it does",
     },
 ];
 
