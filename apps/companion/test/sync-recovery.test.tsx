@@ -498,6 +498,30 @@ describe('recovery', () => {
     expect(within(recovery).queryByTestId('recovery-copies')).toBeNull()
   })
 
+  it('keeps the offline copy of the recovery bundle within reach when the list of archives is refused', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.refuseArchives(
+        'the backup checkpoints this device kept when it paired cannot be read (checkpoints.json: not JSON)'
+      )
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+
+    // The refusal is said, and the copy of the bundle alone is still offered beside it.
+    await waitFor(() => {
+      expect(sheet).toHaveTextContent('cannot be read (checkpoints.json: not JSON)')
+    })
+    await person.click(await within(recovery).findByTestId('recovery-copy-bundle'))
+    await waitFor(() => {
+      expect(controls.recovery.exportsMade).toEqual([
+        { path: '/tmp/kalareach-recovery-bundle.krexport', archive: null }
+      ])
+    })
+  })
+
   it('says why the service holds back an archive, by what holds it back, and offers no copy of it', async () => {
     const { person, controls, sheet } = await openSheet()
     const withheld = (suffix: string, fields: Partial<RecoveryArchive>): RecoveryArchive => ({

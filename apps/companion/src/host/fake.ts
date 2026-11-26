@@ -470,6 +470,8 @@ export interface FakeRecovery {
   readonly qrSaved: readonly string[]
   /** Sets the archives the backend lists for an offline copy. */
   setArchives(archives: readonly RecoveryArchive[]): void
+  /** Makes the backend refuse the list of archives with these words, or answer it again with null. */
+  refuseArchives(message: string | null): void
   /** What the page asked to have exported, in order. */
   readonly exportsMade: readonly { readonly path: string; readonly archive: string | null }[]
   /** Sets where recovery stands, as the backend would report it. */
@@ -1688,6 +1690,7 @@ export function fakeHost(
   const qrSaved: string[] = []
   let archives: readonly RecoveryArchive[] = []
   const exportsMade: { readonly path: string; readonly archive: string | null }[] = []
+  let archivesRefused: string | null = null
   let heldTurnOn: Promise<void> | null = null
   let lostTurnOn: string | null = null
   let heldRecoveryRead: Promise<void> | null = null
@@ -3777,6 +3780,7 @@ export function fakeHost(
       if (recovery.state !== 'on') {
         refuse('PERMISSION_DENIED', 'Recovery has not been turned on.')
       }
+      if (archivesRefused !== null) refuse('PERMISSION_DENIED', archivesRefused)
       return Promise.resolve(archives)
     },
     recoveryExportOffline: (path, archive): Promise<ExportSaved> => {
@@ -3831,6 +3835,9 @@ export function fakeHost(
       },
       setArchives(next) {
         archives = next
+      },
+      refuseArchives(message) {
+        archivesRefused = message
       },
       set(view) {
         recovery = { ...recovery, ...view }

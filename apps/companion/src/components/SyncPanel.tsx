@@ -934,7 +934,14 @@ export function SyncPanel({
                     style={{ minBlockSize: target }}
                     onClick={() => {
                       step('recovery', async () => {
-                        setCopies(await port.recoveryArchives())
+                        try {
+                          setCopies(await port.recoveryArchives())
+                        } catch (refused) {
+                          // The copy of the bundle alone needs no list of archives, so it stays
+                          // within reach beside the refusal that the step says.
+                          setCopies([])
+                          throw refused
+                        }
                         return null
                       })
                     }}
