@@ -3033,8 +3033,8 @@ fn kr_req_12_07_the_reader_gives_every_argument_of_a_process_with_a_large_area()
         .collect();
     let area: usize = arguments.iter().map(|argument| argument.len() + 1).sum();
     assert!(
-        area > FIRST_READING && area > 4096,
-        "the area is larger than a page and than the first buffer: {area}"
+        area > FIRST_READING,
+        "the area is larger than the first buffer, which is larger than a page: {area}"
     );
     let refs: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
     let mut child = start_yes(&refs);

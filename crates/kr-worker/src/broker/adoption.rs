@@ -991,7 +991,7 @@ pub fn parse_cmdline(bytes: &[u8]) -> Option<Arguments> {
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn arguments_of(pid: u32) -> Option<Arguments> {
-    parse_cmdline(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?)
+    arguments_from(|| std::fs::File::open(format!("/proc/{pid}/cmdline")).ok())
 }
 
 /// Returns the arguments a process was started with, as the kernel keeps them: macOS's
