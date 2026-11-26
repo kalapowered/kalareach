@@ -266,13 +266,16 @@ fn written_after(directory: &Path, file: &str, begun: SystemTime) -> Option<Dura
 /// `GENEROUS`, until the stand-in it ran has written every file in `files` or no longer deadline is
 /// left, and gives the last run.
 ///
-/// On a hosted Windows runner the first cmdlet of a PowerShell stand-in started more than 10 s, and up
-/// to about 34 s, after its process started, under the three variables these cases give; so the
-/// deadline is not what a case decides by. Each run has a directory of its own and a clock of its
-/// own, which `attempt` makes with the deadline it is given. `attempt` also holds every bound of the
-/// call to that deadline, so that a run that is not used, as much as the last, is judged by the call's
-/// own bounds before the next is made. What a case decides after it is the state of the processes of
-/// the last run. A case whose stand-in never started says so in its own body, by `started`.
+/// On a hosted Windows runner, under the three variables these cases give, a PowerShell stand-in whose
+/// first statement was a cmdlet wrote its first file 13.3 s and 15.2 s after its process started
+/// (measured, one run, two stand-ins), where stand-ins that wrote before any cmdlet took 1.1 s and
+/// 1.8 s. An earlier run's total time suggested a first cmdlet that started as late as about 34 s
+/// after its process: that figure is an inference, not a measurement. So the deadline is not what a
+/// case decides by. Each run has a directory of its own and a clock of its own, which `attempt` makes
+/// with the deadline it is given. `attempt` also holds every bound of the call to that deadline, so
+/// that a run that is not used, as much as the last, is judged by the call's own bounds before the
+/// next is made. What a case decides after it is the state of the processes of the last run. A case
+/// whose stand-in never started says so in its own body, by `started`.
 ///
 /// One line per run says how long the stand-in took to write each file and how many variables the
 /// probe was given, so that a run on another machine measures what the stand-in needs. The files are
@@ -359,30 +362,44 @@ fn kr_req_07_64_a_program_that_never_finishes_is_ended_with_everything_it_starte
                 &ProbeRun::within(deadline),
                 probe::MAX_OUTPUT_BYTES,
             );
-            assert_eq!(probed.mode, None);
+            assert_eq!(probed.mode, None, "deadline {deadline:?}: {probed:?}");
             assert!(
                 probed
                     .unread
                     .as_deref()
                     .is_some_and(|why| why.contains("did not finish")),
-                "{probed:?}"
+                "deadline {deadline:?}: {probed:?}"
             );
-            assert!(probed.late, "a probe that never finishes is late");
+            assert!(
+                probed.late,
+                "a probe that never finishes is late, deadline {deadline:?}: {probed:?}"
+            );
             assert!(
                 probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "{:?}",
+                "the call took {:?}, deadline {deadline:?}",
                 probed.took
             );
-            let end = thread_end(&probed);
-            assert!(
-                end.collected_in_bound,
-                "the probe was ended and collected within the cleanup bound: {end:?}"
-            );
-            assert!(
-                end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "the thread's total, cleanup included: {:?}",
-                end.took
-            );
+            if let Some(end) = thread_end_if_started(&probed, directory) {
+                assert!(
+                    end.collected_in_bound,
+                    "the probe was ended and collected within the cleanup bound, deadline {deadline:?}: {end:?}"
+                );
+                assert!(
+                    end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+                    "the thread's total, cleanup included: {:?}, deadline {deadline:?}",
+                    end.took
+                );
+                // The test's own look at the process table, for an attempt that is not used as much as
+                // for the last: the main process of a run that wrote its number is gone, whatever the
+                // probe reports of itself.
+                if written_pid(directory, "main.pid").is_some() {
+                    let left = survivors(directory, &["main.pid"]);
+                    assert!(
+                        left.is_empty(),
+                        "the main process was left running after the thread ended, deadline {deadline:?}: {left:?}"
+                    );
+                }
+            }
             probed
         },
     );
@@ -543,6 +560,13 @@ fn thread_total(probed: &Probed) -> Duration {
     thread_end(probed).took
 }
 
+/// How the probe's thread ended, or `None` where the call started no thread for `directory`: a call
+/// whose deadline had passed before it began returns at once and makes nothing, so there is no thread
+/// to wait for, and only the call's own bounds apply to it.
+fn thread_end_if_started(probed: &Probed, directory: &Path) -> Option<ThreadEnd> {
+    (probe::seams::threads_started(directory) > 0).then(|| thread_end(probed))
+}
+
 /// The processes a stand-in wrote to `files` that are still there `SLACK` after the probe's thread
 /// has ended.
 fn survivors(directory: &Path, files: &[&str]) -> Vec<String> {
@@ -650,22 +674,26 @@ fn kr_req_07_64_a_probe_that_prints_and_keeps_running_is_ended_within_the_cleanu
                 &ProbeRun::within(deadline),
                 probe::MAX_OUTPUT_BYTES,
             );
-            assert!(probed.late, "its output had not ended: {probed:?}");
+            assert!(
+                probed.late,
+                "its output had not ended, deadline {deadline:?}: {probed:?}"
+            );
             assert!(
                 probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "{:?}",
+                "the call took {:?}, deadline {deadline:?}",
                 probed.took
             );
-            let end = thread_end(&probed);
-            assert!(
-                end.collected_in_bound,
-                "the probe was ended and collected within the cleanup bound: {end:?}"
-            );
-            assert!(
-                end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "the thread's total, cleanup included: {:?}",
-                end.took
-            );
+            if let Some(end) = thread_end_if_started(&probed, directory) {
+                assert!(
+                    end.collected_in_bound,
+                    "the probe was ended and collected within the cleanup bound, deadline {deadline:?}: {end:?}"
+                );
+                assert!(
+                    end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+                    "the thread's total, cleanup included: {:?}, deadline {deadline:?}",
+                    end.took
+                );
+            }
             probed
         },
     );
@@ -711,22 +739,25 @@ fn kr_req_07_64_the_total_time_is_bounded_by_the_deadline_plus_the_cleanup_bound
                 &run,
                 probe::MAX_OUTPUT_BYTES,
             );
-            assert!(probed.late, "{probed:?}");
+            assert!(probed.late, "deadline {deadline:?}: {probed:?}");
             assert!(
                 probed.took >= deadline && probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "from the caller's first instant, the wait included: {:?}",
+                "from the caller's first instant, the wait included: {:?}, deadline {deadline:?}",
                 probed.took
             );
-            let total = thread_total(&probed);
-            assert!(
-                total <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "the thread's total, cleanup included: {total:?}"
-            );
-            let end = thread_end(&probed);
-            assert!(
-                end.collected_in_bound,
-                "the probe was ended and collected within the cleanup bound: {end:?}"
-            );
+            // A queue that used up the deadline leaves a call that started no thread: only the bounds
+            // of the call above apply to it.
+            if let Some(end) = thread_end_if_started(&probed, directory) {
+                assert!(
+                    end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+                    "the thread's total, cleanup included: {:?}, deadline {deadline:?}",
+                    end.took
+                );
+                assert!(
+                    end.collected_in_bound,
+                    "the probe was ended and collected within the cleanup bound, deadline {deadline:?}: {end:?}"
+                );
+            }
             probed
         },
     );
@@ -801,22 +832,26 @@ fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call
                 &ProbeRun::within(deadline),
                 probe::MAX_OUTPUT_BYTES,
             );
-            assert!(probed.late, "the output had not ended: {probed:?}");
+            assert!(
+                probed.late,
+                "the output had not ended, deadline {deadline:?}: {probed:?}"
+            );
             assert!(
                 probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "{:?}",
+                "the call took {:?}, deadline {deadline:?}",
                 probed.took
             );
-            let end = thread_end(&probed);
-            assert!(
-                end.collected_in_bound,
-                "the probe was ended and collected within the cleanup bound: {end:?}"
-            );
-            assert!(
-                end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                "the thread's total, cleanup included: {:?}",
-                end.took
-            );
+            if let Some(end) = thread_end_if_started(&probed, directory) {
+                assert!(
+                    end.collected_in_bound,
+                    "the probe was ended and collected within the cleanup bound, deadline {deadline:?}: {end:?}"
+                );
+                assert!(
+                    end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+                    "the thread's total, cleanup included: {:?}, deadline {deadline:?}",
+                    end.took
+                );
+            }
             probed
         },
     );
@@ -834,8 +869,10 @@ fn kr_req_07_64_a_probe_whose_descendant_holds_the_output_does_not_hold_the_call
 /// KR-REQ-07.64: the call keeps its bounds in the whole environment of this process as it does in the
 /// few variables the other cases give, and the stand-in it ran is not left running. The stand-in runs a
 /// cmdlet (a builtin on Unix) before it writes its number, then runs on, so that the call is late in
-/// both. How long the stand-in took to write its number in each is printed and not decided: a person
-/// reads the pair in the log.
+/// both. In each set the stand-in must have written its number within the longest deadline tried, as
+/// in the other cases: without it nothing is known of the process that ran, and the case fails. How
+/// long it took to write the number in each set is printed and not decided: a person reads the pair
+/// in the log.
 #[test]
 fn kr_req_07_64_the_call_keeps_its_bounds_in_the_whole_environment_as_in_the_given_variables() {
     let standin = Standin::running(
@@ -853,7 +890,12 @@ fn kr_req_07_64_the_call_keeps_its_bounds_in_the_whole_environment_as_in_the_giv
         ),
     ];
     for (label, environment) in &environments {
-        let Attempt { here, started, .. } = until_started(
+        let Attempt {
+            here,
+            probed,
+            deadline,
+            started,
+        } = until_started(
             label,
             environment,
             start_allowance(),
@@ -868,33 +910,38 @@ fn kr_req_07_64_the_call_keeps_its_bounds_in_the_whole_environment_as_in_the_giv
                     &ProbeRun::within(deadline),
                     probe::MAX_OUTPUT_BYTES,
                 );
-                assert!(probed.late, "its output had not ended: {probed:?}");
+                assert!(
+                    probed.late,
+                    "its output had not ended, in {label}, deadline {deadline:?}: {probed:?}"
+                );
                 assert!(
                     probed.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                    "{:?}",
+                    "the call took {:?}, in {label}, deadline {deadline:?}",
                     probed.took
                 );
-                let end = thread_end(&probed);
-                assert!(
-                    end.collected_in_bound,
-                    "the probe was ended and collected within the cleanup bound: {end:?}"
-                );
-                assert!(
-                    end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
-                    "the thread's total, cleanup included: {:?}",
-                    end.took
-                );
+                if let Some(end) = thread_end_if_started(&probed, directory) {
+                    assert!(
+                        end.collected_in_bound,
+                        "the probe was ended and collected within the cleanup bound, in {label}, deadline {deadline:?}: {end:?}"
+                    );
+                    assert!(
+                        end.took <= deadline + probe::CLEANUP_BOUND + SLACK,
+                        "the thread's total, cleanup included: {:?}, in {label}, deadline {deadline:?}",
+                        end.took
+                    );
+                }
                 probed
             },
         );
-        // A stand-in that wrote no number has nothing to be left running; the start is not decided.
-        if started {
-            let left = survivors(here.path(), &["main.pid"]);
-            assert!(
-                left.is_empty(),
-                "left running after the thread ended, in {label}: {left:?}"
-            );
-        }
+        assert!(
+            started,
+            "premise: the stand-in wrote main.pid within the longest deadline tried, {deadline:?}, in {label}: {probed:?}"
+        );
+        let left = survivors(here.path(), &["main.pid"]);
+        assert!(
+            left.is_empty(),
+            "left running after the thread ended, in {label}: {left:?}"
+        );
     }
 }
 
