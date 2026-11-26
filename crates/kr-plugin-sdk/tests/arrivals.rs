@@ -70,6 +70,17 @@ fn the_contract_lists_the_members_that_arrived_inside_a_level() {
     );
 }
 
+/// The ACP launch of `plugin.json` is no entry of the table, so its arrival is tied to the SDK
+/// version here: while the launch is the newest member, the version it arrived at is the SDK's own,
+/// and the package contract states it. A renumber of the SDK must move the launch's arrival with
+/// it, and a later SDK version that adds another member moves this case to the literal
+/// `"0.1.11"`.
+#[test]
+fn the_launch_arrived_at_the_sdk_version_and_the_contract_states_it() {
+    assert_eq!(kr_plugin_sdk::acp_launch::ARRIVAL, SDK_VERSION);
+    assert_eq!(package_contract()["acp_launch"]["sdk_version"], SDK_VERSION);
+}
+
 /// The member arrives at an SDK version above the one before it in the table, and not above the
 /// SDK this crate implements. The entry is found by the member's name, so the case reads the
 /// arrival the table states and holds no version of its own.
