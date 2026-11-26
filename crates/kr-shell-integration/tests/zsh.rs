@@ -431,3 +431,14 @@ fn an_alias_never_stands_in_for_the_program_in_bash_and_zsh() {
 fn a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish() {
     shellpkg::a_program_the_shell_cannot_find_is_the_shells_own_message_in_bash_zsh_and_fish(ZSH);
 }
+
+/// The line that proves a shell works, typed after the keys that put a reader back, keeps its first
+/// byte when the shell is slow to run.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "drives this tree's built Zsh package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slow_to_run() {
+    shellpkg::a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slow_to_run(
+        ZSH,
+    );
+}

@@ -7624,6 +7624,172 @@ pub fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_pre
     );
 }
 
+/// A line typed straight after the keys that put a reader back keeps its first byte, with the
+/// shell slow to run.
+///
+/// [`Session::recover`] types an interrupt among its keys, and the line that proves the shell
+/// works follows. The terminal raises the interrupt as the key goes in. A shell that the scheduler
+/// has not yet run takes the interrupt and the keys behind it together and keeps the interrupt for
+/// the next line it reads: that line is cut short at its first byte, and the rest of it runs as a
+/// command of its own. Where a shell does so, a line goes in first for the interrupt to be spent
+/// on, and the reader's return from it is awaited (see [`Dialect::kept_interrupt_line`]).
+///
+/// Here the shell and this thread share one processor, and the shell is in the idle scheduling
+/// class, so it runs only when this thread waits, whatever the priority of this thread or of the
+/// machine's other work. The wait for the command that ends in the prompt wakes at the terminal's
+/// own write, through a doorbell that the thread reading the terminal rings after each read, so
+/// the shell is still between that write and its next read when the keys go in.
+///
+/// The case is a race, and it is red by likelihood and not by certainty. Without the line, a round
+/// lost the byte in 37 of 96 rounds (2 to 6 of 12 in a run) on a build box at a load of 26 to 44,
+/// and in 21 of 96 on another run of the same kind at a load of 25 to 30. A shell at nice 19 and
+/// not in the idle class, beside a thread at nice 19, lost it in 1 of 48 rounds, so the class
+/// matters; a wait that polls the bridge beside a thread at nice 10 lost it in 1 of 60 rounds and
+/// one that spins in 9 of 60. No form loses it in every round. A run is red unless every round
+/// keeps the byte, so 48 rounds at 15 per cent a round leave 0.85^48, about 4 in 10,000, of a
+/// green run, and fewer at the rates measured. The rate moves with the load of the machine, and a
+/// machine that loses the byte less often needs more rounds. With a bare newline as the line, the
+/// wait for the reader's return failed in 4 of 4 runs, because the shell spent the interrupt on
+/// the newline and cancelled it; with a space, 128 of 128 rounds came back, 89 of them in the
+/// order that holds the shell back.
+///
+/// The case asserts its premise, read back from the kernel for the shell and for this thread:
+/// both on the one processor, the shell in the idle class and this thread not. Where the shell
+/// cannot be put in the class, or the read-back differs, the case fails with the premise's
+/// words, and does not pass. It prints in how many rounds the shell had not yet entered its
+/// reader when the keys went in, and does not assert the count. It runs on Linux only, where
+/// the processor and the class can be set.
+///
+/// # Panics
+///
+/// Panics when the premise does not hold, when the shell does not answer the command that ends
+/// in the prompt the recovery keys are typed at, and when it does not answer a line typed after
+/// them.
+#[cfg(target_os = "linux")]
+pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slow_to_run(
+    kind: ShellKind,
+) {
+    use rustix::process::{Pid, setpriority_process};
+    use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+
+    /// Puts this thread back on the processors it was allowed, whichever way the case ends: a run
+    /// with one test thread runs every case on the same thread.
+    struct Unpinned(CpuSet);
+
+    impl Drop for Unpinned {
+        fn drop(&mut self) {
+            let _ = sched_setaffinity(None, &self.0);
+        }
+    }
+
+    /// The processors a task may run on and the scheduling policy it runs under, as the kernel
+    /// reports them for `task`, which is `/proc/<number>` or `/proc/thread-self`.
+    fn kernel_says_of(task: &str) -> (String, String) {
+        let status = std::fs::read_to_string(format!("{task}/status")).expect("the task's status");
+        let allowed = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+            .expect("the processors the task may run on")
+            .trim()
+            .to_owned();
+        let stat = std::fs::read_to_string(format!("{task}/stat")).expect("the task's stat");
+        // The fields after the command name, whose own text may hold spaces and brackets: the
+        // policy is the 41st field of the line, which is the 39th after the state.
+        let policy = stat
+            .rsplit(')')
+            .next()
+            .and_then(|after| after.split_whitespace().nth(38))
+            .expect("the task's scheduling policy")
+            .to_owned();
+        (allowed, policy)
+    }
+
+    // The shell loses the line's first byte in many rounds of this kind and not in all of them, so
+    // the case makes enough rounds that one of them loses it.
+    const ROUNDS: u8 = 48;
+    // The idle scheduling class, as the kernel numbers it.
+    const IDLE: &str = "5";
+
+    let package = Package::built(kind);
+    // The harness's own threads are started by this one and keep the processor it is on.
+    let allowed = sched_getaffinity(None).expect("the processors this thread may run on");
+    let cpu = (0..CpuSet::MAX_CPU)
+        .rev()
+        .find(|&cpu| allowed.is_set(cpu))
+        .expect("a processor this thread may run on");
+    let mut only = CpuSet::new();
+    only.set(cpu);
+    sched_setaffinity(None, &only).expect("one processor for this thread");
+    let _unpinned = Unpinned(allowed);
+    let mut session = Session::start(&package);
+    let pid = session.child_pid().expect("the shell's process number");
+    assert!(pid > 1, "the shell's process number is {pid}");
+    let shell = Pid::from_raw(i32::try_from(pid).expect("a process number"))
+        .expect("a process number that names a process");
+    setpriority_process(Some(shell), 19).expect("the lowest priority for the shell");
+    let put = std::process::Command::new("chrt")
+        .args(["--idle", "--pid", "0", &pid.to_string()])
+        .status();
+    assert!(
+        put.as_ref().is_ok_and(std::process::ExitStatus::success),
+        "the premise of this case cannot be set, so a pass would show nothing: `chrt --idle` did \
+         not put the shell ({pid}) in the idle class ({put:?})"
+    );
+    session.first_prompt();
+    session.forget_events();
+    let (shell_allowed, shell_policy) = kernel_says_of(&format!("/proc/{pid}"));
+    let (thread_allowed, thread_policy) = kernel_says_of("/proc/thread-self");
+    assert!(
+        shell_allowed == cpu.to_string()
+            && shell_policy == IDLE
+            && thread_allowed == cpu.to_string()
+            && thread_policy != IDLE,
+        "the premise of this case does not hold, so a pass would show nothing: the shell ({pid}) \
+         may run on processors {shell_allowed:?} in scheduling policy {shell_policy}, and this \
+         thread on {thread_allowed:?} in policy {thread_policy}; the case needs both on processor \
+         {cpu} alone, the shell in policy {IDLE} (the idle class) and this thread in another"
+    );
+    let ready = dialect(kind)
+        .ignore_eof_on
+        .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
+    let mut held = 0_u8;
+    for round in 0..ROUNDS {
+        let pending = session.submit(&ready, "kr-ready");
+        let deadline = session.window(REPLY);
+        let shown = session.wait_for_output_after_at_once_by(pending.start, "kr-ready", deadline);
+        assert!(
+            shown,
+            "round {} of {ROUNDS}: the shell did not answer the command that ends in the prompt \
+             the recovery keys are typed at:\n{}",
+            round + 1,
+            session.terminal_output()
+        );
+        let seen = session.commands.arrivals.len();
+        // The recovery keys, and the line that proves the shell works typed behind them.
+        let outcome = session.fenced_after_a_command_or_the_screen(30 + round);
+        assert!(
+            outcome.is_ok(),
+            "round {} of {ROUNDS}: the line typed after the recovery keys did not run, so the \
+             shell may have lost its first byte; the terminal showed:\n{}",
+            round + 1,
+            outcome.as_ref().err().map_or("", String::as_str)
+        );
+        let first_of_the_reader = session.commands.arrivals[seen..]
+            .iter()
+            .find_map(|arrival| match arrival {
+                Arrival::Event(name @ ("editor_enter" | "editor_leave")) => Some(*name),
+                _ => None,
+            });
+        if first_of_the_reader == Some("editor_enter") {
+            held += 1;
+        }
+    }
+    eprintln!(
+        "rounds in which the shell had not yet entered its reader when the recovery keys went in: \
+         {held} of {ROUNDS}"
+    );
+}
+
 #[cfg(test)]
 mod dependency_guards {
     use super::{is_a_macos_system_library, is_relative_to_the_file};

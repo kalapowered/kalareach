@@ -61,9 +61,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 # The package tests wait on the bridge's endpoint for the system to say it is ready rather than
 # sleeping and asking again, so that the time a reply takes does not depend on a timer the system
-# may delay.
+# may delay. One case also pins its shell to a processor, which needs the `thread` feature.
 [target.'cfg(unix)'.dev-dependencies]
-rustix = { workspace = true, features = ["event"] }
+rustix = { workspace = true, features = ["event", "thread"] }
 
 [lints]
 workspace = true

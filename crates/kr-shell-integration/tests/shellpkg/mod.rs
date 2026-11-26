@@ -3051,6 +3051,12 @@ struct TerminalInput {
     cursor_questions: AtomicUsize,
     /// After how many of them the terminal keeps its answers, or `usize::MAX` for never.
     hold_after_cursor_questions: AtomicUsize,
+    /// The doorbell the thread that reads the terminal rings after each read: this end is the one
+    /// a wait sleeps on beside the bridge, so that it wakes when the terminal shows something and
+    /// not when a timer says it may have.
+    bell_heard: UnixStream,
+    /// The end of the doorbell that is rung.
+    bell_rung: UnixStream,
 }
 
 /// Bytes to type, and where to say that they went in.
@@ -3077,13 +3083,35 @@ impl TerminalInput {
                 let _ = next.typed.send(outcome);
             }
         });
+        let (bell_heard, bell_rung) =
+            UnixStream::pair().expect("a doorbell for what the terminal shows");
+        bell_heard
+            .set_nonblocking(true)
+            .expect("a doorbell that does not block");
+        bell_rung
+            .set_nonblocking(true)
+            .expect("a doorbell that does not block");
         Self {
             typing,
             writer,
             held: Mutex::new(None),
             cursor_questions: AtomicUsize::new(0),
             hold_after_cursor_questions: AtomicUsize::new(usize::MAX),
+            bell_heard,
+            bell_rung,
         }
+    }
+
+    /// Rings the doorbell: the terminal has shown something. A bell that is already rung and not
+    /// yet heard needs no second ring, so a full one is left as it is.
+    fn ring(&self) {
+        let _ = (&self.bell_rung).write(&[1]);
+    }
+
+    /// Takes the rings so far, so that the next wait sleeps until the next one.
+    fn hear(&self) {
+        let mut sink = [0u8; 64];
+        while matches!((&self.bell_heard).read(&mut sink), Ok(taken) if taken > 0) {}
     }
 
     /// Types `bytes`, and says by `deadline` whether they went in.
@@ -3217,6 +3245,7 @@ fn read_terminal(master: &dyn MasterPty) -> TerminalReading {
                         .lock()
                         .expect("the output lock")
                         .extend_from_slice(&buffer[..taken]);
+                    answering.ring();
                 }
             }
         }
