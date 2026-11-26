@@ -21,14 +21,14 @@ use kr_client::pairing::paired::{PairedHost, PairedHosts};
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OFFLINE_EXPORT_FORMAT, OfflineExport,
-    PairingStanding, PublicationRefusal, RecoveryError, RestoreError, RestoreSource,
-    RetrievalPolicy, SignInCause, SourceService, SourceSignIn, fresh_locator,
+    PairingStanding, PlannedMember, PublicationRefusal, RecoveryError, RestoreError, RestorePlan,
+    RestoreSource, RetrievalPolicy, SignInCause, SourceService, SourceSignIn, fresh_locator,
 };
 use kr_client::retry::RETRY_BACKOFF_MIN;
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, GenerationStanding, Material,
-    ObjectSource, seal_archive, stage_object,
+    ObjectSource, RestoreGeneration, seal_archive, stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -5062,6 +5062,69 @@ async fn the_host_that_holds_is_data_and_changes_no_word_and_no_digest() {
             ))),
         ],
         "the host is data on the standing and on the refusal"
+    );
+}
+
+/// KR-REQ-20.12: the digest a person confirms is a fixed value for a fixed plan, and the host that
+/// holds the checkpoint is not in it. The standing's sentence is the one text of the digest that
+/// comes from the checkpoint's source, and it is the same for every host.
+#[test]
+fn the_digest_of_a_plan_held_by_a_host_is_a_fixed_value_that_names_no_host() {
+    let plan = |source: CheckpointSource| RestorePlan {
+        origin: ORIGIN.to_owned(),
+        archive_id: archive(),
+        generation: BackupGeneration::new(6),
+        manifest_hash: Digest256::from_bytes([0x22; 32]),
+        writer: KeyId::from_bytes([0x33; 32]),
+        standing: RestoreGeneration {
+            archive_id: archive(),
+            backup_generation: BackupGeneration::new(6),
+            standing: GenerationStanding::Ahead {
+                checkpoint: BackupGeneration::new(5),
+            },
+            source: Some(source),
+        },
+        pairing: PairingStanding::None,
+        bundle_revision: 1,
+        published_at_ms: TimestampMs::new(1_700_000_000_000),
+        members: vec![PlannedMember {
+            object_id: BackupObjectId::new(id(0x20)),
+            stored_len: 41,
+            plaintext_len: Some(10),
+            verdict: MemberVerdict::Restore {
+                role: MemberRole::Configuration,
+                file: "configuration.json".to_owned(),
+            },
+        }],
+    };
+    let host = |byte: u8| CheckpointSource::Pairing(EndpointKey::from_bytes([byte; 32]));
+    let digest = |source| {
+        plan(source)
+            .digest("env", b"/restore/a", "")
+            .expect("a digest")
+    };
+
+    assert_eq!(
+        plan(host(0x42)).standing.describe(),
+        "Restoring backup generation 6. It is newer than generation 5, the newest that a host \
+         this device paired with named when this device asked. No restore can show that the \
+         service is not holding a newer backup back.",
+        "the sentence the digest covers"
+    );
+    assert_eq!(
+        digest(host(0x42)),
+        "354125ee3ea2390001f89dd6a8ef4688508a8e5b47dd25f9010c9bbc9e373b2d",
+        "a plan held by a host"
+    );
+    assert_eq!(
+        digest(host(0x52)),
+        digest(host(0x42)),
+        "no host is in the digest"
+    );
+    assert_eq!(
+        digest(CheckpointSource::RecoveryBundle),
+        "3a08d8954d76476f6cc7404e3a863d43acb280b9aafaf72547b6b709458f76b3",
+        "a plan held by the bundle"
     );
 }
 
