@@ -384,6 +384,14 @@ pub(super) fn present_names(git: &DirHandle) -> Vec<String> {
         .collect()
 }
 
+/// Whether the held Git directory has a `modules` folder: the Git directories of submodules, with
+/// settings and hooks of their own that the broker does not hold. The hold refuses a repository
+/// that has one, so one that is there at the end is new. A name that cannot be shown absent counts
+/// as present.
+pub(super) fn modules_present(git: &DirHandle) -> bool {
+    is_present(git, "modules")
+}
+
 /// The folders of the Git directory that the person's own Git writes into, by name.
 pub const WRITTEN_FOLDERS: [&str; 4] = ["objects", "refs", "logs", "info"];
 

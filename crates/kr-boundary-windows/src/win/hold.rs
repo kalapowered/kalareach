@@ -68,6 +68,8 @@ pub const RULE_PERSON: &str = "hold-person";
 pub const RULE_NO_GIT: &str = "hold-no-git";
 /// The rule of a refusal for a repository with no `config` file.
 pub const RULE_NO_CONFIG: &str = "hold-no-config";
+/// The repository's `.git` holds submodules.
+pub const RULE_MODULES: &str = "hold-modules";
 /// The rule of a refusal for a `config` that has more than one name.
 pub const RULE_CONFIG_LINKS: &str = "hold-config-links";
 /// The rule of a refusal for a `config` that another program has open for writing.
@@ -122,6 +124,10 @@ pub const PERSON_WORDS: &str = "your account cannot read this path";
 // text: NO_GIT_WORDS
 pub const NO_GIT_WORDS: &str =
     "the project folder has no .git folder; a .git file or link in its place is not accepted";
+
+/// The reply when the repository has submodules: not opened through the boundary.
+// text: MODULES_WORDS
+pub const MODULES_WORDS: &str = "this repository has submodules, and the broker does not guard a submodule's own Git settings and hooks, so it does not open it; use Git on it yourself, outside the broker, or name a project without submodules";
 
 /// The reply when the repository has no `config`.
 // text: NO_CONFIG_WORDS
@@ -225,6 +231,9 @@ impl TreeHold {
             }
         }
         names.extend(listing::present_names(&self.git_dir));
+        if listing::modules_present(&self.git_dir) {
+            names.insert("modules".to_owned());
+        }
         names.extend(listing::linked_folders(&self.git_dir));
         names.extend(
             listing::present_states(&self.git_dir)
@@ -390,6 +399,9 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
     };
     person_reads(client, git_dir.handle(), &format!("{display}\\.git"))?;
     let config = read_config(&git_dir, client, &display)?;
+    if listing::modules_present(&git_dir) {
+        return Err(refuse(RefusedKind::Repository, RULE_MODULES, MODULES_WORDS));
+    }
     if let Some(name) = listing::present_names(&git_dir).first() {
         return Err(refuse(
             RefusedKind::Repository,

@@ -42,8 +42,8 @@ use kr_boundary_windows::win::admission::{
 };
 use kr_boundary_windows::win::ffi::{Handle, system_windows_directory};
 use kr_boundary_windows::win::hold::{
-    ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, RULE_ABSENT_NAME, RULE_LISTING_BOUND,
-    TreeHold, hold_tree,
+    ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, MODULES_WORDS, RULE_ABSENT_NAME,
+    RULE_LISTING_BOUND, RULE_MODULES, TreeHold, hold_tree,
 };
 use kr_boundary_windows::win::job::{Job, Limits};
 use kr_boundary_windows::win::launch::{
@@ -956,6 +956,37 @@ fn config_hold_a_junction_in_the_place_of_a_folder_the_git_writes_into_is_seen_a
             .names;
         assert!(names.iter().any(|seen| seen == name), "{name}: {names:?}");
     }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_repository_with_submodules_is_refused_and_a_modules_folder_that_is_new_is_seen() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhcp");
+    let scratch = Scratch::new();
+    // A repository whose Git folder holds submodules is not opened through the boundary.
+    let with = Project::make(&scratch, "modules");
+    fs::create_dir_all(with.git.join(r"modules\sub\hooks")).unwrap();
+    let refusal = hold_tree(with.root.to_str().unwrap(), &ordinary.as_client())
+        .expect_err("a repository with submodules is refused");
+    assert_eq!(refusal.kind, RefusedKind::Repository);
+    assert_eq!(refusal.rule, RULE_MODULES);
+    assert_eq!(refusal.detail(), MODULES_WORDS);
+    // A `modules` folder that is new at the end of an operation is a change.
+    let without = Project::make(&scratch, "nomodules");
+    let hold = hold_tree(without.root.to_str().unwrap(), &ordinary.as_client())
+        .expect("a repository without submodules is held");
+    assert_eq!(hold.end_check(), Ok(()), "nothing is changed yet");
+    fs::create_dir_all(without.git.join(r"modules\sub")).unwrap();
+    assert_eq!(
+        hold.end_check(),
+        Err(changed(&["modules"])),
+        "a new modules folder"
+    );
 }
 
 #[test]
