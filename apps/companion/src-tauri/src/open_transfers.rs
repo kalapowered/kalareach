@@ -1642,6 +1642,8 @@ impl Desk {
         let running = Arc::clone(live);
         let task = tauri::async_runtime::spawn(async move {
             #[cfg(feature = "testing")]
+            testing::gate(running.key, testing::Awaited::BeforeSender).await;
+            #[cfg(feature = "testing")]
             let _exit = testing::ExitNote(running.key);
             #[cfg(feature = "testing")]
             testing::at_sender_start(running.key).await;
@@ -3231,6 +3233,9 @@ pub mod testing {
         BeforeOwed,
         /// A draft sweep, under the device's identifier, has begun and not yet read the folder.
         Sweeping,
+        /// A sender task was made and has not yet run its first line. Held under its key, a stop
+        /// that comes meanwhile cancels the task before it is counted as running.
+        BeforeSender,
     }
 
     /// The operations that came to an [`Awaited`] place, and whether they may go on.
