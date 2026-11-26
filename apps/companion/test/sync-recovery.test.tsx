@@ -538,7 +538,8 @@ describe('recovery', () => {
     await waitFor(() => {
       expect(sheet).toHaveTextContent('cannot be read (checkpoints.json: not JSON)')
     })
-    await person.click(await within(recovery).findByTestId('recovery-copy-bundle'))
+    expect(within(recovery).queryByTestId('recovery-copy-bundle')).toBeInTheDocument()
+    await person.click(within(recovery).getByTestId('recovery-copy-bundle'))
     await waitFor(() => {
       expect(controls.recovery.exportsMade).toEqual([
         { path: '/tmp/kalareach-recovery-bundle.krexport', archive: null }

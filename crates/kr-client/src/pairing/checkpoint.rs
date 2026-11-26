@@ -1408,13 +1408,11 @@ mod tests {
             std::thread::spawn(move || {
                 let _ = sender.send(cause(&checkpoints.held_checkpoints()));
             });
-            receiver.recv_timeout(Duration::from_secs(10))
+            receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the answer came within the 10 s bound")
         };
-        assert_eq!(
-            refused_within(&rig),
-            Ok(Some(SnapshotCause::Lock)),
-            "a link"
-        );
+        assert_eq!(refused_within(&rig), Some(SnapshotCause::Lock), "a link");
         std::fs::remove_file(rig.path(LOCK_FILE)).expect("removed");
 
         let made = std::process::Command::new("mkfifo")
@@ -1422,11 +1420,7 @@ mod tests {
             .status()
             .expect("mkfifo runs");
         assert!(made.success());
-        assert_eq!(
-            refused_within(&rig),
-            Ok(Some(SnapshotCause::Lock)),
-            "a FIFO"
-        );
+        assert_eq!(refused_within(&rig), Some(SnapshotCause::Lock), "a FIFO");
     }
 
     const NOW: u64 = 1_764_000_100_000;
