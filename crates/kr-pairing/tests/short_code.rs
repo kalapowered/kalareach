@@ -2486,3 +2486,115 @@ fn a_code_invitation_that_names_a_current_approval_or_question_is_not_issued() {
     assert!(harness.store.snapshot().is_empty(), "nothing was written");
     assert_eq!(harness.issue().record().state, InvitationState::Open);
 }
+
+/// The host's signed bundle as the release before the backup checkpoints read it, frozen: each type
+/// refuses a field it does not know.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenSignedHostBundle {
+    bundle: FrozenHostBundle,
+    transcript: Digest256,
+    signature: kr_protocol::scalars::Signature64,
+}
+
+/// The host's key bundle as that release read it.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FrozenHostBundle {
+    invitation_id: kr_protocol::ids::InvitationId,
+    device_id: DeviceId,
+    device_key_revision: DeviceKeyRevision,
+    endpoint_id: EndpointKey,
+    keys: DevicePublicKeys,
+    network_config: NetworkConfig,
+    proposed_grant: ProposedGrant,
+}
+
+/// KR-REQ-20.12: a candidate of the release before the backup checkpoints pairs with this host. It
+/// reads the host's signed bundle with its own frozen types, which refuse any field they do not
+/// know, and the bytes it reads are the bytes this host's bundle encodes to. The exchange has no
+/// step in which a candidate asks for a checkpoint (the pairing crate holds no such method), so a
+/// candidate that never asks completes the pairing and the owner's approval commits it.
+#[test]
+fn a_candidate_of_the_release_before_reads_the_hosts_bundle_unchanged_and_pairs() {
+    let harness = Harness::new();
+    let mut host = harness.issue();
+    let entered = EnteredCode::parse(&host.code().display_text()).expect("the code");
+
+    let budget = TestClientBudgetStore::new().expect("a store");
+    let service = TestClient::new(LocatorRecord {
+        invitation_id: host.invitation_id(),
+        advertised_expires_at_ms: TimestampMs::new(0),
+    });
+    let (mut client, admission, _) =
+        ClientAttempt::start(&budget, &harness.clock, &service, &origin(), &entered)
+            .expect("an attempt");
+    let host_pake = host
+        .admit(admission.attempt_id, admission.client_nonce)
+        .expect("admitted");
+    let client_pake = client
+        .with_host_nonce(
+            host.context(admission.attempt_id)
+                .expect("a context")
+                .host_nonce,
+            &harness.clock,
+        )
+        .expect("a nonce");
+    host.receive_client_pake(admission.attempt_id, &client_pake)
+        .expect("the client's message");
+    let client_tag = client
+        .receive_host_pake(&host_pake, &harness.clock)
+        .expect("the host's message");
+    let confirmation = host
+        .verify_client_confirmation(admission.attempt_id, &client_tag)
+        .expect("a confirmation");
+    client
+        .verify_host_confirmation(&confirmation.host_tag, &harness.clock)
+        .expect("the host's confirmation");
+
+    // The host sends its signed bundle; the candidate of the release before reads it with its types.
+    let host_frame = host
+        .seal_host_bundle(admission.attempt_id, &harness.host_keys.authorisation)
+        .expect("the host's bundle");
+    let opened = client
+        .open_host_bundle(&host_frame, &harness.clock)
+        .expect("the bundle opens");
+    let canonical = kr_cbor::to_canonical_vec(&opened).expect("canonical bytes");
+    let Ok(frozen) = kr_cbor::from_canonical_slice::<FrozenSignedHostBundle>(
+        &canonical,
+        &kr_cbor::Limits::DEFAULT,
+    ) else {
+        panic!("the release before reads the host's bundle")
+    };
+    assert_eq!(
+        kr_cbor::to_canonical_vec(&frozen).expect("canonical bytes"),
+        canonical,
+        "the bundle's bytes are what the release before reads and writes back"
+    );
+    assert_eq!(frozen.bundle.invitation_id, opened.bundle.invitation_id);
+    assert_eq!(frozen.bundle.device_id, opened.bundle.device_id);
+    assert_eq!(frozen.bundle.proposed_grant, opened.bundle.proposed_grant);
+
+    // The rest of the pairing goes on from that read, and the owner's approval commits it.
+    let client_frame = client
+        .seal_client_bundle(
+            &harness.client_keys.authorisation,
+            client_bundle(&harness.client_keys),
+            &harness.clock,
+        )
+        .expect("the candidate's bundle");
+    host.open_client_bundle(admission.attempt_id, &client_frame)
+        .expect("the candidate's bundle opens");
+    let host_peer = harness.host_peer();
+    let request = client
+        .finish_request(
+            &host_peer,
+            harness.client_keys.transport.public(),
+            &harness.clock,
+        )
+        .expect("a finish");
+    let client_peer = harness.client_peer();
+    host.finish(&request, &client_peer).expect("finished");
+    assert!(approve(&harness, &mut host).is_ok());
+    assert_eq!(host.record().state, InvitationState::Committed);
+}
