@@ -941,7 +941,35 @@ impl Registry {
         Ok(registry)
     }
 
+    /// The version the file records, read without making a table: `None` for a file with no version
+    /// table or no version row.
+    fn recorded_version(&self) -> Result<Option<i64>> {
+        let has_the_table: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                                 WHERE type = 'table' AND name = 'schema_version')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        if !has_the_table {
+            return Ok(None);
+        }
+        self.connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .map_err(ControllerError::registry)
+    }
+
     fn migrate(&self) -> Result<()> {
+        // The version is read, and a version this build does not open is refused, before any
+        // statement writes: not even a table an ordinary writer makes is made in a file that is
+        // refused.
+        let recorded = self.recorded_version()?;
+        if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
+            return Err(refused_version(version));
+        }
         self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -1003,21 +1031,12 @@ impl Registry {
         self.connection
             .execute_batch(CLOCK_CONTINUITY_SCHEMA)
             .map_err(ControllerError::registry)?;
-        let recorded: Option<i64> = self
-            .connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .optional()
-            .map_err(ControllerError::registry)?;
         // The other writers first and the version last: a file this brought to a version has all
-        // four writers at least at the shape that version stands for. A file past the version this
-        // build reads through is refused below as it is, without a table of theirs being made in
-        // it; a file an earlier build recorded at the current version before the others had opened
-        // it is not brought here, and each writer brings its own tables the next time it opens the
-        // file. A file at 17 or at 20, which no release wrote, is refused below, and nothing is
-        // written in it first: the two tables of version 21 are made by the steps that write it,
-        // never by the batch above.
-        if recorded.is_none_or(|version| version < SCHEMA_VERSION && version != 17 && version != 20)
-        {
+        // four writers at least at the shape that version stands for. A file an earlier build
+        // recorded at the current version before the others had opened it is not brought here, and
+        // each writer brings its own tables the next time it opens the file. The two tables of
+        // version 21 are made by the steps that write it, never by the batch above.
+        if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
             self.bring_the_other_writers_forward()?;
         }
         match recorded {
@@ -1234,31 +1253,13 @@ impl Registry {
                 self.migrate_18_to_19()?;
                 self.migrate_19_to_21()?;
             }
-            Some(17) => {
-                return Err(ControllerError::RegistryUnavailable {
-                    detail: "this registry is at schema version 17, which no release wrote"
-                        .to_owned(),
-                });
-            }
             Some(18) => {
                 self.migrate_18_to_19()?;
                 self.migrate_19_to_21()?;
             }
             Some(19) => self.migrate_19_to_21()?,
-            Some(20) => {
-                return Err(ControllerError::RegistryUnavailable {
-                    detail: "this registry is at schema version 20, which no release wrote"
-                        .to_owned(),
-                });
-            }
-            Some(version) => {
-                return Err(ControllerError::RegistryUnavailable {
-                    detail: format!(
-                        "this registry is at schema version {version}; this build reads versions \
-                         {OLDEST_SCHEMA_VERSION} to {READS_THROUGH_SCHEMA_VERSION}"
-                    ),
-                });
-            }
+            // A version that is refused was refused above, before anything was written.
+            Some(version) => return Err(refused_version(version)),
         }
         self.connection
             .execute(
@@ -3341,6 +3342,28 @@ fn begin_write(connection: &mut Connection) -> Result<rusqlite::Transaction<'_>>
 ///
 /// The registry creates it with its other tables, and so does the device directory, which ends a
 /// boot's lost continuity in the same transaction as the trust record it writes.
+/// Whether this build refuses a registry at `version`: 17 and 20, which no release wrote, and every
+/// version outside the range this build reads.
+const fn is_refused_version(version: i64) -> bool {
+    version == 17
+        || version == 20
+        || version < OLDEST_SCHEMA_VERSION
+        || version > READS_THROUGH_SCHEMA_VERSION
+}
+
+/// The refusal of a registry at a version that [`is_refused_version`] names.
+fn refused_version(version: i64) -> ControllerError {
+    let detail = if version == 17 || version == 20 {
+        format!("this registry is at schema version {version}, which no release wrote")
+    } else {
+        format!(
+            "this registry is at schema version {version}; this build reads versions \
+             {OLDEST_SCHEMA_VERSION} to {READS_THROUGH_SCHEMA_VERSION}"
+        )
+    };
+    ControllerError::RegistryUnavailable { detail }
+}
+
 pub(crate) const CLOCK_CONTINUITY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS clock_continuity (
          boot_epoch        BLOB PRIMARY KEY NOT NULL,
          lost_at_ms        INTEGER NOT NULL,

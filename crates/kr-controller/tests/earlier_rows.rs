@@ -1155,6 +1155,52 @@ fn a_registry_at_20_is_refused_as_a_version_no_release_wrote_and_no_table_is_mad
     assert!(boot_schema(&path).is_empty());
 }
 
+/// KR-REQ-23.45: a registry file that this build refuses is left byte for byte as it was, also when
+/// it lacks a table that an ordinary writer makes as it opens the file: the version is read, and the
+/// refusal made, before any table is. The file here is at 20, which no release wrote, at 17, which
+/// none wrote either, and at 23, past what this build reads, and it lacks one ordinary table and
+/// the clock table.
+#[test]
+fn a_refused_registry_that_lacks_an_ordinary_table_is_left_byte_for_byte_as_it_was() {
+    for version in [20_i64, 17, 23] {
+        let temp = tempfile::tempdir().expect("a directory on the internal disk");
+        let path = temp.path().join("registry.db");
+        drop(open_registry(&path).expect("a registry"));
+        rusqlite::Connection::open(&path)
+            .expect("the registry opens")
+            .execute_batch(&format!(
+                "DROP TABLE tombstones; DROP TABLE clock_continuity;
+                 UPDATE schema_version SET version = {version};"
+            ))
+            .expect("the tables go and the version is put back");
+        let before = std::fs::read(&path).expect("the file reads");
+        let schema = schema_of(&path);
+        assert!(
+            schema.iter().all(|(_, name, _)| name != "tombstones"),
+            "the file lacks an ordinary table"
+        );
+        let refusal = match open_registry(&path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a registry at {version} is refused"),
+        };
+        assert!(
+            refusal.contains(&format!("schema version {version}")),
+            "{refusal}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the file reads"),
+            before,
+            "the file refused at {version} is byte for byte as it was"
+        );
+        assert_eq!(
+            schema_of(&path),
+            schema,
+            "no table was made in the file refused at {version}"
+        );
+        assert_eq!(recorded_version(&path), version);
+    }
+}
+
 /// KR-REQ-23.45: a registry at 22 is the tables of 21 with the configuration document at its next
 /// version, and this build opens it as it finds it: nothing is brought forward, no table is made
 /// and no version is written.
