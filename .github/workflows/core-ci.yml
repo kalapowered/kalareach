@@ -2758,7 +2758,11 @@ jobs:
   # acceleration a hosted Linux runner offers.
   #
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
-  # take the room of one every other job restores. The job's time is the cost of that.
+  # take the room of one every other job restores. The job's time is the cost of that, and so is
+  # every fetch from the public package servers, which answer a runner that asks too often with
+  # "too many requests". Two steps before the builds make that survivable: the fetch of the Gradle
+  # distribution is tried again by the step itself, and Gradle is told to try each refused
+  # dependency fetch again, with waits between the tries (see the two steps).
   #
   # Every step has a limit of its own, so that a step that hangs is ended, and the evidence upload
   # after it still has its time. A step that installs or builds has twice the longest it took in the
@@ -2767,17 +2771,20 @@ jobs:
   # run 45345872273) and the minified build 47 (23.2, run 44759162215). The steps that only set up
   # or read, none of which took more than 1.5 minutes, have 5, or 6 for the disk, as the other
   # jobs' do; the evidence upload has 3, its pause 2 and its second try 3, as in the macOS jobs.
-  # The step that starts the emulator has 65: its own waits can add up to 3510 seconds, the boot's
-  # 600, the launch script's twelve deadlines of 240 seconds (the install's four, seven waits and the
-  # two looks after them) and 30 for its clean-up, and a run that waits that long should still reach
-  # its own error line and keep the device's log; the 6.5 minutes over are for the device's creation
-  # and the library's cases, which took 4.7 minutes in all in the longest of 63 runs. All the limits
-  # add up to 199 of the job's 202 minutes, which leaves 3 for the set-up and clean-up that no step
-  # limit counts. The whole job took 42.4 minutes at most (run 45051604117).
+  # The step that fetches the Gradle distribution has 12: five tries, each of which downloads one
+  # file, and the waits between them, 30, 60, 90 and 120 seconds, 300 in all. The step that sets
+  # Gradle's waits has 5, as the steps that only set up. The step that starts the emulator has 65:
+  # its own waits can add up to 3510 seconds, the boot's 600, the launch script's twelve deadlines
+  # of 240 seconds (the install's four, seven waits and the two looks after them) and 30 for its
+  # clean-up, and a run that waits that long should still reach its own error line and keep the
+  # device's log; the 6.5 minutes over are for the device's creation and the library's cases, which
+  # took 4.7 minutes in all in the longest of 63 runs. All the limits add up to 216 of the job's 219
+  # minutes, which leaves 3 for the set-up and clean-up that no step limit counts. The whole job
+  # took 42.4 minutes at most (run 45051604117).
   android-app:
     name: android-app
     runs-on: ubuntu-24.04
-    timeout-minutes: 202
+    timeout-minutes: 219
     steps:
       # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
       # emulator and a system image to be added to it.
@@ -2853,6 +2860,71 @@ jobs:
       - name: Check the class check
         timeout-minutes: 5
         run: node apps/companion/scripts/android-classes-selftest.mjs
+
+      # The distribution the wrapper names comes from the Gradle service, a server of its own that
+      # refuses a runner at times. Asking for the version fetches it and runs nothing of the build,
+      # so a refusal is tried again here, and only here: five tries, with 30, 60, 90 and 120
+      # seconds between them. A build's own failure is never tried again, since a build is not run
+      # by this step. The Gradle project cannot be asked for its dependencies at this point: the
+      # include files that name them are written by the Rust build, inside the step below.
+      - name: Fetch the Gradle distribution
+        timeout-minutes: 12
+        working-directory: apps/companion/src-tauri/gen/android
+        run: |
+          attempt=1
+          until sh gradlew --version; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "::error::the Gradle distribution could not be fetched in $attempt tries"
+              exit 1
+            fi
+            echo "the fetch failed (try $attempt of 5): trying again in $((attempt * 30)) seconds"
+            sleep "$((attempt * 30))"
+            attempt=$((attempt + 1))
+          done
+          echo "the Gradle distribution was fetched at try $attempt of 5"
+
+      # Gradle tries a dependency fetch again when a server refuses it with "too many requests", a
+      # server error or a timeout, and for no other failure: a compile error or a failed check is
+      # never tried again. Its own limits are three tries with 1 and 2 seconds between them, which a
+      # refusal outlasts: the run that failed here gave up after 25 seconds. These two settings give
+      # six tries with 4, 8, 16, 32 and 64 seconds between them, at most 124 seconds for one fetch.
+      # They are read as system properties by the resolver (`ErrorHandlingModuleComponentRepository`,
+      # which takes them with `Integer.getInteger`), so the properties file needs the `systemProp.`
+      # prefix, and a name without it is a project property that Gradle never reads; they are
+      # Gradle's internal names, not a documented interface, and a wrapper version that drops or
+      # renames them would leave the defaults in force without a word. So the step runs an empty
+      # build with an init script that prints what the build's own process holds, and fails when it
+      # is not what was written; and whoever changes the wrapper's version reads the resolver's
+      # source for the new version again and checks that these two names are still the ones it
+      # reads. The settings are written to the user's Gradle home, which a developer's machine does
+      # not share.
+      - name: Let Gradle wait longer between its fetch tries
+        timeout-minutes: 5
+        run: |
+          tries=6
+          first_wait=4000
+          gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_home"
+          {
+            echo "systemProp.org.gradle.internal.repository.max.tentatives=$tries"
+            echo "systemProp.org.gradle.internal.repository.initial.backoff=$first_wait"
+          } >> "$gradle_home/gradle.properties"
+          probe="$RUNNER_TEMP/gradle-probe"
+          mkdir -p "$probe"
+          echo "rootProject.name = 'probe'" > "$probe/settings.gradle"
+          cat > "$probe/print-fetch-settings.init.gradle" <<'EOF'
+          println "gradle took: tries=" + System.getProperty("org.gradle.internal.repository.max.tentatives") + " first wait=" + System.getProperty("org.gradle.internal.repository.initial.backoff") + " ms"
+          EOF
+          sh apps/companion/src-tauri/gen/android/gradlew -p "$probe" --no-daemon --console=plain \
+            -I "$probe/print-fetch-settings.init.gradle" help > "$RUNNER_TEMP/gradle-probe.log" 2>&1 || {
+            cat "$RUNNER_TEMP/gradle-probe.log"
+            exit 1
+          }
+          grep 'gradle took' "$RUNNER_TEMP/gradle-probe.log"
+          if ! grep -qxF "gradle took: tries=$tries first wait=$first_wait ms" "$RUNNER_TEMP/gradle-probe.log"; then
+            echo "::error::Gradle did not take the fetch settings that this step wrote"
+            exit 1
+          fi
 
       # The package is built the way a person builds it, and the script reads it back: the classes
       # the system resolves by name, among them the Tauri plugin, and the application identifier in
