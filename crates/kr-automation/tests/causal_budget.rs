@@ -588,6 +588,31 @@ async fn a_review_node_charges_one_session_to_its_chain() {
         "review.completed",
         WorkflowActionKind::RequestReview,
     );
+    if cfg!(windows) {
+        // No review node is offered on Windows, so there is no session to charge: the install is
+        // refused as the kind, and nothing of the chain's allowance is in question.
+        let refusal = service
+            .submit_install(
+                &WorkflowInstallParams {
+                    workflow_id: def.workflow_id,
+                    revision: def.revision,
+                    definition: def.clone(),
+                    grant_reference: def.grant_reference,
+                },
+                1_000,
+            )
+            .expect_err("Windows offers no review node");
+        assert!(
+            matches!(
+                refusal,
+                AutomationError::ActionUnavailable {
+                    action_kind: WorkflowActionKind::RequestReview
+                }
+            ),
+            "{refusal}"
+        );
+        return;
+    }
     install_and_enable(&service, &def, 1_000);
 
     let first = service

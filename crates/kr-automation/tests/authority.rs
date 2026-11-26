@@ -1388,6 +1388,27 @@ const REVIEW_RIGHTS: [ActionRight; 6] = [
     ActionRight::SessionView,
 ];
 
+/// What an install says of a review node on a platform that offers none: the refusal of the kind.
+const REVIEW_REFUSED_HERE: &str = "carries out no action of kind";
+
+/// Installs a review node under `grant`, and says what the install came to. Where the platform
+/// offers no review node (Windows) every install is refused as the kind, whatever the grant carries,
+/// and this reads that refusal as the answer; elsewhere it answers what the grant's own check says.
+fn review_install(grant: kr_protocol::grant::Grant, workflow: u8) -> Result<(), String> {
+    let refusal = install_refusal(
+        grant,
+        vec![node("review", WorkflowActionKind::RequestReview)],
+        workflow,
+    );
+    match refusal {
+        Err(words) if cfg!(windows) => {
+            assert!(words.contains(REVIEW_REFUSED_HERE), "{words}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// What the host's check before a dispatch says of a review node under `grant`.
 fn review_dispatch_refusal(grant: &kr_protocol::grant::Grant, workflow: u8) -> Result<(), String> {
     let review = node("review", WorkflowActionKind::RequestReview);
@@ -1429,16 +1450,14 @@ async fn a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_eac
         let workflow = 23 + u8::try_from(index).expect("six rights");
         let words = format!("needs {} and grant", missing.as_str());
 
-        let refusal = install_refusal(
-            common::grant_of(grant_id, &rights),
-            vec![node("review", WorkflowActionKind::RequestReview)],
-            workflow,
-        )
-        .expect_err("a grant missing a right of the effect installs nothing");
-        assert!(
-            refusal.contains(&words),
-            "the install refusal names {missing:?}: {refusal}"
-        );
+        if !cfg!(windows) {
+            let refusal = review_install(common::grant_of(grant_id, &rights), workflow)
+                .expect_err("a grant missing a right of the effect installs nothing");
+            assert!(
+                refusal.contains(&words),
+                "the install refusal names {missing:?}: {refusal}"
+            );
+        }
 
         let refusal = review_dispatch_refusal(&common::grant_of(grant_id, &rights), workflow)
             .expect_err("a grant missing a right of the effect authorises no dispatch");
@@ -1448,12 +1467,8 @@ async fn a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_eac
         );
     }
 
-    install_refusal(
-        common::grant_of(grant_id, &REVIEW_RIGHTS),
-        vec![node("review", WorkflowActionKind::RequestReview)],
-        29,
-    )
-    .expect("a grant that carries all six installs it");
+    review_install(common::grant_of(grant_id, &REVIEW_RIGHTS), 29)
+        .expect("a grant that carries all six installs it, where the platform offers a review");
     review_dispatch_refusal(&common::grant_of(grant_id, &REVIEW_RIGHTS), 29)
         .expect("and authorises its dispatch");
 }
@@ -1477,16 +1492,16 @@ async fn a_review_node_needs_a_grant_that_selects_every_session() {
             .collect(),
     };
     for (workflow, selector) in [(30_u8, one_session), (31, SessionSelector::None)] {
-        let refusals = [
-            install_refusal(
-                named(selector.clone()),
-                vec![node("review", WorkflowActionKind::RequestReview)],
-                workflow,
-            )
-            .expect_err("a grant that does not select every session is refused for a review"),
-            review_dispatch_refusal(&named(selector), workflow)
-                .expect_err("and it authorises no dispatch of one"),
+        let mut refusals = vec![
+            review_dispatch_refusal(&named(selector.clone()), workflow)
+                .expect_err("a grant that does not select every session authorises no dispatch"),
         ];
+        if !cfg!(windows) {
+            refusals.push(
+                review_install(named(selector), workflow)
+                    .expect_err("and it installs no review node, where the platform offers one"),
+            );
+        }
         for refusal in refusals {
             assert!(
                 refusal.contains(
@@ -1497,12 +1512,8 @@ async fn a_review_node_needs_a_grant_that_selects_every_session() {
             );
         }
     }
-    install_refusal(
-        named(SessionSelector::Any),
-        vec![node("review", WorkflowActionKind::RequestReview)],
-        32,
-    )
-    .expect("the broad grant installs it");
+    review_install(named(SessionSelector::Any), 32)
+        .expect("the broad grant installs it, where the platform offers a review");
     review_dispatch_refusal(&named(SessionSelector::Any), 32).expect("and authorises its dispatch");
 }
 

@@ -336,17 +336,40 @@ fn a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_off
         )
     };
 
-    offered(review_node_asking(
-        "Review the change and report what you find.",
-    ))
-    .expect("plain instructions are accepted, so a refusal below is the marker's");
-
     let markers = ["{{", "}}", "${", "$(", "<%", "%>", "eval(", "exec(", "`"];
     assert_eq!(
         markers.len(),
         9,
         "the nine markers a review node's instructions may not hold"
     );
+
+    if cfg!(windows) {
+        // A review node is refused when it is offered on Windows, and that refusal comes before
+        // the instructions are read: plain instructions and each marker meet the same refusal.
+        let plain = "Review the change and report what you find.".to_owned();
+        for instructions in std::iter::once(plain)
+            .chain(markers.map(|marker| format!("Review {marker} the change")))
+        {
+            let refusal = offered(review_node_asking(&instructions))
+                .expect_err("Windows offers no review node");
+            assert!(
+                matches!(
+                    refusal,
+                    AutomationError::ActionUnavailable {
+                        action_kind: WorkflowActionKind::RequestReview
+                    }
+                ),
+                "{instructions:?}: {refusal}"
+            );
+        }
+        return;
+    }
+
+    offered(review_node_asking(
+        "Review the change and report what you find.",
+    ))
+    .expect("plain instructions are accepted, so a refusal below is the marker's");
+
     for marker in markers {
         let refusal = offered(review_node_asking(&format!("Review {marker} the change")))
             .expect_err("the marker is refused");
@@ -444,6 +467,24 @@ fn a_review_node_naming_a_shared_working_tree_is_refused_when_offered() {
             &grant,
         )
     };
+
+    if cfg!(windows) {
+        // A review node is refused when it is offered on Windows, whatever its workspace, and that
+        // refusal comes before the parameters are read: the refusal below is never reached.
+        for workspace in [WorkspaceKind::Isolated, WorkspaceKind::SharedExisting] {
+            let refusal = offered(workspace).expect_err("Windows offers no review node");
+            assert!(
+                matches!(
+                    refusal,
+                    AutomationError::ActionUnavailable {
+                        action_kind: WorkflowActionKind::RequestReview
+                    }
+                ),
+                "{workspace:?}: {refusal}"
+            );
+        }
+        return;
+    }
 
     offered(WorkspaceKind::Isolated).expect("the isolated workspace is accepted");
     let refusal = offered(WorkspaceKind::SharedExisting)
