@@ -850,14 +850,21 @@ mod unix {
     /// What the watches of one process may hold of its open files.
     ///
     /// FSEvents holds one open file for each component of each path it is given and eight more
-    /// for each watch of a copy and the directory beside it: 29 for a copy 11 components deep,
-    /// measured on macOS with notify 9.0.0. A process whose limit of open files started at 256,
-    /// which its first stream raised to 2560, held 88 such watches before a watch could not
-    /// start, and past that the library can end the process. So the host refuses first: a watch
-    /// is admitted only while the cost of the watches the process holds, with its own, is no
-    /// more than half of the process's soft limit of open files, read when the watch starts, and
-    /// half of 2560 where that limit is higher or there is none, since nothing was measured past
-    /// it. The other half is left to the rest of the process.
+    /// for each watch of a copy and the directory beside it. That was measured on macOS 27.2.1
+    /// (build 26B131) with notify 9.0.0: 29 for a copy 11 components deep, 31 at 12 and 39 at 16,
+    /// with the soft limit of open files at 256 and at 2560, and nothing else was measured. At 11
+    /// components a process whose limit started at 256, which its first stream raised to 2560,
+    /// held 88 such watches before a watch could not start, and past that the library can end
+    /// the process. So the host refuses first: a watch is admitted only while the cost of the
+    /// watches the process holds, with its own, is no more than half of the process's soft limit
+    /// of open files, read when the watch starts, and half of 2560 where that limit is higher or
+    /// there is none, since nothing was measured past it. The other half is an allowance for the
+    /// rest of the process and not a reservation: the host does not count the process's other
+    /// open files, nor the one directory that each watch reopens beside its copy, so a process
+    /// that holds more than that half for other reasons can still reach the edge. Until the
+    /// first stream has raised the limit, and for good where a hard limit of 256 does not allow
+    /// the raise, the budget admits at most 4 watches of 29. A limit below twice the cost of one
+    /// watch, 58 at 11 components, refuses every watch with the same words.
     #[cfg(any(target_os = "macos", test))]
     mod budget {
         use std::path::{Component, Path};
@@ -879,17 +886,24 @@ mod unix {
             live: AtomicU64,
         }
 
-        /// The cost of one watch, held for as long as the watch lives, and given back when it is
-        /// dropped, also when the watch could not be started.
-        pub(super) struct Held<'a> {
+        /// What one watch has taken of the budget, given back when it is dropped.
+        struct Cost<'a> {
             budget: &'a Budget,
             cost: u64,
         }
 
-        impl Drop for Held<'_> {
+        impl Drop for Cost<'_> {
             fn drop(&mut self) {
                 self.budget.live.fetch_sub(self.cost, Ordering::AcqRel);
             }
+        }
+
+        /// A watch and its cost, held for as long as the watch lives. The watch is dropped first
+        /// and the cost goes back after it, on every path, so that the budget never admits another
+        /// watch while the stream of this one still holds its files.
+        pub(super) struct Held<'a, T> {
+            _watch: T,
+            _cost: Cost<'a>,
         }
 
         impl Budget {
@@ -902,22 +916,26 @@ mod unix {
 
             /// Makes the watch with `start` when the process's watches, with this one, would cost
             /// no more than half of `soft`, the soft limit of open files, taken as 2560 where it
-            /// is higher or none, and makes none otherwise: the library is not asked.
+            /// is higher or none, and makes none otherwise: the library is not asked. A watch
+            /// that could not be started holds nothing.
             pub(super) fn admit<T>(
                 &self,
                 cost: u64,
                 soft: Option<u64>,
                 start: impl FnOnce() -> Result<T, String>,
-            ) -> Result<(T, Held<'_>), String> {
+            ) -> Result<Held<'_, T>, String> {
                 let half = soft.map_or(MEASURED, |soft| soft.min(MEASURED)) / 2;
                 self.live
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
                         live.checked_add(cost).filter(|total| *total <= half)
                     })
                     .map_err(|_| REFUSED.to_owned())?;
-                let held = Held { budget: self, cost };
-                let value = start()?;
-                Ok((value, held))
+                let cost = Cost { budget: self, cost };
+                let watch = start()?;
+                Ok(Held {
+                    _watch: watch,
+                    _cost: cost,
+                })
             }
         }
 
@@ -937,15 +955,13 @@ mod unix {
         mod tests {
             use std::cell::Cell;
             use std::path::Path;
+            use std::sync::atomic::Ordering;
 
             use super::{Budget, Held, cost_of};
 
             /// A watch of `cost` made with nothing to start, held or refused.
-            fn admitted(budget: &Budget, cost: u64, soft: Option<u64>) -> Option<Held<'_>> {
-                budget
-                    .admit(cost, soft, || Ok(()))
-                    .ok()
-                    .map(|(_, held)| held)
+            fn admitted(budget: &Budget, cost: u64, soft: Option<u64>) -> Option<Held<'_, ()>> {
+                budget.admit(cost, soft, || Ok(())).ok()
             }
 
             /// How many watches of `cost` the budget admits, one after the other, under `soft`,
@@ -1042,6 +1058,45 @@ mod unix {
                 );
             }
 
+            /// What the budget counted when this was dropped.
+            struct Probe<'a> {
+                budget: &'a Budget,
+                counted: &'a Cell<Option<u64>>,
+            }
+
+            impl Drop for Probe<'_> {
+                fn drop(&mut self) {
+                    self.counted
+                        .set(Some(self.budget.live.load(Ordering::Acquire)));
+                }
+            }
+
+            /// A dropped watch is dropped before its cost goes back: while it is, the budget still
+            /// counts the cost, so no other watch is admitted while its stream holds its files.
+            #[test]
+            fn a_dropped_watch_is_dropped_before_its_cost_goes_back() {
+                let budget = Budget::new();
+                let counted = Cell::new(None);
+                let held = budget.admit(29, Some(256), || {
+                    Ok(Probe {
+                        budget: &budget,
+                        counted: &counted,
+                    })
+                });
+                assert!(held.is_ok(), "the watch is admitted");
+                assert_eq!(counted.get(), None, "the watch is held");
+                drop(held);
+                assert_eq!(
+                    counted.get(),
+                    Some(29),
+                    "the cost was still counted when the watch was dropped"
+                );
+                assert!(
+                    admitted(&budget, 29, Some(256)).is_some(),
+                    "and it went back after"
+                );
+            }
+
             /// A deeper path costs more, so fewer watches are admitted under the same limit.
             #[test]
             fn a_deeper_path_costs_more_and_so_fewer_are_admitted() {
@@ -1104,9 +1159,9 @@ mod unix {
 
         /// How long the host waits for the watcher to report a file the host wrote itself.
         ///
-        /// FSEvents delivers reports in order and on its own schedule, so the only way to know it
-        /// has delivered every report up to a moment is to make a change at that moment and wait
-        /// for it to be reported.
+        /// FSEvents delivers reports on its own schedule, so the host makes a change of its own at
+        /// the moment it asks and waits for that change to be reported. The report shows how far
+        /// the watcher has come in its stream, and not that every earlier change was reported.
         const REPORT_WAIT: Duration = Duration::from_secs(10);
 
         /// The start of the name of a file the host writes to find out whether the watcher is
@@ -1147,10 +1202,9 @@ mod unix {
         /// A watch on the copy, which reports each name written in the directories declared
         /// outputs are in, and each change to those directories themselves.
         pub struct NameWatch {
-            /// Held so that the stream is.
-            _watcher: notify::RecommendedWatcher,
-            /// What the stream costs the process, given back after the stream has stopped.
-            _held: Held<'static>,
+            /// The watcher, held with what its stream costs the process: the cost goes back after
+            /// the stream has stopped, on every path.
+            _watcher: Held<'static, notify::RecommendedWatcher>,
             shared: Arc<Mutex<Shared>>,
             reported: Mutex<mpsc::Receiver<PathBuf>>,
             /// The directory the copy is in, where the host writes the files it marks time with.
@@ -1202,6 +1256,11 @@ mod unix {
                         return Err("the copy is no longer where it was opened".to_owned());
                     }
                 }
+                // Every step that can fail without the library is made before the admission, so
+                // that nothing after it fails but the library's own calls.
+                let reopened = beside
+                    .try_clone()
+                    .map_err(|error| format!("the copy's place could not be reopened: {error}"))?;
                 let places = Arc::new(Places::new(copy_path.clone(), parents.clone()));
                 let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
@@ -1226,7 +1285,7 @@ mod unix {
                 // FSEvents holds open files for each stream root, and a start that fails for want
                 // of them can end the process, so the host asks only for a watch that the budget
                 // admits.
-                let (watcher, held) = WATCHES.admit(
+                let watcher = WATCHES.admit(
                     budget::cost_of(&copy_path, &beside_path),
                     soft_limit(),
                     || {
@@ -1241,12 +1300,9 @@ mod unix {
                 )?;
                 let watch = Self {
                     _watcher: watcher,
-                    _held: held,
                     shared,
                     reported: Mutex::new(reported),
-                    beside: beside.try_clone().map_err(|error| {
-                        format!("the copy's place could not be reopened: {error}")
-                    })?,
+                    beside: reopened,
                     beside_path,
                     copy_path,
                 };
@@ -1259,8 +1315,9 @@ mod unix {
                 Ok(Some(watch))
             }
 
-            /// Writes a file beside the copy and waits until the watcher has reported it, and so
-            /// every change made before it.
+            /// Writes a file beside the copy and waits until the watcher has reported it. That
+            /// shows how far the watcher has come in its stream, and not that every earlier change
+            /// was reported.
             fn up_to_date(&self) -> Result<(), String> {
                 let mark = format!("{MARK}{}", kr_ipc::new_uuid());
                 let name = RelativeName::parse(&mark)
@@ -1318,11 +1375,14 @@ mod unix {
         mod tests {
             use std::collections::{BTreeMap, BTreeSet};
             use std::path::PathBuf;
+            use std::sync::{Mutex, MutexGuard, PoisonError};
 
             use notify::Event;
             use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RenameMode};
 
-            use super::{Places, Shared, take};
+            use super::{
+                AuthorisedDirectory, Held, NameWatch, Places, Shared, WATCHES, budget, take,
+            };
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
             /// `out` at its root.
@@ -1420,6 +1480,93 @@ mod unix {
                 take(&places(), &mut shared, Ok(changed("/work/run/copy")));
                 assert_eq!(shared.heard.written, BTreeSet::from([String::new()]));
                 assert!(shared.heard.lost.is_none());
+            }
+
+            /// The whole budget of this process, held for as long as this lives, so that a start
+            /// made meanwhile is refused at any limit. The cases that hold it run one at a time,
+            /// and no other case of this program starts a watch.
+            struct WholeBudget {
+                _held: Held<'static, ()>,
+                _turn: MutexGuard<'static, ()>,
+            }
+
+            fn the_whole_budget() -> WholeBudget {
+                static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+                let turn = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
+                // Half of 2560, the most that any limit admits.
+                let held = WATCHES
+                    .admit(1280, Some(2560), || Ok(()))
+                    .expect("the budget is free");
+                WholeBudget {
+                    _held: held,
+                    _turn: turn,
+                }
+            }
+
+            /// A copy in a folder of its own, with the directory beside it, both opened, and one
+            /// declared output at its root.
+            struct Copy {
+                _root: tempfile::TempDir,
+                copy_path: PathBuf,
+                copy: AuthorisedDirectory,
+                beside: AuthorisedDirectory,
+                parents: BTreeMap<String, BTreeSet<String>>,
+            }
+
+            fn a_copy() -> Copy {
+                let root = tempfile::TempDir::new().expect("a folder to work in");
+                let beside_path = std::fs::canonicalize(root.path())
+                    .expect("the folder resolves")
+                    .join("materialisations");
+                let copy_path = beside_path.join("copy");
+                std::fs::create_dir_all(&copy_path).expect("the copy");
+                let open = |path: &PathBuf| {
+                    AuthorisedDirectory::open_root(
+                        kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                        path,
+                    )
+                    .expect("the directory opens")
+                };
+                Copy {
+                    copy: open(&copy_path),
+                    beside: open(&beside_path),
+                    _root: root,
+                    copy_path,
+                    parents: BTreeMap::from([(String::new(), BTreeSet::from(["out".to_owned()]))]),
+                }
+            }
+
+            /// KR-REQ-14.34: a start that the budget does not admit is refused, with the words
+            /// that make the result indeterminate, and the library is not asked: with the whole
+            /// budget held, a start for a copy returns the refusal and makes no stream.
+            #[test]
+            fn a_start_past_the_budget_is_refused_without_a_stream() {
+                let made = a_copy();
+                let _whole = the_whole_budget();
+                let started = NameWatch::start(&made.copy, &made.beside, &made.parents);
+                assert_eq!(
+                    started.err().as_deref(),
+                    Some(budget::REFUSED),
+                    "the start was not refused"
+                );
+            }
+
+            /// What the host does itself comes before the budget is asked: with the whole budget
+            /// held, a start for a copy that is no longer where it was opened says that, and not
+            /// that too many copies are watched.
+            #[test]
+            fn a_step_of_the_host_that_fails_is_reported_before_the_budget_is_asked() {
+                let made = a_copy();
+                std::fs::rename(&made.copy_path, made.copy_path.with_file_name("moved"))
+                    .expect("the copy is moved away");
+                std::fs::create_dir(&made.copy_path).expect("another directory is at its place");
+                let _whole = the_whole_budget();
+                let started = NameWatch::start(&made.copy, &made.beside, &made.parents);
+                assert_eq!(
+                    started.err().as_deref(),
+                    Some("the copy is no longer where it was opened"),
+                    "the host's own step did not come first"
+                );
             }
         }
     }
