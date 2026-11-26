@@ -75,6 +75,7 @@ export function Notices({ target }: { readonly target: number }): ReactNode {
         <div className="account-actions">
           <p className="account-note">{NOTICES_NOTE}</p>
           <Button
+            data-wraps
             aria-expanded={open}
             aria-controls={regionId}
             style={{ minBlockSize: target }}
