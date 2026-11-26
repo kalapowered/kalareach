@@ -226,8 +226,13 @@ fn broker_admission_every_spelling_of_one_tree_gives_one_chain_and_one_slot() {
         .expect("the plain path's slot");
     let mut holds = Vec::new();
     for (what, spelling) in &spellings {
-        let hold = hold_tree(spelling, &person.as_client())
-            .unwrap_or_else(|refusal| panic!("{what}: the tree is held, not refused: {refusal}"));
+        let held = hold_tree(spelling, &person.as_client());
+        assert!(
+            held.is_ok(),
+            "{what}: the tree is held, not refused: {:?}",
+            held.as_ref().err()
+        );
+        let hold = held.expect("held");
         assert_eq!(hold.identity, reference.identity, "{what}: the same chain");
         assert_eq!(hold.path, reference.path, "{what}: the same final path");
         let refusal = table
