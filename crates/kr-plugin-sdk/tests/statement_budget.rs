@@ -185,8 +185,9 @@ fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin()
         "the longer statement is {longest} characters: the budget is {STATEMENT_CHARS}, which \
          leaves less than the margin of {MARGIN}"
     );
-    assert!(
-        STATEMENT_CHARS <= 10_000,
+    assert_eq!(
+        STATEMENT_CHARS.min(10_000),
+        STATEMENT_CHARS,
         "the budget is {STATEMENT_CHARS}, which is more than the 10,000 characters a device shows"
     );
 }
