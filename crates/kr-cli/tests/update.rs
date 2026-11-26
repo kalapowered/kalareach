@@ -2215,6 +2215,8 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
         idle.temp.environment_id(),
     )
     .expect("holds the environment");
+    #[cfg(unix)]
+    let mut named = stand_in_holder(&idle.temp.environment().singleton_lock());
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert_eq!(
         output.status.code(),
@@ -2230,11 +2232,14 @@ async fn an_update_that_cannot_take_the_install_lock_stops_nothing() {
     );
     // Where the lock file can be read while it is held, the process that holds the environment
     // is named; a Windows daemon holds it with no sharing at all, so there none can be.
-    if cfg!(unix) {
+    #[cfg(unix)]
+    {
         assert!(
-            message.contains(&stop_command(std::process::id())),
+            message.contains(&stop_command(named.id())),
             "the process that holds the environment nothing answers for is named: {said}"
         );
+        let _ = named.kill();
+        let _ = named.wait();
     }
     let daemon_pid = u32::try_from(host.daemon_started_like().await.pid.get()).expect("a process");
     assert!(
@@ -2646,6 +2651,19 @@ fn an_install_makes_the_store_first_and_publishes_under_the_install_lock() {
         host.store.current().expect("reads"),
         Some(one.name().clone())
     );
+}
+
+/// A process of its own that a lock file names in place of this test's process. This process is the
+/// parent of the `kr` that reads the file, and no message tells a person to end the parent of the
+/// program that says it. The caller ends the process by the handle it gets.
+#[cfg(unix)]
+fn stand_in_holder(lock: &Path) -> std::process::Child {
+    let process = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .expect("starts a process");
+    std::fs::write(lock, format!("{}\n", process.id())).expect("names the process");
+    process
 }
 
 /// The command a message names to end the process `pid` on this platform.
@@ -7822,6 +7840,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
         host.tree.environment_id(),
     )
     .expect("holds the environment");
+    let mut named = stand_in_holder(&host.tree.environment().singleton_lock());
 
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert_eq!(
@@ -7834,7 +7853,7 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill -KILL {}", std::process::id())),
+            .contains(&format!("kill -KILL {}", named.id())),
         "the process that holds the environment is named: {said}"
     );
     assert_eq!(
@@ -7844,6 +7863,8 @@ async fn an_update_to_a_fixed_release_is_not_held_by_a_daemon_of_the_one_that_fa
     );
     assert_eq!(host.record()["update"]["state"], "switched");
 
+    let _ = named.kill();
+    let _ = named.wait();
     drop(holding);
     let (output, said) = host.kr_json(&["host", "update", "--archive", &archive, "--json"]);
     assert!(
@@ -8878,6 +8899,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
         host.tree.environment_id(),
     )
     .expect("holds the environment");
+    let mut named = stand_in_holder(&host.tree.environment().singleton_lock());
 
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -8890,7 +8912,7 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
         said["message"]
             .as_str()
             .unwrap_or_default()
-            .contains(&format!("kill -KILL {}", std::process::id())),
+            .contains(&format!("kill -KILL {}", named.id())),
         "the process that holds the environment is named: {said}"
     );
     assert!(
@@ -8907,6 +8929,8 @@ async fn a_rollback_names_the_process_that_holds_the_environment_and_starts_noth
     );
     assert_eq!(host.record()["update"]["state"], "switched");
 
+    let _ = named.kill();
+    let _ = named.wait();
     drop(holding);
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(

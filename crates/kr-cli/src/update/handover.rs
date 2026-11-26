@@ -353,6 +353,47 @@ pub(crate) const STOP_COMMAND: &str = if cfg!(windows) {
     "kill -KILL"
 };
 
+/// Whether a message may tell a person to end the process `pid` with [`STOP_COMMAND`]: not for 0
+/// and 1, which name no one process (`kill -KILL 0` ends a whole group), and not for this process
+/// or its parent, which is the person's shell or the program that runs this one. A number that a
+/// lock file names is read from a file anyone can write, and a command a message gives is run as
+/// it stands.
+///
+/// On Windows the standard library names no parent, so only 0, 1 and this process are refused there.
+pub(crate) fn may_tell_to_stop(pid: u64) -> bool {
+    pid > 1 && pid != u64::from(std::process::id()) && parent_process_id() != Some(pid)
+}
+
+/// The number of this process's parent, where the standard library names it.
+#[cfg(unix)]
+fn parent_process_id() -> Option<u64> {
+    Some(u64::from(std::os::unix::process::parent_id()))
+}
+
+/// The number of this process's parent, where the standard library names it.
+#[cfg(not(unix))]
+fn parent_process_id() -> Option<u64> {
+    None
+}
+
+/// The process numbers that no printed command may name: 0 and 1, this process and its parent.
+#[cfg(test)]
+pub(crate) fn never_named() -> Vec<u64> {
+    [0, 1, u64::from(std::process::id())]
+        .into_iter()
+        .chain(parent_process_id())
+        .collect()
+}
+
+/// A process number above 1 that is neither this process nor its parent.
+#[cfg(test)]
+pub(crate) fn an_ordinary_number() -> u64 {
+    let never = never_named();
+    (4242..)
+        .find(|number| !never.contains(number))
+        .expect("a number")
+}
+
 /// The refusal `error`, a wait for the store's install lock that ran out, with the process that holds
 /// each of `environments`, which are those no daemon answered for, added where one does: a daemon
 /// that hangs in its start holds the install lock and its environment, and is the person's to stop.
@@ -365,6 +406,7 @@ pub fn naming_holders(error: CliError, environments: &[&Environment]) -> CliErro
         if let Some(pid) = SingletonLock::holder(&environment.paths.singleton_lock())
             .ok()
             .flatten()
+            .filter(|&pid| may_tell_to_stop(u64::from(pid)))
         {
             said = shown!(
                 "{}; the control daemon of environment {} is process {}, and `{} {}` stops it",
@@ -529,7 +571,11 @@ pub async fn hold(
                 )));
             }
             Err(kr_controller::ControllerError::AlreadyRunning { .. }) => {
-                let holder = match SingletonLock::holder(&path).ok().flatten() {
+                let holder = match SingletonLock::holder(&path)
+                    .ok()
+                    .flatten()
+                    .filter(|&pid| may_tell_to_stop(u64::from(pid)))
+                {
                     Some(pid) => shown!(
                         "; it is process {}, and `{} {}` stops it",
                         pid,
@@ -636,6 +682,14 @@ pub(super) fn holder_said(
     expected: &ReleaseName,
 ) -> Shown {
     let expected_build = format!("kr-controller/{expected}");
+    // A process is named only where a message may tell a person to end it: the others are said as
+    // a lock that names none.
+    let holder = holder.map(|(pid, answers_as)| {
+        (
+            pid.filter(|&pid| may_tell_to_stop(u64::from(pid))),
+            answers_as,
+        )
+    });
     match holder {
         None => shown!(
             "the control daemon of environment {} went away while the update waited for it; run \
@@ -824,6 +878,133 @@ fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The environment of a host of this test's own.
+    fn environment_of(temp: &kr_ipc::testing::TempHost) -> Environment {
+        Environment {
+            environment_id: temp.environment_id(),
+            paths: temp.environment(),
+            host: temp.paths().clone(),
+        }
+    }
+
+    /// A message may tell a person to end a process of a number above 1 that is not this process
+    /// or its parent, and no other.
+    #[test]
+    fn a_stop_command_is_printed_only_for_a_number_that_a_person_may_end() {
+        for number in never_named() {
+            assert!(!may_tell_to_stop(number), "{number}");
+        }
+        assert!(may_tell_to_stop(an_ordinary_number()));
+        let just_above = (2..)
+            .find(|number| !never_named().contains(number))
+            .expect("a number");
+        assert!(may_tell_to_stop(just_above), "{just_above}");
+        assert!(may_tell_to_stop(u64::MAX));
+    }
+
+    /// A lock file that names such a number adds no clause about it to the refusal of an update
+    /// that waited for the install lock, and one that names another number adds the clause.
+    #[test]
+    fn a_lock_file_that_names_a_number_that_must_not_be_ended_adds_no_clause_to_the_refusal() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = environment_of(&temp);
+        let lock = environment.paths.singleton_lock();
+        std::fs::create_dir_all(lock.parent().expect("a state directory")).expect("a directory");
+        let refusal = "the store's install lock is held";
+        let said = |number: u64| {
+            std::fs::write(&lock, format!("{number}\n")).expect("names a process");
+            let CliError::UpdateDeferred(said) = naming_holders(
+                CliError::UpdateDeferred(Shown::said(refusal)),
+                &[&environment],
+            ) else {
+                panic!("the refusal stays a refusal to wait");
+            };
+            said.to_string()
+        };
+        for number in never_named() {
+            assert_eq!(said(number), refusal, "{number}");
+        }
+        let ordinary = an_ordinary_number();
+        assert_eq!(
+            said(ordinary),
+            format!(
+                "{refusal}; the control daemon of environment {} is process {ordinary}, and \
+                 `{STOP_COMMAND} {ordinary}` stops it",
+                environment.environment_id
+            )
+        );
+    }
+
+    /// An environment held by a daemon that was not listening, whose lock file names such a number,
+    /// is said to be held with no process named; one that names another number names it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lock_that_names_a_number_that_must_not_be_ended_leaves_the_refusal_with_no_process()
+    {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = environment_of(&temp);
+        let lock = environment.paths.singleton_lock();
+        let _daemon = SingletonLock::acquire(&lock, environment.environment_id)
+            .expect("a daemon holds the environment");
+        let held = format!(
+            "a control daemon holds environment {}, and it was not listening when the update \
+             asked each daemon to make way",
+            environment.environment_id
+        );
+        let ordinary = an_ordinary_number();
+        for number in never_named().into_iter().chain([ordinary]) {
+            std::fs::write(&lock, format!("{number}\n")).expect("names a process");
+            let Err(refused) = hold(&environment, None).await else {
+                panic!("the daemon has not gone");
+            };
+            let expected = if number == ordinary {
+                format!("{held}; it is process {number}, and `{STOP_COMMAND} {number}` stops it")
+            } else {
+                held.clone()
+            };
+            assert_eq!(refused.to_string(), expected, "{number}");
+        }
+    }
+
+    /// What is said of a daemon that still holds an environment names no command for such a
+    /// number, and says what it says where the lock names no process; for another number it names
+    /// the command.
+    #[test]
+    fn a_daemon_whose_number_must_not_be_ended_is_said_with_no_command() {
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+        let expected = ReleaseName::new("0.2.0+bbbbbbbbbbbb").expect("a release");
+        let before = BuildId::new("kr-controller/0.1.0+aaaaaaaaaaaa").expect("a build");
+        let said = |holder| holder_said(environment_id, holder, &expected).to_string();
+        for number in never_named() {
+            let number = u32::try_from(number).expect("a process number");
+            for answers_as in [Some(&before), None] {
+                let named = said(Some((Some(number), answers_as)));
+                assert!(
+                    !named.contains("kill -KILL") && !named.contains("taskkill"),
+                    "{number}: {named}"
+                );
+                assert_eq!(named, said(Some((None, answers_as))), "{number}");
+            }
+        }
+        let ordinary = u32::try_from(an_ordinary_number()).expect("a process number");
+        let another = said(Some((Some(ordinary), Some(&before))));
+        assert!(
+            another.contains(&format!(
+                "(process {ordinary}) answers as kr-controller/0.1.0+aaaaaaaaaaaa, not as a \
+                 daemon of 0.2.0+bbbbbbbbbbbb; stop it with `{STOP_COMMAND} {ordinary}` and run"
+            )),
+            "{another}"
+        );
+        let silent = said(Some((Some(ordinary), None)));
+        assert!(
+            silent.contains(&format!(
+                "(process {ordinary}) is still running and does not answer; stop it with \
+                 `{STOP_COMMAND} {ordinary}` and run"
+            )),
+            "{silent}"
+        );
+    }
 
     /// A wait for the store's install lock that another holder keeps ends at its bound and no
     /// later: the pause between two tries is cut to what is left of the bound, so that the wait

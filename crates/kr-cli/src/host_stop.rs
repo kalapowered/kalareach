@@ -1194,7 +1194,7 @@ pub(crate) fn how_to_end_the_holder(environment: &EnvironmentPaths) -> Shown {
 /// What a person does if the process that holds the environment stays, where the process that the
 /// lock file names is `named`.
 pub(crate) fn how_to_end_the_process(named: Option<u64>) -> Shown {
-    match named {
+    match named.filter(|&pid| handover::may_tell_to_stop(pid)) {
         Some(pid) => shown!(
             "If it stays like this, process {} is the daemon and {} {} ends it.",
             pid,
@@ -2315,21 +2315,10 @@ fn after_the_probe(
     }
 }
 
-/// M4: the daemon was asked and has not ended after the wait. A process is named only while it is
-/// a process named kr-controller: `old`, the process that held the environment before the request
-/// where the daemon's answer, if it came, named it too, or the one the lock file names now.
-fn not_ended(
-    which: Which,
-    environment: &EnvironmentPaths,
-    id: EnvironmentId,
-    what: &Shown,
-    old: Option<&ProcessStartIdentity>,
-) -> Shown {
-    let ends_with = match old
-        .filter(|holder| runs_the_daemon(holder))
-        .map(|holder| holder.pid.get())
-        .or_else(|| named_daemon(environment))
-    {
+/// How M4 says to end the daemon that has not ended, where `named` is the process that may be
+/// named as that daemon.
+fn ends_with_said(named: Option<u64>) -> Shown {
+    match named.filter(|&pid| handover::may_tell_to_stop(pid)) {
         Some(pid) => shown!(
             "If it stays, {} {} ends it, and the next daemon recovers as it does after a crash.",
             handover::STOP_COMMAND,
@@ -2343,7 +2332,24 @@ fn not_ended(
             "If it stays, end the process that holds the lock file; the next daemon recovers as it \
              does after a crash.",
         ),
-    };
+    }
+}
+
+/// M4: the daemon was asked and has not ended after the wait. A process is named only while it is
+/// a process named kr-controller: `old`, the process that held the environment before the request
+/// where the daemon's answer, if it came, named it too, or the one the lock file names now.
+fn not_ended(
+    which: Which,
+    environment: &EnvironmentPaths,
+    id: EnvironmentId,
+    what: &Shown,
+    old: Option<&ProcessStartIdentity>,
+) -> Shown {
+    let ends_with = ends_with_said(
+        old.filter(|holder| runs_the_daemon(holder))
+            .map(|holder| holder.pid.get())
+            .or_else(|| named_daemon(environment)),
+    );
     let then = match which {
         Which::Stop => "",
         Which::Restart => " Run kr host restart again once the old one has ended.",
@@ -3367,6 +3373,48 @@ pub(crate) mod tests {
             "{said}"
         );
         assert!(!said.contains(&own.to_string()), "{said}");
+    }
+
+    /// The ways to end the process that holds the environment name no command for a process number
+    /// that no person is told to end: 0 and 1, this process and its parent. They say what they say
+    /// where no process is named, and the same words for a number above 1 as before.
+    #[test]
+    fn the_ways_to_end_a_daemon_name_no_command_for_a_number_that_must_not_be_ended() {
+        let command = handover::STOP_COMMAND;
+        for number in handover::never_named() {
+            for said in [
+                how_to_end_the_process(Some(number)).to_string(),
+                ends_with_said(Some(number)).to_string(),
+            ] {
+                assert!(
+                    !said.contains("kill -KILL") && !said.contains("taskkill"),
+                    "{number}: {said}"
+                );
+            }
+            assert_eq!(
+                how_to_end_the_process(Some(number)).to_string(),
+                how_to_end_the_process(None).to_string(),
+                "{number}"
+            );
+            assert_eq!(
+                ends_with_said(Some(number)).to_string(),
+                ends_with_said(None).to_string(),
+                "{number}"
+            );
+        }
+        let ordinary = handover::an_ordinary_number();
+        assert_eq!(
+            how_to_end_the_process(Some(ordinary)).to_string(),
+            format!(
+                "If it stays like this, process {ordinary} is the daemon and {command} {ordinary} ends it."
+            )
+        );
+        assert_eq!(
+            ends_with_said(Some(ordinary)).to_string(),
+            format!(
+                "If it stays, {command} {ordinary} ends it, and the next daemon recovers as it does after a crash."
+            )
+        );
     }
 
     /// The words of a daemon that was told and has not ended, and of an environment that is held after
