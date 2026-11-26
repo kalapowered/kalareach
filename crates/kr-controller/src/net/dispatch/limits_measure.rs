@@ -350,7 +350,22 @@ fn longest_refusal_shown() -> String {
         )))
     };
     let mut best = "r".repeat(CUT);
-    for quoted in ["``", "`x`", "`ls`", "`a command`"] {
+    // A quotation with white space inside it is shown as "a command", which is longer than the
+    // shortest of them: a backtick, a space and a backtick (three bytes) become nine, and the door
+    // puts a space between those words and a neighbour that would run into them. A text that would
+    // be shown over the longest an error may be is replaced by a fixed sentence, so the search
+    // stops short of it by taking the best of the counts.
+    for quoted in [
+        "``",
+        "` `",
+        "r` `",
+        "` `r",
+        "r` `r",
+        "`x`",
+        "`ls`",
+        "`a b`",
+        "`a command`",
+    ] {
         for count in 1..=CUT / quoted.len() {
             let text = format!(
                 "{}{}",
@@ -571,8 +586,16 @@ fn close_answer(record: &ClosureRecord, twice: bool) -> ControlFrame {
 }
 
 /// A screen driven by `script`, installed the way a worker installs it for a projected client, at
-/// `cols` by `rows` and in pages of the compiled bound.
+/// `cols` by `rows` and in pages of the compiled bound, with the send queue at the floor.
 fn installed(cols: u32, rows: u32, script: &[u8]) -> Vec<Outgoing> {
+    installed_within(cols, rows, script, QUEUE_FLOOR)
+}
+
+/// The same, held to `budget`: the send queue the subscriber has, as the worker passes it (`limit_of`
+/// of the attachment). A queue that is small against the screen cuts the installation before the
+/// page's own bound ends a page: the first page of the three rows of linked cells is 721,334 bytes
+/// at the floor and 1,037,370 with room to spare.
+fn installed_within(cols: u32, rows: u32, script: &[u8], budget: usize) -> Vec<Outgoing> {
     use kr_term::budget::GridSize;
     use kr_term::engine::{Engine, EngineConfig};
     use kr_term::snapshot::Viewport;
@@ -597,7 +620,7 @@ fn installed(cols: u32, rows: u32, script: &[u8]) -> Vec<Outgoing> {
         ProjectionResetReason::Attached,
         u64::MAX,
         false,
-        PAGE_BYTES,
+        budget,
         kr_worker::render::Scope::WholeScreen,
         &engine,
     )
@@ -617,8 +640,10 @@ fn header_of(events: &[Outgoing]) -> ProjectionSnapshot {
 }
 
 /// What a script that fills every table a header carries asks of a screen: a title and a pushed
-/// title at each depth, a colour for each palette index, a tab stop at each column and a link.
-fn crowded_script(cols: u32) -> Vec<u8> {
+/// title at each depth, a colour for each palette index, a tab stop at each column and a link. With
+/// `switching` the script also sets the three modes that switch to the alternate screen, which reset
+/// the projection.
+fn crowded_script(cols: u32, switching: bool) -> Vec<u8> {
     let mut script = String::new();
     for depth in 0..=kr_term::title::MAX_DEPTH {
         let title = format!(
@@ -645,13 +670,16 @@ fn crowded_script(cols: u32) -> Vec<u8> {
         1_u32, 6, 7, 9, 12, 25, 45, 47, 66, 69, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1047,
         1048, 1049, 2004, 2026,
     ] {
+        if !switching && matches!(mode, 47 | 1047 | 1049) {
+            continue;
+        }
         write!(script, "\x1b[?{mode}h").expect("a string takes a write");
     }
     script.push_str("\x1b[38;2;1;2;3;48;2;4;5;6;58;2;7;8;9;1;3;4m");
     write!(
         script,
         "\x1b]8;;h://{}\x07",
-        "u".repeat(LINK_BYTES - "h://".len())
+        "u".repeat(LINK_BYTES - 1 - "h://".len())
     )
     .expect("a string takes a write");
     script.into_bytes()
@@ -678,15 +706,17 @@ fn styled_cells(cells: u32) -> Vec<u8> {
     (0..cells).map(styled_cell).collect::<String>().into_bytes()
 }
 
-/// The target of one of two hyperlinks, each of [`LINK_BYTES`] bytes.
+/// The target of one of two hyperlinks, each the largest the engine admits: it holds the parameters, a
+/// semicolon and the target to [`LINK_BYTES`] together, and these links have no parameters, so the
+/// target is one byte short of it.
 fn link_target(which: u32) -> String {
     let mut target = String::from("h://");
     target.push(if which.is_multiple_of(2) { 'a' } else { 'b' });
-    target.push_str(&"u".repeat(LINK_BYTES - target.len()));
+    target.push_str(&"u".repeat(LINK_BYTES - 1 - target.len()));
     target
 }
 
-/// A script that writes `cells` styled cells, each under a hyperlink of [`LINK_BYTES`] bytes. The
+/// A script that writes `cells` styled cells, each under the largest hyperlink the engine admits. The
 /// link alternates from one cell to the next, so every cell is a run of its own, and a run carries
 /// its own copy of its link.
 fn linked_cells(cells: u32) -> Vec<u8> {
@@ -738,7 +768,9 @@ fn product_delta(cells: u32) -> Option<Outgoing> {
         cols,
     };
     let (base, _) = engine.snapshot(window, 0);
-    engine.feed(&crowded_script(cols), 0);
+    // The changes without the three modes that switch screens: a switch resets the projection, drops
+    // every base, and a client is then sent a snapshot and not a delta.
+    engine.feed(&crowded_script(cols, false), 0);
     engine.feed(&linked_cells(cells), 0);
     let delta = engine
         .delta(base.output_cursor, base.projection_generation)
@@ -802,13 +834,13 @@ fn projection_charge(event: &ProjectionEvent) -> usize {
 
 /// Every kind of notification a worker sends, at its widest, with what the worker's queue charges.
 fn widest_events() -> Vec<Measured> {
-    let events = installed(2_048, 24, &crowded_script(2_048));
+    let events = installed(2_048, 24, &crowded_script(2_048, true));
     let header = header_of(&events);
     // The pages of a screen of three rows of linked cells, the widest of which is the widest page: a
     // run carries its own copy of its link, so a page of runs that each hold a link of the largest
     // size reaches the byte bound of a page before the limit of its values. The first page of an
     // installation is the buffer that is not showing, and it is empty.
-    let packed = installed(2_048, 3, &packed_script(2_048, 3));
+    let packed = installed_within(2_048, 3, &packed_script(2_048, 3), 4 * PAGE_BYTES);
     let page = widest(
         packed
             .iter()
@@ -1300,16 +1332,17 @@ fn the_small_records_and_the_reserve_they_make() {
 ///
 /// The stuffed header is built from the limits of the engine's tables: ten title pairs of
 /// `kr_term::title::MAX_TITLE_BYTES` and `MAX_DEPTH`, a tab stop in each of 2,048 columns, a
-/// palette override for each of 256 indices, three hyperlinks of [`LINK_BYTES`] (the open link and
+/// palette override for each of 256 indices, three hyperlinks of the largest size the engine admits,
+/// [`LINK_BYTES`] less the semicolon that parts its parameters from its target (the open link and
 /// the link of each buffer's saved cursor), a saved cursor for each buffer, and a flag stack of
 /// [`KEYBOARD_STACK_DEPTH`] for each buffer's keyboard.
 #[test]
 fn the_widest_projection_header_and_row() {
     let cols = 2_048;
-    let events = installed(cols, 24, &crowded_script(cols));
+    let events = installed(cols, 24, &crowded_script(cols, true));
     let driven = header_of(&events);
     let link = ProjectedHyperlink {
-        uri: "u".repeat(LINK_BYTES),
+        uri: "u".repeat(LINK_BYTES - 1),
         params: String::new(),
     };
     let mut stuffed = driven.clone();
@@ -1406,8 +1439,9 @@ fn the_widest_projection_header_and_row() {
             .hyperlink
             .0
             .as_ref()
-            .is_some_and(|link| link.uri.len() + link.params.len() == LINK_BYTES)),
-        "each saved cursor carries a link of {LINK_BYTES} bytes"
+            .is_some_and(|link| link.uri.len() + link.params.len() == LINK_BYTES - 1)),
+        "each saved cursor carries the largest link the engine admits, {} bytes",
+        LINK_BYTES - 1
     );
     assert!(
         stuffed.keyboard.primary.stack.len() == KEYBOARD_STACK_DEPTH
@@ -1808,6 +1842,19 @@ fn the_widest_close_answer_of_a_closed_session() {
         )));
         with - without
     };
+    // The one entry that carries a note, in the same form, so that the lists' bound is the budget
+    // and that entry and not a figure of this case's own.
+    let note_entry = {
+        let with = frame_len(&shown(&notice(
+            SESSION_CLOSED_EVENT,
+            &closure(0, "/", CLOSURE_TEXT_BYTES / 2, 0),
+        )));
+        let without = frame_len(&shown(&notice(
+            SESSION_CLOSED_EVENT,
+            &closure(0, "/", 0, 0),
+        )));
+        with - without
+    };
     let survivors = CLOSURE_LISTS_BOUND / device_entry;
     let record = closure(survivors, "/", CLOSURE_TEXT_BYTES / 2, CLOSURE_TEXT_BYTES);
     let bare = closure(0, "/", 0, CLOSURE_TEXT_BYTES);
@@ -1842,14 +1889,14 @@ fn the_widest_close_answer_of_a_closed_session() {
     ));
     writeln!(
         table,
-        "MEASURE | {survivors} survivors of {device_entry} bytes each | lists as shown {lists} | members outside the lists with root_signal at {CLOSURE_TEXT_BYTES}: {fixed} | notification envelope {envelope}"
+        "MEASURE | {survivors} survivors of {device_entry} bytes each and a note's entry of {note_entry} | lists as shown {lists} | members outside the lists with root_signal at {CLOSURE_TEXT_BYTES}: {fixed} | notification envelope {envelope}"
     )
     .expect("a string takes a write");
     println!("{table}");
 
     assert!(
-        lists <= CLOSURE_LISTS_BOUND + CLOSURE_TEXT_BYTES / 2 + 512,
-        "the lists as a device is shown them are within the budget and the entry, found {lists}"
+        lists <= CLOSURE_LISTS_BOUND + note_entry,
+        "the lists as a device is shown them are within the budget and the note's entry of {note_entry} bytes, found {lists}"
     );
     assert!(
         fixed <= CLOSURE_FIXED_BOUND,
@@ -1994,19 +2041,30 @@ fn cut_page(
 /// How many live instances an answer carries at the floor before the door's frame is over, with the
 /// page cut as the worker cuts it, and where the worker itself refuses the peer.
 struct Fit {
-    /// The most instances for which a device receives the answer.
+    /// The most instances for which a device receives the answer at every count tried up to it: the
+    /// count before the first at which the door's frame is over the bound. A page is cut to whole
+    /// resources, so a larger count can fit again by the room a cut leaves.
     fit: usize,
     /// The most instances for which the worker still answers: one more and it refuses the peer
     /// because its frame cannot hold the answer and one resource.
     worker_limit: usize,
     /// The resources the page carries at `fit`.
     carried: usize,
-    /// The frame at `fit` and at one more instance, as a device is shown it.
+    /// The frame at `fit`, and at the first count over the bound (0 where there is none).
     frames: (usize, usize),
+    /// Of the counts sampled above `fit`, up to the worker's limit: how many are over the bound, and
+    /// how many were sampled.
+    over_above_the_fit: (usize, usize),
 }
 
+/// Every count to this one is tried; above it, every `SCAN_STRIDE`th. The whole range costs minutes
+/// in a debug build, and the counts a device sees without a refusal that the door lengthens lie
+/// well below it.
+const SCAN_EXACT: usize = 64;
+const SCAN_STRIDE: usize = 32;
+
 /// The largest count in `0..=4_096` for which `holds` is true, taking it to be true up to a count
-/// and false beyond.
+/// and false beyond (the worker's refusal of a peer is: a longer list only makes the answer larger).
 fn largest_count(holds: impl Fn(usize) -> bool) -> usize {
     let (mut low, mut high) = (0_usize, 4_096_usize);
     while low < high {
@@ -2067,16 +2125,39 @@ fn fit_at_the_floor<T: Serialize>(
         worker_answer(make, one, resources, count)
             .map(|(frame, carried)| (frame_len(&shown(&frame)), carried))
     };
-    let fits = |count: usize| shown_len(count).is_some_and(|(frame, _)| frame <= bound);
-    let fit = largest_count(fits);
+    let is_over = |count: usize| shown_len(count).is_some_and(|(frame, _)| frame > bound);
     let worker_limit = largest_count(|count| shown_len(count).is_some());
+    // The first count the door's frame is over is found by counting up and not by halving: the frame
+    // does not grow with the count alone.
+    let mut counts: Vec<usize> = (0..=worker_limit.min(SCAN_EXACT)).collect();
+    counts.extend((SCAN_EXACT + SCAN_STRIDE..=worker_limit).step_by(SCAN_STRIDE));
+    if counts.last() != Some(&worker_limit) {
+        counts.push(worker_limit);
+    }
+    let first_sampled_over = counts.iter().position(|count| is_over(*count));
+    // Between two sampled counts the first one over is found by counting up.
+    let first_over = first_sampled_over.map(|at| {
+        let from = if at == 0 { 0 } else { counts[at - 1] + 1 };
+        (from..=counts[at])
+            .find(|count| is_over(*count))
+            .unwrap_or(counts[at])
+    });
+    let fit = first_over.map_or(worker_limit, |count| count.saturating_sub(1));
     let (frame, carried) = shown_len(fit).expect("the worker answers at the fit");
-    let over = shown_len(fit + 1).map_or(0, |(frame, _)| frame);
+    let over = first_over.map_or(0, |count| shown_len(count).map_or(0, |(frame, _)| frame));
+    let above: Vec<usize> = first_over.map_or_else(Vec::new, |count| {
+        (count..=worker_limit).step_by(SCAN_STRIDE).collect()
+    });
+    let over_above_the_fit = (
+        above.iter().filter(|count| is_over(**count)).count(),
+        above.len(),
+    );
     Fit {
         fit,
         worker_limit,
         carried,
         frames: (frame, over),
+        over_above_the_fit,
     }
 }
 
@@ -2136,12 +2217,14 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
             ] {
                 writeln!(
                     table,
-                    "MEASURE | {kind}, {form}, {resources_name} | fit at the floor {} | the worker refuses the peer from {} instances | page carries {} resources at the fit | frame at the fit {} | frame at one more {}",
+                    "MEASURE | {kind}, {form}, {resources_name} | fit at the floor {} | the worker refuses the peer from {} instances | page carries {} resources at the fit | frame at the fit {} | frame at the first count over {} | sampled counts above the fit that are over the bound, up to the worker's refusal: {} of {}",
                     found.fit,
                     found.worker_limit + 1,
                     found.carried,
                     found.frames.0,
-                    found.frames.1
+                    found.frames.1,
+                    found.over_above_the_fit.0,
+                    found.over_above_the_fit.1
                 )
                 .expect("a string takes a write");
                 if refusal.as_ref().is_some_and(|text| text.len() == 512)
