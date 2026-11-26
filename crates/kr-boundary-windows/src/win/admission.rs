@@ -323,7 +323,7 @@ fn right_words(right: Right) -> &'static str {
 
 /// The text, cut at its start with `...` when it is longer than `room` bytes, so that the end of a
 /// path, which names the object, is never the part that is lost.
-fn cut_start(text: &str, room: usize) -> String {
+pub(super) fn cut_start(text: &str, room: usize) -> String {
     if text.len() <= room {
         return text.to_owned();
     }

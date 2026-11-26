@@ -35,6 +35,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use kr_boundary_windows::frame::invocation::{MAX_DETAIL_BYTES, MAX_PATH_BYTES};
 use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::wide;
 use kr_boundary_windows::win::hold::{
@@ -404,6 +405,44 @@ fn broker_text_a_link_or_a_mounted_volume_above_the_tree_is_refused_and_never_fo
     assert_eq!(refusal.detail(), MOUNT_POINT_WORDS);
     drop(unmount);
     drop(disk);
+}
+
+/// A path that is too long for the reply's words and itself is cut at its start, so the reply
+/// keeps the last parts of the path and the words stay whole.
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_text_a_path_too_long_for_the_reply_is_cut_at_its_start_and_keeps_its_end() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "long", &person.sid);
+    let client = person.as_client();
+    let name = "l".repeat(170);
+    let link = scratch.path(&name);
+    let text = link.to_str().unwrap();
+    let room = MAX_DETAIL_BYTES - FOLDER_LINK_WORDS.len() - ": ".len();
+    assert!(
+        text.len() > room && text.len() <= MAX_PATH_BYTES,
+        "the path is longer than the reply has room for and a request may hold it: {}",
+        text.len()
+    );
+    run(
+        "cmd",
+        &["/c", "mklink", "/J", text, project.root.to_str().unwrap()],
+    );
+    let refusal = hold_tree(text, &client).expect_err("a link is refused");
+    assert_eq!(refusal.rule, RULE_FOLDER_LINK);
+    let detail = refusal.detail();
+    assert_eq!(detail.len(), MAX_DETAIL_BYTES, "{detail}");
+    assert!(
+        detail.starts_with(&format!("{FOLDER_LINK_WORDS}: ...")),
+        "{detail}"
+    );
+    assert!(detail.ends_with(&name), "{detail}");
 }
 
 /// A volume mounted in a folder, unmounted when it is dropped: the case's own mount, by its path.

@@ -33,13 +33,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::filekey::FileKey;
-use crate::frame::invocation::RefusedKind;
+use crate::frame::invocation::{MAX_DETAIL_BYTES, RefusedKind};
 use crate::journal::rows::{Row, SnapshotKind};
 use crate::local_path;
 use crate::refusal::Refusal;
 use crate::slot::TreeIdentity;
 
-use super::admission::{attributes_refusal, is_cloud_tag, reparse_refusal};
+use super::admission::{attributes_refusal, cut_start, is_cloud_tag, reparse_refusal};
 use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
 use super::listing::{self, Failure, RepositoryListing};
@@ -359,8 +359,12 @@ fn failed(failure: &ffi::Error) -> Refusal {
     )
 }
 
+/// The words, a colon and the text, with the text cut at its start when the whole would be longer
+/// than a detail may be: the last parts of a path are what a person recognises, as in the
+/// admission's replies.
 fn named(words: &str, path: &str) -> String {
-    format!("{words}: {path}")
+    let room = MAX_DETAIL_BYTES.saturating_sub(words.len() + ": ".len());
+    format!("{words}: {}", cut_start(path, room))
 }
 
 /// Holds the project the request names: takes the text apart, opens the drive's root and then each
