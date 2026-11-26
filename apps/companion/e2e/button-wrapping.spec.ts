@@ -138,6 +138,8 @@ const BASIC: readonly Part[] = [
 interface Found {
   readonly faults: readonly string[]
   readonly buttons: number
+  /** For each holder: the width of its content box, and each button's width, the width it would have on one line, and its lines. */
+  readonly widths: readonly string[]
 }
 
 /**
@@ -149,9 +151,10 @@ async function measured(page: Page, text = true): Promise<Found> {
   const own = await page.evaluate((root) => {
     const faults: string[] = []
     const base = document.querySelector(root)
-    if (base === null) return { faults: ['no fixture'], buttons: 0 }
+    if (base === null) return { faults: ['no fixture'], buttons: 0, widths: [] as string[] }
     const room = base.getBoundingClientRect()
     let buttons = 0
+    const widths: string[] = []
     for (const holder of base.querySelectorAll('[data-case]')) {
       const name = holder.getAttribute('data-case') ?? 'holder'
       const box = holder.getBoundingClientRect()
@@ -179,11 +182,35 @@ async function measured(page: Page, text = true): Promise<Found> {
           }
         }
       }
+      // The numbers: the content box of the holder, and each button as drawn and held on one line.
+      const style = getComputedStyle(holder)
+      const inset = (name2: string): number => parseFloat(style.getPropertyValue(name2)) || 0
+      const content = box.width - inset('padding-left') - inset('padding-right') - inset('border-left-width') - inset('border-right-width')
+      const now = each.map((button) => {
+        const b = button.getBoundingClientRect()
+        const range = document.createRange()
+        range.selectNodeContents(button)
+        const lines = new Set(Array.from(range.getClientRects()).filter((line) => line.width > 0).map((line) => Math.round(line.top))).size
+        return { label: (button.textContent ?? '').trim(), width: b.width, lines }
+      })
+      for (const button of each) {
+        ;(button as HTMLElement).style.whiteSpace = 'nowrap'
+        ;(button as HTMLElement).style.maxInlineSize = 'none'
+      }
+      const one = each.map((button) => button.getBoundingClientRect().width)
+      for (const button of each) {
+        ;(button as HTMLElement).style.whiteSpace = ''
+        ;(button as HTMLElement).style.maxInlineSize = ''
+      }
+      widths.push(
+        `${name}: content ${content.toFixed(0)} px; ` +
+          now.map((each2, at) => `"${each2.label}" ${each2.width.toFixed(0)} px (${one[at].toFixed(0)} px on one line, ${each2.lines} line)`).join('; ')
+      )
     }
-    return { faults, buttons }
+    return { faults, buttons, widths }
   }, FIXTURE)
   const overrun = text ? await overrunning(page, FIXTURE) : []
-  return { faults: [...own.faults, ...overrun.map((each) => `text ${each}`)], buttons: own.buttons }
+  return { faults: [...own.faults, ...overrun.map((each) => `text ${each}`)], buttons: own.buttons, widths: own.widths }
 }
 
 function shot(name: string): string {
@@ -504,6 +531,8 @@ for (const holding of HOLDINGS) {
       await drawn(page, form, LARGEST, holding.parts)
       const found = await measured(page, holding.buttonsOnly !== true)
       expect(found.buttons, 'the fixture draws its buttons').toBeGreaterThan(0)
+      // The numbers go with the case, for whoever reads the holder's verdict.
+      for (const line of found.widths) test.info().annotations.push({ type: 'widths', description: line })
       expect(found.faults, 'buttons and text that run out of the box that holds them').toEqual([])
     })
   }
