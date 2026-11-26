@@ -314,6 +314,48 @@ async fn a_daemon_behind_a_proxy_that_asks_for_a_login_starts_says_so_and_takes_
     assert!(!log.contains(&basic), "the daemon's log holds the login");
 }
 
+/// KR-REQ-23.45: a daemon whose start skips the network, because its proxy asks for a
+/// login it does not hold, records its boot once at its start and registers no network. The
+/// regular pass that raises a boot's high is a turn of the task that the registration starts, so
+/// this host has none: its high stays what its start read until a grant is given a point or the
+/// daemon starts again. The case states that limit and kills no mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_whose_start_skips_the_network_records_its_boot_once_and_has_no_regular_pass() {
+    let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
+    let (host, _relay, _) = host_behind(&proxy).await;
+
+    let mut daemon = Daemon::start(&host);
+    let said = network_detail(&host).await;
+    assert!(
+        said.contains("this host is not on the network"),
+        "no registration: {said}"
+    );
+    let boots: Vec<(i64, i64, i64)> = {
+        let connection = rusqlite::Connection::open(host.environment().registry_database())
+            .expect("the registry opens");
+        let mut statement = connection
+            .prepare("SELECT ordinal, high_ms, spoiled FROM boots ORDER BY ordinal")
+            .expect("the boots table");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("every row")
+    };
+    assert_eq!(
+        boots.len(),
+        1,
+        "the start recorded its boot once: {boots:?}"
+    );
+    assert_eq!(
+        (boots[0].0, boots[0].2),
+        (1, 0),
+        "as the first boot, told apart: {boots:?}"
+    );
+    assert!(boots[0].1 > 0, "with the reading it took: {boots:?}");
+    daemon.stop();
+}
+
 /// KR-REQ-10.02: a daemon whose stored login the proxy refuses is written no login after the
 /// check that found the refusal: the proxy counts one wrong login, the diagnostics say that the
 /// proxy refused it and that this host starts no new request through the proxy, and the local
