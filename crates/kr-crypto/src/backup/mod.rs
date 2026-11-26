@@ -58,7 +58,7 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration};
 use kr_protocol::scalars::KeyId;
 
 pub use crate::backup::generations::{
-    GenerationExpectation, GenerationStanding, RestoreGeneration,
+    CheckpointSource, GenerationExpectation, GenerationStanding, RestoreGeneration,
 };
 pub use crate::backup::material::{
     Admission, Material, RestoreAdmissions, RestoreLimits, admit_for_restore, may_back_up,

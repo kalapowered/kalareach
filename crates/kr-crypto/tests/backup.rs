@@ -7,10 +7,10 @@
 use kr_crypto::CryptoError;
 use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
-    GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource, RestoreGeneration,
-    RetainedObjectKeys, SealedArchive, StagedObject, open_archive, recipient_key_id, seal_archive,
-    stage_object, still_readable_after_revocation,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
+    CollectionKind, GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
+    RestoreGeneration, RetainedObjectKeys, SealedArchive, StagedObject, open_archive,
+    recipient_key_id, seal_archive, stage_object, still_readable_after_revocation,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -1402,6 +1402,14 @@ fn checkpoint(generation: u64, hash: Digest256) -> ArchiveCheckpoint {
     }
 }
 
+/// The expectation a restore holds when the checkpoint is the recovery bundle's.
+fn from_the_bundle(checkpoint: &ArchiveCheckpoint) -> GenerationExpectation<'_> {
+    GenerationExpectation::Checkpoint {
+        checkpoint,
+        source: CheckpointSource::RecoveryBundle,
+    }
+}
+
 #[test]
 fn a_checkpoint_catches_a_replayed_older_archive() {
     let parties = Parties::generate();
@@ -1410,10 +1418,7 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
     let new = seal(&parties, 7, &objects);
 
     let verified = checkpoint(7, new.descriptor.encrypted_manifest.encrypted_object_hash);
-    let replayed = RestoreGeneration::against(
-        &old.descriptor,
-        GenerationExpectation::Checkpoint(&verified),
-    );
+    let replayed = RestoreGeneration::against(&old.descriptor, from_the_bundle(&verified));
     assert!(matches!(
         replayed.standing,
         GenerationStanding::Replayed { .. }
@@ -1426,7 +1431,7 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
     // manifest verifies.
     let against = ArchiveExpectation {
         archive_id: archive_id(),
-        generation: GenerationExpectation::Checkpoint(&verified),
+        generation: from_the_bundle(&verified),
     };
     assert!(
         open_archive(
@@ -1441,10 +1446,7 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
         "a replayed older archive is refused by the restore, not only reported"
     );
 
-    let current = RestoreGeneration::against(
-        &new.descriptor,
-        GenerationExpectation::Checkpoint(&verified),
-    );
+    let current = RestoreGeneration::against(&new.descriptor, from_the_bundle(&verified));
     assert!(matches!(current.standing, GenerationStanding::AtCheckpoint));
     assert!(current.is_admissible());
     let opened = open_archive(
@@ -1477,6 +1479,7 @@ fn a_named_older_generation_is_admitted_past_the_checkpoint_and_no_other() {
     let verified = checkpoint(7, seven.descriptor.encrypted_manifest.encrypted_object_hash);
     let naming = |accepted: u64| GenerationExpectation::AcceptingOlder {
         checkpoint: &verified,
+        source: CheckpointSource::RecoveryBundle,
         accepted: BackupGeneration::new(accepted),
     };
 
@@ -1508,7 +1511,7 @@ fn a_named_older_generation_is_admitted_past_the_checkpoint_and_no_other() {
     // The control: without the name, the same archive is a replay and the restore refuses it.
     let unnamed = ArchiveExpectation {
         archive_id: archive_id(),
-        generation: GenerationExpectation::Checkpoint(&verified),
+        generation: from_the_bundle(&verified),
     };
     assert!(
         open_archive(
@@ -1572,10 +1575,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
         archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
         ..checkpoint(1, Digest256::from_bytes([0xcd; 32]))
     };
-    let standing = RestoreGeneration::against(
-        &sealed.descriptor,
-        GenerationExpectation::Checkpoint(&other),
-    );
+    let standing = RestoreGeneration::against(&sealed.descriptor, from_the_bundle(&other));
     assert!(matches!(
         standing.standing,
         GenerationStanding::OtherArchive { .. }
@@ -1588,7 +1588,7 @@ fn an_archive_of_another_collection_is_not_the_backup_that_was_asked_for() {
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                generation: GenerationExpectation::Checkpoint(&other),
+                generation: from_the_bundle(&other),
             },
             &sealed.descriptor_bytes,
             &sealed.encrypted_manifest,
@@ -1604,10 +1604,7 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
     let second = seal(&parties, 5, &[stage(1, "a.cbor", b"something else")]);
     let verified = checkpoint(5, first.descriptor.encrypted_manifest.encrypted_object_hash);
 
-    let substituted = RestoreGeneration::against(
-        &second.descriptor,
-        GenerationExpectation::Checkpoint(&verified),
-    );
+    let substituted = RestoreGeneration::against(&second.descriptor, from_the_bundle(&verified));
     assert!(matches!(
         substituted.standing,
         GenerationStanding::Substituted { .. }
@@ -1620,7 +1617,7 @@ fn an_archive_claiming_the_checkpoints_generation_with_another_manifest_is_refus
             &[trusted(&parties.writer)],
             &ArchiveExpectation {
                 archive_id: archive_id(),
-                generation: GenerationExpectation::Checkpoint(&verified),
+                generation: from_the_bundle(&verified),
             },
             &second.descriptor_bytes,
             &second.encrypted_manifest,
@@ -1657,7 +1654,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
         &[trusted(&parties.writer)],
         &ArchiveExpectation {
             archive_id: archive_id(),
-            generation: GenerationExpectation::Checkpoint(&bundle_checkpoint),
+            generation: from_the_bundle(&bundle_checkpoint),
         },
         &sealed.descriptor_bytes,
         &sealed.encrypted_manifest,
@@ -1679,10 +1676,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     // With the bundle's checkpoint: it is newer than what was verified, which is what an owner who
     // kept backing up looks like.
     let verified = checkpoint(9, Digest256::from_bytes([0xab; 32]));
-    let ahead = RestoreGeneration::against(
-        &sealed.descriptor,
-        GenerationExpectation::Checkpoint(&verified),
-    );
+    let ahead = RestoreGeneration::against(&sealed.descriptor, from_the_bundle(&verified));
     assert!(matches!(ahead.standing, GenerationStanding::Ahead { .. }));
     assert!(ahead.is_admissible());
     assert!(ahead.checkpoint_available());
@@ -1698,6 +1692,230 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     assert!(bare.is_admissible());
     assert!(!bare.checkpoint_available());
     assert!(bare.describe().contains("generation 11"));
+}
+
+const NOT_HELD_BACK: &str =
+    "No restore can show that the service is not holding a newer backup back.";
+
+#[test]
+fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
+    let parties = Parties::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let three = seal(&parties, 3, &objects);
+    let seven = seal(&parties, 7, &objects);
+    let eleven = seal(&parties, 11, &objects);
+    let other_seven = seal(&parties, 7, &[stage(2, "b.cbor", b"two")]);
+    let verified = checkpoint(7, seven.descriptor.encrypted_manifest.encrypted_object_hash);
+    let held_to = |source| GenerationExpectation::Checkpoint {
+        checkpoint: &verified,
+        source,
+    };
+    let accepting = |source| GenerationExpectation::AcceptingOlder {
+        checkpoint: &verified,
+        source,
+        accepted: BackupGeneration::new(3),
+    };
+    let said = |lead: &str, generation: u64, standing: &str| {
+        format!("{lead} {generation}. {standing} {NOT_HELD_BACK}")
+    };
+    let restoring = "Restoring backup generation";
+    let offered = "The service offered backup generation";
+    let bundle = CheckpointSource::RecoveryBundle;
+    let pairing = CheckpointSource::Pairing;
+
+    let at = |source| RestoreGeneration::against(&seven.descriptor, held_to(source)).describe();
+    assert_eq!(
+        at(bundle),
+        said(
+            restoring,
+            7,
+            "It is the generation the recovery bundle last verified."
+        ),
+        "at the bundle's checkpoint"
+    );
+    assert_eq!(
+        at(pairing),
+        said(
+            restoring,
+            7,
+            "It is the generation a host this device paired with had published when this device \
+             asked."
+        ),
+        "at the pairing's checkpoint"
+    );
+
+    let ahead = |source| RestoreGeneration::against(&eleven.descriptor, held_to(source)).describe();
+    assert_eq!(
+        ahead(bundle),
+        said(
+            restoring,
+            11,
+            "It is newer than generation 7 that the recovery bundle last verified."
+        ),
+        "ahead of the bundle's checkpoint"
+    );
+    assert_eq!(
+        ahead(pairing),
+        said(
+            restoring,
+            11,
+            "It is newer than generation 7, the newest that a host this device paired with had \
+             published when this device asked."
+        ),
+        "ahead of the pairing's checkpoint"
+    );
+
+    let replayed =
+        |source| RestoreGeneration::against(&three.descriptor, held_to(source)).describe();
+    assert_eq!(
+        replayed(bundle),
+        said(
+            offered,
+            3,
+            "It is older than generation 7 that the recovery bundle verified, so it is not \
+             being restored."
+        ),
+        "older than the bundle's checkpoint"
+    );
+    assert_eq!(
+        replayed(pairing),
+        said(
+            offered,
+            3,
+            "It is older than generation 7, the newest that a host this device paired with had \
+             published when this device asked, so it is not being restored."
+        ),
+        "older than the pairing's checkpoint"
+    );
+
+    let substituted =
+        |source| RestoreGeneration::against(&other_seven.descriptor, held_to(source)).describe();
+    assert_eq!(
+        substituted(bundle),
+        said(
+            offered,
+            7,
+            "It claims generation 7 but is not the archive the recovery bundle verified, so it \
+             is not being restored."
+        ),
+        "claiming the bundle's generation with another manifest"
+    );
+    assert_eq!(
+        substituted(pairing),
+        said(
+            offered,
+            7,
+            "It claims generation 7 but is not the archive a host this device paired with had \
+             published when this device asked, so it is not being restored."
+        ),
+        "claiming the pairing's generation with another manifest"
+    );
+
+    let older_accepted =
+        |source| RestoreGeneration::against(&three.descriptor, accepting(source)).describe();
+    assert_eq!(
+        older_accepted(bundle),
+        said(
+            restoring,
+            3,
+            "It is older than generation 7 that the recovery bundle verified, and it is being \
+             restored because that generation was named."
+        ),
+        "an older generation named past the bundle's checkpoint"
+    );
+    assert_eq!(
+        older_accepted(pairing),
+        said(
+            restoring,
+            3,
+            "It is older than generation 7, the newest that a host this device paired with had \
+             published when this device asked, and it is being restored because that generation \
+             was named."
+        ),
+        "an older generation named past the pairing's checkpoint"
+    );
+
+    // A checkpoint of another archive and no checkpoint at all say nothing of a source.
+    let other = ArchiveCheckpoint {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
+        ..checkpoint(7, Digest256::from_bytes([0xcd; 32]))
+    };
+    let elsewhere = |source| {
+        RestoreGeneration::against(
+            &seven.descriptor,
+            GenerationExpectation::Checkpoint {
+                checkpoint: &other,
+                source,
+            },
+        )
+        .describe()
+    };
+    assert_eq!(
+        elsewhere(bundle),
+        elsewhere(pairing),
+        "the words for another archive's checkpoint do not name a source"
+    );
+    assert_eq!(
+        RestoreGeneration::against(&seven.descriptor, GenerationExpectation::Unverified).describe(),
+        said(
+            restoring,
+            7,
+            "There is no verified generation to compare it with."
+        ),
+        "no checkpoint"
+    );
+}
+
+#[test]
+fn a_restore_records_a_source_exactly_when_it_was_given_a_checkpoint() {
+    let parties = Parties::generate();
+    let sealed = seal(&parties, 7, &[stage(1, "a.cbor", b"one")]);
+    let verified = checkpoint(
+        7,
+        sealed.descriptor.encrypted_manifest.encrypted_object_hash,
+    );
+    let other = ArchiveCheckpoint {
+        archive_id: ArchiveId::new(Uuid::from_bytes([0x77; 16])),
+        ..checkpoint(7, Digest256::from_bytes([0xcd; 32]))
+    };
+
+    assert_eq!(
+        RestoreGeneration::against(&sealed.descriptor, GenerationExpectation::Unverified).source,
+        None,
+        "no checkpoint, no source"
+    );
+    for source in [CheckpointSource::RecoveryBundle, CheckpointSource::Pairing] {
+        for (name, expectation) in [
+            (
+                "a checkpoint",
+                GenerationExpectation::Checkpoint {
+                    checkpoint: &verified,
+                    source,
+                },
+            ),
+            (
+                "an older generation named",
+                GenerationExpectation::AcceptingOlder {
+                    checkpoint: &verified,
+                    source,
+                    accepted: BackupGeneration::new(3),
+                },
+            ),
+            (
+                "a checkpoint of another archive",
+                GenerationExpectation::Checkpoint {
+                    checkpoint: &other,
+                    source,
+                },
+            ),
+        ] {
+            assert_eq!(
+                RestoreGeneration::against(&sealed.descriptor, expectation).source,
+                Some(source),
+                "{name} from {source:?} is recorded with its source"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -45,8 +45,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchiveReader, GenerationExpectation, GenerationStanding, Material,
-    OpenArchive, RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
+    ArchiveExpectation, ArchiveReader, CheckpointSource, GenerationExpectation, GenerationStanding,
+    Material, OpenArchive, RestoreGeneration, admit_for_restore, member_cap, member_material,
+    open_archive,
 };
 use kr_crypto::kdf::{RecoveryRecipient, RecoverySeed};
 use kr_crypto::secret::SecretVec;
@@ -1348,9 +1349,13 @@ impl FilesRestore {
         let expectation = match (&checkpoint, accept_older) {
             (Some(checkpoint), Some(accepted)) => GenerationExpectation::AcceptingOlder {
                 checkpoint,
+                source: CheckpointSource::RecoveryBundle,
                 accepted,
             },
-            (Some(checkpoint), None) => GenerationExpectation::Checkpoint(checkpoint),
+            (Some(checkpoint), None) => GenerationExpectation::Checkpoint {
+                checkpoint,
+                source: CheckpointSource::RecoveryBundle,
+            },
             (None, Some(_)) => return Err(RestoreError::NoCheckpointToAcceptPast),
             (None, None) => GenerationExpectation::Unverified,
         };
@@ -1727,10 +1732,13 @@ async fn candidates(
         let newest = match source.generation(*archive_id, checkpoint).await? {
             None => CandidateState::Nothing,
             Some(publication) => {
-                let expectation = checkpoint.map_or(
-                    GenerationExpectation::Unverified,
-                    GenerationExpectation::Checkpoint,
-                );
+                let expectation =
+                    checkpoint.map_or(GenerationExpectation::Unverified, |checkpoint| {
+                        GenerationExpectation::Checkpoint {
+                            checkpoint,
+                            source: CheckpointSource::RecoveryBundle,
+                        }
+                    });
                 match verify_publication(
                     &publication,
                     *archive_id,

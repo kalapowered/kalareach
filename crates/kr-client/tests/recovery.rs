@@ -19,9 +19,9 @@ use kr_client::services::{
     SyncRecoveryId, SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_crypto::backup::{
-    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
-    GenerationExpectation, ObjectSource, RestoreGeneration, open_archive, seal_archive,
-    stage_object,
+    ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CheckpointSource,
+    CollectionKind, GenerationExpectation, ObjectSource, RestoreGeneration, open_archive,
+    seal_archive, stage_object,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -3072,7 +3072,10 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
         archive_id: archive_id(),
         generation: material.checkpoint(archive_id()).map_or(
             GenerationExpectation::Unverified,
-            GenerationExpectation::Checkpoint,
+            |checkpoint| GenerationExpectation::Checkpoint {
+                checkpoint,
+                source: CheckpointSource::RecoveryBundle,
+            },
         ),
     };
     let opened = open_archive(
@@ -3108,10 +3111,14 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
     // it still cannot claim that no newer archive exists.
     let standing = RestoreGeneration::against(
         &descriptor,
-        material.checkpoint(archive_id()).map_or(
-            GenerationExpectation::Unverified,
-            GenerationExpectation::Checkpoint,
-        ),
+        material
+            .checkpoint(archive_id())
+            .map_or(GenerationExpectation::Unverified, |checkpoint| {
+                GenerationExpectation::Checkpoint {
+                    checkpoint,
+                    source: CheckpointSource::RecoveryBundle,
+                }
+            }),
     );
     assert!(standing.describe().contains("generation 4"));
     assert!(!standing.proves_no_newer_archive());

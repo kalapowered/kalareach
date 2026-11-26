@@ -5,12 +5,25 @@
 //! checkpoint the owner trusts: the latest generation it verified, and the hash of that
 //! generation's encrypted manifest.
 //!
-//! The checkpoint a restore compares against is the one the owner's recovery bundle holds. It does
-//! not prove that no newer archive exists, and [`RestoreGeneration::describe`] says so rather than
-//! leaving a person to assume otherwise.
+//! The checkpoint a restore compares against is the one the owner's recovery bundle holds, and
+//! [`CheckpointSource`] says where a checkpoint came from, so that the sentence a restore shows
+//! names it. It does not prove that no newer archive exists, and [`RestoreGeneration::describe`]
+//! says so rather than leaving a person to assume otherwise.
 
 use kr_protocol::archive::{ArchiveCheckpoint, ArchiveDescriptor};
 use kr_protocol::ids::{ArchiveId, BackupGeneration};
+
+/// Where the checkpoint a restore compares against came from.
+///
+/// The two sources say different things about the same generation, so the sentence a person reads
+/// names the one that was used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointSource {
+    /// The latest generation the owner's recovery bundle verified.
+    RecoveryBundle,
+    /// The newest generation a host this device paired with had published when this device asked.
+    Pairing,
+}
 
 /// What a restore compares the generation it is offered against.
 ///
@@ -21,17 +34,25 @@ pub enum GenerationExpectation<'a> {
     /// Nothing to compare against. The recovery-only case: the restore goes ahead and proves
     /// nothing about what else might exist.
     Unverified,
-    /// The latest generation the owner verified. A generation at or after it is admitted; one
-    /// before it is a replay, and one that claims it with another manifest is a substitution.
-    Checkpoint(&'a ArchiveCheckpoint),
-    /// The latest generation the owner verified, with one older generation the person named and
-    /// accepts. Exactly that generation is admitted when it is older than the checkpoint, which a
+    /// The checkpoint the restore holds, the latest generation the owner verified or the newest a
+    /// paired host named. A generation at or after it is admitted; one before it is a replay, and
+    /// one that claims it with another manifest is a substitution.
+    Checkpoint {
+        /// The checkpoint.
+        checkpoint: &'a ArchiveCheckpoint,
+        /// Where it came from.
+        source: CheckpointSource,
+    },
+    /// The checkpoint the restore holds, with one older generation the person named and accepts.
+    /// Exactly that generation is admitted when it is older than the checkpoint, which a
     /// service that was legitimately put back to an earlier state holds and can hold no other. A
     /// generation that claims the checkpoint's own with another manifest is still a substitution,
     /// and no other older generation is admitted.
     AcceptingOlder {
-        /// The latest generation the owner verified.
+        /// The checkpoint the restore holds.
         checkpoint: &'a ArchiveCheckpoint,
+        /// Where it came from.
+        source: CheckpointSource,
         /// The one older generation the person named.
         accepted: BackupGeneration,
     },
@@ -84,19 +105,24 @@ pub struct RestoreGeneration {
     pub backup_generation: BackupGeneration,
     /// Where it stands against the checkpoint.
     pub standing: GenerationStanding,
+    /// Where the checkpoint it was compared with came from, when there was one.
+    pub source: Option<CheckpointSource>,
 }
 
 impl RestoreGeneration {
     /// Compares one descriptor against the checkpoint the owner trusts, if there is one.
     #[must_use]
     pub fn against(descriptor: &ArchiveDescriptor, expectation: GenerationExpectation<'_>) -> Self {
-        let (checkpoint, accepted) = match expectation {
-            GenerationExpectation::Unverified => (None, None),
-            GenerationExpectation::Checkpoint(checkpoint) => (Some(checkpoint), None),
+        let (checkpoint, source, accepted) = match expectation {
+            GenerationExpectation::Unverified => (None, None, None),
+            GenerationExpectation::Checkpoint { checkpoint, source } => {
+                (Some(checkpoint), Some(source), None)
+            }
             GenerationExpectation::AcceptingOlder {
                 checkpoint,
+                source,
                 accepted,
-            } => (Some(checkpoint), Some(accepted)),
+            } => (Some(checkpoint), Some(source), Some(accepted)),
         };
         let standing = match checkpoint {
             None => GenerationStanding::NoCheckpoint,
@@ -137,6 +163,7 @@ impl RestoreGeneration {
             archive_id: descriptor.archive_id,
             backup_generation: descriptor.backup_generation,
             standing,
+            source,
         }
     }
 
@@ -178,21 +205,44 @@ impl RestoreGeneration {
         false
     }
 
-    /// The sentence a restore displays. It always names the generation.
+    /// The sentence a restore displays. It always names the generation, and it names the source of
+    /// the checkpoint the generation was held to: the recovery bundle, or a host this device paired
+    /// with.
     #[must_use]
     pub fn describe(&self) -> String {
         let generation = self.backup_generation.get();
+        let pairing = self.source == Some(CheckpointSource::Pairing);
         let standing = match self.standing {
+            GenerationStanding::AtCheckpoint if pairing => {
+                "It is the generation a host this device paired with had published when this \
+                 device asked."
+                    .to_owned()
+            }
             GenerationStanding::AtCheckpoint => {
                 "It is the generation the recovery bundle last verified.".to_owned()
             }
+            GenerationStanding::Ahead { checkpoint } if pairing => format!(
+                "It is newer than generation {}, the newest that a host this device paired with \
+                 had published when this device asked.",
+                checkpoint.get()
+            ),
             GenerationStanding::Ahead { checkpoint } => format!(
                 "It is newer than generation {} that the recovery bundle last verified.",
+                checkpoint.get()
+            ),
+            GenerationStanding::Replayed { checkpoint } if pairing => format!(
+                "It is older than generation {}, the newest that a host this device paired with \
+                 had published when this device asked, so it is not being restored.",
                 checkpoint.get()
             ),
             GenerationStanding::Replayed { checkpoint } => format!(
                 "It is older than generation {} that the recovery bundle verified, so it is not \
                  being restored.",
+                checkpoint.get()
+            ),
+            GenerationStanding::Substituted { checkpoint } if pairing => format!(
+                "It claims generation {} but is not the archive a host this device paired with \
+                 had published when this device asked, so it is not being restored.",
                 checkpoint.get()
             ),
             GenerationStanding::Substituted { checkpoint } => format!(
@@ -205,6 +255,12 @@ impl RestoreGeneration {
                  backup that was asked for and it is not being restored."
                     .to_owned()
             }
+            GenerationStanding::OlderAccepted { checkpoint } if pairing => format!(
+                "It is older than generation {}, the newest that a host this device paired with \
+                 had published when this device asked, and it is being restored because that \
+                 generation was named.",
+                checkpoint.get()
+            ),
             GenerationStanding::OlderAccepted { checkpoint } => format!(
                 "It is older than generation {} that the recovery bundle verified, and it is being \
                  restored because that generation was named.",
