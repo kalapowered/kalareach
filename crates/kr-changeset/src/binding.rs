@@ -670,7 +670,7 @@ mod unix {
     /// What the host makes of the reports a platform's watcher sends, whichever platform sends them.
     ///
     /// A report is the paths it names and whether it says that reports were lost. Judging a
-    /// report needs nothing of the platform's, so every platform runs these cases.
+    /// report needs nothing of the platform's, so every Unix test target runs these cases.
     #[cfg(any(target_os = "macos", test))]
     mod judged {
         use std::collections::{BTreeMap, BTreeSet};
@@ -733,7 +733,8 @@ mod unix {
             /// is often a directory above the copy or the root of the volume. The watcher passes
             /// it on with that path, so a path outside the copy is no reason to leave it out.
             pub(super) fn hear(&self, heard: &mut Heard, rescan: bool, paths: &[PathBuf]) {
-                // A report that reports are lost is not about a path that was written.
+                // The loss comes first. A path the report names in the copy is kept like any
+                // other, though a result that holds a loss names no written path.
                 if rescan {
                     heard.lost.get_or_insert_with(|| {
                         "the watcher lost reports of changes to the copy".to_owned()
@@ -1217,10 +1218,10 @@ mod unix {
                 };
                 // FSEvents sends a notice that it lost reports at the path where it lost them,
                 // often a directory above the copy or the root of the volume. The backend passes
-                // that notice to the handler whatever path it names, so a loss anywhere on the
-                // volume reaches the handler, which takes it as a loss of the copy's reports too.
-                // A loss FSEvents does not announce shows only as the host's own file not being
-                // reported in time.
+                // every notice it receives on this stream to the handler whatever path it names,
+                // and the handler takes each as a loss of the copy's reports too. The host cannot
+                // see a loss that FSEvents does not announce: its own marker file, reported in
+                // time, shows only that the watcher has not fallen behind, and nothing more.
                 //
                 // FSEvents holds open files for each stream root, and a start that fails for want
                 // of them can end the process, so the host asks only for a watch that the budget
@@ -1380,7 +1381,8 @@ mod unix {
                     &mut shared,
                     Err(notify::Error::generic("the stream stopped")),
                 );
-                let lost = shared.heard.lost.expect("the failure is a loss");
+                assert!(shared.heard.lost.is_some(), "the failure is a loss");
+                let lost = shared.heard.lost.unwrap_or_default();
                 assert!(lost.contains("the watcher failed"), "{lost}");
             }
 

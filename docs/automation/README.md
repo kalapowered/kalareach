@@ -674,13 +674,14 @@ A test result is what this host observed, and nothing a caller reports.
   follows the directory it was set on wherever it is renamed to. On macOS it is FSEvents, which
   reports by path and on its own schedule. The host judges each report as it arrives, and it writes
   a file of its own beside the copy and waits, for up to ten seconds, until the watcher reports it,
-  which means every report up to then has arrived. FSEvents says that it dropped reports at the
-  path where it dropped them, which may be a directory above the copy or the root of the volume.
-  The watcher passes that notice to the host whatever path it names, so it reaches the host and
-  makes the result indeterminate, and so does a loss that has nothing to do with the copy. A loss
-  that FSEvents does not announce shows only as the host's own file not being reported in time. A
-  watcher that cannot start, that lost reports or that does not answer in that time makes the
-  result indeterminate, and so does a platform with no watcher whenever a suite declares an output.
+  which means every report up to then has arrived. FSEvents says that it dropped reports at the path
+  where it dropped them, which may be a directory above the copy or the root of the volume. The
+  watcher passes every such notice it receives on its stream to the host whatever path it names, and
+  the host takes each as a loss, so it makes the result indeterminate, and so does a loss that has
+  nothing to do with the copy. The host cannot see a loss that FSEvents does not announce: its own
+  file, reported in time, shows only that the watcher has not fallen behind, and nothing more. A
+  watcher that cannot start, that lost reports or that does not answer in that time makes the result
+  indeterminate, and so does a platform with no watcher whenever a suite declares an output.
   FSEvents does lose reports, and falls behind by more than the host waits, when files are written
   by the tens of thousands in one burst, by a suite or by anything else on the machine, so on macOS
   such a run can get an indeterminate result that says its watcher cannot be trusted, and a run
