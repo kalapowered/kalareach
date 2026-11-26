@@ -805,6 +805,25 @@ export function closeSheets(): void {
   for (const close of Array.from(openSheets)) close()
 }
 
+/** What a surface that opens over the screen asks of `useModalSurface` beyond the keyboard. */
+export interface ModalSurfaceOptions {
+  /** The control that takes the focus as the surface comes, in place of its first one. */
+  readonly firstStop?: () => HTMLElement | null
+  /**
+   * The control the focus goes to as the surface goes, in place of the one that had it as the
+   * surface came: a press does not give a button the focus in every engine, so that one can be the
+   * page's body. It is read as the surface goes, so what closes the surface can say where.
+   */
+  readonly returnTo?: RefObject<HTMLElement | null>
+  /** The parts of the page behind the surface that take no focus, no press and no reader while it is open. */
+  readonly inactive?: readonly RefObject<HTMLElement | null>[]
+  /** Holds the page behind still: a wheel or a touch that is not on the surface moves nothing. */
+  readonly still?: boolean
+}
+
+/** Whether this web view has the `inert` attribute. Where it has not, the surface's own Tab cycle holds the keyboard. */
+const INERT_SUPPORTED = typeof HTMLElement !== 'undefined' && 'inert' in HTMLElement.prototype
+
 /**
  * What a surface that opens over the screen does for the keyboard while it is mounted.
  *
@@ -814,21 +833,53 @@ export function closeSheets(): void {
  * opened it has the focus again, unless the focus is already somewhere the surface did not take it
  * from: something put it there on purpose while the surface was going, and the surface's leaving
  * does not take it away.
+ *
+ * What a surface that is not alone on the screen needs more is asked for by options, and a surface
+ * that passes none has the above and nothing else.
  */
 export function useModalSurface(
   surface: RefObject<HTMLElement | null>,
   mounted: boolean,
-  close: () => void
+  close: () => void,
+  options: ModalSurfaceOptions = {}
 ): void {
   const restoreFocus = useRef<HTMLElement | null>(null)
+  const latest = useRef(options)
+  useEffect(() => {
+    latest.current = options
+  })
 
   useEffect(() => {
     if (!mounted) return
     const element = surface.current
     if (!element) return
+    const asked = latest.current
     restoreFocus.current = document.activeElement as HTMLElement | null
     const focusable = () => stopsOf(element)
-    focusable()[0]?.focus()
+    ;(asked.firstStop?.() ?? focusable()[0])?.focus()
+    const behind = INERT_SUPPORTED
+      ? (asked.inactive ?? []).flatMap((part) => (part.current === null ? [] : [part.current]))
+      : []
+    for (const part of behind) part.inert = true
+
+    // A wheel or a touch moves the surface's own scroll, and nothing else: where the surface has no
+    // more to scroll that way it moves nothing, so the page behind does not move, and nothing is
+    // taken from the page (a scroll bar is neither added nor removed) that would make it shift.
+    const hold = (event: WheelEvent | TouchEvent): void => {
+      if (!event.cancelable || ('ctrlKey' in event && event.ctrlKey)) return
+      const on = event.target instanceof Node && element.contains(event.target)
+      if (on && event instanceof WheelEvent) {
+        const up = event.deltaY < 0 && element.scrollTop > 0
+        const down = event.deltaY > 0 && element.scrollTop + element.clientHeight < element.scrollHeight - 1
+        if (up || down) return
+      }
+      if (on && !(event instanceof WheelEvent)) return
+      event.preventDefault()
+    }
+    if (asked.still === true) {
+      document.addEventListener('wheel', hold, { passive: false, capture: true })
+      document.addEventListener('touchmove', hold, { passive: false, capture: true })
+    }
 
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== 'Tab') return
@@ -848,8 +899,18 @@ export function useModalSurface(
     document.addEventListener('keydown', onKey)
     return () => {
       document.removeEventListener('keydown', onKey)
+      document.removeEventListener('wheel', hold, { capture: true })
+      document.removeEventListener('touchmove', hold, { capture: true })
+      for (const part of behind) part.inert = false
       const active = document.activeElement
-      if (active === null || active === document.body) restoreFocus.current?.focus()
+      const lost = active === null || active === document.body
+      if (asked.returnTo === undefined) {
+        if (lost) restoreFocus.current?.focus()
+      } else if (lost || element.contains(active)) {
+        // What closed the surface said where the focus goes; a focus left inside it would be lost
+        // to the page's body as the surface is hidden.
+        ;(asked.returnTo.current ?? restoreFocus.current)?.focus()
+      }
     }
   }, [mounted, surface])
 

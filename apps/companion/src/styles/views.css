@@ -1469,17 +1469,110 @@
   }
 }
 
+/*
+ * At 720 points and below the sidebar does not stand beside the page: it is a drawer from the
+ * leading edge, over a scrim, opened from the control at the start of the top bar. The query is the
+ * one `NARROW` names in the application's shell, and the two change form at the same width.
+ *
+ * It is the one sidebar with its own items, so what a person reads there is what they read beside the
+ * page. Its place and its travel follow the writing direction: it starts from the edge the sidebar
+ * stands against, and one custom property turns its way out around. Closed, it lies out of the
+ * window and the shell makes it inert, which keeps it out of the tab order and the reading order.
+ */
 @media (max-width: 720px) {
   .sidebar {
-    display: none;
+    --drawer-from: -100%;
+    position: fixed;
+    inset-inline-start: 0;
+    z-index: 91;
+    flex: none;
+    inline-size: min(max(238px, 14.875rem), calc(100vw - 48px));
+    padding: 14px 16px 18px;
+    border-right: 0;
+    border-inline-end: 1px solid var(--line);
+    /* What the drawer scrolls stays in the drawer: the page behind is held by the shell. */
+    overscroll-behavior: contain;
+    transform: translateX(var(--drawer-from));
+    transition: transform var(--state) var(--ease-out);
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+
+  .sidebar:dir(rtl) {
+    --drawer-from: 100%;
+  }
+
+  .sidebar[data-open='true'] {
+    transform: none;
+    box-shadow: var(--shadow-sheet);
+    transition: transform var(--surface-in) var(--ease-out);
+  }
+
+  /* The scrim is the sheet's own, and a press on it is not a press on the page behind or a drag of the window. */
+  .scrim.drawer-scrim {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--state) var(--ease-out);
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+  }
+
+  .scrim.drawer-scrim[data-open='true'] {
+    opacity: 1;
+    pointer-events: auto;
+    transition: opacity var(--surface-in) var(--ease-out);
+  }
+
+  /* The control that opens the drawer and the one that closes it start at one corner with one
+     height: the drawer covers the first and the second is drawn where it was, so a second press at
+     the same point closes what the first opened. Each takes the width of its own label, and the
+     first lies inside the second. */
+  .btn[data-menu-control] {
+    flex: none;
+    align-self: flex-start;
+  }
+
+  .drawer-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 12px 16px;
+    margin-block-end: 28px;
+  }
+
+  .drawer-head .brand {
+    margin: 0;
+  }
+
+  /* The control and the connection share a row while the words have room beside it (a line of
+     eight of their own letters), and when they have not the words go on a row of their own under
+     the control, at the width of the bar. */
+  /* The bar stays at the top of the window as the page scrolls, so the control is always where
+     the close control is drawn, and under the scrim and the drawer. */
+  .topbar {
+    position: sticky;
+    top: 0;
+    z-index: 80;
+    align-items: flex-start;
+    padding: 14px 16px;
+  }
+
+  .topbar .row {
+    flex: 1 1 auto;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 8px 12px;
+  }
+
+  .topbar .connection {
+    flex: 1 1 8em;
+    /* Level with the control when it is one line, from the top of the row when it is more; the dot
+       stays in the line of the words, on the first. */
+    align-self: center;
   }
 
   main {
     padding: 24px 16px 30px;
-  }
-
-  .topbar {
-    padding: 0 16px;
   }
 
   .theme-options {
@@ -1488,6 +1581,24 @@
 
   .theme-preview {
     height: 72px;
+  }
+}
+
+/* With reduced motion the drawer does not travel: it fades in and out in the place it rests. */
+@media (max-width: 720px) and (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .sidebar[data-open='true'] {
+    transform: none;
+  }
+
+  .sidebar {
+    opacity: 0;
+    transition: opacity var(--press) ease;
+  }
+
+  .sidebar[data-open='true'] {
+    opacity: 1;
+    transition: opacity var(--press) ease;
   }
 }
 

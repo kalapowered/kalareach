@@ -5,12 +5,20 @@
  * and settings are never a fourth destination: they open over whatever the person is doing.
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode
+} from 'react'
 
 import type { ActionRight } from '@kalareach/protocol'
 
 import { AccountPanel, useAccount } from './components/AccountPanel'
-import { Brand, Sheet, Toast } from './components/ui'
+import { Brand, Button, Sheet, Toast, useModalSurface } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
 import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
@@ -36,6 +44,30 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
   { place: { view: 'changesets' }, label: 'Change sets' },
   { place: { view: 'plugins' }, label: 'Plugins' }
 ]
+
+/**
+ * The windows in which the sidebar does not stand beside the page but opens over it from one control
+ * in the top bar. It is the query the style rules of the drawer are written for, in the same words:
+ * the window changes form at one width, in the page and in its styles together.
+ */
+const NARROW = '(max-width: 720px)'
+
+function subscribeNarrow(notify: () => void): () => void {
+  const query = window.matchMedia(NARROW)
+  query.addEventListener('change', notify)
+  return () => {
+    query.removeEventListener('change', notify)
+  }
+}
+
+function isNarrow(): boolean {
+  return window.matchMedia(NARROW).matches
+}
+
+/** Whether the window is narrow now, and again each time it becomes or stops being so. */
+function useNarrow(): boolean {
+  return useSyncExternalStore(subscribeNarrow, isNarrow, () => false)
+}
 
 /**
  * What the toast says when the host withdrew the connection and the application replaced it. A
@@ -137,13 +169,79 @@ export function App(): ReactNode {
     [connection]
   )
 
+  // Below the sidebar's width it is a drawer, which one control in the top bar opens. While it is
+  // open the page behind takes no focus and no scroll, and the drawer closes by Escape, by a press
+  // outside it, by its own control or by a choice. Where the focus goes then is decided by how it
+  // closed: back to the control that opened it, or onto the page that was chosen.
+  const narrow = useNarrow()
+  const [wasNarrow, setWasNarrow] = useState(narrow)
+  const [navigationOpen, setNavigationOpen] = useState(false)
+  // A window widened past the drawer's width while it was open leaves the sidebar where it stands,
+  // and one narrowed again meets the drawer closed.
+  if (wasNarrow !== narrow) {
+    setWasNarrow(narrow)
+    if (!narrow) setNavigationOpen(false)
+  }
+  const open = narrow && navigationOpen
+  const sidebar = useRef<HTMLElement | null>(null)
+  const workspace = useRef<HTMLDivElement | null>(null)
+  const skipLink = useRef<HTMLAnchorElement | null>(null)
+  const menu = useRef<HTMLButtonElement | null>(null)
+  const page = useRef<HTMLElement | null>(null)
+  const focusAfter = useRef<HTMLElement | null>(null)
+  const openNavigation = useCallback(() => {
+    focusAfter.current = menu.current
+    setNavigationOpen(true)
+  }, [])
+  const closeNavigation = useCallback((returnTo: 'menu' | 'page') => {
+    focusAfter.current = returnTo === 'menu' ? menu.current : page.current
+    setNavigationOpen(false)
+  }, [])
+  const closeToMenu = useCallback(() => {
+    closeNavigation('menu')
+  }, [closeNavigation])
+  // The destination that is shown has the focus as the drawer opens, so a person sees where they are.
+  const firstStop = useCallback(
+    () =>
+      sidebar.current?.querySelector<HTMLElement>('[aria-current="page"]') ??
+      sidebar.current?.querySelector<HTMLElement>('.nav-item') ??
+      null,
+    []
+  )
+  useModalSurface(sidebar, open, closeToMenu, {
+    firstStop,
+    returnTo: focusAfter,
+    inactive: [workspace, skipLink],
+    still: true
+  })
+  // A choice in the drawer closes it and leaves the focus on the page that was chosen.
+  const chose = (): void => {
+    if (narrow) closeNavigation('page')
+  }
+
   const shell = (
     <div className="app-shell">
-      <a className="skip-link" href="#main">
+      <a className="skip-link" href="#main" ref={skipLink}>
         Skip to content
       </a>
-      <aside className="sidebar" aria-label="Workspace navigation">
-        <Brand />
+      <aside
+        id="workspace-navigation"
+        className="sidebar"
+        aria-label="Workspace navigation"
+        ref={sidebar}
+        data-open={narrow ? String(open) : undefined}
+        inert={narrow && !open}
+      >
+        {narrow ? (
+          <div className="drawer-head">
+            <Button data-menu-control="close" onClick={closeToMenu}>
+              Close menu
+            </Button>
+            <Brand />
+          </div>
+        ) : (
+          <Brand />
+        )}
         <nav className="nav-group">
           <p className="eyebrow">Workspace</p>
           {NAVIGATION.map((item) => (
@@ -154,6 +252,7 @@ export function App(): ReactNode {
               aria-current={item.place.view === place.view ? 'page' : undefined}
               onClick={() => {
                 go(item.place)
+                chose()
               }}
             >
               {item.label}
@@ -172,6 +271,7 @@ export function App(): ReactNode {
             aria-current={place.view === 'pairing' ? 'page' : undefined}
             onClick={() => {
               go({ view: 'pairing' })
+              chose()
             }}
           >
             Pair with a host
@@ -182,6 +282,7 @@ export function App(): ReactNode {
             aria-current={place.view === 'setup' ? 'page' : undefined}
             onClick={() => {
               go({ view: 'setup' })
+              chose()
             }}
           >
             {setupLinkFor(platform)}
@@ -192,6 +293,9 @@ export function App(): ReactNode {
             aria-haspopup="dialog"
             onClick={() => {
               setAccountOpen(true)
+              // The sheet that opens is the Account sheet's: the focus waits on the control that
+              // led here, which is where closing Account returns it.
+              if (narrow) closeNavigation('menu')
             }}
           >
             <span className="nav-item-lines">
@@ -201,10 +305,30 @@ export function App(): ReactNode {
           </button>
         </div>
       </aside>
+      {narrow ? (
+        <div
+          className="scrim drawer-scrim"
+          data-open={String(open)}
+          data-testid="drawer-scrim"
+          role="presentation"
+          onClick={closeToMenu}
+        />
+      ) : null}
 
-      <div className="workspace">
+      <div className="workspace" ref={workspace}>
         <header className="topbar">
           <span className="row">
+            {narrow ? (
+              <Button
+                ref={menu}
+                data-menu-control="open"
+                aria-expanded={open}
+                aria-controls="workspace-navigation"
+                onClick={openNavigation}
+              >
+                Menu
+              </Button>
+            ) : null}
             <span className="connection">
               {connection === null ? (
                 'Checking the connection…'
@@ -220,7 +344,7 @@ export function App(): ReactNode {
           </span>
         </header>
 
-        <main id="main" tabIndex={-1}>
+        <main id="main" tabIndex={-1} ref={page}>
           {place.view === 'attention' ? <Attention latest={latest} /> : null}
           {place.view === 'sessions' ? <Sessions /> : null}
           {place.view === 'hosts' ? <Hosts /> : null}
