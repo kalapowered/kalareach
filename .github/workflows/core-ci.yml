@@ -2774,9 +2774,13 @@ jobs:
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that, and so is
   # every fetch from the public package servers, which answer a runner that asks too often with
-  # "too many requests". Two steps before the builds make that survivable: the fetch of the Gradle
-  # distribution is tried again by the step itself, and Gradle is told to try each refused
-  # dependency fetch again, with waits between the tries (see the two steps).
+  # "too many requests". Three things make a short refusal survivable: the fetch of the Gradle
+  # distribution is tried again by its own step; Gradle is told to wait longer between the tries of
+  # each refused dependency fetch, which survives a refusal that stops within about two minutes
+  # for each fetch (a nested lookup can wait about twice that); and a build that still fails with
+  # the refusal in its output is run once more after five minutes. A longer refusal fails the job
+  # as before. The fetches of the Android SDK manager, pnpm, rustup and Cargo are not covered:
+  # they keep their own defaults (see the steps).
   #
   # Every step has a limit of its own, so that a step that hangs is ended, and the evidence upload
   # after it still has its time. A step that installs or builds has twice the longest it took in the

@@ -175,7 +175,8 @@ jobs:
           want="$(printf '%s\n' "signed-kalareach-aarch64-apple-darwin-$RELEASE.tar" "signed-kalareach-x86_64-apple-darwin-$RELEASE.tar" STAGED-NOTARY.txt STAGED-RUN.txt | sort)"
           [ "$(awk '{print $2}' "$RUNNER_TEMP/staged-files/STAGED-SHA256SUMS" | sort)" = "$want" ] || { echo "::error::the staged sums do not name the two macOS trees, the notary record and the run record"; exit 1; }
           # The folder's own entries are listed to be compared with the names the sums give. Those names
-          # are fixed and plain, and any other entry makes the comparison fail, which is its purpose.
+          # are fixed and plain, and any other entry makes the comparison fail, which is its purpose;
+          # a listing leaves out hidden files, so an entry whose name starts with a dot does not.
           # shellcheck disable=SC2012
           [ "$(ls "$RUNNER_TEMP/staged-files" | sort)" = "$(printf '%s\nSTAGED-SHA256SUMS\n' "$want" | sort)" ] || { echo "::error::the staging draft holds other files than the sums name"; exit 1; }
           [ "$(cat "$RUNNER_TEMP/staged-files/STAGED-RUN.txt")" = "$(printf 'run=%s\ncommit=%s\nrelease=%s' "$BUILD_RUN" "$COMMIT" "$RELEASE")" ] || { echo "::error::the staged trees were made from another run, commit or release than the inputs name"; exit 1; }
