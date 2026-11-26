@@ -1954,6 +1954,22 @@ fn the_acp_list_is_refused_with_its_own_reason_when_an_entry_is_not_one_package(
             .state,
         DocumentState::Loaded
     );
+    // The bound itself is read: exactly sixty-four packages load.
+    let mut at_the_bound = ConfigurationDocument::empty();
+    at_the_bound.acp.packages = Nullable::some(
+        (0..64)
+            .map(|n| format!("kalareach/agent-{n}"))
+            .collect::<Vec<_>>(),
+    );
+    at_the_bound.level = 8;
+    let text = serde_json::to_string(&at_the_bound).expect("serialises");
+    let loaded = load_in(Some(text.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
     // A level below the section's is refused by name, an empty list included.
     for low in [
         r#"{"version": 3, "level": 7, "acp": {"packages": ["kalareach/gemini-cli"]}}"#,

@@ -888,3 +888,151 @@ fn kr_req_11_26_a_launch_under_a_range_that_starts_at_its_version_is_accepted() 
     let findings = findings_of(&with_range(">=0.1.11, <0.2.0"));
     assert!(findings.is_empty(), "{findings:?}");
 }
+
+/// The example package with `field` of its launch set to `value`.
+fn with_launch_field(field: &str, value: Value) -> Value {
+    let mut launch = declaration();
+    launch[field] = value;
+    manifest_with(&launch, &GRANTS)
+}
+
+/// KR-REQ-11.26: the host refuses a platform the declaration does not list, whichever platform
+/// that is: a declaration that lists one platform is refused on the other.
+#[test]
+fn kr_req_11_26_a_launch_is_refused_on_each_platform_it_does_not_list() {
+    let only = |platform: &str| -> AcpLaunch {
+        let mut declared = declaration();
+        declared["platforms"] = json!([platform]);
+        serde_json::from_value(declared).expect("a launch")
+    };
+    assert_eq!(
+        only("mac_os").admission(&HELD, true, OperatingSystem::Linux),
+        Err(AcpRefusal::Platform {
+            listed: "macOS".to_owned()
+        })
+    );
+    assert_eq!(
+        only("linux").admission(&HELD, true, OperatingSystem::MacOs),
+        Err(AcpRefusal::Platform {
+            listed: "Linux".to_owned()
+        })
+    );
+    let mac_only = only("mac_os");
+    assert_eq!(
+        mac_only.admission(&HELD, true, OperatingSystem::MacOs),
+        Ok(&mac_only)
+    );
+}
+
+/// KR-REQ-11.26: a platform listed twice is refused.
+#[test]
+fn kr_req_11_26_a_platform_listed_twice_is_refused() {
+    let findings = findings_of(&with_launch_field("platforms", json!(["mac_os", "mac_os"])));
+    let reason = "platform: acp_launch lists mac_os more than once";
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: a required name listed twice, and a required list over the bound, are refused,
+/// each in the sentence of its own list.
+#[test]
+fn kr_req_11_26_a_required_list_that_repeats_a_name_or_passes_the_bound_is_refused() {
+    let mut launch = declaration();
+    launch["required_names"] = json!(["PATH", "HOME", "PATH"]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    let reason = "name: \"PATH\" is listed more than once in required_names";
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+    let names: Vec<String> = (0..65).map(|index| format!("NAME_{index}")).collect();
+    let mut launch = declaration();
+    launch["required_names"] = json!(names);
+    launch["passed_names"] = json!(names);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    let reason = "name: required_names lists 65 names, over the 64 one list may";
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: a name of 65 bytes is refused as not a variable name.
+#[test]
+fn kr_req_11_26_a_name_of_sixty_five_bytes_is_refused() {
+    let name = format!("N{}", "A".repeat(64));
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    let reason = format!("name: \"{name}\" in passed_names is not a variable name");
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: the bounds of the contract hold exactly: 64 names in a list, a name of 64 bytes,
+/// 16 constants and a value of 256 bytes are accepted.
+#[test]
+fn kr_req_11_26_the_bounds_of_the_contract_are_accepted_exactly() {
+    let names: Vec<String> = (0..64).map(|index| format!("NAME_{index}")).collect();
+    let long_name = format!("N{}", "A".repeat(63));
+    let constants: Vec<Value> = (0..16)
+        .map(|index| json!({"name": format!("SET_{index}"), "value": "v".repeat(256)}))
+        .collect();
+    let mut launch = declaration();
+    launch["required_names"] = json!(["NAME_0"]);
+    launch["passed_names"] = json!(names);
+    launch["constants"] = json!(constants);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        findings.is_empty(),
+        "64 names, 16 constants of 256 bytes: {findings:?}"
+    );
+    let mut launch = declaration();
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", long_name]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(findings.is_empty(), "a name of 64 bytes: {findings:?}");
+}
+
+/// KR-REQ-11.26: more than 16 constants, a value over 256 bytes, a value with a hidden character,
+/// a constant name that is not a name and one that begins with `KR_` are each refused in their own
+/// sentence.
+#[test]
+fn kr_req_11_26_a_constant_over_a_bound_or_hiding_a_character_is_refused() {
+    let constants: Vec<Value> = (0..17)
+        .map(|index| json!({"name": format!("SET_{index}"), "value": "v"}))
+        .collect();
+    for (constants, reason) in [
+        (
+            json!(constants),
+            "constant: acp_launch sets 17 variables, over the 16 it may".to_owned(),
+        ),
+        (
+            json!([{"name": "A_ONE", "value": "v".repeat(257)}]),
+            "constant: the value of \"A_ONE\" is 257 bytes, over the 256 a value may be".to_owned(),
+        ),
+        (
+            json!([{"name": "A_ONE", "value": "a\u{200B}b"}]),
+            "constant: the value of \"A_ONE\" carries U+200B, which a person reading the \
+             declaration could not see"
+                .to_owned(),
+        ),
+        (
+            json!([{"name": "bad name", "value": "v"}]),
+            "constant: the name \"bad name\" is not a variable name".to_owned(),
+        ),
+        (
+            json!([{"name": "KR_TOKEN", "value": "v"}]),
+            "constant: the name \"KR_TOKEN\" begins with KR_".to_owned(),
+        ),
+    ] {
+        let findings = findings_of(&with_launch_field("constants", constants));
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a finding that begins {reason:?} is expected: {findings:?}"
+        );
+    }
+}
