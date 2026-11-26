@@ -27,9 +27,9 @@ use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FileAttributeTagInfo, FileStandardInfo, GetFinalPathNameByHandleW, OPEN_EXISTING,
-    QueryDosDeviceW, VOLUME_NAME_DOS,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileStandardInfo,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, QueryDosDeviceW, VOLUME_NAME_DOS,
 };
 
 use crate::filekey::FileKey;
@@ -39,6 +39,7 @@ use crate::local_path;
 use crate::refusal::Refusal;
 use crate::slot::TreeIdentity;
 
+use super::admission::{attributes_refusal, is_cloud_tag, reparse_refusal};
 use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
 use super::listing::{self, Failure, RepositoryListing};
@@ -463,6 +464,9 @@ fn not_folder_refusal(refused: &NotFolder, path: &str) -> Refusal {
         NotFolder::Link {
             volume_mount: true, ..
         } => refuse(RefusedKind::Admission, RULE_FOLDER_MOUNT, MOUNT_POINT_WORDS),
+        // A folder that a cloud service synchronises is not a link the person can follow: it gets
+        // the words that say why the broker does not accept it.
+        NotFolder::Link { tag, .. } if is_cloud_tag(*tag) => reparse_refusal(*tag, path),
         NotFolder::Link { .. } => refuse(
             RefusedKind::Admission,
             RULE_FOLDER_LINK,
@@ -602,6 +606,29 @@ fn read_config(
     display: &str,
 ) -> Result<ConfigSnapshot, Refusal> {
     let name: Vec<u16> = "config".encode_utf16().collect();
+    // The attributes come first, from a handle that asks for no data: an encrypted file refuses a
+    // data open to an account that has no key, and the refusal then says why, not "access denied".
+    let path = format!("{display}\\.git\\config");
+    {
+        let looked = DirHandle::open_beneath_shared(
+            git_dir.handle(),
+            &name,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+        );
+        if let Ok(looked) = looked {
+            let tag: FILE_ATTRIBUTE_TAG_INFO = query(
+                &looked,
+                FileAttributeTagInfo,
+                "reading the configuration's attributes",
+            )
+            .map_err(|failure| failed(&failure))?;
+            if let Some(refusal) = attributes_refusal(tag.FileAttributes, &path) {
+                return Err(refusal);
+            }
+        }
+    }
     let handle = match DirHandle::open_beneath_shared(
         git_dir.handle(),
         &name,
@@ -648,7 +675,7 @@ fn read_config(
             CONFIG_LINKS_WORDS,
         ));
     }
-    person_reads(client, &handle, &format!("{display}\\.git\\config"))?;
+    person_reads(client, &handle, &path)?;
     let size = standard.EndOfFile.cast_unsigned();
     if size > MAX_CONFIG_BYTES {
         return Err(refuse(

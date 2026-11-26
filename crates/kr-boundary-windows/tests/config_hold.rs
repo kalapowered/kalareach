@@ -37,6 +37,9 @@ use kr_boundary_windows::operation::settings::{SettingsInput, command_arguments}
 use kr_boundary_windows::quote::quote_command_line;
 use kr_boundary_windows::repository::config::ConfigFacts;
 use kr_boundary_windows::win::acl;
+use kr_boundary_windows::win::admission::{
+    CLOUD_WORDS, ENCRYPTED_WORDS, RULE_CLOUD, RULE_ENCRYPTED,
+};
 use kr_boundary_windows::win::ffi::{Handle, system_windows_directory};
 use kr_boundary_windows::win::hold::{
     ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, RULE_ABSENT_NAME, RULE_LISTING_BOUND,
@@ -799,6 +802,72 @@ fn config_hold_a_reparse_point_set_on_the_held_config_or_a_held_folder_is_seen_a
         Err(failure) => {
             println!("NOT SHOWN: the guest takes no tag on a folder that holds files: {failure}");
         }
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_cloud_folder_on_the_way_and_an_encrypted_config_are_refused_saying_why() {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::EncryptFileW;
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhcp");
+    let scratch = Scratch::new();
+
+    // A folder that a cloud service synchronises, at the tree's root and above it, is told from a
+    // link the person could follow: the refusal says why the broker does not accept it.
+    let tagged = |label: &str, folder: &dyn Fn(&Project) -> std::path::PathBuf| {
+        let project = Project::make(&scratch, label);
+        match set_cloud_tag(&folder(&project)) {
+            Ok(()) => {
+                let refusal = hold_tree(project.root.to_str().unwrap(), &ordinary.as_client())
+                    .expect_err(label);
+                assert_eq!(refusal.kind, RefusedKind::Admission, "{label}");
+                assert_eq!(refusal.rule, RULE_CLOUD, "{label}");
+                assert!(
+                    refusal.detail().ends_with(CLOUD_WORDS),
+                    "{label}: {}",
+                    refusal.detail()
+                );
+            }
+            Err(failure) => {
+                println!("NOT SHOWN: {label}: the guest takes no tag on that folder: {failure}");
+            }
+        }
+    };
+    tagged("cloud-root", &|project| project.root.clone());
+    tagged("cloud-parent", &|project| project.parent.clone());
+
+    // A config that the person encrypted, when the guest lets the account encrypt: the broker has no
+    // key, and the refusal says so, where a data open would only say "access denied".
+    let project = Project::make(&scratch, "encrypted");
+    let config: Vec<u16> = project
+        .git
+        .join("config")
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let (done, failure) = acting_as(Some(&ordinary.primary), || {
+        // SAFETY: the path is NUL-terminated and lives through the call.
+        let done = unsafe { EncryptFileW(config.as_ptr()) };
+        (done, std::io::Error::last_os_error())
+    });
+    if done == 0 {
+        println!("NOT SHOWN: the account cannot encrypt a file on this guest: {failure}");
+    } else {
+        let refusal = hold_tree(project.root.to_str().unwrap(), &ordinary.as_client())
+            .expect_err("an encrypted config is refused");
+        assert_eq!(refusal.rule, RULE_ENCRYPTED);
+        assert!(
+            refusal.detail().ends_with(ENCRYPTED_WORDS),
+            "{}",
+            refusal.detail()
+        );
     }
 }
 
