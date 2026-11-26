@@ -12,7 +12,9 @@
 
 use std::path::Path;
 
-use kr_plugin_sdk::acp_launch::{AcpLaunch, AcpRefusal};
+use kr_plugin_sdk::acp_launch::{
+    AcpLaunch, AcpRefusal, COPIED_NAMES, LOADER_NAMES, START_FILE_NAMES,
+};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::matching::OperatingSystem;
@@ -1422,6 +1424,71 @@ fn kr_req_11_26_the_kerberos_credential_cache_name_is_still_accepted() {
     launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "KRB5CCNAME"]);
     let findings = findings_of(&manifest_with(&launch, &GRANTS));
     assert!(findings.is_empty(), "KRB5CCNAME is passed: {findings:?}");
+}
+
+/// KR-REQ-11.26: the names the floor refuses whole are those exact names, not every name that
+/// begins with one: each exact name followed by a suffix is accepted, passed and as a constant, in
+/// the lists of the loader names, the copied names and the start-file names.
+#[test]
+fn kr_req_11_26_a_name_that_only_begins_like_an_exact_name_is_not_refused() {
+    for listed in LOADER_NAMES
+        .into_iter()
+        .chain(COPIED_NAMES)
+        .chain(START_FILE_NAMES)
+    {
+        let name = format!("{listed}_EXTRA");
+        let findings = findings_of(&with_constant(&name, "x"));
+        assert!(
+            findings.is_empty(),
+            "a constant {name} is not refused: {findings:?}"
+        );
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        assert!(
+            findings.is_empty(),
+            "a passed {name} is not refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the three Node.js names that a launch may pass are those exact names: a longer
+/// name that begins with one is refused, passed and as a constant.
+#[test]
+fn kr_req_11_26_a_name_that_only_begins_like_a_node_data_name_is_refused() {
+    for (name, said) in [
+        (
+            "NODE_EXTRA_CA_CERTS_X",
+            format!("begins with NODE{BEGINNING_REASON}"),
+        ),
+        (
+            "NODE_USE_SYSTEM_CA_X",
+            format!("begins with NODE{BEGINNING_REASON}"),
+        ),
+        (
+            "NODE_USE_ENV_PROXY_X",
+            format!("begins with NODE{BEGINNING_REASON}"),
+        ),
+    ] {
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names {said}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a passed {name} is refused: {findings:?}"
+        );
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = if name.contains("PROXY") {
+            format!("constant: the name \"{name}\" {PROXY_REASON}")
+        } else {
+            format!("constant: the name \"{name}\" {said}")
+        };
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused: {findings:?}"
+        );
+    }
 }
 
 /// KR-REQ-11.26: a constant that begins with `XDG` is refused: the folders it names are where
