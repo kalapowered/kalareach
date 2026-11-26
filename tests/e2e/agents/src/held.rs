@@ -468,7 +468,7 @@ pub fn absent_paths_in(
 /// harness. Every placeholder that names a place in the run expands from the run's one root path,
 /// as its handle gives it (`Run::root`), so the names above `config` are the same in `config` and
 /// in the expanded path. The run's tree is on one volume: the run's directory, the absence check
-/// and the end compare refuse another file system. The absence check ([`absent_below`]) refuses a
+/// and the end compare refuse another file system. The absence check ([`PersonGuard::absent_below`]) refuses a
 /// link and a `..` part below the root, so the path it looks at is the path the system opens. An
 /// absolute path cannot name a place in the run, since the run's folder takes a fresh name when the
 /// run starts: `make_root` makes it `krm-` and eight characters of a new name, which no entry,
@@ -661,8 +661,8 @@ fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Res
 
 /// Whether nothing is at any path of `absent`, the entry's list as [`absent_paths`] gives it, for
 /// the run whose directory is `root` and whose pin is `pin`: each path is looked at by
-/// [`absent_below`]. Nothing is excused: an entry at one of the paths, a link included, is refused,
-/// whatever the entry's allowed files name.
+/// the free `absent_below`. Nothing is excused: an entry at one of the paths, a link included, is
+/// refused, whatever the entry's allowed files name.
 ///
 /// # Errors
 ///
