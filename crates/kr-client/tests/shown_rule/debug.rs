@@ -35,6 +35,13 @@
 //! anything else, or that this reading cannot follow, are findings. So no item, import or glob
 //! this reading sees there gives the name to anything else.
 //!
+//! One macro is read as writing no type and no `Debug`: `tracing::warn!` in
+//! `crates/kr-client/src/pairing/candidate.rs`, in the one form that the rule on log calls allows,
+//! with one string literal that has no holes and at most one field, `cause = ?name`. The `Debug`
+//! of that field is held where its type is declared, so `ReadCause` and `Unsettled` must stay
+//! enums whose variants hold no text. Any other `tracing` call, and this one in any other file,
+//! is a finding.
+//!
 //! This reads the code the workspace writes, not every program Rust accepts, and it does not try
 //! to hold code written to get past it. What it does not read:
 //!
@@ -1031,6 +1038,7 @@ impl Debugs {
                         }
                     }
                 }
+                Ok("tracing::warn") if file == Some(WARNING_FILE) && fixed_warning(tokens, at) => {}
                 Ok(path) if macro_read(path) => {}
                 Ok(path) => self.record(
                     file,
@@ -4496,6 +4504,134 @@ fn what_the_debug_rule_allows_is_not_named() {
                 impl std::fmt::Debug for Said {\n    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Text(text) => write!(formatter, \"Text({} bytes)\", text.len()),\n            Self::Count(count) => write!(formatter, \"Count({count})\"),\n        }\n    }\n}\n";
     let findings = debug_findings_in("debug-allowed", text, OTHER_CONTROL);
     assert!(findings.is_empty(), "{findings:?}");
+}
+
+/// What the `Debug` rule finds in the pairing's candidate and in another file of the client, each
+/// read as the text it is given.
+fn debug_warnings_in(
+    label: &str,
+    candidate: &str,
+    elsewhere: &str,
+) -> (Vec<Finding>, Vec<Finding>) {
+    let scratch = Scratch::files(
+        label,
+        &[
+            (
+                "crates/kr-client/Cargo.toml",
+                "[package]\nname = \"kr-client\"\n",
+            ),
+            ("crates/kr-client/src/lib.rs", "mod pairing;\nmod shown;\n"),
+            ("crates/kr-client/src/shown.rs", SHOWN_CONTROL),
+            (
+                "crates/kr-client/src/pairing/mod.rs",
+                "mod candidate;\nmod elsewhere;\n",
+            ),
+            ("crates/kr-client/src/pairing/candidate.rs", candidate),
+            ("crates/kr-client/src/pairing/elsewhere.rs", elsewhere),
+        ],
+    );
+    let guarded = crate_sources(
+        &scratch.workspace,
+        &scratch.workspace.join("crates/kr-client/src/lib.rs"),
+        "kr_client",
+    )
+    .expect("the control is readable");
+    let findings = debug_findings(&scratch.workspace, guarded);
+    let named = |file: &str| -> Vec<Finding> {
+        findings
+            .iter()
+            .filter(|finding| finding.file.ends_with(file))
+            .cloned()
+            .collect()
+    };
+    (named("pairing/candidate.rs"), named("pairing/elsewhere.rs"))
+}
+
+/// The one log call that the rule on log calls allows, in the one file that may make it, is not
+/// found by the `Debug` rule.
+#[test]
+fn the_pairings_fixed_warning_is_not_found_by_the_debug_rule() {
+    let text = "fn f(cause: Kind) {\n    \
+                tracing::warn!(\"fixed words\");\n    \
+                tracing::warn!(cause = ?cause, \"fixed words\");\n}\n";
+    let (candidate, _) = debug_warnings_in("debug-warning-allowed", text, "");
+    assert!(candidate.is_empty(), "{candidate:?}");
+}
+
+/// A log call of the pairing's candidate that can say more than that is found by the `Debug` rule,
+/// and so is the allowed call in any other file of the client, and a call of a macro named
+/// `tracing::warn` that the client writes itself.
+#[test]
+fn a_warning_that_can_carry_more_is_found_by_the_debug_rule_and_so_is_the_allowed_one_elsewhere() {
+    let cases = [
+        (
+            "a field shown as text",
+            "tracing::warn!(%text, \"failed\");",
+        ),
+        (
+            "a cause shown as text",
+            "tracing::warn!(cause = %text, \"failed\");",
+        ),
+        (
+            "a cause that is not one identifier",
+            "tracing::warn!(cause = ?self.cause, \"failed\");",
+        ),
+        (
+            "a field of another name",
+            "tracing::warn!(kind = ?cause, \"failed\");",
+        ),
+        (
+            "two fields",
+            "tracing::warn!(cause = ?cause, more = ?cause, \"failed\");",
+        ),
+        ("a format argument", "tracing::warn!(\"failed: {}\", text);"),
+        (
+            "a format argument beside the cause",
+            "tracing::warn!(cause = ?cause, \"failed: {}\", text);",
+        ),
+        (
+            "a hole in the message",
+            "tracing::warn!(\"failed: {text}\");",
+        ),
+        (
+            "a hole in the message beside the cause",
+            "tracing::warn!(cause = ?cause, \"failed: {text}\");",
+        ),
+        ("a message that is not a literal", "tracing::warn!(text);"),
+        ("another level", "tracing::error!(\"failed\");"),
+        (
+            "an event",
+            "tracing::event!(tracing::Level::WARN, \"failed\");",
+        ),
+        ("a call not spelled through tracing", "warn!(\"failed\");"),
+        ("another logger", "log::warn!(\"failed\");"),
+    ];
+    for (class, call) in cases {
+        let text = format!("fn f(cause: Kind, text: String) {{\n    {call}\n}}\n");
+        let (candidate, _) = debug_warnings_in("debug-warning-more", &text, "");
+        assert!(
+            candidate
+                .iter()
+                .any(|finding| finding.line == 2 && finding.what.contains("a macro this reading")),
+            "{class}: expected a macro this reading does not follow at line 2, found {candidate:?}"
+        );
+    }
+    let allowed = "fn f(cause: Kind) {\n    tracing::warn!(cause = ?cause, \"fixed words\");\n}\n";
+    let (_, elsewhere) = debug_warnings_in("debug-warning-elsewhere", "", allowed);
+    assert!(
+        elsewhere
+            .iter()
+            .any(|finding| finding.line == 2 && finding.what.contains("a macro this reading")),
+        "the allowed call in another file: expected a macro this reading does not read at line 2, found {elsewhere:?}"
+    );
+    let written = "mod tracing {\n    macro_rules! warn {\n        ($($any:tt)*) => {};\n    }\n    pub(crate) use warn;\n}\nfn f(cause: Kind) {\n    tracing::warn!(cause = ?cause, \"fixed words\");\n}\n";
+    let (candidate, _) = debug_warnings_in("debug-warning-written", written, "");
+    assert!(
+        candidate
+            .iter()
+            .any(|finding| finding.line == 8 && finding.what.contains("a macro this reading")),
+        "a macro the client writes under the name: expected a macro this reading does not read at line 8, found {candidate:?}"
+    );
 }
 
 /// Each way a name can reach the `Debug` trait or a macro that writes a `Debug` is followed as the
