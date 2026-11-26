@@ -11,7 +11,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-11.26 | each package's statement lists the launch's words, then the host's label and reading of the launch after the integration's reading; the budget is the longest of the two plus a margin of 500, rounded up to the next 1,000; a package with no bridge that declares a launch is held to the budget as well |
+//! | KR-REQ-11.26 | each package's statement lists the launch's words, then the host's label and reading of the launch after the integration's reading; the budget holds the longest of the two plus a margin of 500 and is at most the 10,000 characters a device shows; a package with no bridge that declares a launch is held to the budget as well |
 
 use std::path::{Path, PathBuf};
 
