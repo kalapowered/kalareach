@@ -357,6 +357,37 @@ for (const width of WIDTHS) {
   }
 }
 
+test.describe('the connection line', () => {
+  for (const [size, ratio] of SIZES) {
+    test(`keeps the distance from its dot to its first letter at 720 points that it has at 721 and wider, at ${size}`, async ({
+      page
+    }) => {
+      await openWindow(page, 721, ratio)
+      // The distance from the dot's right edge to the left edge of the first letter of the words.
+      const distance = (): Promise<number> =>
+        page.evaluate(() => {
+          const holder = document.querySelector('.topbar .connection') as Element
+          const mark = (holder.querySelector('.status-dot') as Element).getBoundingClientRect()
+          const walk = document.createTreeWalker(holder, NodeFilter.SHOW_TEXT)
+          for (let node = walk.nextNode(); node !== null; node = walk.nextNode()) {
+            const range = document.createRange()
+            range.selectNodeContents(node)
+            const first = Array.from(range.getClientRects()).find((line) => line.width > 0)
+            if (first !== undefined) return first.left - mark.right
+          }
+          return NaN
+        })
+      await expect(page.locator('.topbar .connection')).toContainText('Connected to this machine')
+      const wide = await distance()
+      for (const width of [900, 1280, 720, 600, 480]) {
+        await page.setViewportSize({ width, height: HEIGHT })
+        await expect(page.locator('.topbar .connection')).toContainText('Connected to this machine')
+        expect(await distance(), `the distance at ${width} points against ${wide.toFixed(1)} at 721`).toBeCloseTo(wide, 0)
+      }
+    })
+  }
+})
+
 test.describe('the measure sees what it is there for', () => {
   test('text kept from wrapping runs out of the top bar at 480 points and the largest text size', async ({ page }) => {
     await openWindow(page, 480, LARGEST)
