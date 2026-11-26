@@ -65,29 +65,42 @@ const ATTACHED_VIEWS: usize = 32;
 /// is never below it.
 const RESIDENT_BOUND_KIB: u64 = 500 * 1024;
 
-/// Where the memory the twenty session workers hold stood on a 64-processor Linux host, in
+/// Where the memory the twenty session workers hold stands on a 64-processor Linux host, in
 /// kibibytes: the first figure of the session workers on the `by class` line, each resident page
-/// counted once for the class. Read on 2026-11-16 at commit 3ace455c69 in 13 valid readings of that
-/// one commit, each of which said `1 passed` or `1 failed` by an alarm alone: 110,816 to 111,892 KiB,
-/// a spread of 1,076 KiB and a mean of 111,386 KiB. A reading is low when the memory the group holds
-/// is under 168,000 KiB, which is where mapped pages were taken back (the file pages of the worker
-/// program and of the test program read lower in the same readings); none of the 13 was low, and a
-/// low reading stays out of every mean. Across the 25 normal readings (those 13, and 12 rows from the
-/// verifications of 12 earlier commits made from 2026-11-12 to 2026-11-15, one train having two
-/// verifications of two commits, 6efe9e867b and 4edf69f761; two further commits read low and are
-/// kept out) the figure spans 1,284 KiB, where the sum spans 13,932 KiB over 21 of them.
+/// counted once for the class. Read on 2026-11-26 at the commit that completes the input lane, on
+/// top of commit 1f65b491bd, in 10 valid readings of that one commit, each of which said `1 passed`
+/// or `1 failed` by an alarm alone: 115,436 to 116,640 KiB, a spread of 1,204 KiB and a mean of
+/// 115,849 KiB. A reading is low when the memory the group holds is under 168,000 KiB, which is
+/// where mapped pages were taken back (the file pages of the worker program and of the test program
+/// read lower in the same readings); none of the 10 was low (the group held 178,236 to 179,572
+/// KiB), and a low reading stays out of every mean. The level is set at 115,849 KiB. It is 4,463
+/// KiB above the level before: main's own readings rose by about 1,500 to 2,500 KiB after that
+/// level was set, and the input lane adds about 2,000 to 3,000 KiB more, about 100 to 150 KiB of
+/// private memory in each of the twenty workers. The growth is not traced to a commit.
 /// A growth of private memory in a worker shows in it once for each of the twenty workers. See
 /// [`WORKERS_HELD_ALARM_STEP_KIB`].
-const WORKERS_HELD_RECORDED_KIB: u64 = 111_386;
+///
+/// The level before was 111,386 KiB, read on 2026-11-16 at commit 3ace455c69 in 13 valid readings
+/// of that one commit, each of which said `1 passed` or `1 failed` by an alarm alone: 110,816 to
+/// 111,892 KiB, a spread of 1,076 KiB and a mean of 111,386 KiB; none of the 13 was low. Across the
+/// 25 normal readings (those 13, and 12 rows from the verifications of 12 earlier commits made from
+/// 2026-11-12 to 2026-11-15, one train having two verifications of two commits, 6efe9e867b and
+/// 4edf69f761; two further commits read low and are kept out) the figure spanned 1,284 KiB, where
+/// the sum spanned 13,932 KiB over 21 of them. Main's later readings on the same box, with the
+/// level at 111,386 KiB: 112,840 KiB at commit 40c0b885d1, 113,832 KiB at commit 931d1229e4 and
+/// 108,400 KiB at commit 280664f5ed (its group figure, 168,464 KiB, was just above the line of a
+/// low reading).
+const WORKERS_HELD_RECORDED_KIB: u64 = 115_849;
 
 /// How far the session workers' held figure may rise above [`WORKERS_HELD_RECORDED_KIB`] before the
 /// idle measurement fails, so that a ruling is asked for. The step is 4,096 KiB: 205 KiB of private
 /// memory in each of the twenty workers, and more than three times the 1,284 KiB spread of the 25
-/// normal readings. The failure is an alarm that what the workers hold has grown, and no reading of
-/// the requirement, which the figure that counts each resident page once for the group holds. A low
-/// reading is no alarm: only a rise is. This figure and the program's size are chosen because they
-/// point at the place of a growth; a newly set margin of 10,240 KiB on the sum would also have
-/// passed the 25 normal readings.
+/// normal readings. At the level of 115,849 KiB the step is also more than three times the 1,204
+/// KiB spread of its 10 readings (3,612 KiB). The failure is an alarm that what the workers hold
+/// has grown, and no reading of the requirement, which the figure that counts each resident page
+/// once for the group holds. A low reading is no alarm: only a rise is. This figure and the
+/// program's size are chosen because they point at the place of a growth; a newly set margin of
+/// 10,240 KiB on the sum would also have passed the 25 normal readings.
 const WORKERS_HELD_ALARM_STEP_KIB: u64 = 4 * 1024;
 
 /// The size on disk of the worker program, in kibibytes: the length of the file the daemon starts
