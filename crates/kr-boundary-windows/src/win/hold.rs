@@ -91,7 +91,7 @@ pub const ABSENT_NAME_WORDS: &str =
 
 /// The reply when the hooks folder or the attributes file is over a bound of the listing.
 // text: LISTING_BOUND_WORDS
-pub const LISTING_BOUND_WORDS: &str = "the repository's hooks folder or info attributes file is larger than the broker reads (at most 256 objects in all, 4 levels of folders, 128 entries in the hooks folder, 255 bytes for one name and 1 MiB for one file)";
+pub const LISTING_BOUND_WORDS: &str = "the hooks folder or info attributes file is larger than the broker reads (at most 256 objects in all, 4 levels of folders, 128 entries in the hooks folder, 255 bytes for a name, 1 MiB for a file)";
 
 /// The reply when the text is not a path on a local drive, or names a drive that is not a local disk.
 // text: FOLDER_FORM_WORDS
@@ -127,7 +127,7 @@ pub const NO_GIT_WORDS: &str =
 
 /// The reply when the repository has submodules: not opened through the boundary.
 // text: MODULES_WORDS
-pub const MODULES_WORDS: &str = "this repository has submodules, and the broker does not guard a submodule's own Git settings and hooks, so it does not open it; use Git on it yourself, outside the broker, or name a project without submodules";
+pub const MODULES_WORDS: &str = "this repository has submodules, and the broker does not guard their own Git settings and hooks, so it does not open it; use Git on it outside the broker, or name a project without submodules";
 
 /// The reply when the repository has no `config`.
 // text: NO_CONFIG_WORDS

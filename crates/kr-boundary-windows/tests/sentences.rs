@@ -24,6 +24,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use kr_boundary_windows::frame::invocation::MAX_DETAIL_BYTES;
+
 /// The comment that carries the identifiers of a place, on the line before it.
 const MARKER: &str = "// text: ";
 
@@ -699,4 +701,114 @@ fn the_check_fails_for_a_place_without_a_row_a_row_without_a_place_and_a_row_of_
         )
         .is_empty()
     );
+}
+
+/// The constants of words (`pub const <NAME>_WORDS: &str = "...";`) of a source, as the name and
+/// the text, with the escapes of the string literal and its line continuations resolved.
+fn word_constants(source: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("pub const ") {
+        rest = &rest[at + "pub const ".len()..];
+        let Some((name, after)) = rest.split_once(':') else {
+            break;
+        };
+        let Some((kind, value)) = after.split_once('=') else {
+            break;
+        };
+        if !name.ends_with("_WORDS") || !matches!(kind.trim(), "&str" | "&'static str") {
+            continue;
+        }
+        let mut text = String::new();
+        let mut chars = value.chars().peekable();
+        let mut in_literal = false;
+        while let Some(c) = chars.next() {
+            if !in_literal {
+                match c {
+                    '"' => in_literal = true,
+                    ';' => break,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_literal = false,
+                '\\' => match chars.next() {
+                    Some('n') => text.push('\n'),
+                    Some('"') => text.push('"'),
+                    Some('\'') => text.push('\''),
+                    Some('\\') => text.push('\\'),
+                    Some('\n') => {
+                        while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    other => panic!("{name}: an escape that this scan does not read: {other:?}"),
+                },
+                other => text.push(other),
+            }
+        }
+        found.push((name.to_owned(), text));
+    }
+    found
+}
+
+/// What is wrong with a constant of words as a detail, if anything: a detail is cut at
+/// `MAX_DETAIL_BYTES` by the refusal that carries it, so a longer sentence ends in the middle of a
+/// word where a person reads it.
+fn detail_fault(file: &str, name: &str, text: &str) -> Option<String> {
+    if text.is_empty() {
+        return Some(format!("{file}: {name}: no text was read from its literal"));
+    }
+    (text.len() > MAX_DETAIL_BYTES).then(|| {
+        format!(
+            "{file}: {name} is {} bytes and a detail holds {MAX_DETAIL_BYTES}: the reply would end in the middle of a word",
+            text.len()
+        )
+    })
+}
+
+/// No sentence of the crate's refusals is longer than a detail may be, so a person always reads
+/// each one whole; the next long sentence fails here, where it is written, and not on a guest.
+#[test]
+fn no_constant_of_words_is_longer_than_a_detail_may_be() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut sources = Vec::new();
+    source_files(&src, &src, &mut sources);
+    let mut read = 0;
+    let mut faults = Vec::new();
+    for (file, source) in &sources {
+        for (name, text) in word_constants(source) {
+            read += 1;
+            faults.extend(detail_fault(file, &name, &text));
+        }
+    }
+    assert!(read >= 40, "the scan reads the constants of words: {read}");
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// The scan itself: it reads a constant over two lines and over a continued line, takes a constant
+/// that is not words or not text for none, and finds the sentence that is one byte too long and
+/// not the one that fills the detail exactly.
+#[test]
+fn the_length_check_fails_for_a_sentence_that_would_be_cut_and_for_none_that_is_whole() {
+    let long = "x".repeat(MAX_DETAIL_BYTES + 1);
+    let whole = "y".repeat(MAX_DETAIL_BYTES);
+    let source = format!(
+        "pub const LONG_WORDS: &str = \"{long}\";\n\
+         pub const WHOLE_WORDS: &str =\n    \"{whole}\";\n\
+         pub const LIST_WORDS: [&str; 1] = [\"{long}\"];\n\
+         pub const LIMIT: usize = 3;\n\
+         pub const JOINED_WORDS: &str = \"a b \\\n        c\";\n"
+    );
+    let found = word_constants(&source);
+    let names: Vec<&str> = found.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["LONG_WORDS", "WHOLE_WORDS", "JOINED_WORDS"]);
+    assert!(
+        detail_fault("x.rs", &found[0].0, &found[0].1)
+            .is_some_and(|fault| fault.contains("LONG_WORDS"))
+    );
+    assert!(detail_fault("x.rs", &found[1].0, &found[1].1).is_none());
+    assert_eq!(found[2].1, "a b c");
+    assert!(detail_fault("x.rs", "EMPTY_WORDS", "").is_some());
 }
