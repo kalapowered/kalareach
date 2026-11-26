@@ -1053,7 +1053,7 @@ fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {
     // What is counted is the name as the row records it: a folder's name ends in a backslash (two
     // bytes) and a link's in `:link` (five bytes).
     let folders = Project::make(&scratch, "folders255");
-    fs::create_dir(folders.git.join(format!(r"hooks\{}", "f".repeat(246)))).unwrap();
+    fs::create_dir_all(folders.git.join(format!(r"hooks\{}", "f".repeat(246)))).unwrap();
     held(&folders, "a folder name of 255 bytes");
     fs::create_dir(folders.git.join(format!(r"hooks\{}", "g".repeat(247)))).unwrap();
     refused(&folders, "a folder name of 256 bytes");

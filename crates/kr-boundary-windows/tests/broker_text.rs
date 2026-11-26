@@ -421,8 +421,12 @@ fn broker_text_a_path_too_long_for_the_reply_is_cut_at_its_start_and_keeps_its_e
     let scratch = Scratch::on_drive();
     let project = Project::make_private(&scratch, "long", &person.sid);
     let client = person.as_client();
-    let name = "l".repeat(170);
-    let link = scratch.path(&name);
+    // A long folder, then a junction with a short name in it: the last parts of the path are the
+    // name, which the cut keeps whole.
+    let name = "the-link-to-the-tree";
+    let folder = scratch.path(&"p".repeat(150));
+    std::fs::create_dir(&folder).unwrap();
+    let link = folder.join(name);
     let text = link.to_str().unwrap();
     let room = MAX_DETAIL_BYTES - FOLDER_LINK_WORDS.len() - ": ".len();
     assert!(
@@ -438,11 +442,14 @@ fn broker_text_a_path_too_long_for_the_reply_is_cut_at_its_start_and_keeps_its_e
     assert_eq!(refusal.rule, RULE_FOLDER_LINK);
     let detail = refusal.detail();
     assert_eq!(detail.len(), MAX_DETAIL_BYTES, "{detail}");
+    let kept = detail
+        .strip_prefix(&format!("{FOLDER_LINK_WORDS}: ..."))
+        .unwrap_or_else(|| panic!("the words are whole and the cut path follows: {detail}"));
     assert!(
-        detail.starts_with(&format!("{FOLDER_LINK_WORDS}: ...")),
-        "{detail}"
+        text.ends_with(kept),
+        "the reply keeps the end of the path: {detail}"
     );
-    assert!(detail.ends_with(&name), "{detail}");
+    assert!(kept.ends_with(name), "{detail}");
 }
 
 /// A volume mounted in a folder, unmounted when it is dropped: the case's own mount, by its path.
