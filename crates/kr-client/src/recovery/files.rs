@@ -2054,7 +2054,7 @@ fn verify_publication(
         .map_err(|_| PublicationRefusal::BadSignature)?;
     // Where two checkpoints name one generation with different manifests, neither can be trusted for
     // that generation, whatever the publication says: only it is refused.
-    if let Floor::Disagree { held, disagreement } = floor
+    if let Rule::Disagree { held, disagreement } = &floor.rule
         && payload.descriptor.backup_generation == held.backup_generation
     {
         return Err(Refused::Disagree(*disagreement));
@@ -2150,7 +2150,7 @@ impl From<Disagreement> for RestoreError {
 /// this computer may hold another. The higher generation is the floor, with its source. Two
 /// checkpoints at the floor's generation that name different manifests are a disagreement, whether
 /// both are the bundle's or one is a host's, and neither is trusted for that generation.
-enum Floor {
+enum Rule {
     /// No checkpoint is held for the archive.
     Unheld,
     /// The higher of the two, and where it came from. Equal checkpoints are the bundle's.
@@ -2166,9 +2166,54 @@ enum Floor {
     },
 }
 
+/// What a restore of one archive is held to, and the bundle's own checkpoints for it.
+struct Floor {
+    rule: Rule,
+    /// Every checkpoint the bundle holds for the archive: an older one still holds a generation a
+    /// person names, past a higher checkpoint.
+    kit: Vec<ArchiveCheckpoint>,
+}
+
 impl Floor {
     /// The floor for `archive` at `origin`: the bundle's checkpoints for it, and the one in `held`
     /// for it at that service.
+    fn of(material: &TrustedMaterial, held: &Held, origin: &str, archive: ArchiveId) -> Self {
+        Self {
+            rule: Rule::of(material, held, origin, archive),
+            kit: material.checkpoints_for(archive).cloned().collect(),
+        }
+    }
+
+    /// The checkpoint a generation is compared with and where it came from.
+    fn holding(&self) -> Option<(&ArchiveCheckpoint, CheckpointSource)> {
+        self.rule.holding()
+    }
+
+    /// The checkpoint the service is asked to hold its answer to.
+    fn asked(&self) -> Option<&ArchiveCheckpoint> {
+        self.holding().map(|(checkpoint, _)| checkpoint)
+    }
+
+    /// What a generation is compared with, with the one older generation the person named, if any.
+    fn expectation(&self, accepted: Option<BackupGeneration>) -> GenerationExpectation<'_> {
+        match (self.holding(), accepted) {
+            (None, _) => GenerationExpectation::Unverified,
+            (Some((checkpoint, source)), None) => {
+                GenerationExpectation::Checkpoint { checkpoint, source }
+            }
+            (Some((checkpoint, source)), Some(accepted)) => GenerationExpectation::AcceptingOlder {
+                checkpoint,
+                source,
+                accepted,
+                known: &self.kit,
+            },
+        }
+    }
+}
+
+impl Rule {
+    /// The rule for `archive` at `origin`: the bundle's checkpoints for it, and the one in `held` for
+    /// it at that service.
     fn of(material: &TrustedMaterial, held: &Held, origin: &str, archive: ArchiveId) -> Self {
         let paired = paired_for(held, origin, archive).map(as_archive_checkpoint);
         let Some(top) = material
@@ -2232,26 +2277,6 @@ impl Floor {
             Self::Unheld => None,
             Self::One { checkpoint, source } => Some((checkpoint, *source)),
             Self::Disagree { held, .. } => Some((held, CheckpointSource::RecoveryBundle)),
-        }
-    }
-
-    /// The checkpoint the service is asked to hold its answer to.
-    fn asked(&self) -> Option<&ArchiveCheckpoint> {
-        self.holding().map(|(checkpoint, _)| checkpoint)
-    }
-
-    /// What a generation is compared with, with the one older generation the person named, if any.
-    fn expectation(&self, accepted: Option<BackupGeneration>) -> GenerationExpectation<'_> {
-        match (self.holding(), accepted) {
-            (None, _) => GenerationExpectation::Unverified,
-            (Some((checkpoint, source)), None) => {
-                GenerationExpectation::Checkpoint { checkpoint, source }
-            }
-            (Some((checkpoint, source)), Some(accepted)) => GenerationExpectation::AcceptingOlder {
-                checkpoint,
-                source,
-                accepted,
-            },
         }
     }
 }

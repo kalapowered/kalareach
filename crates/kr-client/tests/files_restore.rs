@@ -3447,6 +3447,79 @@ async fn checkpoints_that_cannot_be_read_refuse_the_restore_and_the_list_and_nev
     );
 }
 
+/// KR-REQ-20.12: an older generation a person accepts past a higher checkpoint is still held to the
+/// bundle's own checkpoint for that generation: the manifest the bundle verified restores, and
+/// another manifest for it is a substitution that names the bundle.
+#[tokio::test]
+async fn an_accepted_older_generation_is_held_to_the_bundles_own_checkpoint_for_it() {
+    let world = World::new();
+    let members = honest_members();
+    let nine = world.seal(9, &members);
+    let five = world.seal(5, &members);
+    let other_five = world.seal(5, &[("host/configuration.json", b"{}".to_vec())]);
+    let held = held_with(vec![given_by_a_host(&nine)]);
+    let bundle = world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&five)),
+        ..Shape::default()
+    });
+    let serving = |sealed: &Sealed| {
+        Arc::new(
+            Scripted::serving(&world, bundle.clone())
+                .publishing(sealed)
+                .honouring_the_hold(),
+        )
+    };
+
+    // The manifest the bundle verified for generation 5 restores, named, past the host's 9.
+    let Ok(prepared) = restore_held(&world, &serving(&five), Some(5), &held).await else {
+        panic!("the generation the bundle verified is accepted past the host's checkpoint")
+    };
+    assert!(matches!(
+        prepared.plan().standing.standing,
+        GenerationStanding::OlderAccepted { .. }
+    ));
+
+    // Another manifest for generation 5 is not what the bundle verified, however it is named.
+    let source = serving(&other_five);
+    let Err(error) = restore_held(&world, &source, Some(5), &held).await else {
+        panic!("another manifest for a generation the bundle verified is refused")
+    };
+    let RestoreError::Publication(PublicationRefusal::Generation(standing, _)) = error else {
+        panic!("a substitution is refused as a publication: {error}")
+    };
+    assert!(matches!(
+        standing.standing,
+        GenerationStanding::Substituted { checkpoint } if checkpoint.get() == 5
+    ));
+    assert_eq!(standing.source, Some(CheckpointSource::RecoveryBundle));
+    assert_eq!(source.object_reads(), 0);
+
+    // The same holds where the bundle's own checkpoint is the higher one and an older entry of its
+    // own is for the generation named.
+    let both = world.bundle(&Shape {
+        checkpoint: Some(checkpoint_of(&nine)),
+        more_checkpoints: vec![checkpoint_of(&five)],
+        ..Shape::default()
+    });
+    let source = Arc::new(
+        Scripted::serving(&world, both)
+            .publishing(&other_five)
+            .honouring_the_hold(),
+    );
+    assert!(
+        restore_held(&world, &source, Some(5), &Held::Absent)
+            .await
+            .is_err(),
+        "an older entry of the bundle's own holds an accepted generation too"
+    );
+
+    // Without the name, generation 5 is a replay as before.
+    let Err(error) = restore_held(&world, &serving(&five), None, &held).await else {
+        panic!("an older generation that is not named is a replay")
+    };
+    assert!(matches!(error, RestoreError::OlderThanTheCheckpoint { .. }));
+}
+
 /// KR-REQ-20.12: accepting an older generation reads the effective checkpoint and writes no file;
 /// there is nothing to accept past only when neither source holds a checkpoint, and a caller with no
 /// store of paired hosts, as the command line is, cannot accept past one a host gave.

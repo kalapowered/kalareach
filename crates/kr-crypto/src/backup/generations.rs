@@ -47,7 +47,8 @@ pub enum GenerationExpectation<'a> {
     /// Exactly that generation is admitted when it is older than the checkpoint, which a
     /// service that was legitimately put back to an earlier state holds and can hold no other. A
     /// generation that claims the checkpoint's own with another manifest is still a substitution,
-    /// and no other older generation is admitted.
+    /// so is the named one when the bundle's own checkpoint for it names another manifest, and no
+    /// other older generation is admitted.
     AcceptingOlder {
         /// The checkpoint the restore holds.
         checkpoint: &'a ArchiveCheckpoint,
@@ -55,6 +56,10 @@ pub enum GenerationExpectation<'a> {
         source: CheckpointSource,
         /// The one older generation the person named.
         accepted: BackupGeneration,
+        /// Every checkpoint the recovery bundle holds for the archive. The checkpoint above may be
+        /// a higher one that another source gave, and the bundle's own checkpoint for the named
+        /// generation still holds: another manifest for it is a substitution.
+        known: &'a [ArchiveCheckpoint],
     },
 }
 
@@ -113,17 +118,19 @@ impl RestoreGeneration {
     /// Compares one descriptor against the checkpoint the owner trusts, if there is one.
     #[must_use]
     pub fn against(descriptor: &ArchiveDescriptor, expectation: GenerationExpectation<'_>) -> Self {
-        let (checkpoint, source, accepted) = match expectation {
-            GenerationExpectation::Unverified => (None, None, None),
+        let (checkpoint, source, accepted, known) = match expectation {
+            GenerationExpectation::Unverified => (None, None, None, &[][..]),
             GenerationExpectation::Checkpoint { checkpoint, source } => {
-                (Some(checkpoint), Some(source), None)
+                (Some(checkpoint), Some(source), None, &[][..])
             }
             GenerationExpectation::AcceptingOlder {
                 checkpoint,
                 source,
                 accepted,
-            } => (Some(checkpoint), Some(source), Some(accepted)),
+                known,
+            } => (Some(checkpoint), Some(source), Some(accepted), known),
         };
+        let mut source = source;
         let standing = match checkpoint {
             None => GenerationStanding::NoCheckpoint,
             Some(checkpoint) if checkpoint.archive_id != descriptor.archive_id => {
@@ -136,8 +143,21 @@ impl RestoreGeneration {
                 let offered = descriptor.backup_generation.get();
                 if offered < trusted {
                     if accepted == Some(descriptor.backup_generation) {
-                        GenerationStanding::OlderAccepted {
-                            checkpoint: checkpoint.backup_generation,
+                        let offered_hash = descriptor.encrypted_manifest.encrypted_object_hash;
+                        let contradicted = known.iter().any(|kept| {
+                            kept.archive_id == descriptor.archive_id
+                                && kept.backup_generation == descriptor.backup_generation
+                                && kept.encrypted_manifest_hash != offered_hash
+                        });
+                        if contradicted {
+                            source = Some(CheckpointSource::RecoveryBundle);
+                            GenerationStanding::Substituted {
+                                checkpoint: descriptor.backup_generation,
+                            }
+                        } else {
+                            GenerationStanding::OlderAccepted {
+                                checkpoint: checkpoint.backup_generation,
+                            }
                         }
                     } else {
                         GenerationStanding::Replayed {

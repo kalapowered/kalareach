@@ -1464,6 +1464,58 @@ fn a_checkpoint_catches_a_replayed_older_archive() {
     ));
 }
 
+/// KR-REQ-24.16: the one older generation a person names is still held to the bundle's own checkpoint
+/// for it, though the checkpoint it passes is a higher one: another manifest for it is a
+/// substitution that names the bundle, and the manifest the bundle verified is admitted.
+#[test]
+fn a_named_older_generation_is_held_to_the_bundles_checkpoint_for_it() {
+    let parties = Parties::generate();
+    let five = seal(&parties, 5, &[stage(1, "a.cbor", b"one")]);
+    let other_five = seal(&parties, 5, &[stage(2, "b.cbor", b"two")]);
+    let nine = seal(&parties, 9, &[stage(1, "a.cbor", b"one")]);
+
+    let higher = checkpoint(9, nine.descriptor.encrypted_manifest.encrypted_object_hash);
+    let known = [checkpoint(
+        5,
+        five.descriptor.encrypted_manifest.encrypted_object_hash,
+    )];
+    let naming = GenerationExpectation::AcceptingOlder {
+        checkpoint: &higher,
+        source: CheckpointSource::Pairing,
+        accepted: BackupGeneration::new(5),
+        known: &known,
+    };
+
+    let verified = RestoreGeneration::against(&five.descriptor, naming);
+    assert!(matches!(
+        verified.standing,
+        GenerationStanding::OlderAccepted { .. }
+    ));
+    assert!(verified.is_admissible());
+
+    let substituted = RestoreGeneration::against(&other_five.descriptor, naming);
+    assert!(matches!(
+        substituted.standing,
+        GenerationStanding::Substituted { checkpoint } if checkpoint.get() == 5
+    ));
+    assert!(!substituted.is_admissible());
+    assert_eq!(substituted.source, Some(CheckpointSource::RecoveryBundle));
+    assert!(
+        substituted
+            .describe()
+            .contains("the recovery bundle verified")
+    );
+
+    // With nothing known for the generation, the name alone admits it, as before.
+    let unknown = GenerationExpectation::AcceptingOlder {
+        checkpoint: &higher,
+        source: CheckpointSource::Pairing,
+        accepted: BackupGeneration::new(5),
+        known: &[],
+    };
+    assert!(RestoreGeneration::against(&other_five.descriptor, unknown).is_admissible());
+}
+
 /// KR-REQ-24.16: the one older generation a person names is admitted past the checkpoint, and only
 /// that one: another older generation is still a replay, and the checkpoint's own generation with
 /// another manifest is still a substitution.
@@ -1481,6 +1533,7 @@ fn a_named_older_generation_is_admitted_past_the_checkpoint_and_no_other() {
         checkpoint: &verified,
         source: CheckpointSource::RecoveryBundle,
         accepted: BackupGeneration::new(accepted),
+        known: &[],
     };
 
     let named = RestoreGeneration::against(&three.descriptor, naming(3));
@@ -1714,6 +1767,7 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         checkpoint: &verified,
         source,
         accepted: BackupGeneration::new(3),
+        known: &[],
     };
     let said = |lead: &str, generation: u64, standing: &str| {
         format!("{lead} {generation}. {standing} {NOT_HELD_BACK}")
@@ -1899,6 +1953,7 @@ fn a_restore_records_a_source_exactly_when_it_was_given_a_checkpoint() {
                     checkpoint: &verified,
                     source,
                     accepted: BackupGeneration::new(3),
+                    known: &[],
                 },
             ),
             (
