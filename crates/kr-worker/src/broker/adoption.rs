@@ -20,12 +20,17 @@
 //! bind the broker refuses leaves nothing adopted, and the next look tries again.
 //!
 //! A program is identified from one reading of its process. Its image is opened and hashed and its
-//! arguments are read once. Then the image the kernel reports, the file that image names and the
+//! arguments are read once, in one call to the kernel: a record that the kernel does not lay out as
+//! observed is read as nothing, and a reading that fills its buffer is made again whole or refused,
+//! never continued. Then the image the kernel reports, by the bytes of its path, the file that was
+//! hashed, by device, file number, size and both times, the file the image is read from now and the
 //! process's identity must all be what they were, or nothing is adopted and the next look reads
 //! again. What is recorded is what that reading found: the path, the digest and the arguments of one
 //! image. A process that executes another program and then the first again between the reads is
-//! read as one program, which the reading cannot tell apart, and a change after the last read is not
-//! part of the record.
+//! read as one program, which the reading cannot tell apart; a change after the last read is not
+//! part of the record; and where the platform names the image by its path, as macOS does, the file
+//! a path names when the image is opened is the one hashed, though it may have replaced the running
+//! image just before.
 //!
 //! A program takes the terminal when the root shell starts a command, and the session knows when
 //! that is likely: the input it accepts, the output it produces, and an invocation the shell's
@@ -525,9 +530,10 @@ impl Adoptions {
             return None;
         }
         // One reading of one program: the image is opened and hashed, then the arguments are read
-        // once, and then the image, the file the opened one is and the process's identity must all
-        // still be what they were. A program that executed another meanwhile, or whose file was
-        // replaced, is adopted on no pair of them: the next look reads again.
+        // once, and then the image's path, the opened file's whole identity, the file the image is
+        // read from and the process's identity must all still be what they were. A program that
+        // executed another meanwhile, whose file was replaced or written to, or that ended, is
+        // adopted on no pair of them: the next look reads again.
         #[cfg(feature = "testing")]
         stop_if_armed(&self.reading_pause);
         // Bounded by the file's size, and stopped when the session closes. The file stays open to
@@ -543,7 +549,7 @@ impl Adoptions {
         let arguments = arguments_of(pid)?;
         #[cfg(feature = "testing")]
         stop_if_armed(&self.arguments_read_pause);
-        if !still_runs(pid, &image, &hashed.file) {
+        if !still_runs(pid, &image, &held, &hashed.file) {
             return None;
         }
         drop(held);
@@ -1134,14 +1140,21 @@ fn running_image(pid: u32, image: &Path) -> std::path::PathBuf {
 }
 
 /// Returns whether the process still runs the image that was read: the executable the kernel
-/// reports is the one it reported before, byte for byte, and the file it names is the file that was
-/// opened and hashed, by device and file number.
+/// reports is the one it reported before, byte for byte; the file that was opened and hashed, which
+/// `held` is, still has the whole identity it had when it was hashed (device, file number, size and
+/// both times), so a write to it in place after the hash is seen; and the file the image is read
+/// from now is that file, by device and file number.
 ///
 /// On Linux that file is the one the process runs, so a replaced image, whose path the kernel
 /// reports with a suffix that says it is deleted, is refused by the first comparison, and a
-/// replacement executed at the same path by the second. On macOS the file is the one the path names
+/// replacement executed at the same path by the last. On macOS the file is the one the path names
 /// now, which a replacement inside the reading changes.
-fn still_runs(pid: u32, image: &Path, opened: &crate::broker::image::FileIdentity) -> bool {
+fn still_runs(
+    pid: u32,
+    image: &Path,
+    held: &std::fs::File,
+    opened: &crate::broker::image::FileIdentity,
+) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -1151,6 +1164,13 @@ fn still_runs(pid: u32, image: &Path, opened: &crate::broker::image::FileIdentit
         return false;
     };
     if now.as_os_str().as_bytes() != image.as_os_str().as_bytes() {
+        return false;
+    }
+    if crate::broker::image::FileIdentity::of_file(held)
+        .ok()
+        .as_ref()
+        != Some(opened)
+    {
         return false;
     }
     std::fs::metadata(running_image(pid, image))
