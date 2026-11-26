@@ -584,7 +584,7 @@
         "migrates_from": 1,
         "reads_through": 22
       },
-      "digest": "960c4030cdc86ea392bcbc1d33f2ca79dff22cc0b11270494f080e6b68613f68",
+      "digest": "00a4c116563c8497a394b7839b95943b5cb11b910465e44ed7372a781fc2fe11",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
