@@ -17,6 +17,7 @@ use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::matching::OperatingSystem;
 use kr_plugin_sdk::package::{MANIFEST_FILE, PRESENTATION_FILE};
+use kr_plugin_sdk::schema::package_contract;
 use kr_plugin_sdk::validate::{Finding, FindingCode, Validated, validate_package_directory};
 use serde_json::{Value, json};
 
@@ -1035,4 +1036,127 @@ fn kr_req_11_26_a_constant_over_a_bound_or_hiding_a_character_is_refused() {
             "a finding that begins {reason:?} is expected: {findings:?}"
         );
     }
+}
+
+/// The words the floor refused when the launch read the command integration's list: every name
+/// that begins with one of them, or that is one of the loader names below, is still refused.
+const REFUSED_BEGINNINGS: [&str; 22] = [
+    "LD", "DYLD", "BASH", "NODE", "NPM", "BUN", "DENO", "PYTHON", "PERL", "RUBY", "LUA", "JAVA",
+    "JDK", "GIT", "GCONV", "SSL", "CURL", "REQUESTS", "COMPLUS", "DOTNET", "CORECLR", "COR",
+];
+
+/// The names the floor refused by the whole name when the launch read the command integration's
+/// list.
+const REFUSED_NAMES: [&str; 3] = ["ENV", "LOCPATH", "_JAVA_OPTIONS"];
+
+/// KR-REQ-11.26: no name that the floor refused before the launch had lists of its own is let
+/// through, as a passed name or as a constant: each beginning stands alone and with a tail, and
+/// each loader name stands alone.
+#[test]
+fn kr_req_11_26_every_name_the_floor_refused_before_its_own_lists_is_still_refused() {
+    let mut names: Vec<String> = Vec::new();
+    for word in REFUSED_BEGINNINGS {
+        names.push(word.to_owned());
+        names.push(format!("{word}_EXAMPLE"));
+    }
+    names.extend(REFUSED_NAMES.iter().map(|name| (*name).to_owned()));
+    for name in &names {
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names ");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a passed {name} is refused: {findings:?}"
+        );
+        let mut launch = declaration();
+        launch["constants"] = json!([{"name": name, "value": "x"}]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("constant: the name \"{name}\" ");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the package contract states the SDK version the launch arrived at.
+#[test]
+fn kr_req_11_26_the_contract_states_the_version_the_launch_arrived_at() {
+    let contract = package_contract();
+    assert_eq!(contract["acp_launch"]["sdk_version"], json!("0.1.11"));
+}
+
+/// KR-REQ-11.26: the beginnings the floor refuses are the launch's own list, stated in the
+/// package contract: a word added to the command integration's list does not change it.
+#[test]
+fn kr_req_11_26_the_loader_beginnings_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["loader_beginnings"],
+        json!([
+            "LD", "DYLD", "BASH", "NODE", "NPM", "BUN", "DENO", "PYTHON", "PERL", "RUBY", "LUA",
+            "JAVA", "JDK", "GIT", "GCONV", "SSL", "CURL", "REQUESTS", "COMPLUS", "DOTNET",
+            "CORECLR", "COR"
+        ])
+    );
+}
+
+/// KR-REQ-11.26: the names the floor refuses whole are the launch's own list, stated in the
+/// package contract.
+#[test]
+fn kr_req_11_26_the_loader_names_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["loader_names"],
+        json!(["ENV", "LOCPATH", "_JAVA_OPTIONS"])
+    );
+}
+
+/// KR-REQ-11.26: the Node.js data names that a launch may pass and may not set are stated in the
+/// package contract.
+#[test]
+fn kr_req_11_26_the_data_names_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["data_names"],
+        json!([
+            "NODE_EXTRA_CA_CERTS",
+            "NODE_USE_ENV_PROXY",
+            "NODE_USE_SYSTEM_CA"
+        ])
+    );
+}
+
+/// KR-REQ-11.26: the names the host copies from the person's shell, which a launch may pass and
+/// may not set, are stated in the package contract.
+#[test]
+fn kr_req_11_26_the_copied_names_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["copied_names"],
+        json!(["PATH", "HOME", "SHELL"])
+    );
+}
+
+/// KR-REQ-11.26: the names that make a shell or a tool run a command or read a start file, which a
+/// launch may pass and may not set, are stated in the package contract.
+#[test]
+fn kr_req_11_26_the_start_file_names_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(
+        contract["acp_launch"]["start_file_names"],
+        json!([
+            "ZDOTDIR",
+            "SHELLOPTS",
+            "PS4",
+            "PROMPT_COMMAND",
+            "PAGER",
+            "EDITOR",
+            "VISUAL",
+            "BROWSER",
+            "SSH_ASKPASS",
+            "SUDO_ASKPASS"
+        ])
+    );
 }

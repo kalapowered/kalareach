@@ -1,11 +1,63 @@
 {
   "acp_launch": {
     "agent_argument": "--acp",
+    "copied_names": [
+      "PATH",
+      "HOME",
+      "SHELL"
+    ],
+    "data_names": [
+      "NODE_EXTRA_CA_CERTS",
+      "NODE_USE_ENV_PROXY",
+      "NODE_USE_SYSTEM_CA"
+    ],
+    "loader_beginnings": [
+      "LD",
+      "DYLD",
+      "BASH",
+      "NODE",
+      "NPM",
+      "BUN",
+      "DENO",
+      "PYTHON",
+      "PERL",
+      "RUBY",
+      "LUA",
+      "JAVA",
+      "JDK",
+      "GIT",
+      "GCONV",
+      "SSL",
+      "CURL",
+      "REQUESTS",
+      "COMPLUS",
+      "DOTNET",
+      "CORECLR",
+      "COR"
+    ],
+    "loader_names": [
+      "ENV",
+      "LOCPATH",
+      "_JAVA_OPTIONS"
+    ],
     "max_constants": 16,
     "max_name_bytes": 64,
     "max_names": 64,
     "max_value_bytes": 256,
-    "private_home_placeholder": "{private_home}"
+    "private_home_placeholder": "{private_home}",
+    "sdk_version": "0.1.11",
+    "start_file_names": [
+      "ZDOTDIR",
+      "SHELLOPTS",
+      "PS4",
+      "PROMPT_COMMAND",
+      "PAGER",
+      "EDITOR",
+      "VISUAL",
+      "BROWSER",
+      "SSH_ASKPASS",
+      "SUDO_ASKPASS"
+    ]
   },
   "arrivals": [
     {

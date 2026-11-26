@@ -237,6 +237,12 @@ pub fn package_contract() -> Value {
             "max_name_bytes": crate::acp_launch::MAX_NAME_BYTES,
             "max_constants": crate::acp_launch::MAX_CONSTANTS,
             "max_value_bytes": crate::acp_launch::MAX_VALUE_BYTES,
+            "sdk_version": crate::acp_launch::ARRIVAL,
+            "loader_beginnings": crate::acp_launch::LOADER_BEGINNINGS,
+            "loader_names": crate::acp_launch::LOADER_NAMES,
+            "data_names": crate::acp_launch::DATA_NAMES,
+            "copied_names": crate::acp_launch::COPIED_NAMES,
+            "start_file_names": crate::acp_launch::START_FILE_NAMES,
         },
         "command_integration": {
             "max_command_bytes": crate::integration::MAX_COMMAND_BYTES,

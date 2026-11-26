@@ -22,8 +22,8 @@
 //!   passed name too, and the launch is refused when the shell has no such variable or it is
 //!   empty.
 //! * No name is a loader or runtime name, passed or set: none begins with a word of
-//!   [`FLOOR_FIRST_WORDS`] other than `KR` (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest),
-//!   and none is one of [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
+//!   [`LOADER_BEGINNINGS`] (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest), and none is one of
+//!   [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
 //!   passed ([`DATA_NAMES`]). A constant is also none of [`COPIED_NAMES`], [`DATA_NAMES`] or
 //!   [`START_FILE_NAMES`].
 //! * A constant is a name and a value on one line. The one value that is not literal is
@@ -36,7 +36,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
 use crate::integration::{command_problem, quoted};
-use crate::launch_variables::FLOOR_FIRST_WORDS;
 use crate::matching::{MatchRule, OperatingSystem};
 use crate::text::{GrantWords, is_forbidden_text_char};
 
@@ -64,9 +63,17 @@ pub const MAX_CONSTANTS: usize = 16;
 /// The longest constant value, in bytes.
 pub const MAX_VALUE_BYTES: usize = 256;
 
-/// Names of loader and runtime variables that no beginning in
-/// [`FLOOR_FIRST_WORDS`] reaches. No declaration
-/// passes or sets one.
+/// The words a name may not begin with, passed or set: the launch's own list, kept apart from the
+/// command integration's so that a word added there does not refuse a published release of a
+/// package that declares a launch. A beginning, not a first word, so `PYTHONSTARTUP` and
+/// `PERL5OPT` are held too.
+pub const LOADER_BEGINNINGS: [&str; 22] = [
+    "LD", "DYLD", "BASH", "NODE", "NPM", "BUN", "DENO", "PYTHON", "PERL", "RUBY", "LUA", "JAVA",
+    "JDK", "GIT", "GCONV", "SSL", "CURL", "REQUESTS", "COMPLUS", "DOTNET", "CORECLR", "COR",
+];
+
+/// Names of loader and runtime variables that no beginning in [`LOADER_BEGINNINGS`] reaches. No
+/// declaration passes or sets one.
 pub const LOADER_NAMES: [&str; 3] = ["ENV", "LOCPATH", "_JAVA_OPTIONS"];
 
 /// Names that begin like a loader or runtime name and load no code: the certificate and proxy
@@ -380,9 +387,8 @@ impl AcpLaunch {
 ///
 /// The floor: no declaration passes or sets a loader or runtime name, whatever the name is. A name
 /// is one when, written in upper case, it begins with a word of
-/// [`FLOOR_FIRST_WORDS`] other than `KR`, or is one of
-/// [`LOADER_NAMES`]. A beginning, not a first word, so `PYTHONSTARTUP` and `PERL5OPT` are held
-/// too. [`DATA_NAMES`] begin like them and load nothing: they may be passed. A constant is also
+/// [`LOADER_BEGINNINGS`], or is one of [`LOADER_NAMES`]. A beginning, not a first word, so
+/// `PYTHONSTARTUP` and `PERL5OPT` are held too. [`DATA_NAMES`] begin like them and load nothing: they may be passed. A constant is also
 /// refused when it is one the host copies ([`COPIED_NAMES`], [`DATA_NAMES`]) or one of the
 /// person's own that makes a shell or a tool run a command ([`START_FILE_NAMES`]).
 fn name_problem(name: &str, role: Role) -> Option<String> {
@@ -418,9 +424,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
             "is {listed}, a loader or runtime name that no ACP launch copies or sets"
         ));
     }
-    FLOOR_FIRST_WORDS
+    LOADER_BEGINNINGS
         .iter()
-        .filter(|word| **word != "KR")
         .find(|word| upper.starts_with(**word))
         .map(|word| {
             format!(
