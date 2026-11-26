@@ -463,12 +463,14 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
 
     let first = components::request("well-behaved", 1);
     bind(&client, served, "well-behaved", &behaved, &first).await;
+    // The report says how many bytes of notices the host still holds, so it is asked once the
+    // binding's first document has been taken off the queue.
+    documents_until(&mut client, first.binding_id, "bind").await;
     client.health().await.expect("a health report");
     client
         .deliver(first.binding_id, &components::scrape("se-1", "building"))
         .await
         .expect("the event is offered");
-    documents_until(&mut client, first.binding_id, "bind").await;
     documents_until(&mut client, first.binding_id, "observe").await;
     client
         .snapshot(first.binding_id, deadline)
