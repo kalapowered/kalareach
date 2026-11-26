@@ -351,9 +351,12 @@ jobs:
 
       # The disk as the tests start, every mount of it: what is left once the image is cleared and
       # the build output of the lint and of the components stands on it, and a second disk of the
-      # runner, if there is one, shows here. It runs after a failed step too.
+      # runner, if there is one, shows here. It runs after a failed step too, and a reading that
+      # fails fails nothing: the three readings of this job only report, and a step that fails
+      # skips every step after it that has no condition of its own, the tests among them.
       - name: What the disk has before the tests
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: df -h
 
       # The step grows with the tests. It took 120 to 166 minutes in each of the last seven runs in
@@ -404,6 +407,7 @@ jobs:
       # workspace's test build took, and what the programs' temporary folders took has gone by now.
       - name: What the disk has after the tests
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: df -h /
 
       # The cases that start a daemon through test trees made without a service manager are ignored
@@ -784,6 +788,7 @@ jobs:
       # reading the first step took.
       - name: What the disk has left
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: df -h /
 
       - name: Save the cargo cache
