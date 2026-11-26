@@ -21,6 +21,11 @@
 //!   The host copies a passed name only when the person's shell has it. A required name is a
 //!   passed name too, and the launch is refused when the shell has no such variable or it is
 //!   empty.
+//! * No name is a loader or runtime name, passed or set: none begins with a word of
+//!   [`FLOOR_FIRST_WORDS`] other than `KR` (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest),
+//!   and none is one of [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
+//!   passed ([`DATA_NAMES`]). A constant is also none of [`COPIED_NAMES`], [`DATA_NAMES`] or
+//!   [`START_FILE_NAMES`].
 //! * A constant is a name and a value on one line. The one value that is not literal is
 //!   [`PRIVATE_HOME_PLACEHOLDER`], which stands alone as a whole value and which the host replaces
 //!   with the path of a folder it makes new and empty for each start.
@@ -31,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::PluginCapability;
 use crate::integration::{command_problem, quoted};
+use crate::launch_variables::FLOOR_FIRST_WORDS;
 use crate::matching::{MatchRule, OperatingSystem};
 use crate::text::{GrantWords, is_forbidden_text_char};
 
@@ -52,6 +58,47 @@ pub const MAX_CONSTANTS: usize = 16;
 
 /// The longest constant value, in bytes.
 pub const MAX_VALUE_BYTES: usize = 256;
+
+/// Names of loader and runtime variables that no beginning in
+/// [`FLOOR_FIRST_WORDS`](crate::launch_variables::FLOOR_FIRST_WORDS) reaches. No declaration
+/// passes or sets one.
+pub const LOADER_NAMES: [&str; 3] = ["ENV", "LOCPATH", "_JAVA_OPTIONS"];
+
+/// Names that begin like a loader or runtime name and load no code: the certificate and proxy
+/// switches of Node.js. A declaration may pass them and may not set them.
+pub const DATA_NAMES: [&str; 3] = [
+    "NODE_EXTRA_CA_CERTS",
+    "NODE_USE_ENV_PROXY",
+    "NODE_USE_SYSTEM_CA",
+];
+
+/// Names the host copies from the person's shell into every agent's start. A declaration may pass
+/// them and may not set them.
+pub const COPIED_NAMES: [&str; 3] = ["PATH", "HOME", "SHELL"];
+
+/// Names that make a shell or a tool run a command or read a start file. They are the person's
+/// own: a declaration may pass them and may not set them.
+pub const START_FILE_NAMES: [&str; 10] = [
+    "ZDOTDIR",
+    "SHELLOPTS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "PAGER",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    "SSH_ASKPASS",
+    "SUDO_ASKPASS",
+];
+
+/// What a declaration does with a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The host copies the variable from the person's shell.
+    Passed,
+    /// The host sets the variable itself.
+    Set,
+}
 
 /// What a package declares about starting its agent in ACP mode.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -282,7 +329,7 @@ impl AcpLaunch {
             }
             let mut seen = std::collections::BTreeSet::new();
             for name in names {
-                if let Some(problem) = name_problem(name) {
+                if let Some(problem) = name_problem(name, Role::Passed) {
                     problems.push(format!("name: {} in {list} {problem}", quoted(name)));
                 }
                 if !seen.insert(name.as_str()) {
@@ -306,7 +353,7 @@ impl AcpLaunch {
         let mut seen = std::collections::BTreeSet::new();
         for constant in &self.constants {
             let name = quoted(&constant.name);
-            if let Some(problem) = name_problem(&constant.name) {
+            if let Some(problem) = name_problem(&constant.name, Role::Set) {
                 problems.push(format!("constant: the name {name} {problem}"));
             }
             if !seen.insert(constant.name.as_str()) {
@@ -324,8 +371,16 @@ impl AcpLaunch {
     }
 }
 
-/// Returns why a variable name is not one a declaration may list, where it is not.
-fn name_problem(name: &str) -> Option<String> {
+/// Returns why a variable name is not one a declaration may list in `role`, where it is not.
+///
+/// The floor: no declaration passes or sets a loader or runtime name, whatever the name is. A name
+/// is one when, written in upper case, it begins with a word of
+/// [`FLOOR_FIRST_WORDS`](crate::launch_variables::FLOOR_FIRST_WORDS) other than `KR`, or is one of
+/// [`LOADER_NAMES`]. A beginning, not a first word, so `PYTHONSTARTUP` and `PERL5OPT` are held
+/// too. [`DATA_NAMES`] begin like them and load nothing: they may be passed. A constant is also
+/// refused when it is one the host copies ([`COPIED_NAMES`], [`DATA_NAMES`]) or one of the
+/// person's own that makes a shell or a tool run a command ([`START_FILE_NAMES`]).
+fn name_problem(name: &str, role: Role) -> Option<String> {
     if !name_has_shape(name) {
         return Some(format!(
             "is not a variable name: letters, digits and '_' only, not beginning with a digit, \
@@ -335,7 +390,38 @@ fn name_problem(name: &str) -> Option<String> {
     if name.starts_with("KR_") {
         return Some("begins with KR_, which only the worker sets".to_owned());
     }
-    None
+    if role == Role::Passed && DATA_NAMES.contains(&name) {
+        return None;
+    }
+    let upper = name.to_ascii_uppercase();
+    if role == Role::Set {
+        if COPIED_NAMES.contains(&upper.as_str()) || DATA_NAMES.contains(&name) {
+            return Some(
+                "is a variable the host copies from the person's shell, and no ACP launch sets it"
+                    .to_owned(),
+            );
+        }
+        if let Some(listed) = START_FILE_NAMES.iter().find(|listed| **listed == upper) {
+            return Some(format!(
+                "is {listed}, a variable that makes a shell or a tool run a command or read a \
+                 start file, and no ACP launch sets it"
+            ));
+        }
+    }
+    if let Some(listed) = LOADER_NAMES.iter().find(|listed| **listed == upper) {
+        return Some(format!(
+            "is {listed}, a loader or runtime name that no ACP launch copies or sets"
+        ));
+    }
+    FLOOR_FIRST_WORDS
+        .iter()
+        .filter(|word| **word != "KR")
+        .find(|word| upper.starts_with(**word))
+        .map(|word| {
+            format!(
+                "begins with {word}, a loader or runtime name that no ACP launch copies or sets"
+            )
+        })
 }
 
 /// Returns why a constant's value is not one a declaration may set, where it is not.

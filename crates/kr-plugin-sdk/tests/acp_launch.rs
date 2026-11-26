@@ -611,3 +611,172 @@ fn kr_req_11_26_the_first_cause_in_the_hosts_order_is_the_one_refused() {
         Err(AcpRefusal::ApprovalsMissing)
     );
 }
+
+/// The sentence a refused loader or runtime name carries after its beginning or its name.
+const LOADER_REASON: &str = ", a loader or runtime name that no ACP launch copies or sets";
+
+/// KR-REQ-11.26: no launch passes a name that loads code into the agent or into a program it
+/// starts, whatever the name is: the loader and runtime names refuse by their beginning or their
+/// name, in either case.
+#[test]
+fn kr_req_11_26_a_passed_name_that_loads_code_is_refused() {
+    for (name, why) in [
+        ("DYLD_INSERT_LIBRARIES", "begins with DYLD"),
+        ("LD_PRELOAD", "begins with LD"),
+        ("ld_preload", "begins with LD"),
+        ("NODE_OPTIONS", "begins with NODE"),
+        ("NODE_PATH", "begins with NODE"),
+        ("BUN_OPTIONS", "begins with BUN"),
+        ("BASH_ENV", "begins with BASH"),
+        ("GCONV_PATH", "begins with GCONV"),
+        ("PYTHONSTARTUP", "begins with PYTHON"),
+        ("ENV", "is ENV"),
+        ("LOCPATH", "is LOCPATH"),
+        ("_JAVA_OPTIONS", "is _JAVA_OPTIONS"),
+    ] {
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names {why}{LOADER_REASON}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a finding that begins {reason:?} is expected: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the required list is held to the same floor, and says so in its own sentence.
+#[test]
+fn kr_req_11_26_a_required_name_that_loads_code_is_refused() {
+    let mut launch = declaration();
+    launch["required_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "LD_PRELOAD"]);
+    launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", "LD_PRELOAD"]);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    let reason = format!("name: \"LD_PRELOAD\" in required_names begins with LD{LOADER_REASON}");
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: a constant is held to the floor too, and to more: no launch sets a variable that
+/// the host copies from the person's shell, nor one that makes a shell or a tool run a command or
+/// read a start file.
+#[test]
+fn kr_req_11_26_a_constant_that_loads_code_or_runs_a_command_is_refused() {
+    let copied = "is a variable the host copies from the person's shell, and no ACP launch sets it";
+    let start = |name: &str| {
+        format!(
+            "is {name}, a variable that makes a shell or a tool run a command or read a start \
+             file, and no ACP launch sets it"
+        )
+    };
+    let mut refused: Vec<(&str, String)> = vec![
+        ("NODE_OPTIONS", format!("begins with NODE{LOADER_REASON}")),
+        ("BASH_ENV", format!("begins with BASH{LOADER_REASON}")),
+        ("ENV", format!("is ENV{LOADER_REASON}")),
+        ("PATH", copied.to_owned()),
+        ("HOME", copied.to_owned()),
+        ("SHELL", copied.to_owned()),
+        ("NODE_EXTRA_CA_CERTS", copied.to_owned()),
+        ("NODE_USE_ENV_PROXY", copied.to_owned()),
+        ("NODE_USE_SYSTEM_CA", copied.to_owned()),
+    ];
+    for name in [
+        "ZDOTDIR",
+        "SHELLOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "PAGER",
+        "EDITOR",
+        "VISUAL",
+        "BROWSER",
+        "SSH_ASKPASS",
+        "SUDO_ASKPASS",
+    ] {
+        refused.push((name, start(name)));
+    }
+    for (name, said) in refused {
+        let mut launch = declaration();
+        launch["constants"] = json!([{"name": name, "value": "x"}]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("constant: the name \"{name}\" {said}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a finding that begins {reason:?} is expected: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: every name the two agents need passes the floor in the list where it stands: the
+/// passed names and the constants of the Gemini-shaped launch, the passed names of the
+/// Qoder-shaped one, and the person's own start-file names as passed names, with a name that
+/// only looks like a `KR_` name.
+#[test]
+fn kr_req_11_26_the_names_the_two_agents_need_pass_the_floor() {
+    let gemini = json!({
+        "command": "example-agent",
+        "platforms": ["mac_os", "linux"],
+        "required_names": ["PATH", "HOME", "GEMINI_API_KEY"],
+        "passed_names": [
+            "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "SHELL",
+            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+            "NODE_USE_ENV_PROXY", "grpc_proxy", "no_grpc_proxy",
+            "NODE_EXTRA_CA_CERTS", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+            "GEMINI_API_KEY", "GEMINI_MODEL"
+        ],
+        "constants": [
+            {"name": "GEMINI_CLI_HOME", "value": "{private_home}"},
+            {"name": "GEMINI_CLI_NO_RELAUNCH", "value": "true"},
+            {"name": "GEMINI_CLI_TRUST_WORKSPACE", "value": "false"},
+            {"name": "GEMINI_PTY_INFO", "value": "child_process"},
+            {"name": "WS_NO_BUFFER_UTIL", "value": "1"},
+            {"name": "WS_NO_UTF_8_VALIDATE", "value": "1"}
+        ],
+        "grant_statement": "Starts the agent in ACP mode"
+    });
+    let qoder = json!({
+        "command": "example-agent",
+        "platforms": ["mac_os", "linux"],
+        "required_names": ["PATH", "HOME"],
+        "passed_names": [
+            "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "SHELL", "XDG_CONFIG_HOME",
+            "QODER_CLI_HOME", "GEMINI_CLI_HOME", "QODER_CONFIG_DIR", "QODER_CONFIG_DIR_NAME",
+            "QODER_HOME", "QODER_FORCE_FILE_STORAGE", "QODER_FORCE_ENCRYPTED_FILE_STORAGE",
+            "GEMINI_FORCE_FILE_STORAGE", "GEMINI_FORCE_ENCRYPTED_FILE_STORAGE",
+            "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
+            "NODE_USE_ENV_PROXY", "grpc_proxy", "no_grpc_proxy",
+            "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH",
+            "QODER_PERSONAL_ACCESS_TOKEN"
+        ],
+        "constants": [],
+        "grant_statement": "Starts the agent in ACP mode"
+    });
+    let own = {
+        let mut launch = declaration();
+        launch["passed_names"] = json!([
+            "PATH",
+            "HOME",
+            "EXAMPLE_API_KEY",
+            "ZDOTDIR",
+            "SHELLOPTS",
+            "PS4",
+            "PROMPT_COMMAND",
+            "PAGER",
+            "EDITOR",
+            "VISUAL",
+            "BROWSER",
+            "SSH_ASKPASS",
+            "SUDO_ASKPASS",
+            "KRB5CCNAME"
+        ]);
+        launch
+    };
+    for launch in [gemini, qoder, own] {
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        assert!(
+            findings.is_empty(),
+            "a launch that names only what the agents need is valid: {findings:?}"
+        );
+    }
+}
