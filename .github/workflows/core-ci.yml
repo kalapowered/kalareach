@@ -2778,17 +2778,17 @@ jobs:
   # distribution is tried again by its own step; Gradle is told to wait longer between the tries of
   # each refused dependency fetch, which survives a refusal that stops within about two minutes
   # for each fetch (a nested lookup can wait about twice that); and a build that still fails with
-  # the refusal in its output is run once more after ten minutes, which covers about twelve minutes
-  # after the first failure. A refusal that lasts longer than that fails the job as before. The
-  # fetches of the Android SDK manager, pnpm, rustup and Cargo are not covered: they keep their own
-  # defaults (see the steps).
+  # the refusal in its output is run once more after ten minutes, with Gradle's own waits coming
+  # after that. A refusal that outlasts that fails the job as before. The fetches of the Android
+  # SDK manager, pnpm, rustup and Cargo are not covered: they keep their own defaults (see the
+  # steps).
   #
   # Every step has a limit of its own, so that a step that hangs is ended, and the evidence upload
   # after it still has its time. A step that installs or builds has twice the longest it took in the
   # 59 to 65 hosted runs of 16 to 24 November, all of them with no cache, since the job restores
   # none, rounded up: the NDK, emulator and system image 5 (1.6 at most), the debug build 26 (13.0,
   # run 45345872273) and the minified build 47 (23.2, run 44759162215); the two builds have five
-  # minutes more, 31 and 52, for the longer wait before the second run that a refusal brings. That
+  # minutes more, 31 and 52, for the ten-minute wait before the second run that a refusal brings. That
   # wait of ten minutes and the second run are inside those limits, not added to them (the steps
   # say when the second run fits). The steps that only set up or read, none of which took more than
   # 1.5 minutes, have 5, or 6 for the disk, as the other jobs' do; the evidence upload has 3, its
@@ -2975,40 +2975,62 @@ jobs:
       # the system resolves by name, among them the Tauri plugin, and the application identifier in
       # the manifest, the code and the libraries.
       #
-      # A build that fails with the package repository's refusal in its own output (the line Gradle
-      # prints, "Received status code 429 from server: Too Many Requests") waits ten minutes and runs
-      # once more, since runs of this job met that refusal again eight to nine minutes after the
-      # first, past what Gradle's own tries wait for. The second run covers about twelve minutes
-      # after the first failure: the wait of ten and the two minutes that Gradle's own tries then
-      # wait. A refusal that lasts longer than that still fails the step, and so does any second
-      # failure. A build that fails for any other reason fails the step at once: a missing module, a
-      # wrong address, a compile error and a failed check are never tried again. The step's limit is
-      # 31 minutes: twice the longest build seen (13.0 minutes, so 26) and five more for the longer
-      # wait. The wait and the second run are inside it, so a second run after the ten-minute wait
-      # fits only when the first one failed within 31 - 10 - 13.0 = 8.0 minutes; after a later
-      # failure the limit ends the second run if it does not finish, and the step fails at its limit.
-      # A refused jar does not disable the repository, so a long refusal of jars ends at the limit
-      # with no refusal line, and then there is no second run. The wait is 600 seconds unless
-      # REFUSAL_WAIT_SECONDS is set; the workflow never sets it, and a local run of this text sets it
-      # to shorten the wait.
+      # A build that fails with the package repository's refusal in its own output waits ten minutes
+      # and runs once more, since runs of this job met that refusal again eight to nine minutes
+      # after the first, past what Gradle's own tries wait for. The refusal is the build tool's own
+      # line for a refused fetch, as the saved logs show it: a line that ends in the status text and
+      # stands as `> Could not GET '<address>'. Received status code 429 from server: Too Many
+      # Requests`. The same words in another form, such as a file's name in a compiler message, start
+      # nothing. That narrows the match; it cannot tell a build that prints the whole line on
+      # purpose. The status of the build and the status of the copying program are read apart, at
+      # once after the pipeline: a failed copy fails the step with a line that says so and never
+      # starts a second build, and the second run is decided by the build's status and the saved
+      # text alone. A second failure fails the step. A build that fails for any other reason fails
+      # the step at once: a missing module, a wrong address, a compile error and a failed check are
+      # never tried again.
+      #
+      # The second run starts ten minutes after the first failure; Gradle's own waits (about two
+      # minutes for each refused fetch, about twice that for a nested lookup) and the time of the
+      # requests come after that, and compiling can come before its first fetch. The ten minutes
+      # leave margin past the last of the saved refusals; they are no deadline by which every refusal
+      # has stopped. The step's limit is 31 minutes: twice the longest build seen (13.0 minutes, so
+      # 26) and five more for the ten-minute wait. The wait and the second run are inside it, so a
+      # second run fits only when the first one failed within 31 - 10 - 13.0 = 8.0 minutes; after a
+      # later failure the limit ends the second run if it does not finish, and the step fails at its
+      # limit. The times seen come from builds with Gradle's own three tries, so with the settings
+      # above a failure comes about two minutes later (about four for a nested lookup). A refused jar
+      # does not disable the repository, so a long refusal of jars can end at the limit with no
+      # refusal line, and then there is no second run.
+      #
+      # The wait is the literal 600 below and no value from the environment: an earlier step runs
+      # files of the checkout and can write the job's environment. A local run of this text puts a
+      # stand-in `sleep` first on the path to shorten and count the wait.
       - name: Build the debug application
         timeout-minutes: 31
         run: |
           set -euo pipefail
           build() { pnpm -C apps/companion android --debug --apk --target aarch64 x86_64; }
           log="$RUNNER_TEMP/debug-build.log"
-          status=0
-          build 2>&1 | tee "$log" || status=$?
-          if [ "$status" -eq 0 ]; then
+          refusal="^[[:space:]]*> Could not GET 'https?://[^' ]+'[.] Received status code 429 from server: Too Many Requests[[:space:]]*\$"
+          set +e
+          build 2>&1 | tee "$log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          build_status="${statuses[0]}"
+          copy_status="${statuses[1]}"
+          if [ "$copy_status" -ne 0 ]; then
+            echo "the copy of the build's output failed (status $copy_status, the build's status $build_status): the step fails, and no second build runs"
+            exit 1
+          fi
+          if [ "$build_status" -eq 0 ]; then
             exit 0
           fi
-          if ! grep -qF 'Received status code 429 from server: Too Many Requests' "$log"; then
+          if ! grep -qE -- "$refusal" "$log"; then
             echo "the build failed, and not with the package repository's refusal: not trying again"
-            exit "$status"
+            exit "$build_status"
           fi
-          wait_seconds="${REFUSAL_WAIT_SECONDS:-600}"
-          echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
-          sleep "$wait_seconds"
+          echo "the build failed with the package repository's refusal: waiting 600 seconds, then running it once more"
+          sleep 600
           echo "the second run of the build"
           build
 
@@ -3093,18 +3115,18 @@ jobs:
       # It runs whatever the emulator step did, so that each answer is read on its own.
       #
       # The build is tried once more after the package repository's refusal, as the debug build is
-      # (see that step): a failure with "Received status code 429 from server: Too Many Requests" in
-      # the build's own output waits ten minutes and runs the build again, any other failure fails
-      # the step at once, and a second failure fails it too. The second run covers about twelve
-      # minutes after the first failure, and a refusal that lasts longer than that still fails the
-      # step. The step's limit is 52 minutes: twice the longest build seen (23.2 minutes, so 47) and
-      # five more for the longer wait. The wait and the second run are inside it, so a second run
-      # after the ten-minute wait fits only when the first one failed within
-      # 52 - 10 - 23.2 = 18.8 minutes; after a later failure the limit ends the second run if it does
-      # not finish, and the step fails at its limit. A refused jar does not disable the repository,
-      # so a long refusal of jars ends at the limit with no refusal line, and then there is no second
-      # run. The wait is 600 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
-      # and a local run of this text sets it to shorten the wait.
+      # (see that step, which says what the refusal is, how the two statuses are read and why the
+      # wait is a literal): a failure with the build tool's own line for a refused fetch, `> Could
+      # not GET '<address>'. Received status code 429 from server: Too Many Requests`, in the
+      # build's output waits ten minutes and runs the build again, any other failure fails the step
+      # at once, and a second failure fails it too. The second run starts ten minutes after the first
+      # failure; Gradle's own waits and the time of the requests come after that. The step's limit is
+      # 52 minutes: twice the longest build seen (23.2 minutes, so 47) and five more for the
+      # ten-minute wait. The wait and the second run are inside it, so a second run fits only when
+      # the first one failed within 52 - 10 - 23.2 = 18.8 minutes; after a later failure the limit
+      # ends the second run if it does not finish, and the step fails at its limit. A refused jar
+      # does not disable the repository, so a long refusal of jars can end at the limit with no
+      # refusal line, and then there is no second run.
       - name: Build the minified application and read its libraries back
         if: ${{ !cancelled() }}
         timeout-minutes: 52
@@ -3115,18 +3137,26 @@ jobs:
           printf '%s\n' '{"project_info":{"project_number":"000000000000","project_id":"throwaway-minified-build"},"client":[{"client_info":{"mobilesdk_app_id":"1:000000000000:android:0000000000000000","android_client_info":{"package_name":"to.kala.reach"}},"api_key":[{"current_key":"throwaway-not-a-key"}]}]}' > "$KR_GOOGLE_SERVICES_JSON"
           build() { pnpm -C apps/companion android --apk --aab --target aarch64 x86_64; }
           log="$RUNNER_TEMP/minified-build.log"
-          status=0
-          build 2>&1 | tee "$log" || status=$?
-          if [ "$status" -eq 0 ]; then
+          refusal="^[[:space:]]*> Could not GET 'https?://[^' ]+'[.] Received status code 429 from server: Too Many Requests[[:space:]]*\$"
+          set +e
+          build 2>&1 | tee "$log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          build_status="${statuses[0]}"
+          copy_status="${statuses[1]}"
+          if [ "$copy_status" -ne 0 ]; then
+            echo "the copy of the build's output failed (status $copy_status, the build's status $build_status): the step fails, and no second build runs"
+            exit 1
+          fi
+          if [ "$build_status" -eq 0 ]; then
             exit 0
           fi
-          if ! grep -qF 'Received status code 429 from server: Too Many Requests' "$log"; then
+          if ! grep -qE -- "$refusal" "$log"; then
             echo "the build failed, and not with the package repository's refusal: not trying again"
-            exit "$status"
+            exit "$build_status"
           fi
-          wait_seconds="${REFUSAL_WAIT_SECONDS:-600}"
-          echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
-          sleep "$wait_seconds"
+          echo "the build failed with the package repository's refusal: waiting 600 seconds, then running it once more"
+          sleep 600
           echo "the second run of the build"
           build
 
