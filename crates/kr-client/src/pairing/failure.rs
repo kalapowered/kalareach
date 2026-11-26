@@ -86,9 +86,12 @@ pub enum FailureKind {
     /// The host may have approved this device while it could not ask, and that cannot be
     /// confirmed now.
     ApprovalUnknown,
-    /// The pairing was removed from this device, or another pairing of the host replaced it, before
-    /// the attempt finished: nothing of this attempt stands.
+    /// The pairing was removed from this device before the attempt finished, and no record of the
+    /// host stands in its place: nothing of this attempt stands.
     PairingRemoved,
+    /// A newer pairing of the same host replaced this pairing's record before the attempt finished:
+    /// this device is paired with the host, by the newer pairing, and nothing of this attempt stands.
+    PairedAgain,
     /// A newer pairing was started on this device before this attempt finished, so this attempt
     /// recorded nothing: the newer pairing's record and attempt file stand.
     NewerPairingStarted,
@@ -142,6 +145,7 @@ impl Said for FailureKind {
             Self::StoreFailed => "StoreFailed",
             Self::ApprovalUnknown => "ApprovalUnknown",
             Self::PairingRemoved => "PairingRemoved",
+            Self::PairedAgain => "PairedAgain",
             Self::NewerPairingStarted => "NewerPairingStarted",
         })
     }
@@ -422,8 +426,9 @@ mod tests {
             (FailureKind::ApprovalUnknown, "approval_unknown"),
             (FailureKind::PairingRemoved, "pairing_removed"),
             (FailureKind::NewerPairingStarted, "newer_pairing_started"),
+            (FailureKind::PairedAgain, "paired_again"),
         ];
-        assert_eq!(kinds.len(), 29);
+        assert_eq!(kinds.len(), 30);
         for (kind, name) in kinds {
             let sent = serde_json::to_value(PairingFailure::new(kind, "a kind")).expect("ok");
             assert_eq!(sent["kind"], serde_json::json!(name), "{name}");

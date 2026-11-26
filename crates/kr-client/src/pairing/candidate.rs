@@ -70,7 +70,7 @@ use super::checkpoint::{
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
-use super::paired::{AttemptMode, FirstWrite, PairedHost, PairedHosts, PendingAttempt};
+use super::paired::{AttemptMode, FirstWrite, Naming, PairedHost, PairedHosts, PendingAttempt};
 use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
 use crate::session::Session;
 use crate::shown::{Said, Shown};
@@ -1447,8 +1447,10 @@ impl Pairing {
             if let Some(answer) = answer {
                 self.settle_answer(&host, answer).await;
             }
-            if !named {
-                return Err(self.removed(pending));
+            match named {
+                Naming::Named => {}
+                Naming::Replaced => return Err(self.paired_again(pending)),
+                Naming::Gone => return Err(self.removed(pending)),
             }
             self.hosts.clear_attempt_of(pending.invitation_id)?;
             progress.send_replace(AttemptState::Paired {
@@ -1559,14 +1561,25 @@ impl Pairing {
         }
     }
 
-    /// Ends the attempt as one whose pairing is gone: the person removed it, or another pairing of
-    /// the host replaced it, before it finished. The attempt file is cleared only while it still
+    /// Ends the attempt as one whose pairing is gone: the person removed it before it finished, and
+    /// no record of the host stands in its place. The attempt file is cleared only while it still
     /// names this invitation.
     fn removed(&self, pending: &PendingAttempt) -> PairingFailure {
         let _ = self.hosts.clear_attempt_of(pending.invitation_id);
         PairingFailure::new(
             FailureKind::PairingRemoved,
-            "the pairing was removed, or replaced by another, before the attempt finished",
+            "the pairing was removed before the attempt finished",
+        )
+    }
+
+    /// Ends the attempt as one whose record a newer pairing of the same host replaced before it
+    /// finished: the device is paired with the host, by the newer pairing. The attempt file is
+    /// cleared only while it still names this invitation.
+    fn paired_again(&self, pending: &PendingAttempt) -> PairingFailure {
+        let _ = self.hosts.clear_attempt_of(pending.invitation_id);
+        PairingFailure::new(
+            FailureKind::PairedAgain,
+            "a newer pairing of the host replaced this one before the attempt finished",
         )
     }
 
@@ -5197,20 +5210,39 @@ mod tests {
         }
     }
 
-    /// KR-REQ-20.12: the attempt of a pairing that was removed, and of one that another pairing of
-    /// the host replaced, ends as one whose pairing is gone, never as a paired one.
+    /// KR-REQ-20.12: the attempt of a pairing that was removed, with no record of the host in its
+    /// place, ends as one whose pairing is gone, never as a paired one.
     #[tokio::test(start_paused = true)]
     async fn a_completion_whose_pairing_is_gone_ends_as_removed() {
         for arm in ARMS {
-            for gone in [Meanwhile::Forget, Meanwhile::Newer] {
-                let run = completed(arm, &[(READ, gone)]).await;
-                assert_eq!(
-                    failure_kind(&run),
-                    Some(FailureKind::PairingRemoved),
-                    "{arm:?} {gone:?}: {:?}",
-                    run.outcome
-                );
-            }
+            let run = completed(arm, &[(READ, Meanwhile::Forget)]).await;
+            assert_eq!(
+                failure_kind(&run),
+                Some(FailureKind::PairingRemoved),
+                "{arm:?}: {:?}",
+                run.outcome
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: the attempt of a pairing whose record a newer pairing of the same host replaced
+    /// ends as one that the device was paired with the host again, and not as one that was removed:
+    /// the newer record stands as it was.
+    #[tokio::test(start_paused = true)]
+    async fn a_completion_whose_record_a_newer_pairing_of_the_host_replaced_ends_as_paired_again() {
+        for arm in ARMS {
+            let run = completed(arm, &[(READ, Meanwhile::Newer)]).await;
+            assert_eq!(
+                failure_kind(&run),
+                Some(FailureKind::PairedAgain),
+                "{arm:?}: {:?}",
+                run.outcome
+            );
+            assert_eq!(
+                stored(&run, "hosts.json"),
+                seen_at(&run, READ).hosts_file,
+                "{arm:?}: the newer record stands byte for byte"
+            );
         }
     }
 

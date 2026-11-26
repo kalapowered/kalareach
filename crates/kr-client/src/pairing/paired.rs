@@ -257,6 +257,18 @@ pub enum FirstWrite {
     NewerAttempt,
 }
 
+/// What the name update of a completion found of its pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Naming {
+    /// The pairing's record is kept, and carries the name when one was given.
+    Named,
+    /// The pairing's record is not kept, and a record of the same host is: a newer pairing of the
+    /// host replaced it.
+    Replaced,
+    /// Neither the pairing's record nor any record of the same host is kept: the person removed it.
+    Gone,
+}
+
 /// How the waiting attempt that is kept stands toward one invitation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AttemptStanding {
@@ -389,8 +401,9 @@ impl PairedHosts {
     ///
     /// The pairing is found by all three parts of its identity, the host's endpoint among them, so
     /// the record of a pairing that was removed, or replaced by another one of the host, is not
-    /// written again. Returns whether the pairing is recorded; when it is not, nothing was written.
-    /// A name that is `None` or already the record's changes nothing.
+    /// written again. Says whether the pairing is recorded, and when it is not, whether a record of
+    /// the same host stands in its place: nothing was written then. A name that is `None` or
+    /// already the record's changes nothing.
     ///
     /// # Errors
     ///
@@ -399,18 +412,28 @@ impl PairedHosts {
         &self,
         id: PairingId,
         name: Option<String>,
-    ) -> Result<bool, PairingFailure> {
+    ) -> Result<Naming, PairingFailure> {
         let _writing = self.lock();
         let mut hosts = self.list()?;
         let Some(host) = hosts.iter_mut().find(|host| PairingId::of(host) == id) else {
-            return Ok(false);
+            // A record replaces another when it has the same host device or the same endpoint,
+            // which is what `record` removes by.
+            let replaced = hosts.iter().any(|host| {
+                host.host_device_id == id.host_device_id
+                    || host.host_endpoint_id == id.host_endpoint_id
+            });
+            return Ok(if replaced {
+                Naming::Replaced
+            } else {
+                Naming::Gone
+            });
         };
         let Some(name) = name.filter(|name| host.name.as_ref() != Some(name)) else {
-            return Ok(true);
+            return Ok(Naming::Named);
         };
         host.name = Some(name);
         self.write_hosts(hosts)?;
-        Ok(true)
+        Ok(Naming::Named)
     }
 
     /// The write of [`Self::record`], with the lock held.
@@ -848,7 +871,7 @@ mod tests {
             .expect("raised");
         assert_eq!(
             store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
-            Ok(true)
+            Ok(Naming::Named)
         );
         assert_eq!(
             store.list().expect("readable"),
@@ -870,7 +893,7 @@ mod tests {
         let before = file_of(&store, HOSTS_FILE);
         assert_eq!(
             store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
-            Ok(false)
+            Ok(Naming::Gone)
         );
         assert_eq!(file_of(&store, HOSTS_FILE), before);
     }
@@ -889,7 +912,65 @@ mod tests {
         let before = file_of(&store, HOSTS_FILE);
         assert_eq!(
             store.name_pairing(PairingId::of(&other), Some("kitchen-pc".to_owned())),
-            Ok(false)
+            Ok(Naming::Replaced)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// A name for a pairing that a newer pairing of the same host replaced writes nothing, and says
+    /// that the host's record is another pairing's.
+    #[test]
+    fn a_name_for_a_pairing_that_a_newer_pairing_of_the_host_replaced_says_so() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        let newer = PairedHost {
+            device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+            ..paired.clone()
+        };
+        store.record(newer).expect("replaced");
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
+            Ok(Naming::Replaced)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// A record at the endpoint of a pairing, which another host identity took, replaced that
+    /// pairing as a record of the same host does: `record` removes by either.
+    #[test]
+    fn a_name_for_a_pairing_whose_endpoint_another_host_identity_took_says_replaced() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        let taken = PairedHost {
+            host_device_id: DeviceId::new(Uuid::from_bytes([7; 16])),
+            ..paired.clone()
+        };
+        store.record(taken).expect("replaced");
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
+            Ok(Naming::Replaced)
+        );
+        assert_eq!(file_of(&store, HOSTS_FILE), before);
+    }
+
+    /// A record of another host is no replacement of a pairing that was removed.
+    #[test]
+    fn a_record_of_another_host_does_not_stand_for_a_removed_pairing() {
+        let (_directory, store) = store_in_a_folder();
+        let paired = host(1, &[ActionRight::SessionView]);
+        store.record(paired.clone()).expect("recorded");
+        store
+            .record(host(5, &[ActionRight::SessionView]))
+            .expect("another host");
+        store.forget(paired.host_device_id).expect("forgotten");
+        let before = file_of(&store, HOSTS_FILE);
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), Some("kitchen-pc".to_owned())),
+            Ok(Naming::Gone)
         );
         assert_eq!(file_of(&store, HOSTS_FILE), before);
     }
@@ -901,10 +982,13 @@ mod tests {
         let paired = host(1, &[ActionRight::SessionView]);
         store.record(paired.clone()).expect("recorded");
         let before = file_of(&store, HOSTS_FILE);
-        assert_eq!(store.name_pairing(PairingId::of(&paired), None), Ok(true));
+        assert_eq!(
+            store.name_pairing(PairingId::of(&paired), None),
+            Ok(Naming::Named)
+        );
         assert_eq!(
             store.name_pairing(PairingId::of(&paired), paired.name.clone()),
-            Ok(true)
+            Ok(Naming::Named)
         );
         assert_eq!(file_of(&store, HOSTS_FILE), before);
     }

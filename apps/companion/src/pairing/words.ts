@@ -251,6 +251,12 @@ function codeWords(
           'A newer pairing was started on this computer before this one finished, so this one was not saved. Finish the newer pairing, or pair again.',
         action: 'done'
       }
+    case 'paired_again':
+      return {
+        sentence:
+          'This computer was paired with the host again before this pairing finished, so this one was not saved. The newer pairing is in use.',
+        action: 'done'
+      }
     case 'did_not_finish':
     default:
       // A kind this build does not know, from a newer native side, says no more than this.

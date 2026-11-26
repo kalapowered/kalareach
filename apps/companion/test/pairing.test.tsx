@@ -211,6 +211,19 @@ describe('pairing with a host', () => {
     expect(failureWords({ kind: 'newer_pairing_started' }, 'reach.kala.to').action).toBe('done')
   })
 
+  it('says that the computer was paired with the host again before this pairing finished, in the ruled words', async () => {
+    const { controls } = start()
+    await screen.findByLabelText('Pairing code')
+    attempt(controls, ended('paired_again', null))
+    expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
+      'This computer was paired with the host again before this pairing finished, so this one was not saved. The newer pairing is in use.'
+    )
+  })
+
+  it('ends the page with Done after the computer was paired with the host again', () => {
+    expect(failureWords({ kind: 'paired_again' }, 'reach.kala.to').action).toBe('done')
+  })
+
   // The tries line counts tries of the code that was charged. After an ending at which the invitation
   // can no longer be used, the code is spent, so no line says how many tries are left on it: not after
   // an ending that starts again, and not after one at which the host consumed or ended the invitation.
