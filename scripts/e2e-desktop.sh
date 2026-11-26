@@ -23,9 +23,10 @@
 # used as they are and not built. KR_E2E_STATE names the directory the daemon keeps its state in,
 # which then outlives the run, so that a later run finds what this one recorded. The folder must be
 # one that this run's wrapper owns: KR_E2E_STATE_OWNER names the wrapper's run, and the folder is
-# new, empty or marked with that name, inside a subfolder of the temporary directory
+# new, empty or marked with that name, inside a subfolder of the temporary directory, with every
+# folder on the way down owned by the caller and closed to writes by others, and no link among them
 # (scripts/lib/e2e-state-folder.sh); anything else ends the script before it makes or starts
-# anything.
+# anything. Every later use of the folder is made from inside it, looked at again there.
 #
 # Nothing the person at this machine owns is touched: the graphical application is a new instance
 # started in the background, and this script ends only the processes it started itself.
@@ -92,11 +93,16 @@ fi
 
 # The run's own root, on the internal disk, with the binaries beside it.
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-desktop.XXXXXX")"
-state_dir="${KR_E2E_STATE:-$run_root/s}"
-mkdir -p "$run_root/bin" "$run_root/r" "$state_dir" "$run_root/evidence"
-# The host's own roots are owner-only and it checks them rather than assuming: /tmp is
-# world-writable by design and a directory this run created with anything looser would be refused.
-chmod 700 "$run_root/r" "$state_dir"
+# Every folder this run makes has mode 700 whatever mask the account runs with: the host's own roots
+# are owner-only and it checks them rather than assuming, and a folder this run created with
+# anything looser would be refused.
+mkdir -m 700 "$run_root/bin" "$run_root/r" "$run_root/evidence"
+# The state folder a wrapper named is the one e2e_state_folder_check made or took: its physical
+# name, with mode 700 already set from inside it. Where none was named, it is this run's own.
+state_dir="${E2E_STATE_FOLDER:-$run_root/s}"
+if [ -z "${E2E_STATE_FOLDER:-}" ]; then
+  mkdir -m 700 "$state_dir"
+fi
 # The build products, wherever this workspace's build cache is. They are copied to the internal
 # disk before anything is started, because a process a service manager launches asks the person at
 # the machine for permission the first time it reaches a removable volume.
@@ -119,11 +125,19 @@ kr="$run_root/bin/kr"
 # The launchd jobs this run's daemon defined, by label. The daemon writes one definition per
 # worker's job into its environment's jobs directory and removes it once the job has gone.
 defined_jobs() {
-  local definition
-  for definition in "$state_dir"/environments/*/jobs/kr-worker-*.plist; do
-    [ -e "$definition" ] || continue
-    basename "$definition" .plist
-  done
+  (
+    # Read from inside the state folder, looked at again there, never by the name a wrapper gave:
+    # a folder that is no longer the one that was checked names no job to unload.
+    if ! e2e_state_folder_enter "$state_dir"; then
+      : >"$run_root/evidence/state-folder-changed"
+      exit 0
+    fi
+    local definition
+    for definition in environments/*/jobs/kr-worker-*.plist; do
+      [ -e "$definition" ] || continue
+      basename "$definition" .plist
+    done
+  )
 }
 
 # Each of those jobs launchd still has loaded, as <domain>/<label>, one to a line. launchd answers
@@ -219,6 +233,11 @@ for entry in document.get("sessions", []):
   else
     echo "no launchd job this run's daemon defined is still loaded"
   fi
+  if [ -e "$run_root/evidence/state-folder-changed" ]; then
+    echo "FAILED: the state folder is no longer the one that was checked, so no job label was read from it"
+    failed=1
+    keep=1
+  fi
   if [ "$keep" -eq 0 ]; then
     rm -rf "${run_root:?}"
   else
@@ -239,12 +258,19 @@ echo "starting the control daemon"
 # The daemon keeps its signing key in a file store under this run's own directory. The platform's
 # credential store is one file for the whole login, and a demonstration that used it would queue
 # behind every other host on the machine for a key it throws away at the end.
-(cd "$run_root" && exec "$run_root/bin/kr-controller" \
-  --runtime-dir "$run_root/r" \
-  --state-dir "$state_dir" \
-  --secret-store file \
-  --worker "$run_root/bin/kr-worker") \
-  >"$run_root/evidence/controller.log" 2>&1 &
+# The daemon is started from the state folder's own working directory and then moved to the run's
+# root: the state folder is looked at again from inside before the daemon is given its name.
+(
+  if ! e2e_state_folder_enter "$state_dir"; then
+    echo "e2e: the state folder is no longer the one that was checked" >&2
+    exit 1
+  fi
+  cd "$run_root" && exec "$run_root/bin/kr-controller" \
+    --runtime-dir "$run_root/r" \
+    --state-dir "$state_dir" \
+    --secret-store file \
+    --worker "$run_root/bin/kr-worker"
+) >"$run_root/evidence/controller.log" 2>&1 &
 controller_pid="$!"
 remember_process "$controller_pid" "$run_root/bin/kr-controller"
 # Three minutes of asking, because this is a real daemon on a real machine: it opens its registry,

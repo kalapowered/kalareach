@@ -81,7 +81,7 @@ cleanup() {
   rm -rf "${work:?}"
 }
 trap cleanup EXIT
-mkdir -p "$work/home" "$work/logs" "$work/artifacts" "$work/unpacked"
+mkdir -m 700 "$work/home" "$work/logs" "$work/artifacts" "$work/unpacked"
 failed=0
 fail() {
   echo "FAILED: $*"
