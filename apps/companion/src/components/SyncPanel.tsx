@@ -781,6 +781,7 @@ export function SyncPanel({
               <div className="account-actions">
                 {recoveryProblem !== null ? (
                   <Button
+                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -792,6 +793,7 @@ export function SyncPanel({
                 ) : null}
                 {offersTurnOn ? (
                   <Button
+                    data-wraps
                     tone="primary"
                     data-testid="recovery-turn-on"
                     disabled={busy}
@@ -805,6 +807,7 @@ export function SyncPanel({
                 ) : null}
                 {blocker?.reason === 'needs_sign_in' ? (
                   <Button
+                    data-wraps
                     tone="primary"
                     data-testid="recovery-sign-in"
                     disabled={busy}
@@ -818,6 +821,7 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'on' && recovery.settings?.state === 'stopped' ? (
                   <Button
+                    data-wraps
                     data-testid="recovery-resume-settings"
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -830,6 +834,7 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'unsettled' && blocker === null ? (
                   <Button
+                    data-wraps
                     tone="primary"
                     data-testid="recovery-settle"
                     disabled={busy}
@@ -890,6 +895,7 @@ export function SyncPanel({
                       Start new backups
                     </Button>
                     <Button
+                      data-wraps
                       data-testid="recovery-replace-cancel"
                       disabled={busy}
                       style={{ minBlockSize: target }}
@@ -903,6 +909,7 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'on' ? (
                   <Button
+                    data-wraps
                     data-testid="recovery-save-kit"
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -985,6 +992,7 @@ export function SyncPanel({
                   ))}
                   <li className="device-row">
                     <Button
+                      data-wraps
                       data-testid="recovery-copies-close"
                       disabled={busy}
                       style={{ minBlockSize: target }}
@@ -1041,6 +1049,7 @@ export function SyncPanel({
                   </div>
                   <div className="account-actions">
                     <Button
+                      data-wraps
                       tone="primary"
                       data-testid="recovery-restore-choose"
                       disabled={busy}
