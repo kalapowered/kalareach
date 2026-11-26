@@ -691,6 +691,9 @@ jobs:
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: |
+          # The single-quoted text is a script for the shell that dbus-run-session starts, and that
+          # shell expands its variables: the quotes keep this one from doing it first.
+          # shellcheck disable=SC2016
           dbus-run-session -- bash -c '
             set -euo pipefail
             store="$(mktemp -d)"
@@ -2373,6 +2376,9 @@ jobs:
           tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/powershell"
           chmod +x "$RUNNER_TEMP/powershell/pwsh"
           echo "$RUNNER_TEMP/powershell" >> "$GITHUB_PATH"
+          # The single-quoted text is a PowerShell command, and the `$` is PowerShell's own variable sigil:
+          # the shell must not expand it.
+          # shellcheck disable=SC2016
           "$RUNNER_TEMP/powershell/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       # The check that reads the shell upstreams' advisories is put through what it must refuse, over
@@ -2633,6 +2639,9 @@ jobs:
             --directory "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
           chmod +x "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh"
           echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
+          # The single-quoted text is a PowerShell command, and the `$` is PowerShell's own variable sigil:
+          # the shell must not expand it.
+          # shellcheck disable=SC2016
           "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       # The cases that drive the PowerShell package, under the second release: the contract, the
@@ -4411,6 +4420,9 @@ jobs:
           tar --extract --gzip --file "$RUNNER_TEMP/$archive" --directory "$RUNNER_TEMP/powershell"
           chmod +x "$RUNNER_TEMP/powershell/pwsh"
           echo "$RUNNER_TEMP/powershell" >> "$GITHUB_PATH"
+          # The single-quoted text is a PowerShell command, and the `$` is PowerShell's own variable sigil:
+          # the shell must not expand it.
+          # shellcheck disable=SC2016
           "$RUNNER_TEMP/powershell/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       # The qualification records what the package found, where the cases look for it, and they
@@ -4456,6 +4468,9 @@ jobs:
             --directory "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION"
           chmod +x "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh"
           echo "KR_SECOND_POWERSHELL=$RUNNER_TEMP/powershell-$POWERSHELL_VERSION" >> "$GITHUB_ENV"
+          # The single-quoted text is a PowerShell command, and the `$` is PowerShell's own variable sigil:
+          # the shell must not expand it.
+          # shellcheck disable=SC2016
           "$RUNNER_TEMP/powershell-$POWERSHELL_VERSION/pwsh" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
 
       # The same cases as above, under the second release.

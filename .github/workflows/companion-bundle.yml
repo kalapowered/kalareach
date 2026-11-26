@@ -153,6 +153,9 @@ jobs:
           fi
 
           # The entry replaced the variable that this step's environment gave the build.
+          # The backquotes belong to the text that the entry prints, which grep searches for as it
+          # stands: the shell must not read them as a command substitution.
+          # shellcheck disable=SC2016
           if ! grep -F 'STATIC_VCRUNTIME was `true` in the environment' "$log"; then
             echo "::error::The entry did not say that it replaced STATIC_VCRUNTIME=true."
             exit 1

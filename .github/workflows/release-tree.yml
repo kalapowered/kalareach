@@ -396,6 +396,9 @@ jobs:
           "$store/current/bin/kr" --version
           for root in "$unpacked" "$store/versions/$RELEASE"; do
             identity="$(cat "$root/shells/zsh/current")"
+            # The single-quoted text is a zsh program, and zsh expands `$module_path` when it runs it:
+            # the shell that starts zsh must not.
+            # shellcheck disable=SC2016
             "$root/shells/zsh/$identity/bin/zsh" -f -c 'zmodload zsh/zle && print -r -- "zle loaded from $module_path[1]"'
           done
           bash scripts/check-host-start.sh "$store/current/bin/kr"
