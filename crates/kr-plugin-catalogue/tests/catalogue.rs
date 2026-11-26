@@ -3014,7 +3014,7 @@ fn placing_package_edited(
     std::fs::write(directory.join("connector.json"), &bytes).expect("writes");
     let mut manifest = read("plugin.json");
     edit_manifest(&mut manifest);
-    manifest["sdk_range"] = serde_json::json!(">=0.1.9, <0.2.0");
+    manifest["sdk_range"] = serde_json::json!(">=0.1.11, <0.2.0");
     let record = manifest["payloads"]
         .as_array_mut()
         .expect("payloads")
