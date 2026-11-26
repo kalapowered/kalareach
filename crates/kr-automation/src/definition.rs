@@ -79,6 +79,13 @@ pub const fn runs_a_command(action_kind: WorkflowActionKind) -> bool {
     )
 }
 
+/// Whether a node of `action_kind` starts a program of its own as the root of a session it creates,
+/// which this platform must be able to launch for a definition that holds one to be offered.
+#[must_use]
+pub const fn needs_root_program(action_kind: WorkflowActionKind) -> bool {
+    runs_a_command(action_kind)
+}
+
 /// What one action of `action_kind` spends of its chain's managed allowance.
 ///
 /// No kind this engine carries out spends one, so a chain that inherited no managed allowance
@@ -153,7 +160,7 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
     for node in &definition.nodes {
         // A command is run as a session's root through a POSIX shell, which this platform has not.
         // A definition that holds one is refused when it is offered rather than at each dispatch.
-        if cfg!(windows) && runs_a_command(node.action_kind) {
+        if cfg!(windows) && needs_root_program(node.action_kind) {
             return Err(AutomationError::ActionUnavailable {
                 action_kind: node.action_kind,
             });

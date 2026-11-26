@@ -250,7 +250,7 @@ pub(crate) mod fixtures {
             WorkflowActionKind::RequestReview => serde_json::json!({
                 "reviewer_id": "reviewer",
                 "version": version,
-                "workspace": kr_protocol::project::WorkspaceKind::SharedExisting,
+                "workspace": kr_protocol::project::WorkspaceKind::Isolated,
                 "instructions": "Review the change.",
             }),
             WorkflowActionKind::CreateSession => {

@@ -1192,6 +1192,17 @@ async fn a_revoked_grant_runs_no_workflow() {
     host.clients.abort();
 }
 
+/// The rights a review node needs: it starts the reviewer as the root of a session of its own, and
+/// prompts it.
+const REVIEW_RIGHTS: [ActionRight; 6] = [
+    ActionRight::TerminalInput,
+    ActionRight::SessionCreate,
+    ActionRight::SessionClose,
+    ActionRight::WorkspaceManage,
+    ActionRight::AgentPrompt,
+    ActionRight::SessionView,
+];
+
 /// The complete parameters of a review node: the reviewer, the version it reads and what it is
 /// asked.
 fn review_params() -> String {
@@ -1215,10 +1226,7 @@ async fn a_node_this_host_cannot_carry_out_fails_rather_than_succeeding() {
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(
-        grant_id(3),
-        &[ActionRight::AgentPrompt, ActionRight::SessionView],
-    );
+    host.issue(grant_id(3), &REVIEW_RIGHTS);
     let document = definition(
         workflow_id(3),
         grant_id(3),
@@ -2061,10 +2069,7 @@ async fn a_run_names_the_revision_it_executed_and_a_revision_never_installed_is_
     let host = host().await;
     let mut control = client(&host).await;
 
-    host.issue(
-        grant_id(33),
-        &[ActionRight::AgentPrompt, ActionRight::SessionView],
-    );
+    host.issue(grant_id(33), &REVIEW_RIGHTS);
     let review = WorkflowNode {
         node_id: "review".to_owned(),
         action_kind: WorkflowActionKind::RequestReview,

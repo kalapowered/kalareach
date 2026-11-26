@@ -302,6 +302,94 @@ fn arbitrary_template_syntax_is_strictly_rejected() {
     }
 }
 
+/// A review node with the stand-in parameters, whose `instructions` are `instructions`.
+fn review_node_asking(instructions: &str) -> WorkflowNode {
+    let mut params: serde_json::Value =
+        serde_json::from_str(&common::params(WorkflowActionKind::RequestReview))
+            .expect("the stand-in parameters are JSON");
+    params["instructions"] = serde_json::json!(instructions);
+    WorkflowNode {
+        node_id: "review".to_owned(),
+        action_kind: WorkflowActionKind::RequestReview,
+        action_params: params.to_string(),
+        declared_environment: Nullable::null(),
+    }
+}
+
+/// KR-REQ-25.13: the instructions of a review node are plain text, so each of the nine markers of
+/// template and shell substitution syntax is refused in them when the workflow is offered, and the
+/// same node with plain instructions is not.
+#[test]
+fn a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered() {
+    let grant = make_dummy_grant(test_grant_id(1), false);
+    let offered = |node: WorkflowNode| {
+        validate_definition(
+            &create_workflow_definition(
+                test_wf_id(1),
+                1,
+                "a review",
+                test_grant_id(1),
+                vec![node],
+                vec![],
+            ),
+            &grant,
+        )
+    };
+
+    offered(review_node_asking(
+        "Review the change and report what you find.",
+    ))
+    .expect("plain instructions are accepted, so a refusal below is the marker's");
+
+    let markers = ["{{", "}}", "${", "$(", "<%", "%>", "eval(", "exec(", "`"];
+    assert_eq!(
+        markers.len(),
+        9,
+        "the nine markers a review node's instructions may not hold"
+    );
+    for marker in markers {
+        let refusal = offered(review_node_asking(&format!("Review {marker} the change")))
+            .expect_err("the marker is refused");
+        assert!(
+            matches!(
+                &refusal,
+                AutomationError::TemplateCodeRejected { node_id } if node_id == "review"
+            ),
+            "marker {marker:?}: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains("template code is forbidden"),
+            "marker {marker:?}: {refusal}"
+        );
+    }
+}
+
+/// KR-REQ-25.14: a run of tests is run as the root of a session through a POSIX shell, so a
+/// definition that holds a test node is refused when it is offered on Windows.
+#[cfg(windows)]
+#[test]
+fn run_tests_stays_refused_on_windows_when_offered() {
+    let definition = create_workflow_definition(
+        test_wf_id(1),
+        1,
+        "a node that runs tests",
+        test_grant_id(1),
+        vec![common::node("tests", WorkflowActionKind::RunTests)],
+        vec![],
+    );
+    let refusal = validate_definition(&definition, &make_dummy_grant(test_grant_id(1), true))
+        .expect_err("Windows runs no test suite as the root of a session");
+    assert!(
+        matches!(
+            refusal,
+            AutomationError::ActionUnavailable {
+                action_kind: WorkflowActionKind::RunTests
+            }
+        ),
+        "{refusal}"
+    );
+}
+
 /// KR-REQ-25.13: a node names a registered action kind.
 ///
 /// A kind nothing registers never becomes a node: the definition naming it is refused when it is
@@ -393,7 +481,7 @@ fn each_action_kind_takes_its_complete_typed_parameters() {
             serde_json::json!({
                 "reviewer_id": "claude-code",
                 "version": version_value,
-                "workspace": serde_json::to_value(WorkspaceKind::SharedExisting).expect("a kind"),
+                "workspace": serde_json::to_value(WorkspaceKind::Isolated).expect("a kind"),
                 "instructions": "Review the change for correctness.",
             }),
         ),
