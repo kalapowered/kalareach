@@ -3808,7 +3808,7 @@ async fn an_owner_device_keeps_the_checkpoint_the_host_names_when_it_is_committe
     .await;
 
     let checkpoints = device.pairing.hosts.checkpoints();
-    let Held::Read { entries, owed } = checkpoints.held_checkpoints() else {
+    let Held::Read { entries, owed, .. } = checkpoints.held_checkpoints() else {
         panic!("the checkpoints are readable");
     };
     assert_eq!(owed, 0, "the host has answered");
@@ -3848,7 +3848,7 @@ async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_needs_another_r
     assert!(
         matches!(
             checkpoints.held_checkpoints(),
-            Held::Read { ref entries, owed: 0 } if entries.is_empty()
+            Held::Read { ref entries, owed: 0, .. } if entries.is_empty()
         ),
         "nothing is held and nothing is owed"
     );
@@ -3946,7 +3946,7 @@ async fn a_device_that_pairs_again_and_fails_its_first_read_is_owed_and_keeps_it
         Ok(Acquisition::Owed),
         "the old pairing's answer does not settle the new one"
     );
-    let Held::Read { entries, owed } = checkpoints.held_checkpoints() else {
+    let Held::Read { entries, owed, .. } = checkpoints.held_checkpoints() else {
         panic!("the checkpoints are readable");
     };
     assert_eq!(owed, 1, "the host owes one answer");

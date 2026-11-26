@@ -21,7 +21,7 @@
 //!   runs it on a blocking task.
 //! * A file this release cannot read is a refusal, never an empty set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -56,6 +56,10 @@ const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most checkpoints the file holds. A host cannot fill the file by naming archives.
 const MAX_CHECKPOINTS: usize = 1_024;
+
+/// The most checkpoints one host endpoint holds over the whole history of this file, whatever its
+/// producers, services, archives and pairings. A host cannot take the file's room for itself.
+const MAX_PER_HOST: usize = 16;
 
 /// The file the checkpoints and the answers are kept in.
 const CHECKPOINTS_FILE: &str = "checkpoints.json";
@@ -210,6 +214,10 @@ pub enum Held {
         entries: Vec<PairedCheckpoint>,
         /// How many owner pairings have no answer on file.
         owed: usize,
+        /// The hosts `hosts.json` lists, each by its endpoint and the name it gives people, read
+        /// together with the entries. An entry names its host by endpoint whether or not the host
+        /// is listed.
+        listed: Vec<(EndpointKey, Option<String>)>,
     },
     /// The checkpoints cannot be read. A restore refuses, and never reads this as no checkpoint.
     Unreadable {
@@ -400,6 +408,11 @@ impl PairedCheckpoints {
         match self.snapshot() {
             Ok((_lock, snapshot)) => Held::Read {
                 owed: snapshot.owed(),
+                listed: snapshot
+                    .hosts
+                    .iter()
+                    .map(|host| (host.host_endpoint_id, host.name.clone()))
+                    .collect(),
                 entries: snapshot.file.checkpoints,
             },
             Err(refused) => Held::Unreadable {
@@ -502,8 +515,9 @@ impl PairedCheckpoints {
         if next != file {
             let bytes = serde_json::to_vec(&next).map_err(|_| Unsettled::WriteFailed)?;
             // No readable file reaches this check. `parse` refuses a file of more than 1,024
-            // checkpoints or one that names a key or a pairing twice, and `take` refuses a new key
-            // at 1,024, so a result holds at most 1,024 checkpoints of 473 bytes or less (the
+            // checkpoints, one that names a key or a pairing twice and one that holds more than 16
+            // checkpoints of one endpoint, and `take` refuses a new key at 1,024 or at 16 of its
+            // endpoint, so a result holds at most 1,024 checkpoints of 473 bytes or less (the
             // longest service, an endpoint and a producer of 43 characters each, a generation and
             // a time of 20 digits). The settle drops each `told` entry of a pairing that no record
             // of `hosts.json` holds, so a result holds at most one `told` entry of 231 bytes or
@@ -593,7 +607,8 @@ impl PairedCheckpoints {
 
 /// Sets `given` against the checkpoint that `host` gave for its archive at its service, and takes
 /// it when it is newer. The entry is the one with the same endpoint, producer, service and archive;
-/// an answer of another host never raises it. A new key past the bound is refused.
+/// an answer of another host never raises it. A new key past the file's bound, or past the bound of
+/// the host's endpoint, is refused; an entry held is never refused, lowered or dropped.
 fn take(
     held: &mut Vec<PairedCheckpoint>,
     host: &PairedHost,
@@ -619,7 +634,13 @@ fn take(
         Standing::Lower => Ok(Outcome::Lower),
         Standing::Disagrees => Ok(Outcome::Disagrees),
         Standing::Raises => {
-            if !known && held.len() >= MAX_CHECKPOINTS {
+            // An entry held always rises. A new key is refused at the file's bound and at the
+            // bound of its host, which counts every entry of that endpoint.
+            let of_host = held
+                .iter()
+                .filter(|entry| entry.host_endpoint_id == host.host_endpoint_id)
+                .count();
+            if !known && (held.len() >= MAX_CHECKPOINTS || of_host >= MAX_PER_HOST) {
                 return Err(Unsettled::Full);
             }
             held.retain(|entry| !key(entry));
@@ -750,6 +771,16 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
     }) {
         return Err(unreadable(Shown::said(
             "it names one archive of one service for one host and producer twice",
+        )));
+    }
+    let mut per_host: BTreeMap<EndpointKey, usize> = BTreeMap::new();
+    for held in &file.checkpoints {
+        *per_host.entry(held.host_endpoint_id).or_default() += 1;
+    }
+    if per_host.values().any(|count| *count > MAX_PER_HOST) {
+        return Err(unreadable(crate::shown!(
+            "it holds more than {} checkpoints of one host",
+            MAX_PER_HOST
         )));
     }
     let mut pairings = BTreeSet::new();
@@ -974,6 +1005,28 @@ mod tests {
         other
     }
 
+    /// `value` as 32 bytes: `tag` and then the number, so that no two numbers share bytes.
+    fn counted(value: usize, tag: u8) -> [u8; 32] {
+        let mut bytes = [tag; 32];
+        bytes[24..].copy_from_slice(&u64::try_from(value).expect("a count").to_be_bytes());
+        bytes
+    }
+
+    /// `count` entries spread over endpoints, sixteen to each, so that the bound of a host is never
+    /// reached before the file's own.
+    fn spread(count: usize) -> Vec<PairedCheckpoint> {
+        (0..count)
+            .map(|position| PairedCheckpoint {
+                host_endpoint_id: EndpointKey::from_bytes(counted(position / MAX_PER_HOST, 0x10)),
+                producer: KeyId::from_bytes(counted(position / MAX_PER_HOST, 0x20)),
+                archive_id: ArchiveId::new(Uuid::from_bytes(
+                    u128::try_from(position + 1).expect("a count").to_be_bytes(),
+                )),
+                ..entry(1, 1)
+            })
+            .collect()
+    }
+
     struct Rig {
         _directory: tempfile::TempDir,
         hosts: PairedHosts,
@@ -1028,7 +1081,7 @@ mod tests {
     #[test]
     fn an_absent_file_is_the_empty_set_and_an_unanswered_owner_is_owed() {
         let rig = Rig::new();
-        let Held::Read { entries, owed } = rig.checkpoints.held_checkpoints() else {
+        let Held::Read { entries, owed, .. } = rig.checkpoints.held_checkpoints() else {
             panic!("an absent file reads as the empty set");
         };
         assert!(entries.is_empty());
@@ -1038,7 +1091,7 @@ mod tests {
         rig.hosts
             .record(host(7, &[ActionRight::SessionView]))
             .expect("recorded");
-        let Held::Read { entries, owed } = rig.checkpoints.held_checkpoints() else {
+        let Held::Read { entries, owed, .. } = rig.checkpoints.held_checkpoints() else {
             panic!("an absent file reads as the empty set");
         };
         assert!(entries.is_empty());
@@ -1056,7 +1109,7 @@ mod tests {
             vec![entry(1, 7), entry(2, 3)],
             vec![told(&first, Intended::Checkpoint)],
         );
-        let Held::Read { entries, owed } = rig.checkpoints.held_checkpoints() else {
+        let Held::Read { entries, owed, .. } = rig.checkpoints.held_checkpoints() else {
             panic!("a readable file");
         };
         assert_eq!(entries, vec![entry(1, 7), entry(2, 3)]);
@@ -1081,15 +1134,7 @@ mod tests {
             change(&mut value);
             value
         };
-        let too_many: Vec<PairedCheckpoint> = (0..=MAX_CHECKPOINTS)
-            .map(|position| {
-                let mut held = entry(1, 1);
-                held.archive_id = ArchiveId::new(Uuid::from_bytes(
-                    u128::try_from(position).expect("a count").to_be_bytes(),
-                ));
-                held
-            })
-            .collect();
+        let too_many = spread(MAX_CHECKPOINTS + 1);
         let cases: Vec<(&str, Vec<u8>, SnapshotCause)> = vec![
             ("a zero-byte file", Vec::new(), SnapshotCause::Unreadable),
             ("not JSON", b"{".to_vec(), SnapshotCause::Unreadable),
@@ -2035,9 +2080,9 @@ mod tests {
     }
 
     /// An entry is named once by its four-part key: two entries that differ in any one part read,
-    /// and two that repeat the key are refused.
+    /// two that repeat the key are refused, and one endpoint holds at most sixteen.
     #[test]
-    fn a_file_names_each_entry_once_by_its_four_part_key() {
+    fn a_file_names_each_entry_once_by_its_four_part_key_and_an_endpoint_at_most_sixteen_times() {
         let rig = Rig::new();
         let host = owner(1);
         let base = entry_of(&host, 1, 7);
@@ -2088,6 +2133,26 @@ mod tests {
             cause(&rig.checkpoints.held_checkpoints()),
             Some(SnapshotCause::Unreadable),
             "a repeated key"
+        );
+
+        let of_one_endpoint = |count: u8| -> Vec<PairedCheckpoint> {
+            (1..=count)
+                .map(|archive| entry_of(&host, archive, 1))
+                .collect()
+        };
+        rig.write_file(of_one_endpoint(16), Vec::new());
+        assert_eq!(held(&rig).len(), 16, "sixteen entries of one endpoint read");
+        rig.write_file(of_one_endpoint(17), Vec::new());
+        assert_eq!(
+            cause(&rig.checkpoints.held_checkpoints()),
+            Some(SnapshotCause::Unreadable),
+            "seventeen entries of one endpoint"
+        );
+        rig.write_file(spread(MAX_CHECKPOINTS), Vec::new());
+        assert_eq!(
+            held(&rig).len(),
+            MAX_CHECKPOINTS,
+            "1,024 entries spread over endpoints read"
         );
     }
 
@@ -2186,10 +2251,20 @@ mod tests {
         assert_eq!(held(&rig), before, "no answer changed an entry");
 
         rig.hosts.forget(first.host_device_id).expect("forgotten");
+        let Held::Read {
+            entries, listed, ..
+        } = rig.checkpoints.held_checkpoints()
+        else {
+            panic!("a readable file");
+        };
         assert_eq!(
-            held(&rig),
-            before,
+            entries, before,
             "a forgotten host's entry is still returned"
+        );
+        assert_eq!(
+            listed,
+            vec![(second.host_endpoint_id, second.name.clone())],
+            "the hosts that are listed come from the same read"
         );
         assert_eq!(
             settle(&second, given(1, 1)),
@@ -2200,12 +2275,18 @@ mod tests {
 
         let mut replaced = at_another_endpoint(&second);
         replaced.device_id = DeviceId::new(Uuid::from_bytes([60; 16]));
-        rig.hosts.record(replaced).expect("a new pairing");
+        rig.hosts.record(replaced.clone()).expect("a new pairing");
+        let Held::Read {
+            entries, listed, ..
+        } = rig.checkpoints.held_checkpoints()
+        else {
+            panic!("a readable file");
+        };
         assert_eq!(
-            held(&rig),
-            before,
+            entries, before,
             "a replaced pairing's entry is still returned"
         );
+        assert_eq!(listed, vec![(replaced.host_endpoint_id, replaced.name)]);
     }
 
     /// A record that is no owner takes nothing, whether or not the lock is held; a pairing that is
@@ -2396,48 +2477,136 @@ mod tests {
     /// The bytes of the file's own members.
     const FILE_BYTES: u64 = 40;
 
-    /// A new archive past the bound is refused and an archive already held still rises, and an
-    /// answer of generation 0 is never written.
+    /// Whether two entries have the same key: endpoint, producer, service and archive.
+    fn same_key(left: &PairedCheckpoint, right: &PairedCheckpoint) -> bool {
+        left.host_endpoint_id == right.host_endpoint_id
+            && left.producer == right.producer
+            && left.service_origin == right.service_origin
+            && left.archive_id == right.archive_id
+    }
+
+    /// A new key is refused at sixteen entries of one endpoint, whatever its producer, service or
+    /// pairing; an entry held still rises there, another endpoint still settles, nothing is dropped,
+    /// and an answer of generation 0 is never written.
     #[test]
-    fn the_bound_refuses_a_new_archive_and_generation_zero_is_never_written() {
+    fn a_new_key_is_full_at_sixteen_entries_of_one_endpoint_and_nothing_is_dropped() {
         let rig = Rig::new();
-        let record = owner(1);
-        rig.hosts.record(record.clone()).expect("recorded");
-        let full: Vec<PairedCheckpoint> = (0..MAX_CHECKPOINTS)
-            .map(|position| {
-                let mut held = entry_of(&record, 1, 1);
-                held.archive_id = ArchiveId::new(Uuid::from_bytes(
-                    u128::try_from(position + 1).expect("a count").to_be_bytes(),
-                ));
-                held
-            })
-            .collect();
-        rig.write_file(full, Vec::new());
+        let first = owner(1);
+        rig.hosts.record(first.clone()).expect("recorded");
+        for archive in 1..=16 {
+            assert_eq!(
+                rig.checkpoints
+                    .settle_checkpoint(&first, &given(archive, 1), NOW),
+                settled(Outcome::New),
+                "archive {archive}"
+            );
+        }
         let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
 
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(&record, &given(200, 1), NOW),
-            Err(Unsettled::Full)
+                .settle_checkpoint(&first, &given(17, 1), NOW),
+            Err(Unsettled::Full),
+            "the 17th archive of one endpoint"
         );
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(&record, &given(1, 0), NOW),
-            Err(Unsettled::Malformed)
+                .settle_checkpoint(&under_another_producer(&first), &given(17, 1), NOW),
+            Err(Unsettled::Full),
+            "the same endpoint under another producer"
+        );
+        let elsewhere = Answer::Checkpoint(host_checkpoint("https://other.example", 1, 1, 1));
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&first, &elsewhere, NOW),
+            Err(Unsettled::Full),
+            "the same endpoint at another service"
+        );
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&first, &given(1, 0), NOW),
+            Err(Unsettled::Malformed),
+            "generation 0 is never written"
+        );
+        let mut again = first.clone();
+        again.device_id = DeviceId::new(Uuid::from_bytes([50; 16]));
+        rig.hosts.record(again.clone()).expect("a second pairing");
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&again, &given(17, 1), NOW),
+            Err(Unsettled::Full),
+            "the same endpoint under a second pairing"
         );
         assert_eq!(
             std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
             before,
             "nothing was written"
         );
-        let mut known = host_checkpoint("https://reach.kala.to", 1, 5, 1);
-        known.archive_id = ArchiveId::new(Uuid::from_bytes(1_u128.to_be_bytes()));
+
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&again, &given(1, 9), NOW),
+            settled(Outcome::Raised),
+            "an entry held still rises at sixteen"
+        );
+        assert_eq!(held(&rig).len(), 16, "nothing was dropped");
+        let second = owner(4);
+        rig.hosts.record(second.clone()).expect("recorded");
         assert_eq!(
             rig.checkpoints
-                .settle_checkpoint(&record, &Answer::Checkpoint(known), NOW),
-            settled(Outcome::Raised),
-            "an archive already held still rises at the bound"
+                .settle_checkpoint(&second, &given(17, 1), NOW),
+            settled(Outcome::New),
+            "another endpoint still settles"
         );
+        assert_eq!(held(&rig).len(), 17);
+    }
+
+    /// A new key is refused at the file's total bound, and the bound of a host cannot be what
+    /// refuses it; an entry held still rises there; no entry is lowered or removed.
+    #[test]
+    fn a_new_key_is_full_at_the_total_bound_and_an_entry_held_still_rises_there() {
+        let rig = Rig::new();
+        let hosts: Vec<PairedHost> = (0..MAX_CHECKPOINTS / MAX_PER_HOST)
+            .map(|position| owner(u8::try_from(1 + 3 * position).expect("a byte")))
+            .collect();
+        let full: Vec<PairedCheckpoint> = hosts
+            .iter()
+            .flat_map(|host| (1..=16_u8).map(move |archive| entry_of(host, archive, 1)))
+            .collect();
+        assert_eq!(full.len(), MAX_CHECKPOINTS);
+        rig.write_file(full.clone(), Vec::new());
+        assert_eq!(held(&rig).len(), MAX_CHECKPOINTS, "the file reads");
+        let extra = owner(250);
+        rig.hosts.record(extra.clone()).expect("recorded");
+        rig.hosts.record(hosts[0].clone()).expect("recorded");
+        let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
+
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&extra, &given(1, 1), NOW),
+            Err(Unsettled::Full),
+            "a host that holds none is refused at the total bound"
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            before,
+            "nothing was written"
+        );
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&hosts[0], &given(1, 9), NOW),
+            settled(Outcome::Raised),
+            "an entry held still rises at the total bound"
+        );
+        let after = held(&rig);
+        assert_eq!(after.len(), MAX_CHECKPOINTS, "nothing was dropped");
+        for was in &full {
+            let now = after
+                .iter()
+                .find(|entry| same_key(entry, was))
+                .expect("every entry is kept");
+            assert!(
+                now.backup_generation >= was.backup_generation,
+                "none is lowered"
+            );
+        }
+        assert_eq!(generation_at(&rig, &hosts[0], ORIGIN, 1), Some(9));
     }
 
     /// An answer of a pairing that has gone is dropped at the next settle.
@@ -2562,48 +2731,84 @@ mod tests {
         );
     }
 
-    /// Handles of one directory, on two threads, never lose each other's entries or lower one.
+    /// How long a test settles again after Busy. Each try already waited the lock's own bound, so a
+    /// slow disk is waited for and a lock that is never let go is still found.
+    const SETTLE_WITHIN: Duration = Duration::from_secs(120);
+
+    /// Settles, and settles again after each Busy until [`SETTLE_WITHIN`] has passed. The store's
+    /// answer at Busy is legal and writes nothing; a caller that wants the answer kept asks again.
+    fn settled_within(
+        checkpoints: &PairedCheckpoints,
+        host: &PairedHost,
+        answer: &Answer,
+    ) -> Result<Settled, Unsettled> {
+        let started = Instant::now();
+        loop {
+            match checkpoints.settle_checkpoint(host, answer, NOW) {
+                Err(Unsettled::Busy) if started.elapsed() < SETTLE_WITHIN => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Four owners that no record shares an identity or an endpoint with.
+    fn four_owners(rig: &Rig) -> Vec<PairedHost> {
+        let hosts: Vec<PairedHost> = [1_u8, 4, 7, 10].into_iter().map(owner).collect();
+        for host in &hosts {
+            rig.hosts.record(host.clone()).expect("recorded");
+        }
+        hosts
+    }
+
+    /// Handles of one directory, on two threads, never lose each other's entries or lower one. A
+    /// settle that meets Busy is made again, so the checks are on what the file holds.
     #[test]
     fn two_handles_settling_beside_each_other_lose_no_entry_and_lower_none() {
         let rig = Rig::new();
-        let record = owner(1);
-        rig.hosts.record(record.clone()).expect("recorded");
-        let spawn = |archives: std::ops::Range<u8>| {
+        let hosts = four_owners(&rig);
+        let spawn = |own: Vec<PairedHost>| {
             let checkpoints = rig.hosts.checkpoints();
-            let record = record.clone();
             std::thread::spawn(move || {
-                for archive in archives {
-                    checkpoints
-                        .settle_checkpoint(&record, &given(archive, 1), NOW)
-                        .expect("settled");
+                for host in &own {
+                    for archive in 1..=8_u8 {
+                        settled_within(&checkpoints, host, &given(archive, 1)).expect("settled");
+                    }
                 }
             })
         };
-        let (first, second) = (spawn(1..31), spawn(31..61));
+        let (first, second) = (spawn(hosts[..2].to_vec()), spawn(hosts[2..].to_vec()));
         first.join().expect("the first thread");
         second.join().expect("the second thread");
-        assert_eq!(entries(&rig).len(), 60, "every entry is there");
+        assert_eq!(held(&rig).len(), 32, "every entry is there");
+        for host in &hosts {
+            for archive in 1..=8_u8 {
+                assert_eq!(generation_at(&rig, host, ORIGIN, archive), Some(1));
+            }
+        }
 
         for round in 0..20_u8 {
+            let host = &hosts[usize::from(round) % hosts.len()];
             let key = 100 + round;
             let handles: Vec<_> = [10_u64, 12, 11]
                 .into_iter()
                 .map(|generation| {
                     let checkpoints = rig.hosts.checkpoints();
-                    let record = record.clone();
+                    let host = host.clone();
                     std::thread::spawn(move || {
-                        checkpoints.settle_checkpoint(&record, &given(key, generation), NOW)
+                        settled_within(&checkpoints, &host, &given(key, generation))
                     })
                 })
                 .collect();
             for handle in handles {
                 handle.join().expect("a thread").expect("settled");
             }
-            assert!(
-                entries(&rig).contains(&(key, 12)),
+            assert_eq!(
+                generation_at(&rig, host, ORIGIN, key),
+                Some(12),
                 "round {round}: generations 10, 12 and 11 end at 12"
             );
         }
+        assert_eq!(held(&rig).len(), 52, "no entry was lost or added twice");
     }
 
     /// A second process settles beside this one under the same lock.
@@ -2611,19 +2816,19 @@ mod tests {
     fn a_second_process_settles_beside_this_one() {
         const CHILD: &str = "KR_CHECKPOINT_TEST_DIRECTORY";
         if let Ok(directory) = std::env::var(CHILD) {
-            // The child process: it settles thirty archives through a handle of its own.
+            // The child process: it settles eight archives of each of the last two hosts through a
+            // handle of its own.
             let checkpoints = PairedCheckpoints::open(&directory).expect("the directory");
-            let record = read_hosts(Path::new(&directory)).expect("hosts").remove(0);
-            for archive in 31..61_u8 {
-                checkpoints
-                    .settle_checkpoint(&record, &given(archive, 1), NOW)
-                    .expect("settled");
+            let hosts = read_hosts(Path::new(&directory)).expect("hosts");
+            for host in &hosts[2..] {
+                for archive in 1..=8_u8 {
+                    settled_within(&checkpoints, host, &given(archive, 1)).expect("settled");
+                }
             }
             return;
         }
         let rig = Rig::new();
-        let record = owner(1);
-        rig.hosts.record(record.clone()).expect("recorded");
+        let hosts = four_owners(&rig);
         let mut child = std::process::Command::new(std::env::current_exe().expect("this program"))
             .args([
                 "--exact",
@@ -2632,12 +2837,90 @@ mod tests {
             .env(CHILD, rig.hosts.directory())
             .spawn()
             .expect("the child starts");
-        for archive in 1..31_u8 {
-            rig.checkpoints
-                .settle_checkpoint(&record, &given(archive, 1), NOW)
-                .expect("settled");
+        for host in &hosts[..2] {
+            for archive in 1..=8_u8 {
+                settled_within(&rig.checkpoints, host, &given(archive, 1)).expect("settled");
+            }
         }
         assert!(child.wait().expect("the child ends").success());
-        assert_eq!(entries(&rig).len(), 60, "both processes' entries are there");
+        assert_eq!(held(&rig).len(), 32, "both processes' entries are there");
+        for host in &hosts {
+            for archive in 1..=8_u8 {
+                assert_eq!(generation_at(&rig, host, ORIGIN, archive), Some(1));
+            }
+        }
+    }
+
+    /// The store's own promise at Busy, with no load: while another handle holds the lock, every
+    /// settle that would change the file answers Busy after the lock's bound, writes nothing and
+    /// lowers nothing, and the same answers settle once the lock is let go. The holder is a second
+    /// handle of the lock file, which is what another process holding it is to the store.
+    #[test]
+    fn a_settle_that_meets_a_held_lock_answers_busy_and_writes_and_lowers_nothing() {
+        let rig = Rig::new();
+        let (record, fresh) = (owner(1), owner(4));
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.hosts.record(fresh.clone()).expect("recorded");
+        for (archive, generation) in [(1, 9), (2, 4)] {
+            rig.checkpoints
+                .settle_checkpoint(&record, &given(archive, generation), NOW)
+                .expect("settled");
+        }
+        let before = std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file");
+        let holder = kr_ipc::paths::open_lock_file(&rig.path(LOCK_FILE)).expect("a lock file");
+        kr_flush::lock::exclusive(&holder).expect("held");
+
+        // A raise, a lower, an answer of nothing published, a new archive and the first answer of a
+        // host that was never told wait for the bound on their own threads, so that the case takes
+        // one bound and not five.
+        let answers = [
+            (&record, given(1, 12)),
+            (&record, given(1, 5)),
+            (&record, Answer::NothingPublished),
+            (&record, given(3, 1)),
+            (&fresh, given(4, 1)),
+        ];
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = answers
+                .iter()
+                .map(|(host, answer)| {
+                    scope.spawn(|| rig.checkpoints.settle_checkpoint(host, answer, NOW))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a thread"))
+                .collect()
+        });
+        assert_eq!(results, vec![Err(Unsettled::Busy); answers.len()]);
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            before,
+            "nothing was written"
+        );
+
+        kr_flush::lock::release(&holder).expect("released");
+        assert_eq!(entries(&rig), vec![(1, 9), (2, 4)], "nothing was lowered");
+        assert_eq!(
+            rig.checkpoints.acquisition(&fresh),
+            Ok(Acquisition::Owed),
+            "a host whose answer met Busy is still owed, so the next ask is made"
+        );
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&record, &given(1, 12), NOW),
+            settled(Outcome::Raised),
+            "the same answer settles once the lock is let go"
+        );
+        assert_eq!(
+            rig.checkpoints.settle_checkpoint(&fresh, &given(4, 1), NOW),
+            settled(Outcome::New)
+        );
+        assert_eq!(
+            rig.checkpoints.acquisition(&fresh),
+            Ok(Acquisition::Told),
+            "and the host is told once it settles"
+        );
+        assert_eq!(entries(&rig), vec![(1, 12), (2, 4), (4, 1)]);
     }
 }

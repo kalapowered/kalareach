@@ -335,7 +335,7 @@ fn a_rollback_reads_the_paired_hosts_as_before_and_the_checkpoints_are_there_whe
         "the waiting attempt is the one that was kept"
     );
     let checkpoints = PairedCheckpoints::open(&folder).expect("opened again");
-    let Held::Read { entries, owed } = checkpoints.held_checkpoints() else {
+    let Held::Read { entries, owed, .. } = checkpoints.held_checkpoints() else {
         panic!("the checkpoints are read again")
     };
     assert_eq!(owed, 0, "the host's answer is still on file");
@@ -352,4 +352,79 @@ fn a_rollback_reads_the_paired_hosts_as_before_and_the_checkpoints_are_there_whe
         panic!("the checkpoints are read again")
     };
     assert_eq!(entries[0].backup_generation.get(), 7);
+}
+
+/// KR-REQ-20.12: the older release never reads `checkpoints.json`, so what it does to the paired
+/// hosts leaves every entry. A forget by it takes a record out of `hosts.json` and no entry out of
+/// the checkpoints, and the newer release, back again, returns every entry with only the hosts that
+/// remain listed.
+#[test]
+fn a_forget_by_the_older_release_leaves_every_entry() {
+    let directory = tempfile::tempdir().expect("a directory");
+    let folder = directory.path().join("pairing");
+    let hosts = PairedHosts::open(&folder).expect("a store");
+    let (first, second) = (owner(0x10), owner(0x20));
+    hosts.record(first.clone()).expect("a paired host");
+    hosts.record(second.clone()).expect("a paired host");
+    let checkpoints = hosts.checkpoints();
+    checkpoints
+        .settle_checkpoint(&first, &the_answer(5), 1_000)
+        .expect("the first host's answer");
+    checkpoints
+        .settle_checkpoint(&second, &the_answer(6), 2_000)
+        .expect("the second host's answer");
+    let entries_before = bytes(&folder, "checkpoints.json").expect("the checkpoints file");
+
+    // The older release reads the file of hosts as its own type and writes it back without the
+    // first host, then without any.
+    let Ok(frozen) =
+        serde_json::from_slice::<FrozenHostsFile>(&bytes(&folder, "hosts.json").expect("hosts"))
+    else {
+        panic!("the older release reads the file of hosts")
+    };
+    let remaining: Vec<FrozenHost> = frozen
+        .hosts
+        .into_iter()
+        .filter(|host| host.host_device_id != first.host_device_id)
+        .collect();
+    assert_eq!(remaining.len(), 1);
+    for (left, listed) in [(remaining, vec![second.clone()]), (Vec::new(), Vec::new())] {
+        kr_ipc::paths::write_owner_only_file(
+            &folder.join("hosts.json"),
+            &serde_json::to_vec(&FrozenHostsFile {
+                version: 1,
+                hosts: left,
+            })
+            .expect("the file of hosts"),
+        )
+        .expect("written by the older release");
+        assert_eq!(
+            bytes(&folder, "checkpoints.json"),
+            Some(entries_before.clone()),
+            "the older release does not touch the checkpoints"
+        );
+        let again = PairedCheckpoints::open(&folder).expect("opened again");
+        let Held::Read {
+            entries,
+            owed: _,
+            listed: now,
+        } = again.held_checkpoints()
+        else {
+            panic!("the checkpoints are read again")
+        };
+        let mut generations: Vec<u64> = entries
+            .iter()
+            .map(|entry| entry.backup_generation.get())
+            .collect();
+        generations.sort_unstable();
+        assert_eq!(generations, vec![5, 6], "every entry is still returned");
+        assert_eq!(
+            now,
+            listed
+                .iter()
+                .map(|host| (host.host_endpoint_id, host.name.clone()))
+                .collect::<Vec<_>>(),
+            "only the hosts that remain are listed"
+        );
+    }
 }

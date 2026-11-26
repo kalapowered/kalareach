@@ -2884,7 +2884,11 @@ fn given_by_a_host(sealed: &Sealed) -> PairedCheckpoint {
 
 /// The checkpoints a computer holds when each of `entries` was given by a host and none is owed.
 fn held_with(entries: Vec<PairedCheckpoint>) -> Held {
-    Held::Read { entries, owed: 0 }
+    Held::Read {
+        entries,
+        owed: 0,
+        listed: Vec::new(),
+    }
 }
 
 /// A restore held to `held`, with the older generation named when `accept` is.
@@ -3954,6 +3958,7 @@ async fn the_list_says_what_holds_an_archive_back_and_what_the_paired_hosts_say_
     let owed = Held::Read {
         entries: Vec::new(),
         owed: 1,
+        listed: Vec::new(),
     };
     assert_eq!(
         list(&world, &source, &owed).await[0].pairing,
@@ -3969,7 +3974,8 @@ async fn the_list_says_what_holds_an_archive_back_and_what_the_paired_hosts_say_
             &source,
             &Held::Read {
                 entries: vec![elsewhere],
-                owed: 1
+                owed: 1,
+                listed: Vec::new(),
             }
         )
         .await[0]

@@ -4963,7 +4963,7 @@ mod tests {
             let checkpoints = run.hosts.checkpoints();
             let held = checkpoints.held_checkpoints();
             assert!(
-                matches!(&held, Held::Read { entries, owed: 0 } if entries.len() == 1
+                matches!(&held, Held::Read { entries, owed: 0, .. } if entries.len() == 1
                     && entries[0].backup_generation.get() == 7),
                 "told {told}: {held:?}"
             );
@@ -5018,7 +5018,7 @@ mod tests {
         );
         assert!(matches!(
             checkpoints.held_checkpoints(),
-            Held::Read { ref entries, owed: 0 } if entries.is_empty()
+            Held::Read { ref entries, owed: 0, .. } if entries.is_empty()
         ));
     }
 
@@ -5281,7 +5281,7 @@ mod tests {
             let run = completed(arm, &[(READ, Meanwhile::Forget)]).await;
             assert!(
                 matches!(run.hosts.checkpoints().held_checkpoints(),
-                    Held::Read { ref entries, owed: 0 } if entries.len() == 1
+                    Held::Read { ref entries, owed: 0, .. } if entries.len() == 1
                         && entries[0].backup_generation.get() == 7),
                 "{arm:?}"
             );
@@ -5552,7 +5552,7 @@ mod tests {
             );
             assert!(
                 matches!(first.hosts.checkpoints().held_checkpoints(),
-                    Held::Read { ref entries, owed: 0 } if entries.len() == 1),
+                    Held::Read { ref entries, owed: 0, .. } if entries.len() == 1),
                 "told {told}: the answer is kept and the host is not owed"
             );
             assert_eq!(
@@ -5651,7 +5651,7 @@ mod tests {
             );
             assert!(
                 matches!(checkpoints.held_checkpoints(),
-                    Held::Read { ref entries, owed: 0 } if entries.len() == 1
+                    Held::Read { ref entries, owed: 0, .. } if entries.len() == 1
                         && entries[0].backup_generation.get() == 7),
                 "recorded {recorded}: the checkpoint is kept"
             );
