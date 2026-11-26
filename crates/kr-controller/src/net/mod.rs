@@ -5511,15 +5511,10 @@ pub(crate) mod tests {
             .execute_batch("UPDATE boots SET high_ms = 0")
             .expect("the high goes back");
         assert_eq!(high(), 0);
-        // The loop's task makes its sleep when it is first polled, so it is polled before the
-        // time moves: a sleep made after the move would not be due.
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::advance(super::CLOCK_MARK_INTERVAL + std::time::Duration::from_secs(1)).await;
-        for _ in 0..200 {
-            tokio::task::yield_now().await;
-        }
+        // The test's own sleep ends one second after the loop's, on the time this test moves: the
+        // runtime moves the time to the earliest sleep, so the loop's turn is over when this
+        // returns, and nothing here waits for it by a count or a bound.
+        tokio::time::sleep(super::CLOCK_MARK_INTERVAL + std::time::Duration::from_secs(1)).await;
         assert!(
             high() > 0,
             "a turn of the loop raised the high that the test had put back"
