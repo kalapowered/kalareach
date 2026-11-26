@@ -249,6 +249,7 @@ impl TreeHold {
             config_digest: hex::encode(self.config.digest),
             hooks: self.listing.hooks.clone(),
             info_attributes: self.listing.info_attributes.clone(),
+            info_exclude: self.listing.info_exclude.clone(),
             absent_names: self.listing.absent_names.clone(),
         }
     }

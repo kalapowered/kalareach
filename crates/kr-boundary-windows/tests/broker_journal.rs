@@ -57,6 +57,7 @@ fn snapshot(id: u32, kind: SnapshotKind) -> Row {
             sha256: "cd".repeat(32),
         }],
         info_attributes: None,
+        info_exclude: None,
         absent_names: vec!["info/exclude.lock".to_owned()],
     }
 }
@@ -999,6 +1000,7 @@ fn worst_snapshot(id: u32) -> Row {
         config_digest: "ab".repeat(32),
         hooks: (0..limits::HOOKS as u64).map(file).collect(),
         info_attributes: Some(file(7)),
+        info_exclude: Some(file(8)),
         absent_names: vec!["a".repeat(limits::NAME_BYTES); limits::ABSENT_NAMES],
     }
 }
@@ -2203,6 +2205,7 @@ fn a_writer_that_resumes_a_file_counts_the_bytes_that_are_in_it_and_what_it_stil
             })
             .collect(),
         info_attributes: None,
+        info_exclude: None,
         absent_names: Vec::new(),
     };
     let mut reader = Tracker::reading();

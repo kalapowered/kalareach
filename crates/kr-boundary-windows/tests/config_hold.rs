@@ -655,6 +655,8 @@ fn config_hold_a_listed_hook_is_held_for_reading_only_and_a_new_name_is_seen_at_
     plant(&hook, b"echo one\n");
     plant(&nested, b"echo two\n");
     plant(&attributes, b"* text=auto\n");
+    let exclude = project.git.join(r"info\exclude");
+    plant(&exclude, b"*.log\n");
     let hold =
         hold_tree(project.root.to_str().unwrap(), &ordinary.as_client()).expect("the tree is held");
     // What the hold took, by name, and the journal's row of it.
@@ -674,6 +676,13 @@ fn config_hold_a_listed_hook_is_held_for_reading_only_and_a_new_name_is_seen_at_
             .as_ref()
             .map(|file| file.name.as_str()),
         Some(r"info\attributes")
+    );
+    assert_eq!(
+        hold.listing
+            .info_exclude
+            .as_ref()
+            .map(|file| file.name.as_str()),
+        Some(r"info\exclude")
     );
     let row = hold.snapshot_row(1, SnapshotKind::Initial);
     row.check_caps().expect("the journal records the row");
@@ -698,6 +707,7 @@ fn config_hold_a_listed_hook_is_held_for_reading_only_and_a_new_name_is_seen_at_
         ("a hook", &hook),
         ("a hook in a folder", &nested),
         ("the attributes file", &attributes),
+        ("the exclude file", &exclude),
     ] {
         let written = fs::write(file, b"echo ONE\n").expect_err(what);
         assert_eq!(code(&written), SHARING_VIOLATION, "{what} is written");

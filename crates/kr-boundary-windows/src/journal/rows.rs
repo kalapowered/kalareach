@@ -199,6 +199,8 @@ pub enum Row {
         hooks: Vec<DigestedFile>,
         /// The `info\attributes` file, when there is one.
         info_attributes: Option<DigestedFile>,
+        /// The `info\exclude` file, when there is one.
+        info_exclude: Option<DigestedFile>,
         /// The names that must be absent from the Git directory.
         absent_names: Vec<String>,
     },
@@ -449,6 +451,7 @@ impl Row {
                 config_digest,
                 hooks,
                 info_attributes,
+                info_exclude,
                 absent_names,
                 ..
             } => {
@@ -462,6 +465,9 @@ impl Row {
                     digested(hook)?;
                 }
                 if let Some(file) = info_attributes {
+                    digested(file)?;
+                }
+                if let Some(file) = info_exclude {
                     digested(file)?;
                 }
                 if absent_names.len() > ABSENT_NAMES {

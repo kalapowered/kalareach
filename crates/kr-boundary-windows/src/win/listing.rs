@@ -63,6 +63,8 @@ pub struct RepositoryListing {
     pub hooks: Vec<DigestedFile>,
     /// The `info\attributes` file, when there is one.
     pub info_attributes: Option<DigestedFile>,
+    /// The `info\exclude` file, when there is one.
+    pub info_exclude: Option<DigestedFile>,
     /// The names that must be absent.
     pub absent_names: Vec<String>,
 }
@@ -278,29 +280,44 @@ fn list_hooks(
     }
 }
 
-/// The `info\attributes` file, when the `info` folder has one.
+/// The `info\attributes` and `info\exclude` files, when the `info` folder has them: in that order.
 fn read_info(
     git: &DirHandle,
     child: &Child,
-    holds: Option<&mut Vec<Handle>>,
-) -> Result<Option<DigestedFile>, Failure> {
+    mut holds: Option<&mut Vec<Handle>>,
+) -> Result<(Option<DigestedFile>, Option<DigestedFile>), Failure> {
     let name = child.display();
     if !is_folder(child) {
         // A file or a link where the folder belongs is recorded as it is, and nothing is entered.
-        return Ok(Some(record(git, child, name, MAX_FILE_BYTES, holds)?));
+        return Ok((Some(record(git, child, name, MAX_FILE_BYTES, holds)?), None));
     }
     let info = open_folder(git, child)?;
     let Some(inside) = info.children_up_to(MAX_OBJECTS)? else {
         return Err(Failure::TooLarge);
     };
+    let (mut attributes, mut exclude) = (None, None);
     for inner in inside {
+        let relative = format!("{name}\\{}", inner.display());
         if inner.display().eq_ignore_ascii_case("attributes") {
-            let relative = format!("{name}\\{}", inner.display());
             let limit = MAX_ATTRIBUTES_BYTES as u64;
-            return record(&info, &inner, relative, limit, holds).map(Some);
+            attributes = Some(record(
+                &info,
+                &inner,
+                relative,
+                limit,
+                holds.as_deref_mut(),
+            )?);
+        } else if inner.display().eq_ignore_ascii_case("exclude") {
+            exclude = Some(record(
+                &info,
+                &inner,
+                relative,
+                MAX_FILE_BYTES,
+                holds.as_deref_mut(),
+            )?);
         }
     }
-    Ok(None)
+    Ok((attributes, exclude))
 }
 
 /// Takes the listing of the held Git directory.
@@ -331,6 +348,7 @@ fn take_by(
 ) -> Result<RepositoryListing, Failure> {
     let mut hooks = Vec::new();
     let mut info_attributes = None;
+    let mut info_exclude = None;
     let Some(inside) = git.children_up_to(MAX_OBJECTS)? else {
         return Err(Failure::TooLarge);
     };
@@ -339,7 +357,7 @@ fn take_by(
         if name.eq_ignore_ascii_case("hooks") {
             list_hooks(git, &child, &mut hooks, holds.as_deref_mut())?;
         } else if name.eq_ignore_ascii_case("info") {
-            info_attributes = read_info(git, &child, holds.as_deref_mut())?;
+            (info_attributes, info_exclude) = read_info(git, &child, holds.as_deref_mut())?;
         }
     }
     if hooks.len() > HOOKS {
@@ -349,6 +367,7 @@ fn take_by(
     Ok(RepositoryListing {
         hooks,
         info_attributes,
+        info_exclude,
         absent_names: ABSENT_NAMES.iter().map(|name| (*name).to_owned()).collect(),
     })
 }
@@ -430,6 +449,9 @@ pub(super) fn differences(held: &RepositoryListing, now: &RepositoryListing) -> 
     compare(&held.hooks, &now.hooks, &mut names);
     let before: Vec<DigestedFile> = held.info_attributes.iter().cloned().collect();
     let after: Vec<DigestedFile> = now.info_attributes.iter().cloned().collect();
+    compare(&before, &after, &mut names);
+    let before: Vec<DigestedFile> = held.info_exclude.iter().cloned().collect();
+    let after: Vec<DigestedFile> = now.info_exclude.iter().cloned().collect();
     compare(&before, &after, &mut names);
     names.into_iter().collect()
 }

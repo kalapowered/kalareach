@@ -80,7 +80,7 @@ pub const BEGIN_MAX: usize =
 /// The largest `RepositorySnapshot` row.
 pub const SNAPSHOT_MAX: usize = OVERHEAD
     + 64
-    + (HOOKS + 1) * (NAME_BYTES + KEY_JSON + 64 + 64)
+    + (HOOKS + 2) * (NAME_BYTES + KEY_JSON + 64 + 64)
     + ABSENT_NAMES * (NAME_BYTES + 4);
 /// The largest `RootIntent`, `RootMade` or `RootRemoved` row.
 pub const ROOT_MAX: usize = OVERHEAD;

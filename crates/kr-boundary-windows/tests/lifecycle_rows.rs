@@ -46,6 +46,7 @@ fn snapshot(id: u32, kind: SnapshotKind) -> Row {
             sha256: "cd".repeat(32),
         }],
         info_attributes: None,
+        info_exclude: None,
         absent_names: Vec::new(),
     }
 }
