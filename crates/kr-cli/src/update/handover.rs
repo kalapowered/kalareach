@@ -356,11 +356,13 @@ pub(crate) const STOP_COMMAND: &str = if cfg!(windows) {
 /// Whether a message may tell a person to end the process `pid` with [`STOP_COMMAND`]: not for 0
 /// and 1, which name no one process (`kill -KILL 0` ends a whole group), and not for this process
 /// or its parent, which is the person's shell or the program that runs this one. A number that a
-/// lock file names is read from a file anyone can write, and a command a message gives is run as
-/// it stands. A number above [`LARGEST_NAMED_PROCESS`] is refused too, since a command line tool may
-/// read the number into 32 bits, and a result of 0 or below names a group of processes.
+/// lock file names is read from a file that any program of this account can write, and a command a
+/// message gives is run as it stands. A number above [`LARGEST_NAMED_PROCESS`] is refused too,
+/// since a command line tool may read the number into 32 bits, and a result of 0 or below names a
+/// group of processes.
 ///
-/// On Windows the standard library names no parent, so only 0, 1 and this process are refused there.
+/// On Windows the standard library names no parent, so only 0, 1, this process and a number above
+/// `u32::MAX` are refused there.
 pub(crate) fn may_tell_to_stop(pid: u64) -> bool {
     pid > 1
         && pid <= LARGEST_NAMED_PROCESS
@@ -390,12 +392,18 @@ fn parent_process_id() -> Option<u64> {
     None
 }
 
-/// The process numbers that no printed command may name: 0 and 1, this process and its parent.
+/// The process numbers that no printed command may name: 0 and 1, this process and its parent. The
+/// parent is read from the standard library here, not through [`parent_process_id`], so that a cut
+/// in that function leaves the number that the cases expect.
 #[cfg(test)]
 pub(crate) fn never_named() -> Vec<u64> {
+    #[cfg(unix)]
+    let parent = Some(u64::from(std::os::unix::process::parent_id()));
+    #[cfg(not(unix))]
+    let parent: Option<u64> = None;
     [0, 1, u64::from(std::process::id())]
         .into_iter()
-        .chain(parent_process_id())
+        .chain(parent)
         .collect()
 }
 
