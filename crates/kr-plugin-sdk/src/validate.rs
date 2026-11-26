@@ -1372,48 +1372,67 @@ fn check_arrivals(range: &VersionRange, table: &serde_json::Value, report: &mut 
         if !(arrival.carried_by)(table) {
             continue;
         }
-        let Ok(arrived) = crate::version::PackageVersion::parse(arrival.sdk_version) else {
-            // The table is constants and its own test refuses such an entry; a package that carries
-            // the member is refused here as well, so that no entry is skipped.
-            report.push(Finding::at(
-                FindingCode::ConnectorTableInvalid,
-                CONNECTOR_FILE,
-                format!(
-                    "the table carries {}.{}, and the arrival table lists it at {}, which is not \
-                     a version, so the sdk_range cannot be held to it",
-                    arrival.definition, arrival.member, arrival.sdk_version
-                ),
-            ));
-            continue;
-        };
-        if range.has_a_prerelease() {
-            report.push(Finding::at(
-                FindingCode::ConnectorTableInvalid,
-                CONNECTOR_FILE,
-                format!(
-                    "the table carries {}.{}, which arrived at SDK {}, and the sdk_range {range} \
-                     has a prerelease part: the check cannot decide a range with a prerelease \
-                     part, so state the range with release versions only, for example \
-                     `>={}, <{}.{}.0`",
-                    arrival.definition,
-                    arrival.member,
-                    arrival.sdk_version,
-                    arrival.sdk_version,
-                    arrived.get().major,
-                    arrived.get().minor + 1
-                ),
-            ));
-        } else if range.admits_a_version_below(&arrived) {
-            report.push(Finding::at(
-                FindingCode::ConnectorTableInvalid,
-                CONNECTOR_FILE,
-                format!(
-                    "the table carries {}.{}, which arrived at SDK {}, and the sdk_range {range} \
-                     admits an SDK version below it",
-                    arrival.definition, arrival.member, arrival.sdk_version
-                ),
-            ));
-        }
+        check_range_holds_arrival(
+            range,
+            &format!(
+                "the table carries {}.{}",
+                arrival.definition, arrival.member
+            ),
+            arrival.sdk_version,
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            report,
+        );
+    }
+}
+
+/// Holds `range` to the SDK version a member arrived at, for the package that carries it: refuses
+/// the range when it admits an SDK version below `sdk_version`, and when it has a prerelease part,
+/// which the check cannot decide. `subject` says what the package carries, and the finding is of
+/// `code` at `file`. One rule for every member, the connector table's and the manifest's.
+fn check_range_holds_arrival(
+    range: &VersionRange,
+    subject: &str,
+    sdk_version: &str,
+    code: FindingCode,
+    file: &str,
+    report: &mut Report,
+) {
+    let Ok(arrived) = crate::version::PackageVersion::parse(sdk_version) else {
+        // The versions are constants and their own tests refuse such an entry; a package that
+        // carries the member is refused here as well, so that no entry is skipped.
+        report.push(Finding::at(
+            code,
+            file,
+            format!(
+                "{subject}, and the arrival table lists it at {sdk_version}, which is not a \
+                 version, so the sdk_range cannot be held to it"
+            ),
+        ));
+        return;
+    };
+    if range.has_a_prerelease() {
+        report.push(Finding::at(
+            code,
+            file,
+            format!(
+                "{subject}, which arrived at SDK {sdk_version}, and the sdk_range {range} has a \
+                 prerelease part: the check cannot decide a range with a prerelease part, so \
+                 state the range with release versions only, for example `>={sdk_version}, \
+                 <{}.{}.0`",
+                arrived.get().major,
+                arrived.get().minor + 1
+            ),
+        ));
+    } else if range.admits_a_version_below(&arrived) {
+        report.push(Finding::at(
+            code,
+            file,
+            format!(
+                "{subject}, which arrived at SDK {sdk_version}, and the sdk_range {range} admits \
+                 an SDK version below it"
+            ),
+        ));
     }
 }
 
@@ -2009,6 +2028,14 @@ fn check_acp_launch(
             ),
         ));
     }
+    check_range_holds_arrival(
+        &manifest.sdk_range,
+        "range: the package declares acp_launch",
+        crate::acp_launch::ARRIVAL,
+        FindingCode::AcpLaunchInvalid,
+        MANIFEST_FILE,
+        report,
+    );
     check_acp_words(manifest, launch, report);
     let supported: Vec<crate::matching::OperatingSystem> = manifest
         .platforms

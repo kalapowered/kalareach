@@ -1498,15 +1498,14 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         "the longest that fits"
     );
 
-    // The package as `package_edited` writes it, with the SDK range that holds the arrival of a
-    // placement kept, and the whole validation result returned.
+    // The package as `package_edited` writes it, with the SDK range of a package that declares a
+    // launch, which holds the arrival of a placement too, and the whole validation result returned.
     let whole = |length: usize| {
         package_edited(
             "claude-code",
             |manifest| {
-                let range = manifest["sdk_range"].clone();
                 *manifest = with_filler(length);
-                manifest["sdk_range"] = range;
+                manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
             },
             |table| table["placement"] = claude(),
         )

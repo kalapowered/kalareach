@@ -206,6 +206,7 @@ fn validate_example_with(launch: &Value) -> Vec<kr_plugin_sdk::validate::Finding
             }));
     }
     manifest["acp_launch"] = launch.clone();
+    manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
     let temporary = tempfile::tempdir().expect("a temporary directory");
     let package = temporary.path().join("package");
     std::fs::create_dir_all(&package).expect("the package directory");

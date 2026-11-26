@@ -47,6 +47,11 @@ pub const AGENT_ARGUMENT: &str = "--acp";
 /// folder it makes new and empty for the start.
 pub const PRIVATE_HOME_PLACEHOLDER: &str = "{private_home}";
 
+/// The SDK version the `acp_launch` member of `plugin.json` arrived at: the first release that has
+/// it. A package that declares one states an `sdk_range` that admits no earlier version, because
+/// an earlier host parses the manifest and cannot read the member.
+pub const ARRIVAL: &str = "0.1.11";
+
 /// The most names one list may hold.
 pub const MAX_NAMES: usize = 64;
 

@@ -41,6 +41,8 @@ fn manifest_with(launch: &Value, requested: &[&str]) -> Value {
             }));
     }
     manifest["acp_launch"] = launch.clone();
+    // A package that declares a launch states a range that starts at the member's version.
+    manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
     manifest
 }
 
@@ -835,4 +837,54 @@ fn kr_req_11_26_each_approval_grant_is_needed_on_its_own() {
         launch.admission(&respond_only, true, OperatingSystem::Linux),
         Err(AcpRefusal::ApprovalsMissing)
     );
+}
+
+/// The example package with the launch and `range` as its `sdk_range`.
+fn with_range(range: &str) -> Value {
+    let mut manifest = manifest_with(&declaration(), &GRANTS);
+    manifest["sdk_range"] = json!(range);
+    manifest
+}
+
+/// KR-REQ-11.26: a host from before the member tests `sdk_range` before it reads the package, so
+/// a package that declares a launch states a range that admits no SDK before the member's
+/// version, as a package with a placement or launch variables does.
+#[test]
+fn kr_req_11_26_a_launch_under_a_range_that_admits_an_earlier_sdk_is_refused() {
+    for range in [">=0.1.0, <0.2.0", ">=0.1.2, <0.2.0", ">=0.1.10, <0.2.0"] {
+        let findings = findings_of(&with_range(range));
+        let reason = format!(
+            "range: the package declares acp_launch, which arrived at SDK 0.1.11, and the \
+             sdk_range {range} admits an SDK version below it"
+        );
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a finding that begins {reason:?} is expected: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a range with a prerelease part cannot be held to the member's version, so it is
+/// refused with the way to state it.
+#[test]
+fn kr_req_11_26_a_launch_under_a_range_with_a_prerelease_part_is_refused() {
+    let range = ">=0.1.11-alpha.1, <0.2.0";
+    let findings = findings_of(&with_range(range));
+    let reason = format!(
+        "range: the package declares acp_launch, which arrived at SDK 0.1.11, and the sdk_range \
+         {range} has a prerelease part: the check cannot decide a range with a prerelease part, \
+         so state the range with release versions only, for example `>=0.1.11, <0.2.0`"
+    );
+    assert!(
+        has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+        "a finding that begins {reason:?} is expected: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: a range that starts at the member's version is the one a package states, and the
+/// package check accepts it.
+#[test]
+fn kr_req_11_26_a_launch_under_a_range_that_starts_at_its_version_is_accepted() {
+    let findings = findings_of(&with_range(">=0.1.11, <0.2.0"));
+    assert!(findings.is_empty(), "{findings:?}");
 }
