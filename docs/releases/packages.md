@@ -315,6 +315,8 @@ the table under a range with a prerelease part as well (`>=0.1.7-alpha, <0.2.0`,
 `>=0.1.7, <0.2.0-rc.1`), because it cannot decide such a range: the package states the range with
 release versions only, as in `>=0.1.7, <0.2.0`.
 
+The `acp_launch` member of `plugin.json` is held to the same rule by a finding of its own, since an earlier host parses the manifest and not only a connector table: the package check refuses the member under a range that admits an SDK version below 0.1.11 or has a prerelease part.
+
 The check fails when it cannot list origin's tags, when this checkout's tags are not origin's, when
 a release's tree cannot be read and when a source is in a form it does not read, and it never leaves
 a release out. A tag that only one side has at the commit under test is left out of the comparison,

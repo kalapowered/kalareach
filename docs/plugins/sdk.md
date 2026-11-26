@@ -43,9 +43,13 @@ section holds the rules.
 The `acp_launch` member of a package's `plugin.json` is in version 0.1.11. It states how the
 package's agent starts in ACP mode: the command, the platforms, the variables the host copies from
 the person's shell and the variables it sets, with the publisher's own words. A manifest without it
-means what it meant before. A host on an earlier version parses all of `plugin.json` before it tests
-`sdk_range`, so it refuses a package that carries the member as a manifest it cannot read. The
-plugin reference's [ACP launch](README.md#acp-launch) section holds the rules.
+means what it meant before. A package that declares it states `"sdk_range": ">=0.1.11, <0.2.0"`,
+and the package check refuses a manifest that carries it under a range that admits an earlier SDK
+version or one with a prerelease part. A host on an earlier version tests `sdk_range` before it
+fetches the package, so with that range it never reads the manifest. A host that is rolled back to a
+version before the member, with such a package installed, reads the package's manifest as corrupt
+and stops the whole package, not only its ACP mode. The plugin reference's
+[ACP launch](README.md#acp-launch) section holds the rules.
 
 The `hidden_when` member of a selection route is in version 0.1.7. It lists conditions on the
 request: each names a place in the request's message and the strings, booleans or integers that
