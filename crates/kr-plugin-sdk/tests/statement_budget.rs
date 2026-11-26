@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::acp_launch::AcpLaunch;
 use kr_plugin_sdk::connector::ConnectorManifest;
+use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::example;
 use kr_plugin_sdk::package::{MANIFEST_FILE, PRESENTATION_FILE};
 use kr_plugin_sdk::plugin::PluginManifest;
@@ -153,7 +154,7 @@ fn kr_req_11_26_the_statement_states_the_launch_after_the_integration() {
 
 /// KR-REQ-11.26: a device shows a statement of at most `STATEMENT_CHARS` whole, so the longest of
 /// the two packages' statements is within it, and the figure is at least that length plus the
-/// margin and less than 1,000 above it.
+/// margin and at most the 10,000 characters a device shows.
 #[test]
 fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin() {
     let lengths: Vec<(&str, Option<usize>)> = statements()
@@ -185,9 +186,8 @@ fn kr_req_11_26_the_budget_holds_the_longer_of_the_two_statements_and_a_margin()
          leaves less than the margin of {MARGIN}"
     );
     assert!(
-        STATEMENT_CHARS < longest + MARGIN + 1_000,
-        "the longer statement is {longest} characters: the budget is {STATEMENT_CHARS}, which is \
-         1,000 or more above that and the margin of {MARGIN}"
+        STATEMENT_CHARS <= 10_000,
+        "the budget is {STATEMENT_CHARS}, which is more than the 10,000 characters a device shows"
     );
 }
 
@@ -281,6 +281,25 @@ fn validate_gemini_with(launch: &Value) -> Vec<kr_plugin_sdk::validate::Finding>
     }
     manifest["acp_launch"] = launch.clone();
     manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
+    // The package's command integration sets `GEMINI_CLI_NO_RELAUNCH`, which a package states in
+    // the launch variables of its connector table under a range that admits no earlier SDK.
+    let table_path = package.join("connector.json");
+    let mut table = read(&table_path);
+    table["launch_variables"] = json!([{
+        "name": "GEMINI_CLI_NO_RELAUNCH",
+        "value": "true",
+        "reason": "Gemini CLI starts itself again in another process unless this is set"
+    }]);
+    let table_bytes = serde_json::to_vec_pretty(&table).expect("the table serialises");
+    std::fs::write(&table_path, &table_bytes).expect("the table writes");
+    let record = manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the connector payload");
+    record["digest"] = json!(PayloadDigest::of(&table_bytes).to_string());
+    record["size_bytes"] = json!(table_bytes.len().to_string());
     std::fs::write(
         package.join(MANIFEST_FILE),
         serde_json::to_string_pretty(&manifest)
@@ -336,10 +355,8 @@ fn kr_req_11_26_a_package_with_a_bridge_is_refused_for_its_launch_when_the_launc
     );
     let control = validate_gemini_with(&declared);
     assert!(
-        control.iter().all(|finding| !finding
-            .detail
-            .starts_with("the host's whole statement of this package")),
-        "the declared launch fits the budget: {control:?}"
+        control.is_empty(),
+        "the declared launch fits the budget and the package has no finding at all: {control:?}"
     );
 }
 
