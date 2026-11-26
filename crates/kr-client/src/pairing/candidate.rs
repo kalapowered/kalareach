@@ -5263,6 +5263,60 @@ mod tests {
         assert!(!run.hosts.directory().join("checkpoints.json").exists());
     }
 
+    /// KR-REQ-20.12: a recovery that has less time before its reserve than the read's own bound
+    /// ends the read by the reserve: a host that never answers does not keep it past that, and the
+    /// host stays recorded and owed.
+    #[tokio::test]
+    async fn a_read_with_less_time_left_than_its_bound_ends_by_the_reserve() {
+        let connection = a_finished_connection().await;
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        let reserve = UNPAIRED_LIFE - LAST_CALL_MARGIN;
+        let run = waited(
+            Script {
+                held: Reply::CommittedFrom(start + reserve),
+                fail_after: Duration::ZERO,
+                // The recovery starts when the refusal arrives, two seconds before the reserve.
+                opening: Some((
+                    Duration::from_secs(40),
+                    connection,
+                    Reply::RefusedAt(start + reserve - Duration::from_secs(2)),
+                )),
+                deadline: Duration::from_secs(300),
+                paired: vec![Paired::Committed, Paired::Committed],
+                held_opened: Duration::ZERO,
+                owner: true,
+                checkpoint: Checkpoint::Silent,
+                file: None,
+                names: Names::Label("a real host"),
+                attempt: Attempt::Absent,
+                again: None,
+                start: Start::Waiting,
+            },
+            Duration::from_secs(120),
+        )
+        .await;
+        assert!(
+            methods(&run)
+                .iter()
+                .any(|(_, method)| *method == "backup.checkpoint"),
+            "the read was made: {:?}",
+            run.requests
+        );
+        // `CHECKPOINT_WITHIN` is a second longer than the time the recovery has left.
+        assert!(
+            run.elapsed < reserve + Duration::from_millis(500),
+            "the read ends by the reserve, not at its own bound: {:?}",
+            run.elapsed
+        );
+        let hosts = recorded(&run);
+        assert_eq!(hosts.len(), 1, "the host is recorded");
+        assert_eq!(
+            run.hosts.checkpoints().acquisition(&hosts[0]),
+            Ok(Acquisition::Owed)
+        );
+    }
+
     /// KR-REQ-20.12: a proof that fails, because the host names another device or refuses the
     /// question, is followed by no read of the checkpoint and by no file.
     #[tokio::test(start_paused = true)]

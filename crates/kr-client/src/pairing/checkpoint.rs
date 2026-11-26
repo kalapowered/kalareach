@@ -259,9 +259,10 @@ pub enum Outcome {
 pub struct Settled {
     /// How the answer stood against the file.
     pub outcome: Outcome,
-    /// Whether the directory is known to hold the file. It is not when the file was replaced and
-    /// the flush of the directory after it failed: the file is then the old one or the new one,
-    /// whole.
+    /// Whether the directory is known to hold the file this settle wrote. It is not when that file
+    /// was replaced and the flush of the directory after it failed: the file is then the old one or
+    /// the new one, whole. A settle that writes nothing gives `true`, also after an earlier settle
+    /// whose write was not confirmed.
     pub confirmed: bool,
 }
 
@@ -280,7 +281,9 @@ pub enum Unsettled {
     Unreadable(SnapshotCause),
     /// Something else holds the lock.
     Busy,
-    /// The file could not be written, and it was not replaced.
+    /// The file could not be written. Either a second read showed the old file, or that read
+    /// failed too; in the second case the replacement may have landed, since a failed read after a
+    /// failed write cannot tell.
     WriteFailed,
 }
 
@@ -466,6 +469,8 @@ impl PairedCheckpoints {
             if (self.write)(&path, &bytes).is_err() {
                 match self.read_file() {
                     Ok(read) if read == next => confirmed = false,
+                    // The file read again is not the one meant, or cannot be read: a failed read
+                    // after a failed write cannot tell whether the replacement landed.
                     _ => return Err(Unsettled::WriteFailed),
                 }
             }
@@ -1664,16 +1669,16 @@ mod tests {
         rig.checkpoints
             .settle_checkpoint(id(&record), &given(1, 9), NOW)
             .expect("settled");
+        // An answer of nothing published changes the pairing's entry, so that the answer after it is
+        // written again. The first is settled before the writer changes: the lower answer is then
+        // the first one that a write that fails after the replacement meets.
+        rig.checkpoints
+            .settle_checkpoint(id(&record), &Answer::NothingPublished, NOW)
+            .expect("settled");
         rig.checkpoints = rig.checkpoints.clone().with_writer(fails_after);
         let settle = |answer: Answer| rig.checkpoints.settle_checkpoint(id(&record), &answer, NOW);
         let other_manifest = Answer::Checkpoint(host_checkpoint("https://reach.kala.to", 1, 9, 77));
 
-        // Each answer of nothing published changes the pairing's entry, so that the answer after it
-        // is written again.
-        assert_eq!(
-            settle(Answer::NothingPublished),
-            unconfirmed(Outcome::NothingPublished)
-        );
         assert_eq!(settle(given(1, 8)), unconfirmed(Outcome::Lower));
         assert_eq!(
             settle(Answer::NothingPublished),
