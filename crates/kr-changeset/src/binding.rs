@@ -61,37 +61,39 @@
 //! a rename moves the time of change of the renamed entry. That was measured on two APFS volumes:
 //! at each of 60 renames of files and folders on each, and in each of 10 swaps of a file with a
 //! clone of another file on each. So the stamp shows such a swap whether or not the renames are
-//! reported. The library reports a clone and a hard link of a file as the creation of a file, a
-//! clone with the note "is: clone", and not as another kind, so the stamp decides each as it
-//! decides any creation of a file. A name that the host did not record is a write whatever the kind
-//! of the report, however briefly it existed, if the watcher reports it before the end of the wait.
-//! Of the paths whose reports the host reads (a parent, the copy's own directory and a name
-//! directly in a parent that is no declared output), every other report of a recorded path is a
-//! write: a removal, a rename, a change of its mode or owner, any other change of its metadata, a
-//! change of its content, and a creation of another kind, a mount among them; the reports of an
-//! entry in any other directory are not read, and its stamp decides. A file made with content gives
-//! three reports, its creation, a change of its attributes and its content, and the third is a
-//! write at once, so a second delivery of those reports for a recorded file directly in a parent,
-//! if the file-event service makes one after the host's start, still makes the result indeterminate
-//! where nothing was written; a second delivery for a folder directly in a parent, for a parent and
-//! for the copy's own directory does not. On Linux the watcher is another module, and a parent's
-//! attribute report is a write there. The record of a parent leaves out its mode, owner, flags,
-//! access list and times, and a parent keeps its device and inode when a suite changes any of them,
-//! whether it puts them back or not, and when a suite moves it away and back, so only the watcher's
-//! reports show such a change, and a report that comes late or not at all leaves it unseen. An
-//! extended attribute of a parent that a suite changes and puts back is not seen when the listing
-//! call returns it: that call returns the attributes that the system lets a process list, so any it
-//! keeps back, such as the compression attributes, are not compared, and a change of Finder
-//! information is another kind of report, a write. The host reads a parent by its path and does not
-//! follow a link in the last part of it, and a link in an earlier part is followed. The record of
-//! the directory above a parent shows a move away and back too, except for the copy itself and for
-//! a parent in a directory that is also a parent. A parent whose full path takes 1,024 bytes or
-//! more, which macOS does not allow for a path, cannot be read, nor can a parent with more than 64
-//! extended attributes, names that take more than 8,192 bytes or a value of more than 4,096 bytes,
-//! and every result of that suite is indeterminate. A name takes at most 127 bytes and its end, so
-//! 64 names fit in 8,192 bytes, and the buffer's range error, which the call gives, can come before
-//! the count's refusal; both end in the same words. A watcher the host cannot start, or whose
-//! reports it cannot be sure it has all of, makes the result indeterminate too.
+//! reported. On a file system where a rename leaves that time as it was, the stamp does not show
+//! such a swap, and only the watcher's reports do. The library reports a clone and a hard link of a
+//! file as the creation of a file, a clone with the note "is: clone", and not as another kind, so
+//! the stamp decides each as it decides any creation of a file. A name that the host did not record
+//! is a write whatever the kind of the report, however briefly it existed, if the watcher reports
+//! it before the end of the wait. Of the paths whose reports the host reads (a parent, the copy's
+//! own directory and a name directly in a parent that is no declared output), every other report of
+//! a recorded path is a write: a removal, a rename, a change of its mode or owner, any other change
+//! of its metadata, a change of its content, and a creation of another kind, a mount among them;
+//! the reports of an entry in any other directory are not read, and its stamp decides. A file made
+//! with content gives three reports, its creation, a change of its attributes and its content, and
+//! the third is a write at once, so a second delivery of those reports for a recorded file directly
+//! in a parent, if the file-event service makes one after the host's start, still makes the result
+//! indeterminate where nothing was written; a second delivery for a folder directly in a parent,
+//! for a parent and for the copy's own directory does not. On Linux the watcher is another module,
+//! and a parent's attribute report is a write there. The record of a parent leaves out its mode,
+//! owner, flags, access list and times, and a parent keeps its device and inode when a suite
+//! changes any of them, whether it puts them back or not, and when a suite moves it away and back,
+//! so only the watcher's reports show such a change, and a report that comes late or not at all
+//! leaves it unseen. An extended attribute of a parent that a suite changes and puts back is not
+//! seen when the listing call returns it: that call returns the attributes that the system lets a
+//! process list, so any it keeps back, such as the compression attributes, are not compared, and a
+//! change of Finder information is another kind of report, a write. The host reads a parent by its
+//! path and does not follow a link in the last part of it, and a link in an earlier part is
+//! followed. The record of the directory above a parent shows a move away and back too, except for
+//! the copy itself and for a parent in a directory that is also a parent. A parent whose full path
+//! takes 1,024 bytes or more, which macOS does not allow for a path, cannot be read, nor can a
+//! parent with more than 64 extended attributes, names that take more than 8,192 bytes or a value
+//! of more than 4,096 bytes, and every result of that suite is indeterminate. A name takes at most
+//! 127 bytes and its end, so 64 names fit in 8,192 bytes, and the buffer's range error, which the
+//! call gives, can come before the count's refusal; both end in the same words. A watcher the host
+//! cannot start, or whose reports it cannot be sure it has all of, makes the result indeterminate
+//! too.
 //!
 //! # What this does not establish
 //!
