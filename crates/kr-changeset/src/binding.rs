@@ -37,19 +37,29 @@
 //! ended: the platform reports each name created, removed, renamed or changed in it, and a name
 //! other than a declared output makes the result indeterminate, however briefly it existed. The
 //! parent itself is watched too, and so is the copy: a report that the directory was renamed,
-//! removed or changed (its mode, its owner, its attributes) is a write, because the record of a
-//! parent is the one thing the comparison leaves out. On macOS a report of a parent can come after
-//! the host's own file or not at all, so the host also records the device and inode of each parent
-//! before the command starts and reads them again at the end, once the watcher has reported the
-//! host's own file: a parent that is gone, is no longer a directory or has another device or inode
-//! is a write whatever was reported of it. A parent keeps its device and inode when a suite changes
-//! its mode, owner or attributes, whether it puts them back or not, and when a suite moves it away
-//! and back, so only the watcher's reports show such a change. The record of the directory above a
-//! parent shows a move away and back too, except for the copy itself and for a parent in a
-//! directory that is also a parent. A parent whose full path is longer than the 1,024 bytes that
-//! macOS allows for a path cannot be read, and every result of that suite is indeterminate. A
-//! watcher the host cannot start, or whose reports it cannot be sure it has all of, makes the
-//! result indeterminate too.
+//! removed or changed (its mode, its owner, or any of its metadata but its extended attributes) is
+//! a write, because the record of a parent is the one thing the comparison leaves out. On macOS a
+//! report of a parent can come after the host's own file or not at all, and the file-event service
+//! can report the host's own set-up of the copy a second time, after the watcher is up to date. So
+//! the host also records the device, the inode and the extended attributes (names and values) of
+//! each parent before the command starts, and reads them again at the end, once the watcher has
+//! reported the host's own file. A parent that is gone, is no longer a directory, has another
+//! device or inode, or has an extended attribute added, removed or changed in value is a write
+//! whatever was reported of it. A report that a parent was created, or that its extended
+//! attributes changed, is no write by itself, because what the host read at the start decides
+//! both: a directory that has the inode it had was not made in the run, and attributes equal to
+//! the ones read at the start were not left changed. Every other report of a parent is a write: a
+//! removal, a rename, a change of its mode or owner, any other change of its metadata, or a change
+//! of its content. A parent keeps its device and inode when a suite changes its mode or owner,
+//! whether it puts them back or not, and when a suite moves it away and back, so only the
+//! watcher's reports show such a change; an extended attribute that a suite changes and puts back
+//! is not seen at all. The record of the directory above a parent shows a move away and back too,
+//! except for the copy itself and for a parent in a directory that is also a parent. A parent
+//! whose full path is longer than the 1,024 bytes that macOS allows for a path cannot be read, nor
+//! can a parent with more than 64 extended attributes, names that take more than 8,192 bytes or a
+//! value of more than 4,096 bytes, and every result of that suite is indeterminate. A watcher the
+//! host cannot start, or whose reports it cannot be sure it has all of, makes the result
+//! indeterminate too.
 //!
 //! # What this does not establish
 //!
@@ -700,6 +710,17 @@ mod unix {
             pub(super) lost: Option<String>,
         }
 
+        /// What a report says was done to the paths it names, as far as judging a parent needs it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) enum Done {
+            /// Something was created.
+            Created,
+            /// Extended attributes were changed.
+            Attributes,
+            /// Anything else.
+            Other,
+        }
+
         /// Where the watched places are, and what a report about each means.
         #[derive(Debug)]
         pub(super) struct Places {
@@ -718,16 +739,21 @@ mod unix {
             /// A directory a declared output is in, and the copy itself, are judged by what is
             /// reported about the directory: FSEvents says nothing of a directory when a name is
             /// made in it, so a report that names the directory is a rename, a removal or a change
-            /// of its mode, owner or attributes, whichever name the command gave it meanwhile. A
+            /// of its mode, owner or metadata, whichever name the command gave it meanwhile. A
+            /// creation of such a directory and a change of its extended attributes are no write
+            /// by themselves: what the host read of the directory at the start decides both. A
             /// name in such a directory is judged by whether it is a declared output.
-            fn written(&self, path: &Path) -> Option<String> {
+            fn written(&self, path: &Path, done: Done) -> Option<String> {
                 let relative = path.strip_prefix(&self.copy).ok().map(|rest| {
                     rest.components()
                         .map(|part| part.as_os_str().to_string_lossy().into_owned())
                         .collect::<Vec<_>>()
                         .join("/")
                 })?;
-                if relative.is_empty() || self.parents.contains_key(&relative) {
+                if self.parents.contains_key(&relative) {
+                    return (done == Done::Other).then_some(relative);
+                }
+                if relative.is_empty() {
                     return Some(relative);
                 }
                 let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
@@ -736,13 +762,19 @@ mod unix {
             }
 
             /// Takes one report into `heard`: `rescan` is whether it says that reports were lost,
-            /// and `paths` are the paths it names.
+            /// `done` is what it says was done, and `paths` are the paths it names.
             ///
             /// A report that says reports were lost is a loss whatever paths it names, and when it
             /// names none. FSEvents sends such a report at the path where it lost reports, which
             /// is often a directory above the copy or the root of the volume. The watcher passes
             /// it on with that path, so a path outside the copy is no reason to leave it out.
-            pub(super) fn hear(&self, heard: &mut Heard, rescan: bool, paths: &[PathBuf]) {
+            pub(super) fn hear(
+                &self,
+                heard: &mut Heard,
+                rescan: bool,
+                done: Done,
+                paths: &[PathBuf],
+            ) {
                 // The loss comes first. A path the report names in the copy is kept like any
                 // other, though a result that holds a loss names no written path.
                 if rescan {
@@ -752,7 +784,7 @@ mod unix {
                 }
                 for path in paths {
                     if heard.written.len() < KEPT
-                        && let Some(relative) = self.written(path)
+                        && let Some(relative) = self.written(path, done)
                     {
                         heard.written.insert(relative);
                     }
@@ -765,7 +797,7 @@ mod unix {
             use std::collections::{BTreeMap, BTreeSet};
             use std::path::PathBuf;
 
-            use super::{Heard, Places};
+            use super::{Done, Heard, Places};
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
             /// `out` at its root and another, `gen`, in its directory `sub`.
@@ -779,12 +811,17 @@ mod unix {
                 )
             }
 
-            /// What is heard of one report that names `paths`.
-            fn heard_of(rescan: bool, paths: &[&str]) -> Heard {
+            /// What is heard of one report of `done` that names `paths`.
+            fn heard_done(rescan: bool, done: Done, paths: &[&str]) -> Heard {
                 let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
                 let mut heard = Heard::default();
-                places().hear(&mut heard, rescan, &paths);
+                places().hear(&mut heard, rescan, done, &paths);
                 heard
+            }
+
+            /// What is heard of one report that names `paths` and says nothing more than that.
+            fn heard_of(rescan: bool, paths: &[&str]) -> Heard {
+                heard_done(rescan, Done::Other, paths)
             }
 
             /// KR-REQ-14.34: a notice that reports were lost is a loss at whatever path it names.
@@ -852,6 +889,37 @@ mod unix {
                 assert_eq!(
                     heard.written,
                     BTreeSet::from(["".to_owned(), "other".to_owned(), "sub/x".to_owned()])
+                );
+            }
+
+            /// KR-REQ-14.34: a creation of a directory an output is in, and a change of its
+            /// extended attributes, are no write by themselves, the copy's own directory among
+            /// them when an output is at its root; every other report that names it is a write.
+            #[test]
+            fn a_creation_or_attribute_report_of_a_parent_is_no_write_and_any_other_is() {
+                for parent in ["/work/run/copy", "/work/run/copy/sub"] {
+                    for done in [Done::Created, Done::Attributes] {
+                        let heard = heard_done(false, done, &[parent]);
+                        assert!(heard.written.is_empty(), "{parent} {done:?} is no write");
+                    }
+                    let heard = heard_done(false, Done::Other, &[parent]);
+                    assert_eq!(heard.written.len(), 1, "{parent} is a write");
+                }
+            }
+
+            /// KR-REQ-14.34: a creation of a name beside a declared output, or in a directory
+            /// that no output is in, is a write all the same: what the host read at the start
+            /// decides only the directories an output is in.
+            #[test]
+            fn a_creation_of_a_name_that_is_no_parent_is_a_write() {
+                let heard = heard_done(
+                    false,
+                    Done::Created,
+                    &["/work/run/copy/other", "/work/run/copy/sub/x"],
+                );
+                assert_eq!(
+                    heard.written,
+                    BTreeSet::from(["other".to_owned(), "sub/x".to_owned()])
                 );
             }
         }
@@ -1147,15 +1215,30 @@ mod unix {
         }
     }
 
-    /// What a directory is, whatever is written in it.
+    /// What a directory an output is in was before the command started, to be read again at the
+    /// end.
     ///
-    /// The stamp of a directory an output is in is not recorded, because making the output changes
-    /// it. Its device and inode, and that it is a directory, do not change when a name is made in
-    /// it, and they are another when the directory was removed and made again.
+    /// The stamp of such a directory is not recorded, because making the output changes it. Its
+    /// device and inode, that it is a directory, and its extended attributes do not change when a
+    /// name is made in it. The first three are another when the directory was removed and made
+    /// again, and the attributes are another when one is added, removed or given another value.
     #[cfg(any(target_os = "macos", test))]
-    mod identity {
+    mod record {
+        use std::collections::BTreeMap;
         #[cfg(target_os = "macos")]
         use std::path::Path;
+
+        /// The most extended attributes of a directory that the host reads.
+        #[cfg(target_os = "macos")]
+        const MOST_ATTRIBUTES: usize = 64;
+
+        /// The most bytes that the names of those attributes take, each with its end.
+        #[cfg(target_os = "macos")]
+        const MOST_NAME_BYTES: usize = 8192;
+
+        /// The most bytes of one value.
+        #[cfg(target_os = "macos")]
+        const MOST_VALUE_BYTES: usize = 4096;
 
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub(super) struct Identity {
@@ -1187,9 +1270,76 @@ mod unix {
             }
         }
 
+        /// The extended attributes of a directory, each name with its value.
+        type Attributes = BTreeMap<Vec<u8>, Vec<u8>>;
+
+        /// What a directory is and what extended attributes it holds.
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub(super) struct Record {
+            identity: Identity,
+            attributes: Attributes,
+        }
+
+        impl Record {
+            /// What is at `path` now, a link not followed. A directory with more extended
+            /// attributes than the host reads, or larger ones, is an error, and so is an
+            /// attribute that is gone before it is read.
+            #[cfg(target_os = "macos")]
+            pub(super) fn of(path: &Path) -> std::io::Result<Self> {
+                Ok(Self {
+                    identity: Identity::of(path)?,
+                    attributes: attributes_of(path)?,
+                })
+            }
+
+            /// Whether `now` is another place than this one, or holds other extended attributes:
+            /// one added, one removed, or one with another value.
+            pub(super) fn is_another(&self, now: &Self) -> bool {
+                self.identity.is_another(now.identity) || self.attributes != now.attributes
+            }
+        }
+
+        /// The extended attributes at `path`, a link not followed.
+        #[cfg(target_os = "macos")]
+        fn attributes_of(path: &Path) -> std::io::Result<Attributes> {
+            use rustix::io::Errno;
+
+            let too_many = || {
+                std::io::Error::other(
+                    "it has more extended attributes, or larger ones, than the host reads",
+                )
+            };
+            let read = |error: Errno| {
+                if error == Errno::RANGE {
+                    too_many()
+                } else {
+                    error.into()
+                }
+            };
+            let mut listed = vec![0u8; MOST_NAME_BYTES];
+            let length = rustix::fs::llistxattr(path, &mut listed[..]).map_err(read)?;
+            let names: Vec<&[u8]> = listed[..length]
+                .split(|byte| *byte == 0)
+                .filter(|name| !name.is_empty())
+                .collect();
+            if names.len() > MOST_ATTRIBUTES {
+                return Err(too_many());
+            }
+            let mut attributes = Attributes::new();
+            for name in names {
+                let mut value = vec![0u8; MOST_VALUE_BYTES];
+                let length = rustix::fs::lgetxattr(path, name, &mut value[..]).map_err(read)?;
+                value.truncate(length);
+                attributes.insert(name.to_vec(), value);
+            }
+            Ok(attributes)
+        }
+
         #[cfg(test)]
         mod tests {
-            use super::Identity;
+            use std::collections::BTreeMap;
+
+            use super::{Identity, Record};
 
             fn directory(device: u64, inode: u64) -> Identity {
                 Identity {
@@ -1236,6 +1386,43 @@ mod unix {
                     "what was a directory is not one now"
                 );
             }
+
+            /// A directory holding the attributes of the same names and values is as it was.
+            fn record(attributes: &[(&str, &str)]) -> Record {
+                Record {
+                    identity: directory(1, 2),
+                    attributes: attributes
+                        .iter()
+                        .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
+                        .collect::<BTreeMap<_, _>>(),
+                }
+            }
+
+            #[test]
+            fn a_directory_holding_the_attributes_it_held_is_as_it_was() {
+                assert!(
+                    !record(&[("a", "1"), ("b", "2")])
+                        .is_another(&record(&[("a", "1"), ("b", "2")]))
+                );
+            }
+
+            /// KR-REQ-14.34: a directory with an attribute more is not as it was.
+            #[test]
+            fn a_directory_with_an_attribute_added_is_another() {
+                assert!(record(&[("a", "1")]).is_another(&record(&[("a", "1"), ("b", "2")])));
+            }
+
+            /// KR-REQ-14.34: a directory with an attribute less is not as it was.
+            #[test]
+            fn a_directory_with_an_attribute_removed_is_another() {
+                assert!(record(&[("a", "1"), ("b", "2")]).is_another(&record(&[("a", "1")])));
+            }
+
+            /// KR-REQ-14.34: a directory with an attribute of another value is not as it was.
+            #[test]
+            fn a_directory_with_an_attribute_of_another_value_is_another() {
+                assert!(record(&[("a", "1")]).is_another(&record(&[("a", "2")])));
+            }
         }
     }
 
@@ -1246,13 +1433,14 @@ mod unix {
         use std::sync::{Arc, Mutex, PoisonError, mpsc};
         use std::time::{Duration, Instant};
 
+        use notify::event::{EventKind, MetadataKind, ModifyKind};
         use notify::{Event, RecursiveMode, Watcher as _};
 
         use kr_transfer::{AuthorisedDirectory, RelativeName};
 
         use super::budget::{self, Budget, Held};
-        use super::identity::Identity;
-        use super::judged::{Heard, Places};
+        use super::judged::{Done, Heard, Places};
+        use super::record::Record;
 
         /// What the watches of this process cost, in open files.
         static WATCHES: Budget = Budget::new();
@@ -1281,6 +1469,15 @@ mod unix {
             awaited: Option<PathBuf>,
         }
 
+        /// What a report of the watcher says was done to the paths it names.
+        fn done_by(kind: &EventKind) -> Done {
+            match kind {
+                EventKind::Create(_) => Done::Created,
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)) => Done::Attributes,
+                _ => Done::Other,
+            }
+        }
+
         /// Takes one report from the watcher into `shared`, and gives back the file the host is
         /// waiting to hear of when the report names it.
         fn take(
@@ -1290,7 +1487,12 @@ mod unix {
         ) -> Option<PathBuf> {
             match report {
                 Ok(event) => {
-                    places.hear(&mut shared.heard, event.need_rescan(), &event.paths);
+                    places.hear(
+                        &mut shared.heard,
+                        event.need_rescan(),
+                        done_by(&event.kind),
+                        &event.paths,
+                    );
                     let awaited = shared.awaited.as_ref();
                     event.paths.into_iter().find(|path| Some(path) == awaited)
                 }
@@ -1322,7 +1524,7 @@ mod unix {
             beside_path: PathBuf,
             copy_path: PathBuf,
             /// What each directory an output is in was, by its path in the copy.
-            identities: BTreeMap<String, Identity>,
+            records: BTreeMap<String, Record>,
         }
 
         /// The place of a directory in the copy, the empty path being the copy itself.
@@ -1335,15 +1537,15 @@ mod unix {
         }
 
         /// What each directory an output is in is now, by its path in the copy.
-        fn identities_of(
+        fn records_of(
             copy_path: &Path,
             parents: &BTreeMap<String, BTreeSet<String>>,
-        ) -> Result<BTreeMap<String, Identity>, String> {
+        ) -> Result<BTreeMap<String, Record>, String> {
             parents
                 .keys()
                 .map(|relative| {
-                    Identity::of(&place_in(copy_path, relative))
-                        .map(|identity| (relative.clone(), identity))
+                    Record::of(&place_in(copy_path, relative))
+                        .map(|record| (relative.clone(), record))
                         .map_err(|error| {
                             format!("a directory an output is in could not be examined: {error}")
                         })
@@ -1353,8 +1555,9 @@ mod unix {
 
         impl Site {
             /// Reads where `copy` is, with `beside` the directory it is in, and what each
-            /// directory an output is in is before the command starts, to be read again when it
-            /// has ended. A failure is the host's own and comes before the budget is asked.
+            /// directory an output is in is, its identity and its extended attributes, before the
+            /// command starts, to be read again when it has ended. A failure is the host's own and
+            /// comes before the budget is asked.
             fn of(
                 copy: &AuthorisedDirectory,
                 beside: &AuthorisedDirectory,
@@ -1383,12 +1586,12 @@ mod unix {
                 let reopened = beside
                     .try_clone()
                     .map_err(|error| format!("the copy's place could not be reopened: {error}"))?;
-                let identities = identities_of(&copy_path, parents)?;
+                let records = records_of(&copy_path, parents)?;
                 Ok(Self {
                     beside: reopened,
                     beside_path,
                     copy_path,
-                    identities,
+                    records,
                 })
             }
         }
@@ -1519,20 +1722,20 @@ mod unix {
                 }
             }
 
-            /// The directories an output is in that are not the places they were when the watch
-            /// started: gone, no longer a directory, or on another device or with another inode.
-            /// This reads the copy and not the watcher's reports, which come on the platform's
-            /// schedule.
-            fn replaced(&self) -> Result<BTreeSet<String>, String> {
-                let mut replaced = BTreeSet::new();
-                for (relative, before) in &self.site.identities {
-                    match Identity::of(&place_in(&self.site.copy_path, relative)) {
-                        Ok(now) if !before.is_another(now) => {}
+            /// The directories an output is in that are not what they were when the watch
+            /// started: gone, no longer a directory, on another device or with another inode, or
+            /// with an extended attribute added, removed or changed in value. This reads the copy
+            /// and not the watcher's reports, which come on the platform's schedule.
+            fn changed(&self) -> Result<BTreeSet<String>, String> {
+                let mut changed = BTreeSet::new();
+                for (relative, before) in &self.site.records {
+                    match Record::of(&place_in(&self.site.copy_path, relative)) {
+                        Ok(now) if !before.is_another(&now) => {}
                         Ok(_) => {
-                            replaced.insert(relative.clone());
+                            changed.insert(relative.clone());
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            replaced.insert(relative.clone());
+                            changed.insert(relative.clone());
                         }
                         Err(error) => {
                             return Err(format!(
@@ -1541,15 +1744,15 @@ mod unix {
                         }
                     }
                 }
-                Ok(replaced)
+                Ok(changed)
             }
 
             /// The paths written beside a declared output since the watch started, and the
-            /// directories themselves when something was done to them or when one is not the
-            /// place it was, whether the watcher reported it or not.
+            /// directories themselves when something was done to them or when one is not what it
+            /// was, whether the watcher reported it or not.
             pub fn drain(&self) -> Result<Vec<String>, String> {
                 self.up_to_date()?;
-                let replaced = self.replaced()?;
+                let changed = self.changed()?;
                 let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 match &shared.heard.lost {
                     Some(why) => Err(why.clone()),
@@ -1557,7 +1760,7 @@ mod unix {
                         .heard
                         .written
                         .iter()
-                        .chain(&replaced)
+                        .chain(&changed)
                         .cloned()
                         .collect::<BTreeSet<_>>()
                         .into_iter()
@@ -1573,7 +1776,10 @@ mod unix {
             use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
             use notify::Event;
-            use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RemoveKind, RenameMode};
+            use notify::event::{
+                CreateKind, DataChange, EventKind, Flag, MetadataKind, ModifyKind, RemoveKind,
+                RenameMode,
+            };
 
             use super::{
                 AuthorisedDirectory, Budget, Duration, Held, Instant, MARK, NameWatch, Places,
@@ -1800,12 +2006,32 @@ mod unix {
                 }
             }
 
-            fn a_place() -> Place {
+            /// The attribute that the cases put on the directory `target` before the host reads
+            /// it, so that what the host records holds an attribute that the cases control.
+            const KEPT: &str = "kr.test";
+
+            fn set_attribute(path: &Path, name: &str, value: &[u8]) {
+                rustix::fs::lsetxattr(path, name, value, rustix::fs::XattrFlags::empty())
+                    .expect("the attribute is set");
+            }
+
+            /// A folder of its own with the copy and the directory beside it, both opened. The
+            /// copy holds the directories above its declared outputs, `target` with the attribute
+            /// that the cases control.
+            struct Layout {
+                _root: tempfile::TempDir,
+                copy: PathBuf,
+                copy_directory: AuthorisedDirectory,
+                beside: AuthorisedDirectory,
+            }
+
+            fn a_layout() -> Layout {
                 let root = tempfile::TempDir::new().expect("a directory to work in");
                 let root_path = std::fs::canonicalize(root.path()).expect("the directory resolves");
                 let beside_path = root_path.join("materialisations");
                 let copy = beside_path.join("copy");
                 std::fs::create_dir_all(copy.join("target/debug")).expect("the directories above");
+                set_attribute(&copy.join("target"), KEPT, b"one");
                 let open = |path: &Path| {
                     AuthorisedDirectory::open_root(
                         kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
@@ -1814,19 +2040,33 @@ mod unix {
                     .expect("the directory opens")
                 };
                 let (copy_directory, beside) = (open(&copy), open(&beside_path));
-                let places = Arc::new(Places::new(copy.clone(), parents_of_outputs()));
+                Layout {
+                    _root: root,
+                    copy,
+                    copy_directory,
+                    beside,
+                }
+            }
+
+            fn a_place() -> Place {
+                let layout = a_layout();
+                let places = Arc::new(Places::new(layout.copy.clone(), parents_of_outputs()));
                 let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
                 let watch = NameWatch {
                     _watcher: no_stream(),
                     shared: Arc::clone(&shared),
                     reported: Mutex::new(reported),
-                    site: Site::of(&copy_directory, &beside, &parents_of_outputs())
-                        .expect("the directories above are examined"),
+                    site: Site::of(
+                        &layout.copy_directory,
+                        &layout.beside,
+                        &parents_of_outputs(),
+                    )
+                    .expect("the directories above are examined"),
                 };
                 Place {
-                    _root: root,
-                    copy,
+                    _root: layout._root,
+                    copy: layout.copy,
                     watch,
                     places,
                     shared,
@@ -2081,6 +2321,236 @@ mod unix {
                     why.contains("could not be examined"),
                     "the directory was not read before the budget was asked: {why:?}"
                 );
+            }
+
+            fn created() -> EventKind {
+                EventKind::Create(CreateKind::Folder)
+            }
+
+            fn attributes_changed() -> EventKind {
+                EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended))
+            }
+
+            /// What the watch says was written when the stream reports `kinds` of the directory
+            /// `target` ahead of the host's marker, and the directory is as the host recorded it.
+            fn written_for(kinds: Vec<EventKind>) -> Vec<String> {
+                let place = a_place();
+                let parent = place.copy.join("target");
+                let before = kinds
+                    .into_iter()
+                    .map(|kind| report(kind, &parent))
+                    .collect();
+                written_with(&place, before, || {}, Vec::new())
+            }
+
+            /// KR-REQ-14.34: a report that a directory an output is in was created is no write
+            /// when the directory is the one the host recorded: the host made it itself, before
+            /// the watch, and the service can report that later.
+            #[test]
+            fn a_creation_report_of_a_parent_with_its_record_held_is_no_write() {
+                let written = written_for(vec![created()]);
+                assert!(
+                    written.is_empty(),
+                    "the directory is as recorded, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: the same for a report that its extended attributes changed, when
+            /// they are the ones the host recorded.
+            #[test]
+            fn an_attribute_report_of_a_parent_with_its_record_held_is_no_write() {
+                let written = written_for(vec![attributes_changed()]);
+                assert!(
+                    written.is_empty(),
+                    "the attributes are as recorded, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: what a failing run heard: the service delivers the host's own making
+            /// of the directory as a creation and a change of its extended attributes, and
+            /// delivers both again after the watcher is up to date.
+            #[test]
+            fn the_creation_and_attribute_reports_the_service_delivers_again_are_no_write() {
+                let written = written_for(vec![
+                    created(),
+                    attributes_changed(),
+                    created(),
+                    attributes_changed(),
+                ]);
+                assert!(
+                    written.is_empty(),
+                    "the directory is as recorded, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// What the watch says was written when `change` is made to the directory `target`
+            /// as the host waits for its marker, without a report of the change and then with a
+            /// report that its extended attributes changed.
+            fn written_when_changed(change: fn(&Path)) -> [Vec<String>; 2] {
+                [false, true].map(|reported| {
+                    let place = a_place();
+                    let parent = place.copy.join("target");
+                    let before = if reported {
+                        vec![report(attributes_changed(), &parent)]
+                    } else {
+                        Vec::new()
+                    };
+                    written_with(&place, before, move || change(&parent), Vec::new())
+                })
+            }
+
+            /// KR-REQ-14.34: an extended attribute added to a directory an output is in is a
+            /// write, reported or not.
+            #[test]
+            fn an_attribute_added_to_a_parent_is_a_write() {
+                for written in
+                    written_when_changed(|parent| set_attribute(parent, "kr.other", b"two"))
+                {
+                    assert_eq!(
+                        written,
+                        vec!["target".to_owned()],
+                        "an attribute was added, and the watch says it wrote {written:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: an extended attribute of a directory an output is in that has
+            /// another value is a write, reported or not.
+            #[test]
+            fn an_attribute_changed_in_value_is_a_write() {
+                for written in written_when_changed(|parent| set_attribute(parent, KEPT, b"two")) {
+                    assert_eq!(
+                        written,
+                        vec!["target".to_owned()],
+                        "an attribute has another value, and the watch says it wrote {written:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: an extended attribute removed from a directory an output is in is a
+            /// write, reported or not.
+            #[test]
+            fn an_attribute_removed_from_a_parent_is_a_write() {
+                for written in written_when_changed(|parent| {
+                    rustix::fs::lremovexattr(parent, KEPT).expect("the attribute is removed");
+                }) {
+                    assert_eq!(
+                        written,
+                        vec!["target".to_owned()],
+                        "an attribute was removed, and the watch says it wrote {written:?}"
+                    );
+                }
+            }
+
+            /// What a directory can hold that the host does not read: more than 64 extended
+            /// attributes, and a value of more than 4,096 bytes.
+            fn more_than_the_host_reads() -> [fn(&Path); 2] {
+                [
+                    |parent| {
+                        for number in 0..65 {
+                            set_attribute(parent, &format!("kr.n{number}"), b"x");
+                        }
+                    },
+                    |parent| set_attribute(parent, "kr.big", &[b'x'; 4097]),
+                ]
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that holds more than the host reads is
+            /// not read: the start fails, before the budget is asked.
+            #[test]
+            fn a_parent_with_more_attributes_than_the_host_reads_is_not_read() {
+                for grow in more_than_the_host_reads() {
+                    let layout = a_layout();
+                    grow(&layout.copy.join("target"));
+                    let why = Site::of(
+                        &layout.copy_directory,
+                        &layout.beside,
+                        &parents_of_outputs(),
+                    )
+                    .err()
+                    .unwrap_or_default();
+                    assert!(
+                        why.contains("could not be examined"),
+                        "the directory was read though it holds more than the host reads: {why:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that comes to hold more than the host
+            /// reads cannot be read at the end: the drain fails, and it is neither a write nor
+            /// none.
+            #[test]
+            fn a_parent_that_grows_past_what_the_host_reads_makes_the_drain_fail() {
+                for grow in more_than_the_host_reads() {
+                    let place = a_place();
+                    let parent = place.copy.join("target");
+                    let (platform, decided) =
+                        deliver(&place, Vec::new(), move || grow(&parent), Vec::new());
+                    let drained = place.watch.drain();
+                    decided.send(()).expect("the platform waits");
+                    platform.join().expect("the platform ends");
+                    let why = drained.err().unwrap_or_default();
+                    assert!(
+                        why.contains("could not be examined"),
+                        "the drain did not fail as it should: {why:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: a directory removed and made again has another inode, which is a
+            /// write whatever was reported of it, also when what was reported is a creation, and
+            /// the directory made again holds the attribute that was recorded.
+            #[test]
+            fn a_creation_report_of_a_parent_with_another_inode_is_a_write() {
+                let place = a_place();
+                replace_the_parent(&place.copy);
+                let parent = place.copy.join("target");
+                set_attribute(&parent, KEPT, b"one");
+                let before = vec![report(created(), &parent)];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert!(
+                    written.iter().any(|path| path == "target"),
+                    "the directory has another inode, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: every report of a directory an output is in but a creation or a
+            /// change of its extended attributes is a write, with the directory as recorded: a
+            /// removal.
+            #[test]
+            fn a_removal_report_of_a_parent_is_a_write() {
+                let written = written_for(vec![EventKind::Remove(RemoveKind::Folder)]);
+                assert_eq!(written, vec!["target".to_owned()]);
+            }
+
+            /// KR-REQ-14.34: a rename.
+            #[test]
+            fn a_rename_report_of_a_parent_is_a_write() {
+                let written =
+                    written_for(vec![EventKind::Modify(ModifyKind::Name(RenameMode::Any))]);
+                assert_eq!(written, vec!["target".to_owned()]);
+            }
+
+            /// KR-REQ-14.34: a change of its owner, and of its mode.
+            #[test]
+            fn an_owner_or_mode_report_of_a_parent_is_a_write() {
+                for kind in [MetadataKind::Ownership, MetadataKind::Permissions] {
+                    let written = written_for(vec![EventKind::Modify(ModifyKind::Metadata(kind))]);
+                    assert_eq!(written, vec!["target".to_owned()], "{kind:?}");
+                }
+            }
+
+            /// KR-REQ-14.34: any other metadata, and its content.
+            #[test]
+            fn any_other_metadata_or_content_report_of_a_parent_is_a_write() {
+                for kind in [
+                    EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                    EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+                    EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                ] {
+                    let written = written_for(vec![kind]);
+                    assert_eq!(written, vec!["target".to_owned()], "{kind:?}");
+                }
             }
         }
     }

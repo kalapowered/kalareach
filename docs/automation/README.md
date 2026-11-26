@@ -667,28 +667,38 @@ A test result is what this host observed, and nothing a caller reports.
   indeterminate however briefly it existed: a scratch file the suite made and removed again at the
   copy's root, beside an output called `target`, is such a name. The parent itself is watched too,
   because a record that leaves it out would miss what is done to it: a report that it was renamed,
-  removed, or had its mode, owner or attributes changed makes the result indeterminate, and so does
-  the same for the copy's own directory, which is a parent when an output is at its root. A suite
-  that removes a directory above its declared output, or moves its copy away, writes in it and moves
-  it back, is writing outside the output; on macOS the host sees the move away and back of the copy
-  itself only through the watcher's reports, as said below. On Linux the watcher is the kernel's
-  inotify, which follows the directory it was set on wherever it is renamed to. On macOS it is
-  FSEvents, which reports by path and on its own schedule. The host judges each report as it
-  arrives, and it writes a file of its own beside the copy and waits, for up to ten seconds, until
-  the watcher reports it, which shows how far the watcher has come in its stream, and not that every
-  earlier change was reported. A report of a parent can come after the report of the host's own
-  file, or not at all, so the host also records the device and inode of each parent before the suite
-  starts and reads them again at the end, after that wait: a parent that is gone, is no longer a
-  directory or has another device or inode makes the result indeterminate whatever the watcher
-  reported of it. A parent keeps its device and inode when a suite changes its mode, owner or
-  attributes, whether it puts them back or not, and when it moves the parent away and back, so the
-  watcher's reports alone show such a change. The record of the directory above a parent shows a
-  move away and back as well, except for the copy itself and for a parent in a directory that is
-  also a parent (declared outputs `out` and `target/debug` give that layout: `target` is in the
-  copy, which is a parent too). For those, and so for a suite that moves its copy away, tests other
-  sources at its path and moves it back, the host sees the move only through the watcher's reports,
-  and a loss that FSEvents does not announce leaves it unseen. A parent whose full path is longer
-  than the 1,024 bytes that macOS allows for a path makes every result of that suite indeterminate.
+  removed, or had its mode, owner or any metadata but its extended attributes changed makes the
+  result indeterminate, and so does the same for the copy's own directory, which is a parent when an
+  output is at its root. A suite that removes a directory above its declared output, or moves its
+  copy away, writes in it and moves it back, is writing outside the output; on macOS the host sees
+  the move away and back of the copy itself only through the watcher's reports, as said below. On
+  Linux the watcher is the kernel's inotify, which follows the directory it was set on wherever it
+  is renamed to. On macOS it is FSEvents, which reports by path and on its own schedule. The host
+  judges each report as it arrives, and it writes a file of its own beside the copy and waits, for
+  up to ten seconds, until the watcher reports it, which shows how far the watcher has come in its
+  stream, and not that every earlier change was reported. A report of a parent can come after the
+  report of the host's own file, or not at all, and the file-event service of macOS can report the
+  host's own set-up of the copy a second time, after the watcher is up to date. So the host also
+  records the device, the inode and the extended attributes (names and values) of each parent before
+  the suite starts, and reads them again at the end, after that wait. A parent that is gone, is no
+  longer a directory, has another device or inode, or has an extended attribute added, removed or
+  changed in value makes the result indeterminate whatever the watcher reported of it. A report that
+  a parent was created, or that its extended attributes changed, does not by itself make the result
+  indeterminate, because what the host read at the start decides both: a directory with the inode it
+  had was not made in the run, and attributes equal to the ones read at the start were not left
+  changed. Every other report of a parent makes the result indeterminate: a removal, a rename, a
+  change of its mode or owner, any other change of its metadata, or a change of its content. A
+  parent keeps its device and inode when a suite changes its mode or owner, whether it puts them
+  back or not, and when it moves the parent away and back, so the watcher's reports alone show such
+  a change, and an extended attribute that a suite changes and puts back is not seen at all. The
+  record of the directory above a parent shows a move away and back as well, except for the copy
+  itself and for a parent in a directory that is also a parent (declared outputs `out` and
+  `target/debug` give that layout: `target` is in the copy, which is a parent too). For those, and
+  so for a suite that moves its copy away, tests other sources at its path and moves it back, the
+  host sees the move only through the watcher's reports, and a loss that FSEvents does not announce
+  leaves it unseen. A parent whose full path is longer than the 1,024 bytes that macOS allows for a
+  path makes every result of that suite indeterminate, and so does a parent with more than 64
+  extended attributes, names that take more than 8,192 bytes or a value of more than 4,096 bytes.
   FSEvents says that it dropped reports at the path where it dropped them, which may be a directory
   above the copy or the root of the volume. The watcher passes every such notice it receives on its
   stream to the host whatever path it names, and the host takes each as a loss, so it makes the
