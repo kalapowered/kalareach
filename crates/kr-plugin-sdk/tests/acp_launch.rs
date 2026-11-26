@@ -1443,3 +1443,116 @@ fn kr_req_11_26_a_passed_name_that_begins_with_xdg_is_accepted() {
         "XDG_CONFIG_HOME is passed: {findings:?}"
     );
 }
+
+/// What a constant whose name has `PROXY` in it is told, after the name.
+const PROXY_REASON: &str = "has PROXY in its name, in upper or lower case; a variable named so \
+     tells many tools where to send their network traffic, and no ACP launch sets one; a launch \
+     may pass the name, which keeps the person's own value";
+
+/// Names that have `PROXY` in them, in upper, lower and mixed case, at the start, in the middle and
+/// at the end, and the proxy names the two real launches pass.
+const PROXY_NAMES: [&str; 14] = [
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "GRPC_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "grpc_proxy",
+    "no_grpc_proxy",
+    "Https_Proxy",
+    "EXAMPLE_PROXYING",
+    "EXAMPLE_PROXY_URL",
+    "PROXY",
+];
+
+/// KR-REQ-11.26: a constant whose name has `PROXY` in it, in upper, lower or mixed case, anywhere in
+/// the name, is refused in a sentence of its own: a proxy's host can be written as one word or as a
+/// number, which the value rule admits, so the name closes the route. A name of a loader family
+/// that has it is told this sentence too.
+#[test]
+fn kr_req_11_26_a_constant_with_proxy_in_its_name_is_refused() {
+    for name in PROXY_NAMES
+        .into_iter()
+        .chain(["GIT_PROXY_COMMAND", "NPM_CONFIG_PROXY"])
+    {
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = format!("constant: the name \"{name}\" {PROXY_REASON}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused in its own sentence: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a name that has `PROXY` in it may be passed: it is the person's own value, and the
+/// two real launches pass such names.
+#[test]
+fn kr_req_11_26_a_name_with_proxy_in_it_may_be_passed() {
+    let mut launch = declaration();
+    let mut passed = vec!["PATH", "HOME", "EXAMPLE_API_KEY"];
+    passed.extend(PROXY_NAMES);
+    launch["passed_names"] = json!(passed);
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        findings.is_empty(),
+        "the proxy names are passed: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: a name that only resembles `PROXY` is not refused: the rule is the whole word.
+#[test]
+fn kr_req_11_26_a_name_that_only_resembles_proxy_is_not_refused() {
+    for name in [
+        "EXAMPLE_PROXIMITY",
+        "EXAMPLE_PROXIES",
+        "EXAMPLE_PROXI",
+        "PROX",
+        "PRO_XY",
+        "example_prox",
+    ] {
+        let findings = findings_of(&with_constant(name, "x"));
+        assert!(
+            findings.is_empty(),
+            "a constant {name} is not refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a letter from another script in the place of a letter of `PROXY` makes the name
+/// one that no launch may list: the name's own rule is letters, digits and `_` of ASCII only, so
+/// the proxy rule needs no spelling of its own and compares in ASCII upper case.
+#[test]
+fn kr_req_11_26_a_look_alike_letter_for_a_letter_of_proxy_is_refused_by_the_names_own_rule() {
+    for name in [
+        "HTTPS_\u{420}ROXY",
+        "HTTPS_\u{3a1}ROXY",
+        "HTTPS_PROX\u{3a5}",
+        "https_pr\u{43e}xy",
+    ] {
+        let findings = findings_of(&with_constant(name, "x"));
+        let reason = format!("constant: the name \"{name}\" is not a variable name");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a constant {name} is refused by the name's own rule: {findings:?}"
+        );
+        let mut launch = declaration();
+        launch["passed_names"] = json!(["PATH", "HOME", "EXAMPLE_API_KEY", name]);
+        let findings = findings_of(&manifest_with(&launch, &GRANTS));
+        let reason = format!("name: \"{name}\" in passed_names is not a variable name");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "a passed {name} is refused by the name's own rule: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the parts a constant's name may not hold are the launch's own list, stated in the
+/// package contract.
+#[test]
+fn kr_req_11_26_the_set_only_parts_are_the_launchs_own_list() {
+    let contract = package_contract();
+    assert_eq!(contract["acp_launch"]["set_only_parts"], json!(["PROXY"]));
+}

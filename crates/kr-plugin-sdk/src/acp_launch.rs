@@ -25,8 +25,9 @@
 //!   [`LOADER_BEGINNINGS`] (`LD`, `DYLD`, `BASH`, `NODE`, `BUN` and the rest) and none is one of
 //!   [`LOADER_NAMES`]. It is a list, not a proof: a name that no list holds can pass. Three data
 //!   names of Node.js begin that way and may be passed ([`DATA_NAMES`]). A constant is also none
-//!   of [`COPIED_NAMES`], [`DATA_NAMES`] or [`START_FILE_NAMES`], and does not begin with a word
-//!   of [`SET_ONLY_BEGINNINGS`].
+//!   of [`COPIED_NAMES`], [`DATA_NAMES`] or [`START_FILE_NAMES`], does not begin with a word of
+//!   [`SET_ONLY_BEGINNINGS`] and holds no part of [`SET_ONLY_PARTS`] anywhere in it, in upper or
+//!   lower case.
 //! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
 //!   which the host replaces with the path of a folder it makes new and empty for each start, or
 //!   only ASCII letters, digits and `_`. The alphabet has no dot, hyphen, slash, colon or space,
@@ -123,6 +124,14 @@ pub const START_FILE_NAMES: [&str; 10] = [
 /// folders that `XDG` names are where Git, fish and other tools read what they run, and a passed
 /// name is the person's own.
 pub const SET_ONLY_BEGINNINGS: [&str; 1] = ["XDG"];
+
+/// Parts a constant's name may not hold anywhere in it, though a declaration may pass such a name:
+/// the name, compared in ASCII upper case, is refused when it has one of them at its start, in its
+/// middle or at its end, not only as a whole word. `PROXY` marks the variables that tell a tool
+/// where to send its network traffic; a proxy's host can be written as one word or as a number,
+/// which a constant's value may be, so the name closes that route. A passed name is the person's
+/// own.
+pub const SET_ONLY_PARTS: [&str; 1] = ["PROXY"];
 
 /// What a declaration does with a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,7 +421,9 @@ impl AcpLaunch {
 /// nothing, such as `SSL_CERT_FILE`. [`DATA_NAMES`] begin like them and change only which
 /// certificates and proxy Node.js uses: they may be passed. A constant is also refused when it is
 /// one of [`COPIED_NAMES`], [`DATA_NAMES`] or [`START_FILE_NAMES`], or begins with a word of
-/// [`SET_ONLY_BEGINNINGS`].
+/// [`SET_ONLY_BEGINNINGS`], or holds a part of [`SET_ONLY_PARTS`] anywhere. A name has only ASCII
+/// letters, digits and `_`, so the upper-case form the lists are compared in is the whole of its
+/// spelling: a letter of another script in a name is refused by the name's own rule.
 fn name_problem(name: &str, role: Role) -> Option<String> {
     if !name_has_shape(name) {
         return Some(format!(
@@ -448,6 +459,13 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
             return Some(format!(
                 "begins with {word}, a variable that moves where a tool reads the settings and \
                  start files it runs, and no ACP launch sets it"
+            ));
+        }
+        if let Some(part) = SET_ONLY_PARTS.iter().find(|part| upper.contains(**part)) {
+            return Some(format!(
+                "has {part} in its name, in upper or lower case; a variable named so tells many \
+                 tools where to send their network traffic, and no ACP launch sets one; a launch \
+                 may pass the name, which keeps the person's own value"
             ));
         }
     }

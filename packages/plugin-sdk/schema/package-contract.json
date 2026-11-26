@@ -59,6 +59,9 @@
     "set_only_beginnings": [
       "XDG"
     ],
+    "set_only_parts": [
+      "PROXY"
+    ],
     "start_file_names": [
       "ZDOTDIR",
       "SHELLOPTS",
