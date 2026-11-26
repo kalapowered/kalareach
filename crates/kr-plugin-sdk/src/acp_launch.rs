@@ -29,7 +29,8 @@
 //!   of [`SET_ONLY_BEGINNINGS`].
 //! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
 //!   which the host replaces with the path of a folder it makes new and empty for each start, or
-//!   only ASCII letters, digits, `_`, `.` and `-`, and not dots only.
+//!   only ASCII letters, digits and `_`. The alphabet has no dot, hyphen, slash, colon or space,
+//!   so a dotted host name, a path, a URL, a command line and an option are refused.
 //! * The declaration has no argument member: the host passes [`AGENT_ARGUMENT`] and nothing else.
 
 use schemars::JsonSchema;
@@ -468,7 +469,10 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
 }
 
 /// Returns why a constant's value is not one a declaration may set, where it is not: a value is
-/// the private-home word alone, or only ASCII letters, digits, `_`, `.` and `-`.
+/// the private-home word alone, or only ASCII letters, digits and `_`. A dot, a hyphen, a slash, a
+/// colon and a space are none of them, so a dotted host name, a path, a URL, a command line and an
+/// option are refused by the alphabet. A later SDK version can admit a character again; it cannot
+/// refuse one that a published release used.
 fn value_problem(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("is empty".to_owned());
@@ -494,23 +498,31 @@ fn value_problem(value: &str) -> Option<String> {
     if value == PRIVATE_HOME_PLACEHOLDER {
         return None;
     }
-    if value.chars().all(|c| c == '.') {
-        return Some(format!(
-            "is made only of dots, which name a place, not a word; {}",
-            value_rule()
-        ));
-    }
     value
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
-        .map(|character| format!("holds '{character}'; {}", value_rule()))
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map(|character| {
+            format!(
+                "holds {}; a value is {PRIVATE_HOME_PLACEHOLDER} alone, or only ASCII letters, \
+                 digits and '_'",
+                character_shown(character)
+            )
+        })
 }
 
-/// What a value may be, as a refused value is told.
-fn value_rule() -> String {
-    format!(
-        "a value is {PRIVATE_HOME_PLACEHOLDER} alone, or only letters, digits, '_', '.' and '-'"
-    )
+/// Returns a character as a refused value is told of it: a visible ASCII character as itself and
+/// its code point, the space by its name and its code point, and any other character as one
+/// outside ASCII with its code point, since a reader cannot tell a non-breaking space from a
+/// space. The refusal tells of the first character that breaks the rule and of no other.
+fn character_shown(character: char) -> String {
+    let code = u32::from(character);
+    if character.is_ascii_graphic() {
+        format!("'{character}' (U+{code:04X})")
+    } else if character == ' ' {
+        format!("a space (U+{code:04X})")
+    } else {
+        format!("a character outside ASCII (U+{code:04X})")
+    }
 }
 
 /// Why a host does not start an agent in ACP mode, in the order the host checks.

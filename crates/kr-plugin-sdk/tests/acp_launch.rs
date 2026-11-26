@@ -1189,8 +1189,7 @@ fn kr_req_11_26_the_start_file_names_are_the_launchs_own_list() {
 }
 
 /// What a refused constant value is told, after the character that breaks the rule.
-const VALUE_RULE: &str =
-    "a value is {private_home} alone, or only letters, digits, '_', '.' and '-'";
+const VALUE_RULE: &str = "a value is {private_home} alone, or only ASCII letters, digits and '_'";
 
 /// The example launch with one constant, `name` set to `value`.
 fn with_constant(name: &str, value: &str) -> Value {
@@ -1199,23 +1198,33 @@ fn with_constant(name: &str, value: &str) -> Value {
     manifest_with(&launch, &GRANTS)
 }
 
-/// KR-REQ-11.26: a constant's value is the host's private-home word alone, or only letters,
-/// digits, `_`, `.` and `-`: a path, an address, a command line, a space, a slash and a
-/// character outside ASCII are each refused, with the first character that breaks the rule.
+/// KR-REQ-11.26: a constant's value is the host's private-home word alone, or only ASCII letters,
+/// digits and `_`: a path, an address, a command line, a space, a slash and a character outside
+/// ASCII are each refused, with the first character that breaks the rule written as a code
+/// point, so a character that a reader cannot tell from a space is still named.
 #[test]
 fn kr_req_11_26_a_constant_value_that_is_not_plain_is_refused() {
     for (what, value, shown) in [
-        ("a path", "/etc/ssl/openssl.cnf", '/'),
-        ("a relative path", "conf/x.cnf", '/'),
-        ("an address", "https://index.example/simple", ':'),
-        ("a command line", "less -R", ' '),
-        ("a space", "a b", ' '),
-        ("a slash", "a/b", '/'),
-        ("a character outside ASCII", "caf\u{e9}", '\u{e9}'),
+        ("a path", "/etc/ssl/openssl.cnf", "'/' (U+002F)"),
+        ("a relative path", "conf/x.cnf", "'/' (U+002F)"),
+        ("an address", "https://index.example/simple", "':' (U+003A)"),
+        ("a command line", "less -R", "a space (U+0020)"),
+        ("a space", "a b", "a space (U+0020)"),
+        ("a slash", "a/b", "'/' (U+002F)"),
+        (
+            "a character outside ASCII",
+            "caf\u{e9}",
+            "a character outside ASCII (U+00E9)",
+        ),
+        (
+            "a non-breaking space",
+            "a\u{a0}b",
+            "a character outside ASCII (U+00A0)",
+        ),
     ] {
         let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
         let reason =
-            format!("constant: the value of \"EXAMPLE_VALUE\" holds '{shown}'; {VALUE_RULE}");
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds {shown}; {VALUE_RULE}");
         assert!(
             has(&findings, FindingCode::AcpLaunchInvalid, &reason),
             "{what} ({value:?}) is refused: {findings:?}"
@@ -1223,25 +1232,96 @@ fn kr_req_11_26_a_constant_value_that_is_not_plain_is_refused() {
     }
 }
 
-/// KR-REQ-11.26: a value of dots only names a place, not a word, and is refused in its own
-/// sentence.
+/// KR-REQ-11.26: a refused value is told of the first character that breaks the rule, and only that
+/// one.
+#[test]
+fn kr_req_11_26_a_refused_value_is_told_of_its_first_wrong_character() {
+    for (value, shown) in [
+        ("a b/c", "a space (U+0020)"),
+        ("a/b c", "'/' (U+002F)"),
+        ("ok_1;\u{a0}x", "';' (U+003B)"),
+        ("ok_1\u{a0};x", "a character outside ASCII (U+00A0)"),
+    ] {
+        let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
+        let reason =
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds {shown}; {VALUE_RULE}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "{value:?} is told of {shown}: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the characters that join a value to an assignment, a variable, a second command
+/// or a pipe are each refused, with the sentence of the alphabet.
+#[test]
+fn kr_req_11_26_a_constant_value_with_an_assignment_or_shell_character_is_refused() {
+    for (what, value, shown) in [
+        ("an equals sign", "a=b", "'=' (U+003D)"),
+        ("an option with its argument", "keys=on", "'=' (U+003D)"),
+        ("a variable", "$HOME", "'$' (U+0024)"),
+        ("a second command", "a;b", "';' (U+003B)"),
+        ("a pipe", "a|b", "'|' (U+007C)"),
+    ] {
+        let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
+        let reason =
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds {shown}; {VALUE_RULE}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "{what} ({value:?}) is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: the dot and the hyphen are not in a value's alphabet: a value of dots only, a
+/// dotted host name, a dotted address and an option, with or without its argument, are refused
+/// by the same sentence as any other character that the alphabet leaves out.
+#[test]
+fn kr_req_11_26_a_constant_value_with_a_dot_or_a_hyphen_is_refused() {
+    for (what, value, shown) in [
+        ("a dot", ".", "'.' (U+002E)"),
+        ("two dots", "..", "'.' (U+002E)"),
+        ("three dots", "...", "'.' (U+002E)"),
+        ("a dotted host name", "index.example", "'.' (U+002E)"),
+        ("a dotted address", "10.0.0.1", "'.' (U+002E)"),
+        ("a file name", "policy.conf", "'.' (U+002E)"),
+        ("a short option", "-R", "'-' (U+002D)"),
+        ("a long option", "--no-pager", "'-' (U+002D)"),
+        ("a hyphenated word", "a-b", "'-' (U+002D)"),
+    ] {
+        let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
+        let reason =
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds {shown}; {VALUE_RULE}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "{what} ({value:?}) is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a value of dots only is refused by the alphabet, in no sentence of its own.
 #[test]
 fn kr_req_11_26_a_constant_value_of_dots_only_is_refused() {
     for value in [".", "..", "..."] {
         let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
-        let reason = format!(
-            "constant: the value of \"EXAMPLE_VALUE\" is made only of dots, which name a place, \
-             not a word; {VALUE_RULE}"
-        );
+        let reason =
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds '.' (U+002E); {VALUE_RULE}");
         assert!(
             has(&findings, FindingCode::AcpLaunchInvalid, &reason),
             "{value:?} is refused: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.detail.contains("made only of dots")),
+            "{value:?} has no sentence of its own: {findings:?}"
         );
     }
 }
 
 /// KR-REQ-11.26: every constant of the two real launches meets the value rule, and so do the
-/// private-home word alone and a value of every kind of character the rule allows.
+/// private-home word alone and a value of every kind of character the rule allows: upper-case and
+/// lower-case letters, digits and the underscore.
 #[test]
 fn kr_req_11_26_the_constants_of_the_two_real_launches_pass_the_value_rule() {
     let mut constants: Vec<Value> = Vec::new();
@@ -1254,7 +1334,7 @@ fn kr_req_11_26_the_constants_of_the_two_real_launches_pass_the_value_rule() {
                 .expect("a launch");
         constants.extend(launch["constants"].as_array().expect("constants").clone());
     }
-    constants.push(json!({"name": "EXAMPLE_PLAIN", "value": "Ab_1.2-c"}));
+    constants.push(json!({"name": "EXAMPLE_PLAIN", "value": "Ab_12_c"}));
     assert!(
         constants
             .iter()
