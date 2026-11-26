@@ -471,8 +471,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
     }
     if let Some(listed) = LOADER_NAMES.iter().find(|listed| **listed == upper) {
         return Some(format!(
-            "is {listed}, a name that can decide what code or command a loader, a runtime or a \
-             library loads or runs, and no ACP launch passes or sets it"
+            "is {listed}, a name that can decide what code, command or data a loader, a runtime or a \
+             library reads or runs, and no ACP launch passes or sets it"
         ));
     }
     LOADER_BEGINNINGS
@@ -481,7 +481,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
         .map(|word| {
             format!(
                 "begins with {word}; a name that begins so can decide what code or command a \
-                 loader, a runtime or a library loads or runs, and no ACP launch passes or sets one"
+                 loader, a runtime or a library loads or runs, or which certificates or proxy a \
+                 tool uses, and no ACP launch passes or sets this name"
             )
         })
 }

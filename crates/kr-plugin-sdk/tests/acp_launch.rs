@@ -634,11 +634,12 @@ fn kr_req_11_26_the_first_cause_in_the_hosts_order_is_the_one_refused() {
 
 /// What a name refused for its beginning is told after the beginning.
 const BEGINNING_REASON: &str = "; a name that begins so can decide what code or command a loader, a \
-     runtime or a library loads or runs, and no ACP launch passes or sets one";
+     runtime or a library loads or runs, or which certificates or proxy a tool uses, and no ACP \
+     launch passes or sets this name";
 
 /// What a name refused whole is told after the name.
-const NAME_REASON: &str = ", a name that can decide what code or command a loader, a runtime or a \
-     library loads or runs, and no ACP launch passes or sets it";
+const NAME_REASON: &str = ", a name that can decide what code, command or data a loader, a runtime or a \
+     library reads or runs, and no ACP launch passes or sets it";
 
 /// KR-REQ-11.26: no launch passes a name that loads code into the agent or into a program it
 /// starts, whatever the name is: the loader and runtime names refuse by their beginning or their
@@ -655,6 +656,12 @@ fn kr_req_11_26_a_passed_name_that_loads_code_is_refused() {
         ("BASH_ENV", "begins with BASH"),
         ("GCONV_PATH", "begins with GCONV"),
         ("PYTHONSTARTUP", "begins with PYTHON"),
+        ("SSL_CERT_FILE", "begins with SSL"),
+        ("CURL_CA_BUNDLE", "begins with CURL"),
+        ("REQUESTS_CA_BUNDLE", "begins with REQUESTS"),
+        ("OPENSSL_CONF", "begins with OPENSSL"),
+        ("GIT_PROXY_COMMAND", "begins with GIT"),
+        ("NPM_CONFIG_PROXY", "begins with NPM"),
         ("ENV", "is ENV"),
         ("LOCPATH", "is LOCPATH"),
         ("_JAVA_OPTIONS", "is _JAVA_OPTIONS"),
