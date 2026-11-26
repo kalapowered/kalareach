@@ -187,34 +187,51 @@ fn kr_req_11_26_the_statement_of_a_launch_with_no_constant_says_so() {
 }
 
 /// KR-REQ-11.26: a package that declares a launch without the approval grants is refused, because
-/// an approval the agent asks for could not be answered.
+/// an approval the agent asks for could not be answered. Holding `approval.decode` and not
+/// `approval.respond` names `approval.respond` alone.
 #[test]
 fn kr_req_11_26_a_launch_without_the_approval_grants_is_refused() {
-    let reason = "grants missing:";
     let findings = findings_of(&manifest_with(
         &declaration(),
         &["command_integration.launch"],
     ));
+    let reason = "grants missing:";
     assert!(
         has(&findings, FindingCode::AcpLaunchWithoutCapability, reason),
         "a finding that begins {reason:?} is expected: {findings:?}"
     );
-    let validated = validate(&manifest_with(
+    let findings = findings_of(&manifest_with(
         &declaration(),
         &["command_integration.launch", "approval.decode"],
     ));
-    let finding = validated
-        .report
-        .findings
+    let finding = findings
         .iter()
-        .find(|finding| finding.code == FindingCode::AcpLaunchWithoutCapability)
-        .expect("a finding for the missing grant");
+        .find(|finding| finding.code == FindingCode::AcpLaunchWithoutCapability);
     assert!(
-        finding.detail.starts_with("grants missing:")
+        finding.is_some_and(|finding| finding.detail.starts_with("grants missing:")
             && finding.detail.contains("approval.respond")
-            && !finding.detail.contains("approval.decode"),
-        "{}",
-        finding.detail
+            && !finding.detail.contains("approval.decode")),
+        "approval.respond alone is named: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: holding the launch grant and `approval.respond` and not `approval.decode` is
+/// refused, and names `approval.decode` alone: the host decodes what the agent asks before the
+/// owner answers it.
+#[test]
+fn kr_req_11_26_a_launch_without_approval_decode_alone_is_refused() {
+    let findings = findings_of(&manifest_with(
+        &declaration(),
+        &["command_integration.launch", "approval.respond"],
+    ));
+    let finding = findings
+        .iter()
+        .find(|finding| finding.code == FindingCode::AcpLaunchWithoutCapability);
+    assert!(
+        finding.is_some_and(|finding| finding.detail.starts_with("grants missing:")
+            && finding.detail.contains("approval.decode")
+            && !finding.detail.contains("approval.respond")),
+        "approval.decode alone is named: {findings:?}"
     );
 }
 
@@ -794,5 +811,28 @@ fn kr_req_11_26_launch_words_with_a_non_breaking_space_are_refused() {
             finding.code == FindingCode::ManifestUnreadable && finding.detail.contains("U+00A0")
         }),
         "the manifest is unreadable for U+00A0: {findings:?}"
+    );
+}
+
+/// KR-REQ-11.26: each approval grant is needed on its own: with the launch grant and only one of
+/// the two, the host refuses in the sentence of the approvals, whichever one is missing.
+#[test]
+fn kr_req_11_26_each_approval_grant_is_needed_on_its_own() {
+    let launch = launch();
+    let decode_only = [
+        PluginCapability::CommandIntegrationLaunch,
+        PluginCapability::ApprovalDecode,
+    ];
+    let respond_only = [
+        PluginCapability::CommandIntegrationLaunch,
+        PluginCapability::ApprovalRespond,
+    ];
+    assert_eq!(
+        launch.admission(&decode_only, true, OperatingSystem::Linux),
+        Err(AcpRefusal::ApprovalsMissing)
+    );
+    assert_eq!(
+        launch.admission(&respond_only, true, OperatingSystem::Linux),
+        Err(AcpRefusal::ApprovalsMissing)
     );
 }
