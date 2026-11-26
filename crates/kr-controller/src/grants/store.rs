@@ -6933,7 +6933,17 @@ mod the_boundary_of_a_reading {
 
     use kr_protocol::ids::BootEpoch;
 
-    use super::GrantDirectory;
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::{
+        AuthorityRevision, DeviceId, EnvironmentId, GrantId, InvitationId, SessionId,
+    };
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+    use kr_protocol::sharing::{InvitationPreview, SessionRole};
+
+    use super::{GrantDirectory, GrantRecord};
     use crate::boots::BootClock;
     use crate::boots::testing::{SetClock, a_site_reads_after_the_lock};
 
@@ -6950,6 +6960,114 @@ mod the_boundary_of_a_reading {
         NEXT_START_PASS_WAITS.fetch_add(1, Ordering::SeqCst);
         std::thread::yield_now();
         true
+    }
+
+    /// A busy handler for one case: it counts how often the site waits for the lock, which is how
+    /// the case knows the site is waiting and not still on its way to the lock.
+    macro_rules! waits {
+        ($waits:ident, $count:ident) => {
+            static $waits: AtomicU64 = AtomicU64::new(0);
+
+            fn $count(_attempts: i32) -> bool {
+                $waits.fetch_add(1, Ordering::SeqCst);
+                std::thread::yield_now();
+                true
+            }
+        };
+    }
+
+    waits!(ISSUE_WAITS, count_the_issue_wait);
+    waits!(REDEMPTION_WAITS, count_the_redemption_wait);
+    waits!(TRANSFER_WAITS, count_the_transfer_wait);
+
+    const NOW_MS: u64 = 5_000_000;
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+    fn an_id(byte: u8) -> Uuid {
+        Uuid::from_bytes([byte; 16])
+    }
+
+    /// A grant of a session: `number` names it, `parent` is the grant it stands under.
+    fn a_grant(number: u8, parent: Option<GrantId>, actions: &[ActionRight]) -> GrantRecord {
+        let session = SessionId::new(an_id(0xa0));
+        GrantRecord {
+            grant: Grant {
+                grant_id: GrantId::new(an_id(number)),
+                parent_grant_id: Nullable(parent),
+                issuer_device_id: DeviceId::new(an_id(0xf0)),
+                recipient_device_id: DeviceId::new(an_id(0x31)),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::These {
+                    environment_ids: [EnvironmentId::new(an_id(0xe0))].into_iter().collect(),
+                },
+                session_selector: SessionSelector::These {
+                    session_ids: [session].into_iter().collect(),
+                },
+                actions: actions.iter().copied().collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::from_iter([]),
+                    named_approvals: CanonicalSet::from_iter([]),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            session_id: Some(session),
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    }
+
+    /// A share nobody has redeemed, with the invitation that carries it.
+    fn a_share(parent: GrantId, number: u8, invitation: u8) -> (GrantRecord, InvitationPreview) {
+        let mut carried = a_grant(number, Some(parent), &[ActionRight::SessionView]);
+        carried.activated_at_ms = None;
+        let preview = InvitationPreview {
+            invitation_id: InvitationId::new(an_id(invitation)),
+            session_id: SessionId::new(an_id(0xa0)),
+            environment_id: EnvironmentId::new(an_id(0xe0)),
+            role: SessionRole::Viewer,
+            actions: carried.grant.actions.clone(),
+            history: carried.grant.history.clone(),
+            expires_at_ms: TimestampMs::new(NOW_MS + DAY_MS),
+            live_screen: Nullable::null(),
+            named_questions: Vec::new(),
+            named_approvals: Vec::new(),
+            notices: CanonicalSet::from_iter([]),
+            historical_attachment_keys: false,
+            single_use: true,
+        };
+        (carried, preview)
+    }
+
+    /// A store with a root grant in it, whose writes wait for the lock another writer holds and
+    /// count their waits through `count`.
+    fn a_store_with_a_root(
+        path: &std::path::Path,
+        count: fn(i32) -> bool,
+    ) -> (GrantDirectory, GrantId) {
+        let store = GrantDirectory::open(path).expect("the store");
+        let root = a_grant(
+            1,
+            None,
+            &[ActionRight::SessionView, ActionRight::TerminalInput],
+        );
+        store.issue(&root, || Ok(())).expect("the root");
+        store
+            .connection
+            .lock()
+            .expect("the connection")
+            .busy_handler(Some(count))
+            .expect("the handler");
+        (store, root.grant.grant_id)
+    }
+
+    /// An earlier boot of the same host: what a share was issued in, before the case's boot.
+    fn an_earlier_boot() -> BootClock {
+        BootClock::new(SetClock::at(10) as _, BootEpoch::new(6))
     }
 
     /// The regular pass reads the counter after its transaction holds the write lock.
@@ -6969,6 +7087,11 @@ mod the_boundary_of_a_reading {
         let delayed = a_site_reads_after_the_lock(&path, &REGULAR_PASS_WAITS, &clock, 7, || {
             store.observe_boot(&boot).expect("the pass");
         });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
         assert_eq!(
             delayed.reads_while_held, 0,
             "the counter was read while another writer held the lock"
@@ -6997,6 +7120,125 @@ mod the_boundary_of_a_reading {
         let delayed = a_site_reads_after_the_lock(&path, &NEXT_START_PASS_WAITS, &clock, 7, || {
             store.start_points_at_start(&boot, 1).expect("the pass");
         });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
+    }
+
+    /// A share's issue reads the counter after its transaction holds the write lock.
+    #[test]
+    fn the_issue_of_a_share_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let (store, root) = a_store_with_a_root(&path, count_the_issue_wait);
+        let (share, preview) = a_share(root, 2, 0x91);
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &ISSUE_WAITS, &clock, 7, || {
+            store
+                .issue_shared(
+                    &share,
+                    &preview,
+                    DeviceId::new(an_id(0xf0)),
+                    NOW_MS,
+                    &boot,
+                    || Ok(()),
+                )
+                .expect("the share is issued");
+        });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
+    }
+
+    /// So does a redemption.
+    #[test]
+    fn the_redemption_of_a_share_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let (store, root) = a_store_with_a_root(&path, count_the_redemption_wait);
+        let (share, preview) = a_share(root, 2, 0x91);
+        store
+            .issue_shared(
+                &share,
+                &preview,
+                DeviceId::new(an_id(0xf0)),
+                NOW_MS,
+                &an_earlier_boot(),
+                || Ok(()),
+            )
+            .expect("the share is issued in an earlier boot");
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &REDEMPTION_WAITS, &clock, 7, || {
+            store
+                .redeem(
+                    preview.invitation_id,
+                    share.grant.recipient_device_id,
+                    NOW_MS,
+                    &boot,
+                    || Ok(()),
+                    None,
+                )
+                .expect("the share is redeemed");
+        });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
+    }
+
+    /// So does a transfer of control.
+    #[test]
+    fn a_transfer_reads_the_counter_after_it_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let (store, root) = a_store_with_a_root(&path, count_the_transfer_wait);
+        let replacement = a_grant(9, None, &[ActionRight::SessionView]);
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &TRANSFER_WAITS, &clock, 7, || {
+            store
+                .transfer(root, &replacement, NOW_MS, &boot, |_| Ok(()), None)
+                .expect("the control is transferred");
+        });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
         assert_eq!(
             delayed.reads_while_held, 0,
             "the counter was read while another writer held the lock"

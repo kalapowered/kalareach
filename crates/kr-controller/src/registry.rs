@@ -5804,6 +5804,11 @@ mod the_boundary_of_a_reading_at_a_start {
         let delayed = a_site_reads_after_the_lock(&path, &START_WAITS, &clock, 7, || {
             registry.record_boot(&boot).expect("the start is recorded");
         });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
         assert_eq!(
             delayed.reads_while_held, 0,
             "the counter was read while another writer held the lock"

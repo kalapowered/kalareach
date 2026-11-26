@@ -3336,3 +3336,68 @@ mod a_previous_holder_that_is_letting_go {
         );
     }
 }
+
+/// The boundary of a reading of the order counter at a pairing: the transaction that records a
+/// device is the one the pairing's start point is taken in, and it holds the registry's write lock
+/// from its first statement, so the reading is taken after any other writer's.
+#[cfg(test)]
+mod the_boundary_of_a_reading {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use kr_protocol::ids::BootEpoch;
+
+    use super::DeviceDirectory;
+    use crate::attention::order::StartPoint;
+    use crate::boots::BootClock;
+    use crate::boots::testing::{SetClock, a_site_reads_after_the_lock};
+
+    static PAIRING_WAITS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_the_pairing_wait(_attempts: i32) -> bool {
+        PAIRING_WAITS.fetch_add(1, Ordering::SeqCst);
+        std::thread::yield_now();
+        true
+    }
+
+    /// A pairing's point is read after the device store's transaction holds the write
+    /// lock. The case takes the point as the pairing's commit does, in the store's own
+    /// transaction; a commit needs a candidate and a confirmation that no unit case builds, and
+    /// the daemon's pairing cases run it for real.
+    #[test]
+    fn a_pairings_point_is_read_after_the_device_stores_transaction_holds_the_write_lock() {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let directory = DeviceDirectory::open(&path).expect("the store");
+        directory
+            .connection
+            .lock()
+            .expect("the connection")
+            .busy_handler(Some(count_the_pairing_wait))
+            .expect("the handler");
+        let clock = SetClock::at(0);
+        let boot = BootClock::new(Arc::clone(&clock) as _, BootEpoch::new(7));
+        let delayed = a_site_reads_after_the_lock(&path, &PAIRING_WAITS, &clock, 7, || {
+            directory
+                .transaction(|transaction| {
+                    StartPoint::take(1_000, transaction, &boot, &[9; 16])?;
+                    Ok(())
+                })
+                .expect("the pairing's transaction");
+        });
+        assert!(
+            !delayed.went_by_the_lock,
+            "the site went by a write lock that another writer held"
+        );
+        assert!(!delayed.site_failed, "the site failed");
+        assert_eq!(
+            delayed.reads_while_held, 0,
+            "the counter was read while another writer held the lock"
+        );
+        assert_eq!(
+            delayed.spoiled, 0,
+            "a healthy boot was spoiled by an older reading"
+        );
+        assert!(delayed.high >= 101, "{delayed:?}");
+    }
+}

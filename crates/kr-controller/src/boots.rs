@@ -393,6 +393,10 @@ pub(crate) mod testing {
     /// writer held the lock, and the boot's row afterwards. The case asserts them in its own body.
     #[derive(Debug)]
     pub(crate) struct Delayed {
+        /// Whether the site ended without waiting for the lock the other writer held.
+        pub(crate) went_by_the_lock: bool,
+        /// Whether the site panicked.
+        pub(crate) site_failed: bool,
         /// How many times the counter was read while the other writer held the lock.
         pub(crate) reads_while_held: u64,
         /// The boot's high after the site committed.
@@ -427,14 +431,18 @@ pub(crate) mod testing {
         holder
             .execute_batch("BEGIN IMMEDIATE")
             .expect("the holder takes the write lock");
-        let reads_while_held = std::thread::scope(|scope| {
+        let (went_by_the_lock, site_failed, reads_while_held) = std::thread::scope(|scope| {
             let site = scope.spawn(site);
+            let mut went_by_the_lock = false;
             while waiting.load(Ordering::SeqCst) == 0 {
-                assert!(!site.is_finished(), "the site went by a held write lock");
+                if site.is_finished() {
+                    went_by_the_lock = true;
+                    break;
+                }
                 std::thread::yield_now();
             }
-            // Taken while the lock is held and asserted once it is let go, so that a site that
-            // went on without waiting cannot leave the case waiting for it.
+            // Taken while the lock is held and asserted by the case once it is let go, so that a
+            // site that went on without waiting cannot leave the case waiting for it.
             let reads_while_held = clock.reads();
             holder
                 .execute(
@@ -444,8 +452,8 @@ pub(crate) mod testing {
                 .expect("the other writer's high");
             clock.set(101);
             holder.execute_batch("COMMIT").expect("the holder commits");
-            site.join().expect("the site ends");
-            reads_while_held
+            let site_failed = site.join().is_err();
+            (went_by_the_lock, site_failed, reads_while_held)
         });
         let (high, spoiled): (i64, i64) = holder
             .query_row(
@@ -455,6 +463,8 @@ pub(crate) mod testing {
             )
             .expect("the row");
         Delayed {
+            went_by_the_lock,
+            site_failed,
             reads_while_held,
             high,
             spoiled,
