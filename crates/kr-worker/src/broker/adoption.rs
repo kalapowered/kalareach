@@ -510,7 +510,10 @@ impl Adoptions {
         if !parent.matches(&foreground.root_shell) {
             return None;
         }
-        let executable = crate::questions::binding::executable_of(pid)?;
+        // The image as the kernel reports it, with the bytes it has; the text a rule is matched on
+        // and a profile records is the same path as text, as before.
+        let image = crate::questions::binding::executable_path_of(pid)?;
+        let executable = image.display().to_string();
         let recognition = match self.broker.recognise(&executable) {
             Recognition::Nothing => return None,
             found => found,
@@ -530,7 +533,7 @@ impl Adoptions {
         // Bounded by the file's size, and stopped when the session closes. The file stays open to
         // the last comparison, so its number cannot name another file meanwhile.
         let (hashed, held) = crate::broker::image::read_holding(
-            &running_image(pid, &executable),
+            &running_image(pid, &image),
             &self.hashed,
             &self.stopped,
         )
@@ -540,7 +543,7 @@ impl Adoptions {
         let arguments = arguments_of(pid)?;
         #[cfg(feature = "testing")]
         stop_if_armed(&self.arguments_read_pause);
-        if !still_runs(pid, &executable, &hashed.file) {
+        if !still_runs(pid, &image, &hashed.file) {
             return None;
         }
         drop(held);
@@ -1122,11 +1125,11 @@ fn read_by_position(argc: usize, empty_first: usize, rest: &[u8]) -> Option<Argu
 /// Returns where the image a process runs is read from: on Linux the kernel's own link to it,
 /// which names the image even after its path was replaced, and elsewhere the path the kernel
 /// reports.
-fn running_image(pid: u32, executable: &str) -> std::path::PathBuf {
+fn running_image(pid: u32, image: &Path) -> std::path::PathBuf {
     if cfg!(target_os = "linux") {
         std::path::PathBuf::from(format!("/proc/{pid}/exe"))
     } else {
-        std::path::PathBuf::from(executable)
+        image.to_path_buf()
     }
 }
 
@@ -1138,13 +1141,19 @@ fn running_image(pid: u32, executable: &str) -> std::path::PathBuf {
 /// reports with a suffix that says it is deleted, is refused by the first comparison, and a
 /// replacement executed at the same path by the second. On macOS the file is the one the path names
 /// now, which a replacement inside the reading changes.
-fn still_runs(pid: u32, executable: &str, opened: &crate::broker::image::FileIdentity) -> bool {
+fn still_runs(pid: u32, image: &Path, opened: &crate::broker::image::FileIdentity) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
 
-    if crate::questions::binding::executable_of(pid).as_deref() != Some(executable) {
+    // The bytes of the two paths are compared, not their text and not their components: two paths
+    // that differ in a byte are two paths.
+    let Some(now) = crate::questions::binding::executable_path_of(pid) else {
+        return false;
+    };
+    if now.as_os_str().as_bytes() != image.as_os_str().as_bytes() {
         return false;
     }
-    std::fs::metadata(running_image(pid, executable))
+    std::fs::metadata(running_image(pid, image))
         .is_ok_and(|file| file.dev() == opened.device && u128::from(file.ino()) == opened.inode)
 }
 

@@ -538,6 +538,19 @@ pub(crate) fn executable_of(pid: u32) -> Option<String> {
     platform::executable(pid)
 }
 
+/// Returns the path of the executable one process is running, with the bytes the kernel reports it
+/// by, where the platform names it.
+///
+/// Linux reports a path as bytes, which need not be text, and they are kept as they are: two paths
+/// that differ only in bytes that are not text are two paths here, though [`executable_of`] shows
+/// them as one text. macOS reports the path as text (`proc_pidpath` through libproc's `pidpath`,
+/// which returns a string and refuses bytes that are not valid text), so no path that is not text is
+/// ever read there.
+#[cfg(unix)]
+pub(crate) fn executable_path_of(pid: u32) -> Option<std::path::PathBuf> {
+    platform::executable_path(pid)
+}
+
 /// Returns when the kernel recorded `process` starting, on a clock that only moves forward: `None`
 /// where the platform keeps no such record, and an error where it keeps one that could not be read
 /// as this process's.
@@ -955,11 +968,14 @@ pub(crate) fn parent_of(child: &ProcessStartIdentity) -> Option<ProcessStartIden
 
 #[cfg(target_os = "linux")]
 mod platform {
-    /// Returns the executable one process is running.
+    /// Returns the executable one process is running, as the link to it is: bytes.
+    pub(super) fn executable_path(pid: u32) -> Option<std::path::PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+
+    /// Returns the executable one process is running, as text.
     pub(super) fn executable(pid: u32) -> Option<String> {
-        std::fs::read_link(format!("/proc/{pid}/exe"))
-            .ok()
-            .map(|path| path.display().to_string())
+        executable_path(pid).map(|path| path.display().to_string())
     }
 
     /// Reads one process's parent, process group and controlling terminal from one reading of
@@ -1022,6 +1038,12 @@ mod platform {
 
     pub(super) fn executable(pid: u32) -> Option<String> {
         pidpath(i32::try_from(pid).ok()?).ok()
+    }
+
+    /// Returns the executable one process is running, as the path macOS reports, which is text:
+    /// `pidpath` returns a string and refuses a path whose bytes are not valid text.
+    pub(super) fn executable_path(pid: u32) -> Option<std::path::PathBuf> {
+        executable(pid).map(std::path::PathBuf::from)
     }
 
     /// Reads when a process started on the absolute clock, which never goes back within a boot.
