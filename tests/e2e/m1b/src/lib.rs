@@ -87,12 +87,12 @@ pub mod site;
 // This is not a doc comment: the file's own module documentation links to its items, and a link in
 // a module that has both an outer and an inner doc comment is resolved from the parent module.
 #[cfg(all(unix, feature = "legs"))]
-#[path = "../../../../crates/kr-controller/tests/net_support/typing.rs"]
-pub mod typing;
-#[cfg(all(unix, feature = "legs"))]
 pub mod tables;
 #[cfg(all(unix, feature = "legs"))]
 pub mod tree;
+#[cfg(all(unix, feature = "legs"))]
+#[path = "../../../../crates/kr-controller/tests/net_support/typing.rs"]
+pub mod typing;
 #[cfg(all(unix, feature = "legs"))]
 pub mod view;
 #[cfg(all(unix, feature = "legs"))]
