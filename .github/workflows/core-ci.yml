@@ -562,6 +562,19 @@ jobs:
           echo "$passed of the ${#checks[@]} mount checks passed"
           [ "$failed" -eq 0 ] && [ "$passed" -eq "${#checks[@]}" ]
 
+      # The rule that the desktop demonstrations apply to a state folder that a wrapper names
+      # (scripts/lib/e2e-state-folder.sh): a folder in a chain that only the caller can write, no
+      # link on the way, no folder of another run. The cases run both demonstrations as far as
+      # their own first stop on Linux and start nothing. Every folder they make lies in a scratch
+      # folder below a folder of this step's own, which `mktemp -d` makes with mode 700 under the
+      # runner's temporary folder whatever the mask, so the step needs no container and no system
+      # setting.
+      - name: State folder cases
+        run: |
+          set -euo pipefail
+          cases_root="$(mktemp -d "$RUNNER_TEMP/state-folder-cases.XXXXXX")"
+          TMPDIR="$cases_root" bash scripts/e2e-state-folder-cases.sh
+
       - name: Generated protocol schema is current
         run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
 
