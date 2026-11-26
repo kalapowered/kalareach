@@ -2,41 +2,93 @@
 //! opened. Every form but a path on a local drive is refused, and the names of an accepted path are
 //! single names.
 
-use kr_boundary_windows::local_path::{MAX_NAME_UNITS, parse};
+use kr_boundary_windows::local_path::{MAX_NAME_UNITS, is_local_volume_target, parse};
 
-fn names(text: &str) -> Vec<String> {
-    parse(text)
-        .unwrap_or_else(|| panic!("{text:?} is a path on a local drive"))
-        .names
-        .iter()
-        .map(|name| String::from_utf16(name).unwrap())
-        .collect()
+/// The names of a path on a local drive, and nothing for any other text.
+fn names(text: &str) -> Option<Vec<String>> {
+    parse(text).map(|path| {
+        path.names
+            .iter()
+            .map(|name| String::from_utf16(name).unwrap())
+            .collect()
+    })
+}
+
+fn listed(items: &[&str]) -> Option<Vec<String>> {
+    Some(items.iter().map(|item| (*item).to_owned()).collect())
 }
 
 #[test]
 fn a_path_on_a_local_drive_is_taken_apart_into_its_names() {
-    let path = parse(r"c:\work\Some One\project").expect("a drive path");
-    assert_eq!(path.drive, 'C', "the drive's letter is in capitals");
+    assert_eq!(
+        parse(r"c:\work\Some One\project").map(|path| path.drive),
+        Some('C'),
+        "the drive's letter is in capitals"
+    );
     assert_eq!(
         names(r"C:\work\Some One\project"),
-        ["work", "Some One", "project"]
+        listed(&["work", "Some One", "project"])
     );
-    assert!(
-        parse(r"C:\").unwrap().names.is_empty(),
-        "the root has no name"
+    assert_eq!(names(r"C:\"), listed(&[]), "the root has no name");
+    assert_eq!(
+        names(r"C:\a\b\"),
+        listed(&["a", "b"]),
+        "one trailing backslash"
     );
-    assert_eq!(names(r"C:\a\b\"), ["a", "b"], "one trailing backslash");
     assert_eq!(
         names(r"\\?\C:\a\b"),
-        ["a", "b"],
+        listed(&["a", "b"]),
         "the verbatim spelling of the same path"
     );
-    assert_eq!(names(r"C:\PROGRA~1\x"), ["PROGRA~1", "x"], "a short name");
-    assert_eq!(names("C:\\a\u{1F600}"), ["a\u{1F600}"]);
     assert_eq!(
-        names(&format!(r"C:\{}", "n".repeat(MAX_NAME_UNITS))).len(),
-        1
+        names(r"C:\PROGRA~1\x"),
+        listed(&["PROGRA~1", "x"]),
+        "a short name"
     );
+    assert_eq!(names("C:\\a\u{1F600}"), listed(&["a\u{1F600}"]));
+    assert_eq!(
+        names(&format!(r"C:\{}", "n".repeat(MAX_NAME_UNITS))).map(|found| found.len()),
+        Some(1)
+    );
+}
+
+fn units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+#[test]
+fn only_the_name_of_a_local_disk_volume_and_digits_is_the_target_of_a_local_drive() {
+    for target in [
+        r"\Device\HarddiskVolume1",
+        r"\Device\HarddiskVolume3",
+        r"\Device\HarddiskVolume12",
+    ] {
+        assert!(
+            is_local_volume_target(&units(target)),
+            "{target:?} names a local disk volume"
+        );
+    }
+    for target in [
+        // The device's name with no number, and with more than a number after it.
+        r"\Device\HarddiskVolume",
+        r"\Device\HarddiskVolume3\x",
+        r"\Device\HarddiskVolume3 ",
+        "\\Device\\HarddiskVolume\u{FF13}",
+        r"\Device\HarddiskVolumeShadowCopy1",
+        // Another device of the same family.
+        r"\Device\Harddisk1",
+        // A share, as the system names one a drive letter points to.
+        r"\Device\Mup\localhost\C$",
+        r"\Device\LanmanRedirector\;Y:000000000000abcd\host\share",
+        // A folder that `subst` made a drive of.
+        r"\??\C:\folder",
+        "",
+    ] {
+        assert!(
+            !is_local_volume_target(&units(target)),
+            "{target:?} does not name a local disk volume"
+        );
+    }
 }
 
 #[test]
