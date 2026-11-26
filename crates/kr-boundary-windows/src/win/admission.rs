@@ -36,8 +36,8 @@ use super::client::ClientIdentity;
 use super::ffi::{self, Handle};
 use super::hold::{FOLDER_CHANGED_WORDS, RULE_FOLDER_CHANGED, TreeHold};
 use super::rights::{
-    ImpersonationToken, ObjectKind, PERSON_RIGHTS, REPORT_RIGHT, Right, SYSTEM_RIGHTS, Sd, may,
-    probe_token, system_may, write_rights,
+    ImpersonationToken, ObjectKind, PERSON_RIGHTS, REPORT_RIGHT, Right, SYSTEM_RIGHTS, Sd, granted,
+    may, probe_token, system_may, write_rights,
 };
 use super::sd::{Entry as ListEntry, has_label_of_handle, summary_of_handle};
 use super::token::INVOCATION_GROUP_FIRST;
@@ -262,6 +262,33 @@ impl Probes {
     fn both(&self) -> [&ImpersonationToken; 2] {
         [&self.checkout, &self.connect]
     }
+
+    /// Refuses when a probe token holds one of the rights on the descriptor, each right alone. A
+    /// check that cannot be made refuses too: the answer "no" would admit the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal that names the object and the right a probe holds, or the one that says
+    /// the access check could not be made.
+    pub fn refuse_writers(
+        &self,
+        path: &str,
+        descriptor: &Sd,
+        rights: &[Right],
+    ) -> Result<(), Refusal> {
+        for right in rights {
+            for probe in self.both() {
+                match granted(probe, descriptor, right.mask()) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(right_refusal(RULE_SIBLING, path, *right, SIBLING_WORDS));
+                    }
+                    Err(failure) => return Err(failed(&failure)),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn probe_of(manifest: &Manifest, class: Class) -> Result<ImpersonationToken, Refusal> {
@@ -456,24 +483,13 @@ struct Checking<'a> {
 }
 
 impl Checking<'_> {
-    /// Refuses when a probe token holds one of the rights on the descriptor, each right alone.
-    fn siblings(&self, path: &str, descriptor: &Sd, rights: &[Right]) -> Result<(), Refusal> {
-        for right in rights {
-            for probe in self.probes.both() {
-                if may(probe, descriptor, *right) {
-                    return Err(right_refusal(RULE_SIBLING, path, *right, SIBLING_WORDS));
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Every check an object of the grant's walk meets, in order: the siblings' write rights, what
     /// the person needs, what the broker needs, what its list and label say, and then the note for
     /// a read right that is shared.
     fn object(&mut self, object: &Object<'_>) -> Result<(), Refusal> {
         let (path, kind, descriptor) = (object.path, object.kind, object.descriptor);
-        self.siblings(path, descriptor, write_rights(kind))?;
+        self.probes
+            .refuse_writers(path, descriptor, write_rights(kind))?;
         for right in PERSON_RIGHTS {
             if !self.client.may(descriptor, right) {
                 return Err(right_refusal(
@@ -600,7 +616,8 @@ impl Checking<'_> {
             let descriptor =
                 Sd::of_handle(directory.handle()).map_err(|failure| failed(&failure))?;
             let path = paths.get(index).map_or("", String::as_str);
-            self.siblings(path, &descriptor, &ANCESTOR_RIGHTS)?;
+            self.probes
+                .refuse_writers(path, &descriptor, &ANCESTOR_RIGHTS)?;
         }
         Ok(())
     }

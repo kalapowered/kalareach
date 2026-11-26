@@ -31,7 +31,7 @@ use kr_boundary_windows::win::admission::{
     ADMISSION_FAILED_WORDS, Admitted, CASE_SENSITIVE_WORDS, CLOUD_WORDS, DRIVE_WORDS,
     ENCRYPTED_WORDS, Expected, HARD_LINK_WORDS, LABEL_WORDS, LIMITS, LINK_WORDS, Limits,
     NESTED_WORDS, Names, OPEN_WORDS, OWNER_WORDS, PERSON_LACKS_WORDS, PROFILE_WORDS,
-    RECHECK_LINKS_WORDS, RULE_CASE_SENSITIVE, RULE_CLOUD, RULE_DRIVE, RULE_ENCRYPTED,
+    RECHECK_LINKS_WORDS, RULE_CASE_SENSITIVE, RULE_CLOUD, RULE_DRIVE, RULE_ENCRYPTED, RULE_FAILED,
     RULE_HARD_LINK, RULE_LABEL, RULE_LINK, RULE_NESTED, RULE_OPEN, RULE_OWNER, RULE_PERSON_LACKS,
     RULE_PROFILE, RULE_SIBLING, RULE_STALE, RULE_SYSTEM_LACKS, RULE_TOO_LARGE, RULE_WRITER,
     Recheck, SIBLING_WORDS, STALE_WORDS, SYSTEM_LACKS_WORDS, TOO_LARGE_WORDS, WRITER_WORDS, admit,
@@ -279,6 +279,70 @@ fn make_group(prefix: &str, member: &str) -> String {
 
 fn display(path: &Path) -> String {
     path.to_str().unwrap().to_owned()
+}
+
+/// The list of an object read alone, with no owner and no group: no access check accepts it.
+fn list_without_owner(path: &Path) -> Sd {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Security::Authorization::GetSecurityInfo;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    let file = fs::OpenOptions::new()
+        .access_mode(0x0002_0000)
+        .share_mode(7)
+        .open(path)
+        .expect("the file opens for its list");
+    let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: the handle is open; the out-parameter is local and its block is taken below.
+    let code = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            1,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut descriptor,
+        )
+    };
+    assert_eq!(code, 0, "the list reads");
+    // SAFETY: the block is the platform's, and nothing else frees it.
+    unsafe { Sd::from_raw(descriptor) }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_a_sibling_check_that_cannot_be_made_refuses_where_no_would_admit() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, "check", &person.sid);
+    let file = project.root.join("a.txt");
+    fs::write(&file, b"x").unwrap();
+    let probes = siblings.probes();
+    let name = display(&file);
+
+    // The whole descriptor: no sibling may write the file, so nothing refuses.
+    probes
+        .refuse_writers(&name, &descriptor_of(&file), &[Right::WriteData])
+        .expect("no sibling may write a file of the private project");
+
+    // The list alone has no owner, so the access check cannot be made: that is not a "no".
+    let refusal = probes
+        .refuse_writers(&name, &list_without_owner(&file), &[Right::WriteData])
+        .expect_err("a check that cannot be made refuses");
+    assert_eq!(refusal.rule, RULE_FAILED);
+    assert!(
+        refusal.detail().starts_with(ADMISSION_FAILED_WORDS),
+        "{}",
+        refusal.detail()
+    );
 }
 
 #[test]

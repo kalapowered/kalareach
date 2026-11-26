@@ -266,6 +266,21 @@ impl Sd {
     }
 }
 
+#[cfg(feature = "testing")]
+impl Sd {
+    /// For the cases: takes a descriptor block that the platform allocated, which this value then
+    /// frees. A case reads a descriptor that no access check accepts, to see what a check that
+    /// cannot be made does.
+    ///
+    /// # Safety
+    ///
+    /// `descriptor` is a block from the platform's allocator that nothing else frees.
+    #[must_use]
+    pub unsafe fn from_raw(descriptor: *mut c_void) -> Sd {
+        Sd(descriptor)
+    }
+}
+
 impl Drop for Sd {
     fn drop(&mut self) {
         // SAFETY: the block came from the platform's allocator and is freed once.
