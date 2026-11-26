@@ -665,10 +665,14 @@ fn absent_below(root: &Path, pin: &kr_e2e_m1b::run::RootPin, path: &Path) -> Res
 /// the free `absent_below`. Nothing is excused: an entry at one of the paths, a link included, is
 /// refused, whatever the entry's allowed files name.
 ///
+/// It is here for this module's cases only: the gateway looks through the guard
+/// ([`PersonGuard::shown_absent`]), which keeps a failed look, and this free form does not.
+///
 /// # Errors
 ///
 /// Returns the first path that exists, or that could not be shown absent, with what was found.
-pub fn shown_absent(
+#[cfg(test)]
+fn shown_absent(
     root: &Path,
     pin: &kr_e2e_m1b::run::RootPin,
     absent: &[PathBuf],
@@ -676,7 +680,8 @@ pub fn shown_absent(
     shown_absent_by(absent, |path| absent_below(root, pin, path))
 }
 
-/// [`shown_absent`] with the look of each path given: the free [`absent_below`], or the guard's.
+/// Whether nothing is at any path of `absent`, with the look of each path given: the free
+/// [`absent_below`], or the guard's.
 fn shown_absent_by(
     absent: &[PathBuf],
     look: impl Fn(&Path) -> Result<bool, String>,
@@ -2057,9 +2062,11 @@ impl PersonGuard {
         looked
     }
 
-    /// [`shown_absent`] through the guard: each path is looked at by [`PersonGuard::absent_below`],
-    /// so a look that finds a path present, or does not show the absence, stays on the guard's
-    /// record and no shared file is read for the rest of the run.
+    /// Whether nothing is at any path of `absent`, each path looked at by
+    /// [`PersonGuard::absent_below`], so a look that finds a path present, or does not show the
+    /// absence, stays on the guard's record and no shared file is read for the rest of the run.
+    /// Nothing is excused: an entry at one of the paths, a link included, is refused, whatever the
+    /// entry's allowed files name.
     ///
     /// # Errors
     ///
