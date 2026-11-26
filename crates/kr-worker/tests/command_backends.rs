@@ -1977,8 +1977,10 @@ fn a_held_program_that_no_job_took_is_ended_when_it_is_dropped() {
 /// once the launcher's credential has authenticated, and the fixture says so: it presents an argument
 /// vector the backend did not answer and reads the frame that says the launch is not committed, with
 /// the reason the backend keeps in its own record, creates nothing and goes no further. The backend
-/// writes the frame before it lets the connection go, so the frame is what the launcher reads first;
-/// only a connection that did not authenticate is closed without a word.
+/// writes the frame before it lets the connection go, so the frame is what the launcher reads first.
+/// A refusal to an authenticated launcher is written within its bound of 250 ms, and this fixture,
+/// which answers at once, must see it; a write that fails or waits longer leaves the launcher a
+/// closed connection, as one that did not authenticate gets from the start.
 #[cfg(windows)]
 #[tokio::test]
 async fn the_fixture_reads_the_reason_when_the_backend_refuses_its_hello() {
