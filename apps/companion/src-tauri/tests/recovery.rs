@@ -6870,7 +6870,7 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     assert_eq!(
         held_back["message"],
         "the service holds generation 1 of that archive, older than generation 2 that a host this \
-         device paired with had published when this device asked"
+         device paired with named when this device asked"
     );
     assert!(!archive_path.exists());
 
@@ -6910,4 +6910,105 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     )
     .expect("the bundle alone is exported without reading the checkpoints");
     assert!(bundle_path.exists());
+}
+
+/// KR-REQ-20.12: each reason the checkpoints a paired host gave cannot be used is told to the page in
+/// words about the file that is at fault and a remedy that suits it: a lock file that cannot be
+/// opened is not the checkpoints file, so it is not said to hold checkpoints; a lock that something
+/// else holds is use, so no removal is offered; the list of hosts is named; no file name is a code
+/// mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_words_for_checkpoints_that_cannot_be_used_name_the_file_at_fault_and_what_mends_it() {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, _kit) = page.kit(out.path());
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
+    host.sets_up();
+    page.cover_host(&host, false).expect("the host is covered");
+    let folder = computer
+        .data
+        .path()
+        .join(companion_tauri::device::HOSTS_DIRECTORY);
+    kr_client::pairing::checkpoint::PairedCheckpoints::open(&folder).expect("a directory");
+    let lock = folder.join("checkpoints.lock");
+    let listed = || {
+        let refused = page
+            .call("recovery_archives", json!({}))
+            .expect_err("the list is refused while the checkpoints cannot be used");
+        assert_eq!(refused["code"], "PERMISSION_DENIED");
+        let words = refused["message"].as_str().expect("words").to_owned();
+        assert!(!words.contains('`'), "a file name is no code mark: {words}");
+        words
+    };
+
+    // A directory stands where the lock file goes: it cannot be opened. Removing the file loses
+    // nothing, since it holds no checkpoint.
+    std::fs::create_dir(&lock).expect("a directory where the lock file goes");
+    let words = listed();
+    assert!(
+        words.starts_with(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used ("
+        ),
+        "{words}"
+    );
+    assert!(
+        words.ends_with(
+            "). This file only guards the checkpoints and holds none, so removing it loses \
+             nothing. This device lists and exports no archive until that file can be used."
+        ),
+        "{words}"
+    );
+    std::fs::remove_dir(&lock).expect("the directory is removed");
+
+    // Something else holds the lock: that is use, and the lock file is not offered for removal.
+    let holder = kr_ipc::paths::open_lock_file(&lock).expect("a lock file");
+    kr_flush::lock::exclusive(&holder).expect("held");
+    let words = listed();
+    kr_flush::lock::release(&holder).expect("released");
+    assert!(
+        words.starts_with(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used ("
+        ),
+        "{words}"
+    );
+    assert!(
+        words.ends_with(
+            "checkpoints.lock: something else on this device is using it). Close any other \
+             KalaReach program on this device, or try again in a moment."
+        ),
+        "{words}"
+    );
+    assert!(!words.to_lowercase().contains("removing"), "{words}");
+
+    // The checkpoints file is not one this release reads.
+    std::fs::write(folder.join("checkpoints.json"), b"not a file").expect("a file that is not one");
+    let words = listed();
+    assert!(
+        words
+            .starts_with("the backup checkpoints this device kept when it paired cannot be read ("),
+        "{words}"
+    );
+    assert!(words.contains("checkpoints.json: "), "{words}");
+    assert!(words.contains(" Make the file readable. "), "{words}");
+    std::fs::remove_file(folder.join("checkpoints.json")).expect("the file is removed");
+
+    // The list of hosts is not readable, so it cannot be said which hosts owe a checkpoint.
+    std::fs::write(folder.join("hosts.json"), b"not a file").expect("a file that is not one");
+    let words = listed();
+    assert!(
+        words.starts_with("the list of hosts this device paired with cannot be read ("),
+        "{words}"
+    );
+    assert!(words.contains("hosts.json: "), "{words}");
+    assert!(
+        words.ends_with(
+            "). Without that list this device cannot tell which hosts owe it a checkpoint. Make \
+             hosts.json readable."
+        ),
+        "{words}"
+    );
 }

@@ -1792,7 +1792,7 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         said(
             restoring,
             7,
-            "It is the generation a host this device paired with had published when this device \
+            "It is the generation a host this device paired with named when this device \
              asked."
         ),
         "at the pairing's checkpoint"
@@ -1813,8 +1813,8 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         said(
             restoring,
             11,
-            "It is newer than generation 7, the newest that a host this device paired with had \
-             published when this device asked."
+            "It is newer than generation 7, the newest that a host this device paired with \
+             named when this device asked."
         ),
         "ahead of the pairing's checkpoint"
     );
@@ -1836,8 +1836,8 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         said(
             offered,
             3,
-            "It is older than generation 7, the newest that a host this device paired with had \
-             published when this device asked, so it is not being restored."
+            "It is older than generation 7, the newest that a host this device paired with \
+             named when this device asked, so it is not being restored."
         ),
         "older than the pairing's checkpoint"
     );
@@ -1859,8 +1859,8 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         said(
             offered,
             7,
-            "It claims generation 7 but is not the archive a host this device paired with had \
-             published when this device asked, so it is not being restored."
+            "It claims generation 7 but is not the archive a host this device paired with \
+             named when this device asked, so it is not being restored."
         ),
         "claiming the pairing's generation with another manifest"
     );
@@ -1882,8 +1882,8 @@ fn a_restore_names_the_source_of_the_checkpoint_it_was_held_to() {
         said(
             restoring,
             3,
-            "It is older than generation 7, the newest that a host this device paired with had \
-             published when this device asked, and it is being restored because that generation \
+            "It is older than generation 7, the newest that a host this device paired with \
+             named when this device asked, and it is being restored because that generation \
              was named."
         ),
         "an older generation named past the pairing's checkpoint"

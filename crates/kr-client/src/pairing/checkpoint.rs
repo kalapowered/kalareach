@@ -156,11 +156,15 @@ impl CheckpointsFile {
 /// Why the checkpoints could not be read as a whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotCause {
-    /// The file or the lock file cannot be used, or the file is not one this release reads.
+    /// The file cannot be used, or is not one this release reads.
     Unreadable,
     /// A newer release wrote the file.
     NewerVersion,
-    /// Something else holds the lock, and did not let go in time.
+    /// The lock file cannot be opened or locked. It holds no checkpoint, so removing it loses
+    /// nothing.
+    Lock,
+    /// Something else holds the lock, and did not let go in time: a use of the lock, not a change
+    /// to the file.
     Busy,
     /// The list of paired hosts cannot be read, so it cannot be said which hosts owe a checkpoint.
     HostsFile,
@@ -277,7 +281,7 @@ pub enum Unsettled {
     Full,
     /// The answer names generation 0, which no host publishes and the file never holds.
     Malformed,
-    /// The file or `hosts.json` cannot be read.
+    /// The file, its lock file or `hosts.json` cannot be used.
     Unreadable(SnapshotCause),
     /// Something else holds the lock.
     Busy,
@@ -504,7 +508,7 @@ impl PairedCheckpoints {
             cause,
         };
         let file = kr_ipc::paths::open_lock_file(&self.directory.join(LOCK_FILE))
-            .map_err(|error| refused(SnapshotCause::Unreadable, Shown::io(&error)))?;
+            .map_err(|error| refused(SnapshotCause::Lock, Shown::io(&error)))?;
         let started = Instant::now();
         loop {
             match kr_flush::lock::try_exclusive(&file) {
@@ -515,11 +519,11 @@ impl PairedCheckpoints {
                 Err(TryLockError::WouldBlock) => {
                     return Err(refused(
                         SnapshotCause::Busy,
-                        Shown::said("something else on this device is changing it"),
+                        Shown::said("something else on this device is using it"),
                     ));
                 }
                 Err(TryLockError::Error(error)) => {
-                    return Err(refused(SnapshotCause::Unreadable, Shown::io(&error)));
+                    return Err(refused(SnapshotCause::Lock, Shown::io(&error)));
                 }
             }
         }
@@ -1347,6 +1351,15 @@ mod tests {
         let started = Instant::now();
         let held = rig.checkpoints.held_checkpoints();
         assert_eq!(cause(&held), Some(SnapshotCause::Busy), "{held:?}");
+        let Held::Unreadable { file, why, .. } = &held else {
+            panic!("a lock that is held is not empty: {held:?}")
+        };
+        assert!(file.to_string().ends_with(LOCK_FILE), "{file}");
+        assert_eq!(
+            why.to_string(),
+            "something else on this device is using it",
+            "a held lock proves use, not a write"
+        );
         assert!(
             started.elapsed() >= LOCK_WITHIN,
             "it waited for the lock for the bound"
@@ -1399,7 +1412,7 @@ mod tests {
         };
         assert_eq!(
             refused_within(&rig),
-            Ok(Some(SnapshotCause::Unreadable)),
+            Ok(Some(SnapshotCause::Lock)),
             "a link"
         );
         std::fs::remove_file(rig.path(LOCK_FILE)).expect("removed");
@@ -1411,7 +1424,7 @@ mod tests {
         assert!(made.success());
         assert_eq!(
             refused_within(&rig),
-            Ok(Some(SnapshotCause::Unreadable)),
+            Ok(Some(SnapshotCause::Lock)),
             "a FIFO"
         );
     }

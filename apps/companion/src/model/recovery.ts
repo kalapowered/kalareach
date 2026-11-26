@@ -214,7 +214,7 @@ export function describeArchive(archive: RecoveryArchive): string {
     ) {
       const checkpoint =
         archive.checkpoint_source === 'pairing'
-          ? 'a host this device paired with had published when this device asked'
+          ? 'a host this device paired with named when this device asked'
           : 'the recovery bundle verified'
       return `${name}: the service holds generation ${archive.held_generation}, older than generation ${archive.checkpoint_generation} that ${checkpoint}, so it is not offered.`
     }
@@ -223,6 +223,9 @@ export function describeArchive(archive: RecoveryArchive): string {
     }
     if (archive.withheld === 'bundle_disagree' && archive.checkpoint_generation !== null) {
       return `${name}: the recovery bundle holds two different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
+    }
+    if (archive.withheld === 'host_contradicts' && archive.checkpoint_generation !== null) {
+      return `${name}: what the service holds for generation ${archive.checkpoint_generation} is not the archive a host this device paired with named for it, so it is not offered.`
     }
     return `${name}: the service holds no generation of it.`
   }

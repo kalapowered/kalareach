@@ -1036,7 +1036,7 @@ fn candidate_line(candidate: &Candidate) -> Shown {
             source: CheckpointSource::Pairing,
         } => shown!(
             "  {}: the service holds generation {}, older than generation {} that a host this \
-             device paired with had published when this device asked",
+             device paired with named when this device asked",
             id,
             held.get(),
             checkpoint.get()
@@ -1156,7 +1156,7 @@ mod tests {
         assert_eq!(
             line(held_back(CheckpointSource::Pairing)),
             "  11111111-1111-1111-1111-111111111111: the service holds generation 3, older than \
-             generation 5 that a host this device paired with had published when this device asked"
+             generation 5 that a host this device paired with named when this device asked"
         );
         assert_eq!(
             line(CandidateState::CheckpointsDisagree {

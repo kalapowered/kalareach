@@ -43,8 +43,8 @@ use kr_client::Shown;
 use kr_client::pairing::checkpoint::{Held, PairedCheckpoints, SnapshotCause};
 use kr_client::recovery::{
     AccountSource, BundleStore, Candidate, CandidateState, FilesRestore, HostBackups, HostCover,
-    Left, LocalSettings, LostWrite, RecoveryError, RestoreError, RestoreSource, cover_host_archive,
-    fresh_locator, qr_payload, render_kit,
+    Left, LocalSettings, LostWrite, PublicationRefusal, RecoveryError, RestoreError, RestoreSource,
+    cover_host_archive, fresh_locator, qr_payload, render_kit,
 };
 use kr_client::services::account::{
     AccountMark, AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE, SignedInAccount,
@@ -52,7 +52,7 @@ use kr_client::services::account::{
 use kr_client::services::{
     HttpDeadlines, HttpService, ServiceFuture, ServiceSigner, managed_response_limits,
 };
-use kr_crypto::backup::CheckpointSource;
+use kr_crypto::backup::{CheckpointSource, GenerationStanding, RestoreGeneration};
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -223,6 +223,9 @@ pub enum WithheldView {
     /// The recovery bundle holds two checkpoints that name different manifests for the generation
     /// the service holds.
     BundleDisagree,
+    /// A host this computer paired with named a different manifest for the generation the service
+    /// holds.
+    HostContradicts,
 }
 
 /// Where a checkpoint came from, as the page is told.
@@ -1358,6 +1361,17 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
         CandidateState::Nothing => {
             ArchiveView::withheld(candidate.archive_id, WithheldView::Nothing)
         }
+        CandidateState::Refused(PublicationRefusal::Generation(
+            RestoreGeneration {
+                standing: GenerationStanding::Substituted { checkpoint },
+                source: Some(CheckpointSource::Pairing),
+                ..
+            },
+            _,
+        )) => ArchiveView {
+            checkpoint_generation: Some(checkpoint.get().to_string()),
+            ..ArchiveView::withheld(candidate.archive_id, WithheldView::HostContradicts)
+        },
         CandidateState::Refused(_) => {
             ArchiveView::withheld(candidate.archive_id, WithheldView::Refused)
         }
@@ -1397,7 +1411,7 @@ fn said_by_restore(error: RestoreError) -> CommandError {
         disagrees @ RestoreError::PairingCheckpointDisagrees { generation, .. } => {
             CommandError::refused(format!(
                 "{disagrees}. Generation {generation} of this archive stays refused while the two \
-                 disagree; a newer generation is not affected. Removing `checkpoints.json` leaves \
+                 disagree; a newer generation is not affected. Removing checkpoints.json leaves \
                  the recovery bundle's checkpoint alone to decide, and removes what this device \
                  recorded of each host's answer."
             ))
@@ -1427,12 +1441,16 @@ const fn unreadable_recourse(cause: SnapshotCause) -> &'static str {
         SnapshotCause::NewerVersion => {
             "A newer version of this app wrote the file. Update the app."
         }
+        SnapshotCause::Lock => {
+            "This file only guards the checkpoints and holds none, so removing it loses nothing. \
+             This device lists and exports no archive until that file can be used."
+        }
         SnapshotCause::Busy => {
-            "Another part of this app is changing the file. Try again in a moment."
+            "Close any other KalaReach program on this device, or try again in a moment."
         }
         SnapshotCause::HostsFile => {
-            "The list of hosts this device paired with cannot be read, so it cannot tell which \
-             hosts owe it a checkpoint. Make that file readable."
+            "Without that list this device cannot tell which hosts owe it a checkpoint. Make \
+             hosts.json readable."
         }
     }
 }
@@ -1614,5 +1632,59 @@ mod tests {
              Generation 8 of this archive stays refused while they differ; a newer generation is \
              not affected."
         );
+    }
+
+    /// KR-REQ-20.12: a checkpoint a paired host gave and the recovery bundle's name different
+    /// manifests for one generation: the refusal says which two, that only that generation stays
+    /// refused, and what removing the file does, with the file named plainly.
+    #[test]
+    fn the_refusal_for_a_host_checkpoint_the_bundle_contradicts_says_what_removing_the_file_does() {
+        let said = said_by_restore(RestoreError::PairingCheckpointDisagrees {
+            generation: 8,
+            paired: Shown::manifest_digits(&Digest256::from_bytes([0x11; 32])),
+            bundle: Shown::manifest_digits(&Digest256::from_bytes([0x22; 32])),
+        });
+        assert_eq!(
+            said.message,
+            "the checkpoint this device kept when it paired and the recovery bundle name \
+             different manifests for generation 8 (11111111 and 22222222); the restore cannot \
+             tell which is the archive that was published. Generation 8 of this archive stays \
+             refused while the two disagree; a newer generation is not affected. Removing \
+             checkpoints.json leaves the recovery bundle's checkpoint alone to decide, and \
+             removes what this device recorded of each host's answer."
+        );
+    }
+
+    /// KR-REQ-20.12: an archive whose publication a paired host's checkpoint contradicts is told to
+    /// the page as a state of its own, with the generation, apart from a publication that the
+    /// recovery bundle's checkpoint contradicts and from one that does not verify.
+    #[test]
+    fn an_archive_a_paired_hosts_checkpoint_contradicts_is_a_withheld_state_of_its_own() {
+        let refusal = |source| {
+            let restoring = RestoreGeneration {
+                archive_id: ArchiveId::new(Uuid::from_bytes([7; 16])),
+                backup_generation: BackupGeneration::new(9),
+                standing: GenerationStanding::Substituted {
+                    checkpoint: BackupGeneration::new(9),
+                },
+                source: Some(source),
+            };
+            serde_json::to_value(listed(CandidateState::Refused(
+                PublicationRefusal::Generation(restoring, Shown::said("a refusal")),
+            )))
+            .expect("the view as the page receives it")
+        };
+        let by_a_host = refusal(CheckpointSource::Pairing);
+        assert_eq!(by_a_host["withheld"], "host_contradicts");
+        assert_eq!(by_a_host["checkpoint_generation"], "9");
+        assert_eq!(by_a_host["generation"], serde_json::Value::Null);
+
+        let by_the_bundle = refusal(CheckpointSource::RecoveryBundle);
+        assert_eq!(by_the_bundle["withheld"], "refused");
+        let unsigned = serde_json::to_value(listed(CandidateState::Refused(
+            PublicationRefusal::BadSignature,
+        )))
+        .expect("the view as the page receives it");
+        assert_eq!(unsigned["withheld"], "refused");
     }
 }

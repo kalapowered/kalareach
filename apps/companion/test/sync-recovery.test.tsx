@@ -577,7 +577,8 @@ describe('recovery', () => {
         withheld('3', { withheld: 'disagree', checkpoint_generation: '7' }),
         withheld('4', { withheld: 'refused' }),
         withheld('5', { withheld: 'nothing' }),
-        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: '8' })
+        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: '8' }),
+        withheld('7', { withheld: 'host_contradicts', checkpoint_generation: '9' })
       ])
     })
     const recovery = await within(sheet).findByTestId('recovery')
@@ -585,7 +586,7 @@ describe('recovery', () => {
     const copies = await within(recovery).findByTestId('recovery-copies')
 
     expect(copies).toHaveTextContent(
-      'Archive 0a1b2c3d: the service holds generation 3, older than generation 5 that a host this device paired with had published when this device asked, so it is not offered.'
+      'Archive 0a1b2c3d: the service holds generation 3, older than generation 5 that a host this device paired with named when this device asked, so it is not offered.'
     )
     expect(copies).toHaveTextContent(
       'Archive 0a1b2c3d: the service holds generation 4, older than generation 6 that the recovery bundle verified, so it is not offered.'
@@ -600,7 +601,10 @@ describe('recovery', () => {
     expect(copies).toHaveTextContent(
       'Archive 0a1b2c3d: the recovery bundle holds two different backups for generation 8, so it is not offered.'
     )
-    for (const suffix of ['1', '2', '3', '4', '5', '6']) {
+    expect(copies).toHaveTextContent(
+      'Archive 0a1b2c3d: what the service holds for generation 9 is not the archive a host this device paired with named for it, so it is not offered.'
+    )
+    for (const suffix of ['1', '2', '3', '4', '5', '6', '7']) {
       expect(
         within(recovery).getByTestId(`recovery-copy-0a1b2c3d-0000-4000-8000-00000000000${suffix}`),
         `an archive that is not offered has no copy (${suffix})`

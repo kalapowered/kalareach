@@ -503,14 +503,15 @@ pub enum RestoreError {
         /// Which sources held none, as the sentence names them.
         none_words: Shown,
     },
-    /// The checkpoints this computer kept from the hosts it paired with cannot be read.
+    /// The checkpoints this computer kept from the hosts it paired with cannot be used.
     ///
     /// A restore does not go on without them: it could not tell an older backup that a service
     /// hands back from the newest one.
-    #[error(
-        "the backup checkpoints this device kept when it paired cannot be read ({file}: {why})"
-    )]
+    #[error("{what} ({file}: {why})")]
     PairingCheckpointsUnreadable {
+        /// What cannot be used, said for the file at fault: the checkpoints file, the list of
+        /// hosts or the lock file.
+        what: Shown,
         /// The file that cannot be used.
         file: Shown,
         /// Why.
@@ -633,7 +634,7 @@ impl RestoreError {
             checkpoint_words: match source {
                 CheckpointSource::RecoveryBundle => Shown::said("the bundle's checkpoint"),
                 CheckpointSource::Pairing => Shown::said(
-                    "the one a host this device paired with had published when this device asked",
+                    "the one a host this device paired with named when this device asked",
                 ),
             },
         }
@@ -648,9 +649,9 @@ impl RestoreError {
             checkpoint_source: source,
             checkpoint_words: match source {
                 CheckpointSource::RecoveryBundle => Shown::said("the recovery bundle verified"),
-                CheckpointSource::Pairing => Shown::said(
-                    "a host this device paired with had published when this device asked",
-                ),
+                CheckpointSource::Pairing => {
+                    Shown::said("a host this device paired with named when this device asked")
+                }
             },
         }
     }
@@ -2317,11 +2318,28 @@ fn pairing_standing(held: &Held, origin: &str, archive: ArchiveId) -> PairingSta
     }
 }
 
+/// What cannot be used, by the file the cause is about.
+const fn unreadable_what(cause: SnapshotCause) -> Shown {
+    match cause {
+        SnapshotCause::Unreadable | SnapshotCause::NewerVersion => {
+            Shown::said("the backup checkpoints this device kept when it paired cannot be read")
+        }
+        SnapshotCause::HostsFile => {
+            Shown::said("the list of hosts this device paired with cannot be read")
+        }
+        SnapshotCause::Lock | SnapshotCause::Busy => Shown::said(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used",
+        ),
+    }
+}
+
 /// Refuses a restore when the checkpoints paired hosts gave cannot be read, whatever the reason: an
 /// unreadable file is never read as no checkpoints.
 fn refuse_unreadable(held: &Held) -> Result<(), RestoreError> {
     match held {
         Held::Unreadable { file, why, cause } => Err(RestoreError::PairingCheckpointsUnreadable {
+            what: unreadable_what(*cause),
             file: file.clone(),
             why: why.clone(),
             cause: *cause,

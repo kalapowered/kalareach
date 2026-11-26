@@ -2908,7 +2908,7 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     assert_eq!(
         error.to_string(),
         "the service holds generation 3 of that archive, older than generation 5 that a host this \
-         device paired with had published when this device asked"
+         device paired with named when this device asked"
     );
     assert_eq!(source.object_reads(), 0, "a replay costs no download");
 
@@ -2927,8 +2927,8 @@ async fn a_checkpoint_a_paired_host_gave_holds_a_restore_that_the_bundle_alone_w
     ));
     assert_eq!(
         error.to_string(),
-        "the service holds no generation as new as the one a host this device paired with had \
-         published when this device asked, generation 5"
+        "the service holds no generation as new as the one a host this device paired with \
+         named when this device asked, generation 5"
     );
 
     // A service that serves what it holds whatever it was asked to hold it to.
@@ -3372,11 +3372,29 @@ async fn checkpoints_that_cannot_be_read_refuse_the_restore_and_the_list_and_nev
     for cause in [
         SnapshotCause::Unreadable,
         SnapshotCause::NewerVersion,
+        SnapshotCause::Lock,
         SnapshotCause::Busy,
         SnapshotCause::HostsFile,
     ] {
+        let (file, words) = match cause {
+            SnapshotCause::Unreadable | SnapshotCause::NewerVersion => (
+                "checkpoints.json",
+                "the backup checkpoints this device kept when it paired cannot be read \
+                 (checkpoints.json: the file is unreadable)",
+            ),
+            SnapshotCause::Lock | SnapshotCause::Busy => (
+                "checkpoints.lock",
+                "the lock file for the backup checkpoints this device kept when it paired cannot \
+                 be used (checkpoints.lock: the file is unreadable)",
+            ),
+            SnapshotCause::HostsFile => (
+                "hosts.json",
+                "the list of hosts this device paired with cannot be read (hosts.json: the file \
+                 is unreadable)",
+            ),
+        };
         let held = Held::Unreadable {
-            file: Shown::said("checkpoints.json"),
+            file: Shown::said(file),
             why: Shown::said("the file is unreadable"),
             cause,
         };
@@ -3387,11 +3405,7 @@ async fn checkpoints_that_cannot_be_read_refuse_the_restore_and_the_list_and_nev
             matches!(&error, RestoreError::PairingCheckpointsUnreadable { cause: said, .. } if *said == cause),
             "{cause:?}"
         );
-        assert_eq!(
-            error.to_string(),
-            "the backup checkpoints this device kept when it paired cannot be read \
-             (checkpoints.json: the file is unreadable)"
-        );
+        assert_eq!(error.to_string(), words, "{cause:?}");
         let Err(listed) = FilesRestore::archives(
             world.kit(),
             Arc::clone(&source) as Arc<dyn RestoreSource>,
@@ -3444,6 +3458,65 @@ async fn checkpoints_that_cannot_be_read_refuse_the_restore_and_the_list_and_nev
         FilesRestore::export_bundle(world.kit(), Arc::clone(&source) as Arc<dyn RestoreSource>)
             .await
             .is_ok()
+    );
+}
+
+/// KR-REQ-20.12: a lock file that cannot be opened, and a lock that something else holds, refuse a
+/// restore in words about the lock file and not about the checkpoints file, which neither one
+/// touched; a held lock is use, so it is not said to be a change.
+#[tokio::test]
+async fn a_lock_file_that_cannot_be_used_refuses_a_restore_in_words_about_the_lock_file() {
+    let world = World::new();
+    let current = world.seal(5, &honest_members());
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&current));
+    let directory = tempfile::tempdir().expect("a directory");
+    let folder = directory.path().join("pairing");
+    let checkpoints = PairedCheckpoints::open(&folder).expect("a directory");
+    let lock = folder.join("checkpoints.lock");
+
+    // A directory stands where the lock file goes: it cannot be opened.
+    std::fs::create_dir(&lock).expect("a directory where the lock file goes");
+    let Err(error) = restore_held(&world, &source, None, &checkpoints.held_checkpoints()).await
+    else {
+        panic!("a lock file that cannot be opened refuses the restore")
+    };
+    let words = error.to_string();
+    assert!(
+        words.starts_with(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used ("
+        ),
+        "{words}"
+    );
+    assert!(words.contains("checkpoints.lock: "), "{words}");
+    assert!(!words.contains("cannot be read"), "{words}");
+    std::fs::remove_dir(&lock).expect("the directory is removed");
+
+    // Something else holds the lock for longer than a restore waits.
+    let holder = kr_ipc::paths::open_lock_file(&lock).expect("a lock file");
+    kr_flush::lock::exclusive(&holder).expect("held");
+    let Err(error) = restore_held(&world, &source, None, &checkpoints.held_checkpoints()).await
+    else {
+        panic!("a lock that something else holds refuses the restore")
+    };
+    kr_flush::lock::release(&holder).expect("released");
+    let words = error.to_string();
+    assert!(
+        words.starts_with(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used ("
+        ),
+        "{words}"
+    );
+    assert!(
+        words.ends_with("checkpoints.lock: something else on this device is using it)"),
+        "{words}"
+    );
+    assert!(
+        source.asked().is_empty(),
+        "nothing was asked of the service: {:?}",
+        source.asked()
     );
 }
 
@@ -3651,8 +3724,8 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     );
     assert_eq!(
         RestoreError::nothing_as_new(5, pairing).to_string(),
-        "the service holds no generation as new as the one a host this device paired with had \
-         published when this device asked, generation 5"
+        "the service holds no generation as new as the one a host this device paired with \
+         named when this device asked, generation 5"
     );
     assert_eq!(
         RestoreError::older_than_the_checkpoint(3, 5, bundle).to_string(),
@@ -3662,7 +3735,7 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
     assert_eq!(
         RestoreError::older_than_the_checkpoint(3, 5, pairing).to_string(),
         "the service holds generation 3 of that archive, older than generation 5 that a host \
-         this device paired with had published when this device asked"
+         this device paired with named when this device asked"
     );
     assert_eq!(
         RestoreError::named_generation_not_held(3, 5, bundle).to_string(),
@@ -3716,7 +3789,7 @@ fn the_words_of_each_refusal_name_the_source_of_the_checkpoint() {
         refusal(pairing),
         "the checkpoint a host this device paired with gave refuses that generation. The service \
          offered backup generation 3. It is older than generation 5, the newest that a host this \
-         device paired with had published when this device asked, so it is not being restored. No \
+         device paired with named when this device asked, so it is not being restored. No \
          restore can show that the service is not holding a newer backup back."
     );
 }

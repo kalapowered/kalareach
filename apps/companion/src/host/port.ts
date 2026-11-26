@@ -588,7 +588,14 @@ export interface RecoveryArchive {
   /** When the writer signed that generation, in UTC milliseconds. */
   readonly published_at_ms: number | null
   /** Why no generation is offered, when none is. */
-  readonly withheld: 'nothing' | 'refused' | 'held_back' | 'disagree' | 'bundle_disagree' | null
+  readonly withheld:
+    | 'nothing'
+    | 'refused'
+    | 'held_back'
+    | 'disagree'
+    | 'bundle_disagree'
+    | 'host_contradicts'
+    | null
   /** The generation the service holds, when it holds only one older than a checkpoint, as decimal text. */
   readonly held_generation: string | null
   /**
