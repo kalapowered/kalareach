@@ -3234,7 +3234,7 @@ pub mod testing {
         /// A draft sweep, under the device's identifier, has begun and not yet read the folder.
         Sweeping,
         /// A sender task was made and has not yet run its first line. Held under its key, a stop
-        /// that comes meanwhile cancels the task before it is counted as running.
+        /// that comes meanwhile cancels the task before it reaches `SenderStarting`.
         BeforeSender,
     }
 

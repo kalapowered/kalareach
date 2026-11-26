@@ -5665,9 +5665,13 @@ async fn kr_req_13_12_forgotten_stops_a_sender_that_a_restart_started_before_its
 }
 
 /// KR-REQ-13.12 (X1b): `forgotten` removes the entry of a sender that was stopped before it ran its
-/// first line. Such a sender never ran: nothing of the upload is sent, no sender is left to wait
-/// for, and the entry goes in the barrier's turn. The sender's task is held before its first line
-/// for the whole case, so the barrier meets it there, whether or not the task has been polled.
+/// first line. Such a sender never ran: it sends nothing (the upload had begun in the first process
+/// and is only resumed here), no sender is left to wait for, and the entry goes in the barrier's
+/// turn. The sender's task is held before its first line until the barrier has stopped it. The case
+/// shows that the restart made the sender (the start is observed, with a hold released in advance)
+/// and that the barrier found it and waited for it (the barrier's wait is observed, with a hold
+/// that blocks nothing). Then the held task is let go: a barrier that did not stop it would let it
+/// run its first line, and the case reads that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_13_12_forgotten_removes_the_entry_of_a_sender_stopped_before_its_first_line() {
     use testing::{Awaited, Point};
@@ -5680,7 +5684,10 @@ async fn kr_req_13_12_forgotten_removes_the_entry_of_a_sender_stopped_before_its
     let (key, _first, _who) = left_paused(&adopted, &phone, &control, &bytes).await;
     let reading = testing::hold_at(key, Point::Reading);
     let started = testing::hold_at(key, Point::SenderStarting);
-    let _unrun = testing::hold_awaited(key, Awaited::BeforeSender);
+    let made = testing::hold_at(key, Point::Started);
+    made.release();
+    let waiting = testing::hold_at(key, Point::CancelWaiting);
+    let unrun = testing::hold_awaited(key, Awaited::BeforeSender);
     control.stop_holding();
     control.release_all();
     let newer = on_another_connection(companion, &old).await;
@@ -5690,22 +5697,40 @@ async fn kr_req_13_12_forgotten_removes_the_entry_of_a_sender_stopped_before_its
     desk.forgotten(newer.device_id);
     wanted.until_passed(1).await;
     // The restart starts the upload and lets the turn go; the barrier stops the sender that has not
-    // run, and removes the entry.
+    // run, and notes that it waits for it, or, with no sender found, `forgotten` has finished.
     reading.release();
-    tokio::time::timeout(WATCHDOG, desk.idle())
-        .await
-        .expect("the desk's own tasks end");
+    tokio::select! {
+        () = waiting.until_passed(1) => {}
+        () = desk.idle() => {}
+    }
+    // The barrier aborts the sender before it notes its wait, so a task it stopped is gone when the
+    // hold is let go, and only a task it left alone goes on to its first line.
+    unrun.release();
+    tokio::time::timeout(WATCHDOG, async {
+        tokio::select! {
+            () = desk.idle() => {}
+            () = started.until_passed(1) => {}
+        }
+    })
+    .await
+    .expect("the desk's own tasks end, or a sender runs its first line");
+    assert_eq!(made.passed(), 1, "the restart started a sender");
+    assert_eq!(
+        waiting.passed(),
+        1,
+        "the barrier found the sender and waited for it"
+    );
+    assert_eq!(
+        started.passed(),
+        0,
+        "the stopped sender never ran its first line"
+    );
     assert_eq!(
         entries_in(&folder(&phone)),
         0,
         "the entry goes: its sender never ran"
     );
     assert_eq!(desk.held_count_for_test(), 0, "no upload is held");
-    assert_eq!(
-        started.passed(),
-        0,
-        "the stopped sender never ran its first line"
-    );
     adopted.stop().await;
 }
 
