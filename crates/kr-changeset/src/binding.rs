@@ -242,6 +242,13 @@ mod unix {
         }
     }
 
+    /// The record of a copy: the stamp of each entry, by its path.
+    type Stamps = BTreeMap<String, Stamp>;
+
+    /// What a watch gives at the end of the run: the record of the copy that it had taken then,
+    /// and the paths it says were written.
+    type Drained = (Result<Stamps, String>, Result<Vec<String>, String>);
+
     /// The record of one copy, and what it needs to be compared with a second one.
     #[derive(Debug)]
     pub struct Reading {
@@ -282,9 +289,17 @@ mod unix {
 
         pub fn settle(&self, service: &ChangeSetService, id: MaterialisationId) -> Bound {
             let skipped: BTreeSet<String> = self.parents.keys().cloned().collect();
-            let end = match open_copy(service, id)
-                .and_then(|(_, copy)| stamp_tree(&copy, &skipped, &self.declared))
-            {
+            let take_end = || {
+                open_copy(service, id)
+                    .and_then(|(_, copy)| stamp_tree(&copy, &skipped, &self.declared))
+            };
+            // The watch takes the record of the end once it is up to date, so that the record
+            // holds every change that it has reported.
+            let (end, reported) = match &self.names {
+                Some(names) => names.drain(&self.stamps, take_end),
+                None => (take_end(), Ok(Vec::new())),
+            };
+            let end = match end {
                 Ok(end) => end,
                 Err(why) => return Bound::Unestablished(why),
             };
@@ -294,10 +309,6 @@ mod unix {
                     written.push(path.clone());
                 }
             }
-            let reported = match &self.names {
-                Some(names) => names.drain(),
-                None => Ok(Vec::new()),
-            };
             match reported {
                 Ok(names) => written.extend(names),
                 Err(why) if written.is_empty() => return Bound::Unestablished(why),
@@ -642,12 +653,24 @@ mod unix {
                 }))
             }
 
+            /// Takes the record of the copy at the end of the run with `take_end` and says which
+            /// paths were written since the watch started, other than declared outputs. The queue
+            /// is read after the record, so a change made in between is in it.
+            pub fn drain(
+                &self,
+                _start: &super::Stamps,
+                take_end: impl FnOnce() -> Result<super::Stamps, String>,
+            ) -> super::Drained {
+                let end = take_end();
+                (end, self.read())
+            }
+
             /// The paths written since the watch started, other than declared outputs.
             ///
             /// The kernel queues each report as the change happens, so every change made before
             /// this call is in the queue; a queue that overflowed lost some, and then nothing is
             /// established.
-            pub fn drain(&self) -> Result<Vec<String>, String> {
+            fn read(&self) -> Result<Vec<String>, String> {
                 let mut buffer = [MaybeUninit::<u8>::uninit(); 4096];
                 let mut reader = inotify::Reader::new(&self.inotify, &mut buffer);
                 let mut written = Vec::new();
@@ -697,6 +720,8 @@ mod unix {
         use std::collections::{BTreeMap, BTreeSet};
         use std::path::{Path, PathBuf};
 
+        use super::{Kind, Stamp};
+
         /// How many written paths the watcher keeps. A run that has written this many beside its
         /// outputs has been told enough for a result to name a few of them.
         const KEPT: usize = 64;
@@ -709,6 +734,11 @@ mod unix {
             pub(super) written: BTreeSet<String>,
             /// Why the reports cannot be taken as all there were, when they cannot.
             pub(super) lost: Option<String>,
+            /// Where the creation of a folder or a file, or a change of extended attributes, was
+            /// reported at a name in a directory an output is in or at the copy's own directory,
+            /// and of which kinds. The end of the run decides them by what the host recorded at
+            /// the start, since the service can report them again after the watcher is up to date.
+            pub(super) pending: BTreeMap<String, Pending>,
         }
 
         /// What a report says was done to the paths it names, as far as judging a parent needs it.
@@ -716,12 +746,68 @@ mod unix {
         pub(super) enum Done {
             /// A folder was created.
             CreatedFolder,
+            /// A file was created.
+            CreatedFile,
             /// Extended attributes were changed.
             Attributes,
-            /// Anything else: a creation of another kind (a file, a link, a mount, a kind the
-            /// platform does not say), a removal, a rename, a change of mode, owner or other
-            /// metadata, a change of content.
+            /// Anything else: a creation of another kind (a link, a mount, a kind the platform
+            /// does not say), a removal, a rename, a change of mode, owner or other metadata, a
+            /// change of content.
             Other,
+        }
+
+        /// The creations heard at one path that the end of the run decides; a change of extended
+        /// attributes is no kind of its own, since the path being held is all it needs.
+        #[derive(Clone, Copy, Debug, Default)]
+        pub(super) struct Pending {
+            folder: bool,
+            file: bool,
+        }
+
+        impl Pending {
+            fn add(&mut self, done: Done) {
+                match done {
+                    Done::CreatedFolder => self.folder = true,
+                    Done::CreatedFile => self.file = true,
+                    Done::Attributes | Done::Other => {}
+                }
+            }
+
+            /// Whether what was heard is no write: the host recorded the path at the start as the
+            /// kind that each creation names, and the stamp it finds at the end is the one it
+            /// recorded.
+            fn is_no_write(&self, start: Option<&Stamp>, end: Option<&Stamp>) -> bool {
+                let (Some(start), Some(end)) = (start, end) else {
+                    return false;
+                };
+                start == end
+                    && (!self.folder || start.kind == Kind::Directory)
+                    && (!self.file || start.kind == Kind::File)
+            }
+        }
+
+        /// The paths heard of that are writes by what the host recorded at the start (`start`)
+        /// and found at the end (`end`).
+        pub(super) fn pending_writes(
+            pending: &BTreeMap<String, Pending>,
+            start: &BTreeMap<String, Stamp>,
+            end: &BTreeMap<String, Stamp>,
+        ) -> BTreeSet<String> {
+            pending
+                .iter()
+                .filter(|(path, heard)| !heard.is_no_write(start.get(*path), end.get(*path)))
+                .map(|(path, _)| path.clone())
+                .collect()
+        }
+
+        /// What a report of a path means for the result.
+        enum Judged {
+            /// Nothing: the path is judged some other way.
+            Nothing,
+            /// A write.
+            Write(String),
+            /// A write unless the host recorded the path as it is: the end of the run decides.
+            Decide(String),
         }
 
         /// Where the watched places are, and what a report about each means.
@@ -737,32 +823,47 @@ mod unix {
             }
 
             /// The path of the copy that a report about `path` shows to have been written, if it
-            /// does.
-            ///
-            /// A directory a declared output is in, and the copy itself, are judged by what is
-            /// reported about the directory: FSEvents says nothing of a directory when a name is
-            /// made in it, so a report that names the directory is a rename, a removal or a change
-            /// of its mode, owner or metadata, whichever name the command gave it meanwhile. The
-            /// creation of a folder at such a directory's path and a change of its extended
-            /// attributes are no write by themselves: what the host read of the directory at the
-            /// start decides both. Every other creation, a mount among them, is a write. A name
-            /// in such a directory is judged by whether it is a declared output.
-            fn written(&self, path: &Path, done: Done) -> Option<String> {
-                let relative = path.strip_prefix(&self.copy).ok().map(|rest| {
+            /// does. A directory a declared output is in, the copy's own directory, a name in
+            /// such a directory and every other entry that the host recorded at the start are
+            /// judged by what the host recorded. FSEvents says nothing of a directory when a name
+            /// is made in it, so a report that names a directory is a rename, a removal or a
+            /// change of its mode, owner or metadata, a creation, or a change of its extended
+            /// attributes. A report that a folder was created, of a recorded directory, or that a
+            /// file was created, of a recorded file, and a report that extended attributes
+            /// changed, are no write by themselves: the end of the run decides them by the
+            /// record, which is a parent's device, inode and attributes and any other entry's
+            /// stamp. Every other report of a recorded path is a write, a mount among them, and
+            /// so is every report of a name the host did not record, whatever its kind. A name in
+            /// such a directory is judged only if it is no declared output, and a path in any
+            /// other directory is judged nothing, since its stamp decides it.
+            fn judge(&self, path: &Path, done: Done) -> Judged {
+                let Some(relative) = path.strip_prefix(&self.copy).ok().map(|rest| {
                     rest.components()
                         .map(|part| part.as_os_str().to_string_lossy().into_owned())
                         .collect::<Vec<_>>()
                         .join("/")
-                })?;
+                }) else {
+                    return Judged::Nothing;
+                };
                 if self.parents.contains_key(&relative) {
-                    return (done == Done::Other).then_some(relative);
+                    return match done {
+                        Done::CreatedFolder | Done::Attributes => Judged::Nothing,
+                        Done::CreatedFile | Done::Other => Judged::Write(relative),
+                    };
                 }
-                if relative.is_empty() {
-                    return Some(relative);
+                if !relative.is_empty() {
+                    let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
+                    match self.parents.get(parent) {
+                        Some(outputs) if !outputs.contains(name) => {}
+                        _ => return Judged::Nothing,
+                    }
                 }
-                let (parent, name) = relative.rsplit_once('/').unwrap_or(("", &relative));
-                let outputs = self.parents.get(parent)?;
-                (!outputs.contains(name)).then_some(relative)
+                match done {
+                    Done::CreatedFolder | Done::CreatedFile | Done::Attributes => {
+                        Judged::Decide(relative)
+                    }
+                    Done::Other => Judged::Write(relative),
+                }
             }
 
             /// Takes one report into `heard`: `rescan` is whether it says that reports were lost,
@@ -787,10 +888,21 @@ mod unix {
                     });
                 }
                 for path in paths {
-                    if heard.written.len() < KEPT
-                        && let Some(relative) = self.written(path, done)
-                    {
-                        heard.written.insert(relative);
+                    match self.judge(path, done) {
+                        Judged::Nothing => {}
+                        Judged::Write(relative) => {
+                            if heard.written.len() < KEPT {
+                                heard.written.insert(relative);
+                            }
+                        }
+                        // Past the bound, a path left to the end is a write, as a name is.
+                        Judged::Decide(relative) => {
+                            if heard.pending.contains_key(&relative) || heard.pending.len() < KEPT {
+                                heard.pending.entry(relative).or_default().add(done);
+                            } else if heard.written.len() < KEPT {
+                                heard.written.insert(relative);
+                            }
+                        }
                     }
                 }
             }
@@ -801,7 +913,8 @@ mod unix {
             use std::collections::{BTreeMap, BTreeSet};
             use std::path::PathBuf;
 
-            use super::{Done, Heard, Places};
+            use super::super::{Kind, Stamp};
+            use super::{Done, Heard, KEPT, Pending, Places, pending_writes};
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
             /// `out` at its root and another, `gen`, in its directory `sub`.
@@ -906,25 +1019,304 @@ mod unix {
                     for done in [Done::CreatedFolder, Done::Attributes] {
                         let heard = heard_done(false, done, &[parent]);
                         assert!(heard.written.is_empty(), "{parent} {done:?} is no write");
+                        assert!(
+                            heard.pending.is_empty(),
+                            "{parent} {done:?} is left to the end"
+                        );
                     }
                     let heard = heard_done(false, Done::Other, &[parent]);
                     assert_eq!(heard.written.len(), 1, "{parent} is a write");
                 }
             }
 
-            /// KR-REQ-14.34: a creation of a name beside a declared output, or in a directory
-            /// that no output is in, is a write all the same: what the host read at the start
-            /// decides only the directories an output is in.
+            /// KR-REQ-14.34: the creation of a folder or a file, and a change of extended
+            /// attributes, at a name directly in a directory an output is in are left to the end
+            /// of the run, which decides them by what the host recorded: nothing is written yet.
             #[test]
-            fn a_creation_of_a_name_that_is_no_parent_is_a_write() {
-                let heard = heard_done(
-                    false,
-                    Done::CreatedFolder,
-                    &["/work/run/copy/other", "/work/run/copy/sub/x"],
+            fn a_creation_or_attribute_report_of_a_name_in_a_parent_is_left_to_the_end() {
+                for done in [Done::CreatedFolder, Done::CreatedFile, Done::Attributes] {
+                    let heard = heard_done(
+                        false,
+                        done,
+                        &["/work/run/copy/other", "/work/run/copy/sub/x"],
+                    );
+                    assert!(heard.written.is_empty(), "{done:?} is written at once");
+                    assert_eq!(
+                        heard.pending.keys().map(String::as_str).collect::<Vec<_>>(),
+                        ["other", "sub/x"],
+                        "{done:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: the kinds heard at a name are kept, so that a file and a folder
+            /// both reported at it are no write for either kind.
+            #[test]
+            fn the_kinds_heard_at_a_name_are_kept_for_the_end() {
+                let file = stamp(Kind::File);
+                let (start, end) = (
+                    BTreeMap::from([("other".to_owned(), file)]),
+                    BTreeMap::from([("other".to_owned(), file)]),
                 );
+                let path = [PathBuf::from("/work/run/copy/other")];
+                let mut heard = Heard::default();
+                places().hear(&mut heard, false, Done::CreatedFile, &path);
+                assert!(pending_writes(&heard.pending, &start, &end).is_empty());
+                places().hear(&mut heard, false, Done::CreatedFolder, &path);
+                assert_eq!(
+                    pending_writes(&heard.pending, &start, &end),
+                    BTreeSet::from(["other".to_owned()])
+                );
+            }
+
+            /// KR-REQ-14.34: every other report of a name in such a directory is a write at once.
+            #[test]
+            fn every_other_report_of_a_name_in_a_parent_is_a_write_at_once() {
+                let heard = heard_of(false, &["/work/run/copy/other", "/work/run/copy/sub/x"]);
                 assert_eq!(
                     heard.written,
                     BTreeSet::from(["other".to_owned(), "sub/x".to_owned()])
+                );
+                assert!(heard.pending.is_empty());
+            }
+
+            /// KR-REQ-14.34: a declared output is the run's to write, whatever the report.
+            #[test]
+            fn a_declared_output_is_judged_nothing_whatever_the_report() {
+                for done in ALL {
+                    let heard = heard_done(
+                        false,
+                        done,
+                        &["/work/run/copy/out", "/work/run/copy/sub/gen"],
+                    );
+                    assert!(heard.written.is_empty(), "{done:?} is written");
+                    assert!(heard.pending.is_empty(), "{done:?} is left to the end");
+                }
+            }
+
+            /// KR-REQ-14.34: a path in a directory that no output is in is judged nothing here,
+            /// whatever the report: the stamp of the entry decides it.
+            #[test]
+            fn a_path_in_another_directory_is_judged_nothing_whatever_the_report() {
+                for done in ALL {
+                    let heard = heard_done(
+                        false,
+                        done,
+                        &[
+                            "/work/run/copy/deep/er/file",
+                            "/work/run/copy/sub/deeper/file",
+                        ],
+                    );
+                    assert!(heard.written.is_empty(), "{done:?} is written");
+                    assert!(heard.pending.is_empty(), "{done:?} is left to the end");
+                }
+            }
+
+            /// KR-REQ-14.34: a creation of a file at a directory an output is in is a write.
+            #[test]
+            fn a_file_creation_report_of_a_parent_is_a_write() {
+                for parent in ["/work/run/copy", "/work/run/copy/sub"] {
+                    let heard = heard_done(false, Done::CreatedFile, &[parent]);
+                    assert_eq!(heard.written.len(), 1, "{parent} is a write");
+                    assert!(heard.pending.is_empty(), "{parent} is left to the end");
+                }
+            }
+
+            /// KR-REQ-14.34: the copy's own directory, when no output is at its root, is
+            /// recorded by its stamp: the creation of a folder and a change of its extended
+            /// attributes are left to the end, and every other report of it is a write at once.
+            #[test]
+            fn the_copys_own_directory_is_left_to_the_end_when_it_is_no_parent() {
+                let places = Places::new(
+                    PathBuf::from("/work/run/copy"),
+                    BTreeMap::from([("sub".to_owned(), BTreeSet::from(["gen".to_owned()]))]),
+                );
+                let copy = [PathBuf::from("/work/run/copy")];
+                for done in [Done::CreatedFolder, Done::Attributes] {
+                    let mut heard = Heard::default();
+                    places.hear(&mut heard, false, done, &copy);
+                    assert!(heard.written.is_empty(), "{done:?} is written");
+                    assert!(heard.pending.contains_key(""), "{done:?} is not left");
+                }
+                let mut heard = Heard::default();
+                places.hear(&mut heard, false, Done::Other, &copy);
+                assert_eq!(heard.written, BTreeSet::from([String::new()]));
+                assert!(heard.pending.is_empty());
+            }
+
+            /// KR-REQ-14.34: past the bound on the paths heard, a path left to the end is a write,
+            /// as a name is; a path already left to it stays so.
+            #[test]
+            fn past_the_bound_a_path_left_to_the_end_is_a_write() {
+                let paths: Vec<PathBuf> = (0..=KEPT)
+                    .map(|number| PathBuf::from(format!("/work/run/copy/n{number}")))
+                    .collect();
+                let mut heard = Heard::default();
+                places().hear(&mut heard, false, Done::CreatedFile, &paths);
+                assert_eq!(heard.pending.len(), KEPT);
+                assert_eq!(heard.written, BTreeSet::from([format!("n{KEPT}")]));
+                places().hear(&mut heard, false, Done::CreatedFolder, &paths[..1]);
+                assert_eq!(heard.pending.len(), KEPT);
+                assert_eq!(heard.written.len(), 1);
+            }
+
+            /// Every kind of report.
+            const ALL: [Done; 4] = [
+                Done::CreatedFolder,
+                Done::CreatedFile,
+                Done::Attributes,
+                Done::Other,
+            ];
+
+            /// A record of an entry of kind `kind`.
+            fn stamp(kind: Kind) -> Stamp {
+                Stamp {
+                    kind,
+                    device: 1,
+                    inode: 10,
+                    len: 0,
+                    modified: (100, 5),
+                    changed: (100, 7),
+                }
+            }
+
+            /// What was left to the end of the run when `dones` were heard at one path.
+            fn pending_of(dones: &[Done]) -> Pending {
+                let mut pending = Pending::default();
+                for done in dones {
+                    pending.add(*done);
+                }
+                pending
+            }
+
+            /// KR-REQ-14.34: the creation of the kind the host recorded, or a change of extended
+            /// attributes, with the stamp as recorded, is no write; a second delivery of either
+            /// is none.
+            #[test]
+            fn a_creation_of_the_recorded_kind_with_the_stamp_held_is_no_write() {
+                let (file, folder, link) = (
+                    stamp(Kind::File),
+                    stamp(Kind::Directory),
+                    stamp(Kind::Other),
+                );
+                let held = |dones: &[Done], recorded: &Stamp| {
+                    pending_of(dones).is_no_write(Some(recorded), Some(recorded))
+                };
+                assert!(held(&[Done::CreatedFile], &file));
+                assert!(held(&[Done::CreatedFile, Done::CreatedFile], &file));
+                assert!(held(&[Done::CreatedFolder], &folder));
+                assert!(held(&[Done::CreatedFolder, Done::CreatedFolder], &folder));
+                for recorded in [&file, &folder, &link] {
+                    assert!(held(&[Done::Attributes], recorded), "{recorded:?}");
+                }
+            }
+
+            /// KR-REQ-14.34: a stamp that differs in any member is a write.
+            #[test]
+            fn a_stamp_that_differs_in_any_member_is_a_write() {
+                let held = stamp(Kind::File);
+                let later = [
+                    Stamp {
+                        kind: Kind::Directory,
+                        ..held
+                    },
+                    Stamp { device: 2, ..held },
+                    Stamp { inode: 11, ..held },
+                    Stamp { len: 1, ..held },
+                    Stamp {
+                        modified: (100, 6),
+                        ..held
+                    },
+                    Stamp {
+                        modified: (101, 5),
+                        ..held
+                    },
+                    Stamp {
+                        changed: (100, 8),
+                        ..held
+                    },
+                    Stamp {
+                        changed: (101, 7),
+                        ..held
+                    },
+                ];
+                for end in later {
+                    for dones in [&[Done::CreatedFile][..], &[Done::Attributes][..]] {
+                        assert!(
+                            !pending_of(dones).is_no_write(Some(&held), Some(&end)),
+                            "{dones:?} {end:?}"
+                        );
+                    }
+                }
+            }
+
+            /// KR-REQ-14.34: an entry the record lacks, at the start or at the end, is a write.
+            #[test]
+            fn an_entry_absent_at_the_start_or_at_the_end_is_a_write() {
+                let held = stamp(Kind::File);
+                let pending = pending_of(&[Done::CreatedFile]);
+                assert!(!pending.is_no_write(None, Some(&held)));
+                assert!(!pending.is_no_write(Some(&held), None));
+                assert!(!pending.is_no_write(None, None));
+                let attributes = pending_of(&[Done::Attributes]);
+                assert!(!attributes.is_no_write(None, Some(&held)));
+                assert!(!attributes.is_no_write(Some(&held), None));
+                assert!(!attributes.is_no_write(None, None));
+            }
+
+            /// KR-REQ-14.34: a creation of a kind that does not fit what the host recorded is a
+            /// write, and so is a creation of both kinds at one path.
+            #[test]
+            fn a_creation_of_another_kind_than_the_recorded_one_is_a_write() {
+                let (file, folder, link) = (
+                    stamp(Kind::File),
+                    stamp(Kind::Directory),
+                    stamp(Kind::Other),
+                );
+                let no_write = |dones: &[Done], recorded: &Stamp| {
+                    pending_of(dones).is_no_write(Some(recorded), Some(recorded))
+                };
+                assert!(!no_write(&[Done::CreatedFile], &folder));
+                assert!(!no_write(&[Done::CreatedFile], &link));
+                assert!(!no_write(&[Done::CreatedFolder], &file));
+                assert!(!no_write(&[Done::CreatedFolder], &link));
+                for recorded in [&file, &folder] {
+                    assert!(!no_write(
+                        &[Done::CreatedFile, Done::CreatedFolder],
+                        recorded
+                    ));
+                }
+            }
+
+            /// KR-REQ-14.34: the paths left to the end that are writes are those the record does
+            /// not hold as heard, and no others.
+            #[test]
+            fn the_paths_left_to_the_end_that_are_writes_are_the_ones_the_record_does_not_hold() {
+                let (file, folder) = (stamp(Kind::File), stamp(Kind::Directory));
+                let start = BTreeMap::from([
+                    ("held".to_owned(), file),
+                    ("again".to_owned(), folder),
+                    ("gone".to_owned(), file),
+                ]);
+                let end = BTreeMap::from([
+                    ("held".to_owned(), file),
+                    (
+                        "again".to_owned(),
+                        Stamp {
+                            inode: 11,
+                            ..folder
+                        },
+                    ),
+                ]);
+                let pending = BTreeMap::from([
+                    ("held".to_owned(), pending_of(&[Done::CreatedFile])),
+                    ("again".to_owned(), pending_of(&[Done::CreatedFolder])),
+                    ("gone".to_owned(), pending_of(&[Done::Attributes])),
+                    ("new".to_owned(), pending_of(&[Done::CreatedFile])),
+                ]);
+                assert_eq!(
+                    pending_writes(&pending, &start, &end),
+                    BTreeSet::from(["again".to_owned(), "gone".to_owned(), "new".to_owned()])
                 );
             }
         }
@@ -1444,8 +1836,9 @@ mod unix {
         use kr_transfer::{AuthorisedDirectory, RelativeName};
 
         use super::budget::{self, Budget, Held};
-        use super::judged::{Done, Heard, Places};
+        use super::judged::{Done, Heard, Places, pending_writes};
         use super::record::Record;
+        use super::{Drained, Stamps};
 
         /// What the watches of this process cost, in open files.
         static WATCHES: Budget = Budget::new();
@@ -1475,11 +1868,12 @@ mod unix {
         }
 
         /// What a report of the watcher says was done to the paths it names. Only the creation of
-        /// a folder has a variant of its own: the library reports a mount as a creation of kind
-        /// other, and that is a write.
+        /// a folder or of a file has a variant of its own: the library reports a mount as a
+        /// creation of kind other, and that is a write.
         fn done_by(kind: &EventKind) -> Done {
             match kind {
                 EventKind::Create(CreateKind::Folder) => Done::CreatedFolder,
+                EventKind::Create(CreateKind::File) => Done::CreatedFile,
                 EventKind::Modify(ModifyKind::Metadata(MetadataKind::Extended)) => Done::Attributes,
                 _ => Done::Other,
             }
@@ -1754,12 +2148,38 @@ mod unix {
                 Ok(changed)
             }
 
-            /// The paths written beside a declared output since the watch started, and the
-            /// directories themselves when something was done to them or when one is not what it
-            /// was, whether the watcher reported it or not.
-            pub fn drain(&self) -> Result<Vec<String>, String> {
-                self.up_to_date()?;
-                let changed = self.changed()?;
+            /// Waits until the watcher is up to date, takes the record of the copy at the end of
+            /// the run with `take_end`, and says which paths were written beside a declared
+            /// output since the watch started, and which directories themselves, when something
+            /// was done to them or when one is not what it was, whether the watcher reported it
+            /// or not. The record is taken after the wait, so that it holds every change the
+            /// watcher has reported, and it is given back beside the paths: with `start`, the
+            /// record of the start, it decides the creations and attribute changes that were
+            /// reported of recorded entries.
+            pub fn drain(
+                &self,
+                start: &Stamps,
+                take_end: impl FnOnce() -> Result<Stamps, String>,
+            ) -> Drained {
+                let waited = self.up_to_date();
+                let end = take_end();
+                let moved = self.changed();
+                let written = waited.and_then(|()| match (&end, moved) {
+                    (Ok(end), Ok(moved)) => self.reported(start, end, &moved),
+                    (Err(why), _) => Err(why.clone()),
+                    (Ok(_), Err(why)) => Err(why),
+                });
+                (end, written)
+            }
+
+            /// The paths the watcher reported as written, with the directories that `moved` names
+            /// and the paths left to the end that the record of `start` and `end` does not hold.
+            fn reported(
+                &self,
+                start: &Stamps,
+                end: &Stamps,
+                moved: &BTreeSet<String>,
+            ) -> Result<Vec<String>, String> {
                 let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 match &shared.heard.lost {
                     Some(why) => Err(why.clone()),
@@ -1767,8 +2187,9 @@ mod unix {
                         .heard
                         .written
                         .iter()
-                        .chain(&changed)
+                        .chain(moved)
                         .cloned()
+                        .chain(pending_writes(&shared.heard.pending, start, end))
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect()),
@@ -1788,9 +2209,10 @@ mod unix {
                 RenameMode,
             };
 
+            use super::super::{stamp_tree, wait_for_the_clock};
             use super::{
-                AuthorisedDirectory, Budget, Duration, Held, Instant, MARK, NameWatch, Places,
-                Shared, Site, WATCHES, budget, take,
+                AuthorisedDirectory, Budget, Drained, Duration, Held, Instant, MARK, NameWatch,
+                Places, Shared, Site, Stamps, WATCHES, budget, take,
             };
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
@@ -1994,10 +2416,30 @@ mod unix {
             struct Place {
                 _root: tempfile::TempDir,
                 copy: PathBuf,
+                directory: AuthorisedDirectory,
+                skipped: BTreeSet<String>,
+                declared: BTreeSet<String>,
+                /// What the host recorded of the entries of the copy at the start.
+                start: Stamps,
                 watch: NameWatch,
                 places: Arc<Places>,
                 shared: Arc<Mutex<Shared>>,
                 tell: mpsc::Sender<PathBuf>,
+            }
+
+            impl Place {
+                /// What the watch says was written, with the stamps of the entries of the copy
+                /// taken when the watch is up to date: the way the host settles a run.
+                fn drain(&self) -> Result<Vec<String>, String> {
+                    self.drained().1
+                }
+
+                /// What the watch gives at the end: the stamps it took and the paths it names.
+                fn drained(&self) -> Drained {
+                    self.watch.drain(&self.start, || {
+                        stamp_tree(&self.directory, &self.skipped, &self.declared)
+                    })
+                }
             }
 
             /// A watcher that holds no stream, held with a cost of nothing from a budget of its own.
@@ -2039,6 +2481,9 @@ mod unix {
                 let copy = beside_path.join("copy");
                 std::fs::create_dir_all(copy.join("target/debug")).expect("the directories above");
                 set_attribute(&copy.join("target"), KEPT, b"one");
+                std::fs::create_dir_all(copy.join("src")).expect("a source folder");
+                std::fs::write(copy.join("README.md"), b"a source file\n").expect("a source file");
+                std::fs::write(copy.join("src/lib.rs"), b"a deeper one\n").expect("a deeper file");
                 let open = |path: &Path| {
                     AuthorisedDirectory::open_root(
                         kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
@@ -2056,24 +2501,50 @@ mod unix {
             }
 
             fn a_place() -> Place {
+                a_place_for(parents_of_outputs())
+            }
+
+            /// A place whose declared outputs are in the directories `parents` names.
+            fn a_place_for(parents: BTreeMap<String, BTreeSet<String>>) -> Place {
                 let layout = a_layout();
-                let places = Arc::new(Places::new(layout.copy.clone(), parents_of_outputs()));
+                let places = Arc::new(Places::new(layout.copy.clone(), parents.clone()));
                 let shared = Arc::new(Mutex::new(Shared::default()));
                 let (tell, reported) = mpsc::channel();
                 let watch = NameWatch {
                     _watcher: no_stream(),
                     shared: Arc::clone(&shared),
                     reported: Mutex::new(reported),
-                    site: Site::of(
-                        &layout.copy_directory,
-                        &layout.beside,
-                        &parents_of_outputs(),
-                    )
-                    .expect("the directories above are examined"),
+                    site: Site::of(&layout.copy_directory, &layout.beside, &parents)
+                        .expect("the directories above are examined"),
                 };
+                let skipped: BTreeSet<String> = parents.keys().cloned().collect();
+                let declared: BTreeSet<String> = parents
+                    .iter()
+                    .flat_map(|(parent, names)| {
+                        names.iter().map(move |name| {
+                            if parent.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{parent}/{name}")
+                            }
+                        })
+                    })
+                    .collect();
+                let start = stamp_tree(&layout.copy_directory, &skipped, &declared)
+                    .expect("the copy is recorded");
+                let newest = start
+                    .values()
+                    .map(|stamp| stamp.changed)
+                    .max()
+                    .unwrap_or_default();
+                wait_for_the_clock(&layout.beside, newest).expect("the clock passes the record");
                 Place {
                     _root: layout._root,
                     copy: layout.copy,
+                    directory: layout.copy_directory,
+                    skipped,
+                    declared,
+                    start,
                     watch,
                     places,
                     shared,
@@ -2156,7 +2627,7 @@ mod unix {
                 after: Vec<Event>,
             ) -> Vec<String> {
                 let (platform, decided) = deliver(place, before, at_marker, after);
-                let written = place.watch.drain().expect("the watch is up to date");
+                let written = place.drain().expect("the watch is up to date");
                 decided.send(()).expect("the platform waits");
                 platform.join().expect("the platform ends");
                 written
@@ -2302,7 +2773,10 @@ mod unix {
                 let place = a_place();
                 let _shut = Shut::the_directory(&place.copy);
                 let (platform, decided) = deliver(&place, Vec::new(), || {}, Vec::new());
-                let drained = place.watch.drain();
+                let drained = place
+                    .watch
+                    .drain(&place.start, || Ok(place.start.clone()))
+                    .1;
                 decided.send(()).expect("the platform waits");
                 platform.join().expect("the platform ends");
                 let why = drained.err().unwrap_or_default();
@@ -2493,7 +2967,10 @@ mod unix {
                     let parent = place.copy.join("target");
                     let (platform, decided) =
                         deliver(&place, Vec::new(), move || grow(&parent), Vec::new());
-                    let drained = place.watch.drain();
+                    let drained = place
+                        .watch
+                        .drain(&place.start, || Ok(place.start.clone()))
+                        .1;
                     decided.send(()).expect("the platform waits");
                     platform.join().expect("the platform ends");
                     let why = drained.err().unwrap_or_default();
@@ -2583,6 +3060,293 @@ mod unix {
                     assert_eq!(written, vec!["target".to_owned()], "{kind:?}");
                 }
             }
+
+            /// The entries the host records at the start directly in the copy's own directory, a
+            /// directory an output is in, each with the kind of creation that names it.
+            const RECORDED: [(&str, CreateKind); 2] =
+                [("README.md", CreateKind::File), ("src", CreateKind::Folder)];
+
+            /// What the watch says was written when the stream reports `kinds` of the entry
+            /// `name` of the copy ahead of the host's marker, the copy being as it is now.
+            fn written_at(place: &Place, name: &str, kinds: Vec<EventKind>) -> Vec<String> {
+                let path = place.copy.join(name);
+                let before = kinds.into_iter().map(|kind| report(kind, &path)).collect();
+                written_with(place, before, || {}, Vec::new())
+            }
+
+            /// KR-REQ-14.34: the service delivers the host's own making of an entry again after
+            /// the watcher is up to date. A creation report of a recorded file or folder, of the
+            /// kind that fits it, is no write while the entry is as the host recorded it.
+            #[test]
+            fn a_second_delivery_of_the_creation_of_a_recorded_name_is_no_write() {
+                for (name, kind) in RECORDED {
+                    let place = a_place();
+                    let created = EventKind::Create(kind);
+                    let written = written_at(&place, name, vec![created, created]);
+                    assert!(
+                        written.is_empty(),
+                        "{name} is as recorded, and the watch says it wrote {written:?}"
+                    );
+                }
+            }
+
+            /// KR-REQ-14.34: the same for a report that its extended attributes changed, and for
+            /// the pair of reports that the host's own making of an entry gives, delivered twice.
+            #[test]
+            fn an_attribute_report_of_a_recorded_name_with_its_stamp_held_is_no_write() {
+                for (name, kind) in RECORDED {
+                    for kinds in [
+                        vec![attributes_changed()],
+                        vec![
+                            EventKind::Create(kind),
+                            attributes_changed(),
+                            EventKind::Create(kind),
+                            attributes_changed(),
+                        ],
+                    ] {
+                        let place = a_place();
+                        let written = written_at(&place, name, kinds.clone());
+                        assert!(
+                            written.is_empty(),
+                            "{name} {kinds:?} is as recorded, and the watch says it wrote {written:?}"
+                        );
+                    }
+                }
+            }
+
+            /// KR-REQ-14.34: a recorded entry that was removed and made again is a write though
+            /// only its creation was reported: the stamp it has now is another one.
+            #[test]
+            fn a_recorded_name_made_again_is_a_write_though_only_its_creation_was_reported() {
+                for (name, kind) in RECORDED {
+                    let place = a_place();
+                    let path = place.copy.join(name);
+                    if kind == CreateKind::File {
+                        std::fs::remove_file(&path).expect("the run removes the file");
+                        std::fs::write(&path, b"a source file\n").expect("and makes it again");
+                    } else {
+                        std::fs::remove_dir_all(&path).expect("the run removes the folder");
+                        std::fs::create_dir_all(&path).expect("and makes it again");
+                    }
+                    let written = written_at(&place, name, vec![EventKind::Create(kind)]);
+                    assert_eq!(written, vec![name.to_owned()], "{name}");
+                }
+            }
+
+            /// KR-REQ-14.34: a creation report of a name the host did not record is a write
+            /// whatever its kind, and also when the name is gone again at the end.
+            #[test]
+            fn a_creation_report_of_a_name_the_host_did_not_record_is_a_write() {
+                for (name, kind, stays) in [
+                    ("made.txt", CreateKind::File, true),
+                    ("made", CreateKind::Folder, true),
+                    ("gone", CreateKind::File, false),
+                ] {
+                    let place = a_place();
+                    let path = place.copy.join(name);
+                    if stays && kind == CreateKind::File {
+                        std::fs::write(&path, b"made by the run\n").expect("the run makes a file");
+                    } else if stays {
+                        std::fs::create_dir(&path).expect("the run makes a folder");
+                    }
+                    let written = written_at(&place, name, vec![EventKind::Create(kind)]);
+                    assert_eq!(written, vec![name.to_owned()], "{name}");
+                }
+            }
+
+            /// KR-REQ-14.34: a report that the extended attributes of a name the host did not
+            /// record changed is a write.
+            #[test]
+            fn an_attribute_report_of_a_name_the_host_did_not_record_is_a_write() {
+                let place = a_place();
+                std::fs::write(place.copy.join("made.txt"), b"made by the run\n")
+                    .expect("the run makes a file");
+                let written = written_at(&place, "made.txt", vec![attributes_changed()]);
+                assert_eq!(written, vec!["made.txt".to_owned()]);
+            }
+
+            /// KR-REQ-14.34: the kind of creation must fit what the host recorded: a file
+            /// created at the path of a recorded folder, and a folder at that of a recorded
+            /// file, are writes.
+            #[test]
+            fn a_creation_report_of_another_kind_than_the_recorded_entry_is_a_write() {
+                for (name, kind) in RECORDED {
+                    let other = if kind == CreateKind::File {
+                        CreateKind::Folder
+                    } else {
+                        CreateKind::File
+                    };
+                    let place = a_place();
+                    let written = written_at(&place, name, vec![EventKind::Create(other)]);
+                    assert_eq!(written, vec![name.to_owned()], "{name} {other:?}");
+                }
+            }
+
+            /// KR-REQ-14.34: every report of a recorded entry that is neither the creation of its
+            /// kind nor a change of its extended attributes is a write at once, with the entry as
+            /// recorded: a removal, a rename, a change of owner, mode or other metadata, of
+            /// content, and a creation of another kind, a mount among them.
+            #[test]
+            fn a_rename_a_removal_or_any_other_report_of_a_recorded_name_is_a_write() {
+                for (name, _) in RECORDED {
+                    for kind in [
+                        EventKind::Remove(RemoveKind::Any),
+                        EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Ownership)),
+                        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Permissions)),
+                        EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+                        EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                        EventKind::Create(CreateKind::Other),
+                        EventKind::Create(CreateKind::Any),
+                    ] {
+                        let place = a_place();
+                        let written = written_at(&place, name, vec![kind]);
+                        assert_eq!(written, vec![name.to_owned()], "{name} {kind:?}");
+                    }
+                }
+            }
+
+            /// KR-REQ-14.34: an extended attribute changed on a recorded entry after the start
+            /// moves its time of change, which the stamp holds: it is a write when a report says
+            /// so, also when the attribute was put back.
+            #[test]
+            fn an_attribute_changed_on_a_recorded_name_after_the_start_is_a_write() {
+                for (name, _) in RECORDED {
+                    for put_back in [false, true] {
+                        let place = a_place();
+                        let path = place.copy.join(name);
+                        set_attribute(&path, "kr.other", b"two");
+                        if put_back {
+                            rustix::fs::lremovexattr(&path, "kr.other")
+                                .expect("the attribute is put back");
+                        }
+                        let written = written_at(&place, name, vec![attributes_changed()]);
+                        assert_eq!(
+                            written,
+                            vec![name.to_owned()],
+                            "{name} put back: {put_back}"
+                        );
+                    }
+                }
+            }
+
+            /// KR-REQ-14.34: the host takes the record of the end once the watcher is up to date:
+            /// an extended attribute changed on a recorded entry while the host waits for its
+            /// marker, which the watcher reports before the marker, is in the record, so the
+            /// report of it is a write.
+            #[test]
+            fn an_attribute_changed_on_a_recorded_name_while_the_host_waits_is_a_write() {
+                for (name, _) in RECORDED {
+                    let place = a_place();
+                    let path = place.copy.join(name);
+                    let before = vec![report(attributes_changed(), &path)];
+                    let written = written_with(
+                        &place,
+                        before,
+                        move || set_attribute(&path, "kr.other", b"two"),
+                        Vec::new(),
+                    );
+                    assert_eq!(written, vec![name.to_owned()], "{name}");
+                }
+            }
+
+            /// KR-REQ-14.34: the same record holds what is changed in a directory that no output
+            /// is in while the host waits for its marker, which the stamp alone decides.
+            #[test]
+            fn the_record_of_the_end_holds_a_change_made_while_the_host_waits() {
+                let place = a_place();
+                let path = place.copy.join("src/lib.rs");
+                let (platform, decided) = deliver(
+                    &place,
+                    Vec::new(),
+                    move || {
+                        std::fs::write(&path, b"changed while the host waits\n").expect("written")
+                    },
+                    Vec::new(),
+                );
+                let (end, written) = place.drained();
+                decided.send(()).expect("the platform waits");
+                platform.join().expect("the platform ends");
+                written.expect("the watch is up to date");
+                let end = end.expect("the copy is recorded again");
+                assert_ne!(end.get("src/lib.rs"), place.start.get("src/lib.rs"));
+            }
+
+            /// A copy whose declared output is in `target` only: its own directory is no parent,
+            /// so the host records its stamp.
+            fn a_place_with_no_output_at_the_root() -> Place {
+                a_place_for(BTreeMap::from([(
+                    "target".to_owned(),
+                    BTreeSet::from(["debug".to_owned()]),
+                )]))
+            }
+
+            /// KR-REQ-14.34: the copy's own directory, when no output is at its root, is recorded
+            /// by its stamp: the creation and attribute reports of it, delivered again, are no
+            /// write while the stamp is the one recorded.
+            #[test]
+            fn the_creation_and_attribute_reports_of_the_copys_own_directory_are_no_write() {
+                let place = a_place_with_no_output_at_the_root();
+                let before = [
+                    created(),
+                    attributes_changed(),
+                    created(),
+                    attributes_changed(),
+                ]
+                .into_iter()
+                .map(|kind| report(kind, &place.copy))
+                .collect();
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert!(
+                    written.is_empty(),
+                    "the copy is as recorded, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: a rename of the copy's own directory is a write.
+            #[test]
+            fn a_rename_report_of_the_copys_own_directory_is_a_write_when_it_is_no_parent() {
+                let place = a_place_with_no_output_at_the_root();
+                let before = vec![report(
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Any)),
+                    &place.copy,
+                )];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert_eq!(written, vec![String::new()]);
+            }
+
+            /// KR-REQ-14.34: a name made in the copy's own directory moves its time, so a report
+            /// of the directory is a write when the stamp is another.
+            #[test]
+            fn a_report_of_the_copys_own_directory_after_a_name_was_made_in_it_is_a_write() {
+                let place = a_place_with_no_output_at_the_root();
+                std::fs::write(place.copy.join("made.txt"), b"made by the run\n")
+                    .expect("the run makes a file");
+                let before = vec![report(created(), &place.copy)];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert_eq!(written, vec![String::new()]);
+            }
+
+            /// KR-REQ-14.34: a link put in place of a directory an output is in is a write,
+            /// whether or not anything was reported: it is not the directory the host recorded.
+            #[test]
+            fn a_link_put_in_place_of_a_parent_is_a_write() {
+                for reported in [false, true] {
+                    let place = a_place();
+                    let elsewhere = place.copy.with_file_name("elsewhere");
+                    std::fs::create_dir_all(&elsewhere).expect("another folder");
+                    let parent = place.copy.join("target");
+                    std::fs::remove_dir_all(&parent).expect("the run removes the parent");
+                    std::os::unix::fs::symlink(&elsewhere, &parent).expect("and links it");
+                    let before = if reported {
+                        vec![report(created(), &parent)]
+                    } else {
+                        Vec::new()
+                    };
+                    let written = written_with(&place, before, || {}, Vec::new());
+                    assert_eq!(written, vec!["target".to_owned()], "reported: {reported}");
+                }
+            }
         }
     }
 
@@ -2613,8 +3377,12 @@ mod unix {
                 }
             }
 
-            pub fn drain(&self) -> Result<Vec<String>, String> {
-                Ok(Vec::new())
+            pub fn drain(
+                &self,
+                _start: &super::Stamps,
+                take_end: impl FnOnce() -> Result<super::Stamps, String>,
+            ) -> super::Drained {
+                (take_end(), Ok(Vec::new()))
             }
         }
     }
