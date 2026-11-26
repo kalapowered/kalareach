@@ -684,19 +684,24 @@ A test result is what this host observed, and nothing a caller reports.
   FSEvents does lose reports, and falls behind by more than the host waits, when files are written
   by the tens of thousands in one burst, by a suite or by anything else on the machine, so on macOS
   such a run can get an indeterminate result that says its watcher cannot be trusted, and a run
-  again may not. A macOS host whose limit of open files starts at 256 can hold about a hundred of
-  these watchers at once (102 measured with notify 9.0.0, each one two FSEvents stream roots, held
-  while a suite with a declared output runs); a suite that starts past that has no watcher, so its
-  result is indeterminate and says that the copy could not be watched. A file the suite adds
-  beside an output is
-  not left out of the comparison and changes the source (an added empty directory leaves the source
-  as it was, unless the reading cannot open or list it, reaches a bound, or the change set's rules
-  keep its path out, which makes the source indeterminate, so no version of its own is stored for
-  it; the record sees the new entry all the same, and the result attests no version), so a tool that
-  writes beside each source directory (a compiled-code cache is the usual one) makes a run of that
-  suite that exits with status zero unknown and, where what the copy held can be read completely,
-  stores what it wrote as a version of its own under the conditions given above. An output path must
-  be exactly specified; it is not possible to use a pattern. An ancestor of an output is entered to
+  again may not. A macOS host admits a watcher only while the watchers it holds, with the new one,
+  use no more than half of the process's limit of open files, read when the watcher starts, and half
+  of 2560 where that limit is higher or there is none, since nothing was measured past it. A watcher
+  uses one open file for each component of the copy's path and of the path of the directory beside
+  it, and eight more: 29 for the copy of a standard home directory, whose path is 11 components
+  deep. A process whose limit of open files starts at 256, which its first FSEvents stream raises to
+  2560, admits 44 of them at once. A suite that starts past that has no watcher, so its result is
+  indeterminate and says that too many copies are watched at once. The limit is there because
+  FSEvents, with notify 9.0.0, could not start a stream past 88 of these watchers at that depth, and
+  a start that fails there can end the process. A file the suite adds beside an output is not left
+  out of the comparison and changes the source (an added empty directory leaves the source as it
+  was, unless the reading cannot open or list it, reaches a bound, or the change set's rules keep
+  its path out, which makes the source indeterminate, so no version of its own is stored for it; the
+  record sees the new entry all the same, and the result attests no version), so a tool that writes
+  beside each source directory (a compiled-code cache is the usual one) makes a run of that suite
+  that exits with status zero unknown and, where what the copy held can be read completely, stores
+  what it wrote as a version of its own under the conditions given above. An output path must be
+  exactly specified; it is not possible to use a pattern. An ancestor of an output is entered to
   reach it, and its other entries follow the normal rules for the source. Declarations that repeat,
   lie inside one another, or are or contain a path the version holds are refused before the suite
   runs. So is a declaration with a name this host does not carry as input (a colon, one of `< > " |

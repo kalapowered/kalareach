@@ -846,6 +846,239 @@ mod unix {
         }
     }
 
+    /// What the watches of one process may hold of its open files.
+    ///
+    /// FSEvents holds one open file for each component of each path it is given and eight more
+    /// for each watch of a copy and the directory beside it: 29 for a copy 11 components deep,
+    /// measured on macOS with notify 9.0.0. A process whose limit of open files started at 256,
+    /// which its first stream raised to 2560, held 88 such watches before a watch could not
+    /// start, and past that the library can end the process. So the host refuses first: a watch
+    /// is admitted only while the cost of the watches the process holds, with its own, is no
+    /// more than half of the process's soft limit of open files, read when the watch starts, and
+    /// half of 2560 where that limit is higher or there is none, since nothing was measured past
+    /// it. The other half is left to the rest of the process.
+    #[cfg(any(target_os = "macos", test))]
+    mod budget {
+        use std::path::{Component, Path};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// The soft limit of open files under which the cost and the ceiling of a watch were
+        /// measured.
+        const MEASURED: u64 = 2560;
+
+        /// What a watch holds of its own, apart from a file for each component of its two paths.
+        const OWN: u64 = 8;
+
+        /// Why a watch was not made when the budget did not admit it.
+        pub(super) const REFUSED: &str = "the copy could not be watched: too many copies are \
+                                          watched at once";
+
+        /// What the live watches of a process cost, in open files.
+        pub(super) struct Budget {
+            live: AtomicU64,
+        }
+
+        /// The cost of one watch, held for as long as the watch lives, and given back when it is
+        /// dropped, also when the watch could not be started.
+        pub(super) struct Held<'a> {
+            budget: &'a Budget,
+            cost: u64,
+        }
+
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                self.budget.live.fetch_sub(self.cost, Ordering::AcqRel);
+            }
+        }
+
+        impl Budget {
+            /// A budget with no live watch.
+            pub(super) const fn new() -> Self {
+                Self {
+                    live: AtomicU64::new(0),
+                }
+            }
+
+            /// Makes the watch with `start` when the process's watches, with this one, would cost
+            /// no more than half of `soft`, the soft limit of open files, taken as 2560 where it
+            /// is higher or none, and makes none otherwise: the library is not asked.
+            pub(super) fn admit<T>(
+                &self,
+                cost: u64,
+                soft: Option<u64>,
+                start: impl FnOnce() -> Result<T, String>,
+            ) -> Result<(T, Held<'_>), String> {
+                let half = soft.map_or(MEASURED, |soft| soft.min(MEASURED)) / 2;
+                self.live
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+                        live.checked_add(cost).filter(|total| *total <= half)
+                    })
+                    .map_err(|_| REFUSED.to_owned())?;
+                let held = Held { budget: self, cost };
+                let value = start()?;
+                Ok((value, held))
+            }
+        }
+
+        /// What a watch of the copy and the directory beside it holds of the process's open
+        /// files: one for each component of each of the two paths and eight of its own.
+        pub(super) fn cost_of(copy: &Path, beside: &Path) -> u64 {
+            let components = |path: &Path| {
+                path.components()
+                    .filter(|component| matches!(component, Component::Normal(_)))
+                    .count()
+            };
+            u64::try_from(components(copy) + components(beside))
+                .map_or(u64::MAX, |n| n.saturating_add(OWN))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use std::cell::Cell;
+            use std::path::Path;
+
+            use super::{Budget, Held, cost_of};
+
+            /// A watch of `cost` made with nothing to start, held or refused.
+            fn admitted(budget: &Budget, cost: u64, soft: Option<u64>) -> Option<Held<'_>> {
+                budget
+                    .admit(cost, soft, || Ok(()))
+                    .ok()
+                    .map(|(_, held)| held)
+            }
+
+            /// How many watches of `cost` the budget admits, one after the other, under `soft`,
+            /// and whether the next is refused.
+            fn admits(cost: u64, soft: Option<u64>) -> (usize, bool) {
+                let budget = Budget::new();
+                let mut held = Vec::new();
+                while let Some(watch) = admitted(&budget, cost, soft) {
+                    held.push(watch);
+                    if held.len() > 1000 {
+                        return (held.len(), false);
+                    }
+                }
+                (held.len(), true)
+            }
+
+            /// The store's copy under a home directory is 11 components deep.
+            const STORE: &str = "/Users/someone/Library/Application Support/KalaReach/host/environments/\
+                                 0a1b2c3d/changesets/materialisations/id";
+
+            /// The same place with five more components, 16 deep.
+            const DEEPER: &str = "/Users/someone/Library/Application Support/KalaReach/host/environments/\
+                                  0a1b2c3d/changesets/materialisations/a/b/c/d/e/id";
+
+            /// What a watch of the copy at `copy` and the directory it is in costs.
+            fn cost_at(copy: &str) -> u64 {
+                let copy = Path::new(copy);
+                cost_of(copy, copy.parent().unwrap_or(Path::new("/")))
+            }
+
+            fn store_cost() -> u64 {
+                cost_at(STORE)
+            }
+
+            /// A watch holds a file for each component of its two paths and eight of its own.
+            #[test]
+            fn a_watch_costs_one_for_each_component_of_both_paths_and_eight_more() {
+                assert_eq!(cost_of(Path::new("/a/b/c"), Path::new("/a/b")), 13);
+                assert_eq!(store_cost(), 29);
+                assert_eq!(
+                    cost_of(Path::new("/x/a/b/c"), Path::new("/x/a/b")),
+                    13 + 2,
+                    "a deeper path costs two more for each component"
+                );
+            }
+
+            /// The last watch that stays within half of the limit is admitted and the next is
+            /// refused without the library being asked.
+            #[test]
+            fn the_last_watch_within_half_the_limit_is_admitted_and_the_next_is_refused() {
+                let budget = Budget::new();
+                let held: Vec<_> = (0..3).map(|_| admitted(&budget, 29, Some(174))).collect();
+                assert!(held.iter().all(Option::is_some), "29 x 3 is half of 174");
+                let asked = Cell::new(false);
+                let fourth = budget.admit(29, Some(174), || {
+                    asked.set(true);
+                    Ok(())
+                });
+                assert!(fourth.is_err(), "the fourth is past half of 174");
+                assert!(!asked.get(), "a refused watch does not ask the library");
+            }
+
+            /// A watch that passes half of the limit by one is refused.
+            #[test]
+            fn a_watch_that_would_pass_half_the_limit_by_one_is_refused() {
+                let budget = Budget::new();
+                let first = admitted(&budget, 29, Some(172));
+                let second = admitted(&budget, 29, Some(172));
+                assert!(first.is_some() && second.is_some());
+                assert!(admitted(&budget, 29, Some(172)).is_none(), "87 is past 86");
+            }
+
+            /// A dropped watch gives its cost back, so a watch the budget refused is admitted.
+            #[test]
+            fn a_dropped_watch_gives_its_cost_back() {
+                let budget = Budget::new();
+                let mut held: Vec<_> = (0..3).map(|_| admitted(&budget, 29, Some(174))).collect();
+                assert!(admitted(&budget, 29, Some(174)).is_none());
+                held.pop();
+                assert!(admitted(&budget, 29, Some(174)).is_some());
+            }
+
+            /// A watch that could not be started holds nothing: its error comes back as it is,
+            /// and the budget is whole again.
+            #[test]
+            fn a_watch_that_could_not_be_started_gives_its_cost_back() {
+                let budget = Budget::new();
+                let failed = budget.admit(29, Some(58), || Err::<(), _>("no stream".to_owned()));
+                assert_eq!(failed.err().as_deref(), Some("no stream"));
+                let held: Vec<_> = (0..2).map(|_| admitted(&budget, 29, Some(116))).collect();
+                assert!(
+                    held.iter().all(Option::is_some),
+                    "nothing was held by the failure"
+                );
+            }
+
+            /// A deeper path costs more, so fewer watches are admitted under the same limit.
+            #[test]
+            fn a_deeper_path_costs_more_and_so_fewer_are_admitted() {
+                assert_eq!(cost_at(DEEPER), 39);
+                assert_eq!(admits(cost_at(STORE), Some(256)), (4, true));
+                assert_eq!(admits(cost_at(DEEPER), Some(256)), (3, true));
+            }
+
+            /// A soft limit of 256 admits what half of it allows.
+            #[test]
+            fn a_limit_of_256_admits_what_half_of_it_allows() {
+                assert_eq!(
+                    admits(29, Some(256)),
+                    (4, true),
+                    "116 is within 128, 145 is not"
+                );
+            }
+
+            /// Nothing was measured past a limit of 2560: a higher limit, and none, admit what
+            /// half of 2560 allows and refuse the next.
+            #[test]
+            fn a_limit_above_2560_or_none_admits_what_half_of_2560_allows() {
+                assert_eq!(admits(29, Some(2560)), (44, true), "1276 is within 1280");
+                assert_eq!(admits(29, Some(1_048_576)), (44, true));
+                assert_eq!(admits(29, None), (44, true));
+            }
+
+            /// A cost that overflows the count is refused.
+            #[test]
+            fn a_cost_that_overflows_the_count_is_refused() {
+                let budget = Budget::new();
+                let first = admitted(&budget, 29, Some(2560));
+                assert!(first.is_some());
+                assert!(admitted(&budget, u64::MAX, Some(2560)).is_none());
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     mod names {
         use std::collections::{BTreeMap, BTreeSet};
@@ -857,7 +1090,16 @@ mod unix {
 
         use kr_transfer::{AuthorisedDirectory, RelativeName};
 
+        use super::budget::{self, Budget, Held};
         use super::judged::{Heard, Places};
+
+        /// What the watches of this process cost, in open files.
+        static WATCHES: Budget = Budget::new();
+
+        /// The process's soft limit of open files, none when it has none.
+        fn soft_limit() -> Option<u64> {
+            rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+        }
 
         /// How long the host waits for the watcher to report a file the host wrote itself.
         ///
@@ -906,6 +1148,8 @@ mod unix {
         pub struct NameWatch {
             /// Held so that the stream is.
             _watcher: notify::RecommendedWatcher,
+            /// What the stream costs the process, given back after the stream has stopped.
+            _held: Held<'static>,
             shared: Arc<Mutex<Shared>>,
             reported: Mutex<mpsc::Receiver<PathBuf>>,
             /// The directory the copy is in, where the host writes the files it marks time with.
@@ -971,23 +1215,32 @@ mod unix {
                         }
                     }
                 };
-                let mut watcher = notify::recommended_watcher(handler)
-                    .map_err(|error| format!("no watcher could be started: {error}"))?;
                 // FSEvents sends a notice that it lost reports at the path where it lost them,
                 // often a directory above the copy or the root of the volume. The backend passes
                 // that notice to the handler whatever path it names, so a loss anywhere on the
                 // volume reaches the handler, which takes it as a loss of the copy's reports too.
                 // A loss FSEvents does not announce shows only as the host's own file not being
-                // reported in time. The stream takes in no more than the copy and the directory
-                // it is in, two stream roots, and the process pays descriptors for each: a
-                // process whose limit of open files starts at 256 holds about a hundred of these
-                // watches at once, and a watch that cannot start makes the result indeterminate.
-                watcher
-                    .watch(&copy_path, RecursiveMode::Recursive)
-                    .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))
-                    .map_err(|error| format!("the copy could not be watched: {error}"))?;
+                // reported in time.
+                //
+                // FSEvents holds open files for each stream root, and a start that fails for want
+                // of them can end the process, so the host asks only for a watch that the budget
+                // admits.
+                let (watcher, held) = WATCHES.admit(
+                    budget::cost_of(&copy_path, &beside_path),
+                    soft_limit(),
+                    || {
+                        let mut watcher = notify::recommended_watcher(handler)
+                            .map_err(|error| format!("no watcher could be started: {error}"))?;
+                        watcher
+                            .watch(&copy_path, RecursiveMode::Recursive)
+                            .and_then(|()| watcher.watch(&beside_path, RecursiveMode::NonRecursive))
+                            .map_err(|error| format!("the copy could not be watched: {error}"))?;
+                        Ok(watcher)
+                    },
+                )?;
                 let watch = Self {
                     _watcher: watcher,
+                    _held: held,
                     shared,
                     reported: Mutex::new(reported),
                     beside: beside.try_clone().map_err(|error| {
