@@ -176,11 +176,17 @@ export function App(): ReactNode {
   const narrow = useNarrow()
   const [wasNarrow, setWasNarrow] = useState(narrow)
   const [navigationOpen, setNavigationOpen] = useState(false)
+  // Motion answers a person's own act. The drawer goes out by a transition only once a person has
+  // opened it in this form; a window that changes form puts the sidebar in its place without one.
+  const [navigationUsed, setNavigationUsed] = useState(false)
   // A window widened past the drawer's width while it was open leaves the sidebar where it stands,
-  // and one narrowed again meets the drawer closed.
+  // and one narrowed again meets the drawer closed, and not yet used.
   if (wasNarrow !== narrow) {
     setWasNarrow(narrow)
-    if (!narrow) setNavigationOpen(false)
+    if (!narrow) {
+      setNavigationOpen(false)
+      setNavigationUsed(false)
+    }
   }
   const open = narrow && navigationOpen
   const sidebar = useRef<HTMLElement | null>(null)
@@ -192,6 +198,7 @@ export function App(): ReactNode {
   const openNavigation = useCallback(() => {
     focusAfter.current = menu.current
     setNavigationOpen(true)
+    setNavigationUsed(true)
   }, [])
   const closeNavigation = useCallback((returnTo: 'menu' | 'page') => {
     focusAfter.current = returnTo === 'menu' ? menu.current : page.current
@@ -230,6 +237,7 @@ export function App(): ReactNode {
         aria-label="Workspace navigation"
         ref={sidebar}
         data-open={narrow ? String(open) : undefined}
+        data-used={narrow ? String(navigationUsed) : undefined}
         inert={narrow && !open}
       >
         {narrow ? (

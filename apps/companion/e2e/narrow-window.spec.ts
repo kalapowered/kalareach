@@ -601,8 +601,11 @@ test.describe('what moves', () => {
     await expectTravel(page, OPEN_SECONDS, 'a pointer-driven open travels')
     expect(await sidebarLeft(page), 'open, the drawer rests against the leading edge').toBe(0)
 
-    await page.keyboard.press('Escape')
-    await expect(drawerOf(page)).toBeHidden()
+    // A press on the scrim closes it, and it goes out on the exit's time, to the place it came from.
+    await watchTravel(page)
+    await page.mouse.click(594, HEIGHT / 2)
+    await expectTravel(page, CLOSE_SECONDS, 'a pointer-driven close travels')
+    expect(await sidebarLeft(page), 'closed, the drawer is out of the window on its own side again').toBe(rest)
     await menuOf(page).focus()
     await watchTravel(page)
     await page.keyboard.press('Enter')
@@ -613,6 +616,15 @@ test.describe('what moves', () => {
     await page.keyboard.press('Escape')
     await expect.poll(() => sidebarLeft(page)).toBe(rest)
     expect(await travelOf(page), 'a keyboard-driven close runs no transition of the transform').toEqual([])
+  })
+
+  test('a window narrowed from a wide one meets the drawer closed, and nothing travels', async ({ page }) => {
+    await openWindow(page, 1280)
+    await watchTravel(page)
+    await page.setViewportSize({ width: 600, height: HEIGHT })
+    await expect(menuOf(page)).toBeVisible()
+    await expect.poll(() => sidebarLeft(page), 'closed, the drawer is out of the window on its own side').toBeLessThanOrEqual(-238)
+    expect(await travelOf(page), 'a change of the window moves the sidebar to its closed place without a transition').toEqual([])
   })
 
   test.describe('with reduced motion asked for', () => {
@@ -648,9 +660,9 @@ test.describe('under a right-to-left root', () => {
     await expect(menu).toBeVisible()
     const was = await rectangleOf(menu)
     expect(was.x + was.width, 'the control is at the right end of the top bar').toBeGreaterThan(600 - 40)
-    // Narrowed from a wide window, the sidebar travels out to the closed place, on the exit's time: read it there.
-    await expectTravel(page, CLOSE_SECONDS, 'narrowed from a wide window, the sidebar travels out')
-    expect(await sidebarLeft(page), 'closed, the drawer is out of the window on the right').toBe(600)
+    // Narrowed from a wide window, the sidebar is at the closed place at once, with no travel.
+    await expect.poll(() => sidebarLeft(page), 'closed, the drawer is out of the window on the right').toBe(600)
+    expect(await travelOf(page), 'a change of the window moves the sidebar to its closed place without a transition').toEqual([])
     await watchTravel(page)
     await startSampling(page)
     await menu.click()

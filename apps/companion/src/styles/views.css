@@ -1493,13 +1493,19 @@
     /* What the drawer scrolls stays in the drawer: the page behind is held by the shell. */
     overscroll-behavior: contain;
     transform: translateX(var(--drawer-from));
-    transition: transform var(--state) var(--ease-out);
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
 
   .sidebar:dir(rtl) {
     --drawer-from: 100%;
+  }
+
+  /* The drawer goes out by a transition once a person has opened it in this form. A window that
+     changes form puts the sidebar in its closed place without moving it: a resize is not an act
+     that the drawer answers. */
+  .sidebar[data-used='true'] {
+    transition: transform var(--state) var(--ease-out);
   }
 
   .sidebar[data-open='true'] {
@@ -1593,6 +1599,9 @@
 
   .sidebar {
     opacity: 0;
+  }
+
+  .sidebar[data-used='true'] {
     transition: opacity var(--press) ease;
   }
 
