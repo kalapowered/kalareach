@@ -3791,7 +3791,9 @@ async fn pairs_as(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_device_keeps_the_checkpoint_the_host_names_when_it_is_committed() {
     let owner_keys = keys();
-    let host = Host::start(&owner_keys).await;
+    // The host proves its checkpoint with the key its pairing declares, which is the key it seals
+    // with only where the daemon holds one key set, as in the product.
+    let host = Host::start_in_one_key_store(&owner_keys).await;
     let service = host.controller().backup();
     let seeded = SeededBackups::set_up(service);
     let published = seeded.publish(service, 3);
@@ -3827,7 +3829,7 @@ async fn an_owner_device_keeps_the_checkpoint_the_host_names_when_it_is_committe
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_needs_another_read() {
     let owner_keys = keys();
-    let host = Host::start(&owner_keys).await;
+    let host = Host::start_in_one_key_store(&owner_keys).await;
     let device = ProductDevice::new(Arc::new(host.room.clone()), |link| Arc::new(link));
 
     let paired = pairs_as(
@@ -3858,7 +3860,9 @@ async fn an_owner_device_of_a_host_with_no_backup_is_told_so_and_needs_another_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_does_not_manage_the_host_keeps_no_checkpoint() {
     let owner_keys = keys();
-    let host = Host::start(&owner_keys).await;
+    // Started as the cases beside it are, so that a read that was asked for would be proven and
+    // kept: the case then shows that none is asked for.
+    let host = Host::start_in_one_key_store(&owner_keys).await;
     let service = host.controller().backup();
     let seeded = SeededBackups::set_up(service);
     seeded.publish(service, 1);
@@ -3888,7 +3892,7 @@ async fn a_device_that_does_not_manage_the_host_keeps_no_checkpoint() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_pairs_again_and_fails_its_first_read_is_owed_and_keeps_its_checkpoint() {
     let owner_keys = keys();
-    let host = Host::start(&owner_keys).await;
+    let host = Host::start_in_one_key_store(&owner_keys).await;
     let service = host.controller().backup();
     let seeded = SeededBackups::set_up(service);
     let published = seeded.publish(service, 1);
