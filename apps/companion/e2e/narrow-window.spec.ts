@@ -143,9 +143,61 @@ function stopSampling(page: Page): Promise<number[]> {
   })
 }
 
-/** The readings that are neither of the two places the drawer rests in: it was somewhere between. */
-function between(samples: readonly number[], rests: readonly number[]): number[] {
-  return samples.filter((sample) => !rests.some((rest) => Math.abs(sample - rest) < 0.5))
+/** What the page was told of a transition of the sidebar's transform: the event, and the seconds it had run. */
+interface TravelEvent {
+  readonly type: string
+  readonly elapsed: number
+}
+
+/** The ruled times, in seconds: the drawer comes in on `--surface-in` and goes out on `--state`. */
+const OPEN_SECONDS = 0.2
+const CLOSE_SECONDS = 0.16
+/** How far the seconds a transition reports may be from the ruled time. */
+const TOLERANCE_SECONDS = 0.01
+
+/**
+ * Listens, from now on, for the transitions of the sidebar's transform. A transition is the travel:
+ * the engine runs it for its ruled time whatever number of frames it draws in that time, so the
+ * events are read and the frames are not counted.
+ */
+async function watchTravel(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const holder = window as unknown as { __travel?: { type: string; elapsed: number }[]; __travelListening?: boolean }
+    holder.__travel = []
+    if (holder.__travelListening === true) return
+    holder.__travelListening = true
+    for (const type of ['transitionrun', 'transitionstart', 'transitionend', 'transitioncancel']) {
+      document.addEventListener(
+        type,
+        (event) => {
+          const transition = event as TransitionEvent
+          if (transition.propertyName !== 'transform') return
+          if (!(transition.target as Element).matches('aside.sidebar')) return
+          holder.__travel?.push({ type, elapsed: transition.elapsedTime })
+        },
+        true
+      )
+    }
+  })
+}
+
+/** The events of the sidebar's transform since `watchTravel`. */
+function travelOf(page: Page): Promise<TravelEvent[]> {
+  return page.evaluate(() => [...((window as unknown as { __travel?: TravelEvent[] }).__travel ?? [])])
+}
+
+/** The sidebar's transform ran its transition from start to end for the ruled time, and was not cut short. */
+async function expectTravel(page: Page, seconds: number, what: string): Promise<void> {
+  await expect
+    .poll(async () => (await travelOf(page)).some((event) => event.type === 'transitionend' || event.type === 'transitioncancel'), what)
+    .toBe(true)
+  const events = await travelOf(page)
+  expect(
+    events.map((event) => event.type),
+    `${what}: the events of the transition`
+  ).toEqual(['transitionrun', 'transitionstart', 'transitionend'])
+  const ran = events[2]?.elapsed ?? NaN
+  expect(Math.abs(ran - seconds), `${what}: it ran for ${ran} s, and the ruled time is ${seconds} s`).toBeLessThanOrEqual(TOLERANCE_SECONDS)
 }
 
 /** Whether the focus is inside the drawer. */
@@ -517,27 +569,23 @@ test.describe('what moves', () => {
     const rest = await sidebarLeft(page)
     expect(rest, 'closed, the drawer is out of the window on its own side').toBeLessThanOrEqual(-238)
 
-    await startSampling(page)
+    await watchTravel(page)
     await menuOf(page).click()
-    await expect.poll(() => sidebarLeft(page)).toBe(0)
-    await page.waitForTimeout(100)
-    const travelled = between(await stopSampling(page), [rest, 0])
-    expect(travelled.length, 'a pointer-driven open passes through places between').toBeGreaterThan(2)
+    await expectTravel(page, OPEN_SECONDS, 'a pointer-driven open travels')
+    expect(await sidebarLeft(page), 'open, the drawer rests against the leading edge').toBe(0)
 
     await page.keyboard.press('Escape')
     await expect(drawerOf(page)).toBeHidden()
     await menuOf(page).focus()
-    await startSampling(page)
+    await watchTravel(page)
     await page.keyboard.press('Enter')
     await expect.poll(() => sidebarLeft(page)).toBe(0)
-    await page.waitForTimeout(100)
-    expect(between(await stopSampling(page), [rest, 0]), 'a keyboard-driven open has no travel').toEqual([])
+    expect(await travelOf(page), 'a keyboard-driven open runs no transition of the transform').toEqual([])
 
-    await startSampling(page)
+    await watchTravel(page)
     await page.keyboard.press('Escape')
     await expect.poll(() => sidebarLeft(page)).toBe(rest)
-    await page.waitForTimeout(100)
-    expect(between(await stopSampling(page), [rest, 0]), 'a keyboard-driven close has no travel').toEqual([])
+    expect(await travelOf(page), 'a keyboard-driven close runs no transition of the transform').toEqual([])
   })
 
   test.describe('with reduced motion asked for', () => {
@@ -546,16 +594,14 @@ test.describe('what moves', () => {
     test('nothing travels when the drawer opens or closes', async ({ page }) => {
       await openWindow(page, 600)
       const rest = await sidebarLeft(page)
-      await startSampling(page)
+      await watchTravel(page)
       await menuOf(page).click()
       await expect(drawerOf(page)).toBeVisible()
-      await page.waitForTimeout(250)
+      expect(await sidebarLeft(page), 'open, the drawer is where it rests').toBe(rest)
       await page.mouse.click(594, HEIGHT / 2)
       await expect(drawerOf(page)).toBeHidden()
-      await page.waitForTimeout(250)
-      const samples = await stopSampling(page)
-      expect(samples.length).toBeGreaterThan(5)
-      expect(between(samples, [rest]), 'the drawer is never anywhere but where it rests').toEqual([])
+      expect(await sidebarLeft(page), 'closed, the drawer is where it rests').toBe(rest)
+      expect(await travelOf(page), 'a pointer-driven open and close run no transition of the transform').toEqual([])
     })
   })
 })
@@ -569,22 +615,23 @@ test.describe('under a right-to-left root', () => {
     const wide = await rectangleOf(page.locator('.sidebar'))
     expect(wide.x + wide.width, 'the wide sidebar stands against the right edge').toBe(1280)
 
+    await watchTravel(page)
     await page.setViewportSize({ width: 600, height: HEIGHT })
     const menu = menuOf(page)
     await expect(menu).toBeVisible()
     const was = await rectangleOf(menu)
     expect(was.x + was.width, 'the control is at the right end of the top bar').toBeGreaterThan(600 - 40)
-    // Narrowed from a wide window, the sidebar travels out to the closed place: read it there.
-    await expect.poll(() => sidebarLeft(page), 'closed, the drawer is out of the window on the right').toBe(600)
-    const rest = await sidebarLeft(page)
+    // Narrowed from a wide window, the sidebar travels out to the closed place, on the exit's time: read it there.
+    await expectTravel(page, CLOSE_SECONDS, 'narrowed from a wide window, the sidebar travels out')
+    expect(await sidebarLeft(page), 'closed, the drawer is out of the window on the right').toBe(600)
+    await watchTravel(page)
     await startSampling(page)
     await menu.click()
     await expect(drawerOf(page)).toBeVisible()
+    await expectTravel(page, OPEN_SECONDS, 'a pointer-driven open travels')
     await expect.poll(() => sidebarLeft(page)).toBe(600 - 238)
-    await page.waitForTimeout(100)
     const samples = await stopSampling(page)
     expect(Math.min(...samples), 'the drawer never goes past its open place towards the left').toBeGreaterThanOrEqual(600 - 238)
-    expect(between(samples, [rest, 600 - 238]).length, 'it travels').toBeGreaterThan(2)
     const now = await rectangleOf(closeOf(page))
     // The leading corner is the right one: the open control's right edge, top and height are the close control's.
     expect(Math.abs(now.x + now.width - (was.x + was.width))).toBeLessThanOrEqual(1)
