@@ -84,12 +84,12 @@ const RESIDENT_BOUND_KIB: u64 = 500 * 1024;
 /// of that one commit, each of which said `1 passed` or `1 failed` by an alarm alone: 110,816 to
 /// 111,892 KiB, a spread of 1,076 KiB and a mean of 111,386 KiB; none of the 13 was low. Across the
 /// 25 normal readings (those 13, and 12 rows from the verifications of 12 earlier commits made from
-/// 2026-11-12 to 2026-11-15, one train having two verifications of two commits, 6efe9e867b and
-/// 4edf69f761; two further commits read low and are kept out) the figure spanned 1,284 KiB, where
-/// the sum spanned 13,932 KiB over 21 of them. Main's later readings on the same box, with the
-/// level at 111,386 KiB: 112,840 KiB at commit 40c0b885d1, 113,832 KiB at commit 931d1229e4 and
-/// 108,400 KiB at commit 280664f5ed (its group figure, 168,464 KiB, was just above the line of a
-/// low reading).
+/// 2026-11-12 to 2026-11-15, one batch of commits verified together having two verifications of two
+/// commits, 6efe9e867b and 4edf69f761; two further commits read low and are kept out) the figure
+/// spanned 1,284 KiB, where the sum spanned 13,932 KiB over 21 of them. Main's later readings on
+/// the same machine, with the level at 111,386 KiB: 112,840 KiB at commit 40c0b885d1, 113,832 KiB
+/// at commit 931d1229e4 and 108,400 KiB at commit 280664f5ed (its group figure, 168,464 KiB, was
+/// just above the line of a low reading).
 const WORKERS_HELD_RECORDED_KIB: u64 = 115_849;
 
 /// How far the session workers' held figure may rise above [`WORKERS_HELD_RECORDED_KIB`] before the
@@ -105,26 +105,25 @@ const WORKERS_HELD_ALARM_STEP_KIB: u64 = 4 * 1024;
 
 /// The size on disk of the worker program, in kibibytes: the length of the file the daemon starts
 /// each worker from, divided by 1,024 and rounded down, as `scripts/worker-size.sh` prints a size.
-/// Read on a 64-processor Linux machine on 2026-11-25, on the `worker file` line of the verification of each
-/// commit: the program is 37,022 KiB at commit 931d1229e4 and 37,467 KiB at the commit that
-/// completes the input lane. The level is set at 37,467 KiB. The code of the workspace build's
-/// program grew by 223 KiB between the two, read from the `worker code` line of that build, which
-/// is another build of the same sources: kr_worker 56 KiB, core 37, alloc 30, kr_protocol 23,
-/// tokio 23 and ciborium 9.
+/// Read on a 64-processor Linux machine on 2026-11-25, on the `worker file` line of the
+/// verification of each commit: the program is 37,022 KiB at commit 931d1229e4 and 37,467 KiB at
+/// the commit that completes the input lane. The level is set at 37,467 KiB. The code of the
+/// workspace build's program grew by 223 KiB between the two, read from the `worker code` line of
+/// that build, which is another build of the same sources: kr_worker 56 KiB, core 37, alloc 30,
+/// kr_protocol 23, tokio 23 and ciborium 9.
 ///
-/// The level before was 36,800 KiB, read on a 64-processor Linux machine on 2026-11-22 at commit ec97fa24b3: the
-/// program that the idle test's build leaves is 37,682,992 bytes, one file, which is 36,799 KiB
-/// rounded down; the level was set at 36,800 KiB. The build log is `logs/f131-worker-size-ec97fa24.log`,
-/// the line `ROW test file bytes`. The program is 1,174,072 bytes larger than the one the same
-/// build left at commit 85164cab77, 36,508,920 bytes.
+/// The level before was 36,800 KiB, read on a 64-processor Linux machine on 2026-11-22 at commit
+/// ec97fa24b3: the program that the idle test's build leaves is 37,682,992 bytes, one file, which
+/// is 36,799 KiB rounded down; the level was set at 36,800 KiB. The program is 1,174,072 bytes
+/// larger than the one the same build left at commit 85164cab77, 36,508,920 bytes.
 ///
-/// The level before that was 35,328 KiB (36,176,328 bytes, one file), read on a 64-processor Linux machine on
-/// 2026-11-16: in the 8 of the 13 valid readings of commit 3ace455c69 whose runs recorded the
-/// file's hash, and in 4 runs of commit 2bc513d435, which differs from it in this test file, the
-/// guide and a comment of `scripts/performance.sh`: a spread of 0 KiB and a mean of 35,328 KiB. A
-/// size has no low reading, because no reclaim of mapped pages moves it. The `worker size` line
-/// that `scripts/performance.sh` prints before the case is read from the program that
-/// `cargo build --workspace` leaves, which is another build of the same sources: 35,101 KiB at
+/// The level before that was 35,328 KiB (36,176,328 bytes, one file), read on a 64-processor Linux
+/// machine on 2026-11-16: in the 8 of the 13 valid readings of commit 3ace455c69 whose runs
+/// recorded the file's hash, and in 4 runs of commit 2bc513d435, which differs from it in this test
+/// file, the guide and a comment of `scripts/performance.sh`: a spread of 0 KiB and a mean of
+/// 35,328 KiB. A size has no low reading, because no reclaim of mapped pages moves it. The
+/// `worker size` line that `scripts/performance.sh` prints before the case is read from the program
+/// that `cargo build --workspace` leaves, which is another build of the same sources: 35,101 KiB at
 /// commit 3ace455c69, 227 KiB less than this file then. Its sections show where the workspace
 /// build grew, and not this file's; the `worker file` line prints the figure the alarm reads. See
 /// [`WORKER_SIZE_ALARM_STEP_KIB`].

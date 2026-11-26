@@ -4882,7 +4882,7 @@ fn barrier_at(
     }
 }
 
-/// KR-REQ-23.36, C21: a detach that presents a line's capability and a barrier that names another
+/// KR-REQ-23.36: a detach that presents a line's capability and a barrier that names another
 /// attachment than the one the capability resolves to is a definite refusal, whatever position the
 /// barrier counts: a request orders itself after its own typing and no one else's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -458,7 +458,8 @@ async fn an_async_case_with_the_reason_over_two_lines() {}
 }
 
 /// A case ignored for want of the user service manager that the script does not run is a case no
-/// train runs: the box runs the script, and nothing else asks for an ignored case there.
+/// run of the checks executes: a machine with the manager runs the script, and nothing else asks
+/// for an ignored case there.
 #[test]
 fn every_case_whose_ignore_reason_names_the_user_service_manager_is_one_the_script_runs() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

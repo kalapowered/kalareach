@@ -959,9 +959,9 @@ async fn nothing_the_ended_record_held_carries_over_to_the_record_that_replaces_
     .await;
     let new_actor = kr_transport::listener::device_principal(&second.device_id);
 
-    // N10: the ended row is as it was when the revocation finished.
+    // The ended row is as it was when the revocation finished.
     assert_eq!(row_of(&host, first.device_id), revoked);
-    // N1: the new identifier is told it is the first to claim the action, and the old route is
+    // The new identifier is told it is the first to claim the action, and the old route is
     // still the old record's.
     assert_eq!(
         directory
@@ -979,7 +979,7 @@ async fn nothing_the_ended_record_held_carries_over_to_the_record_that_replaces_
         ),
         "the old route stands under the old identifier"
     );
-    // N7: no deadline for the new identifier, and the old one is as it was.
+    // No deadline for the new identifier, and the old one is as it was.
     assert_eq!(
         directory
             .grant_deadline_in(second.device_id, &boot)
@@ -992,7 +992,7 @@ async fn nothing_the_ended_record_held_carries_over_to_the_record_that_replaces_
             .expect("readable"),
         old_deadline
     );
-    // N9: the owner is the same.
+    // The owner is the same.
     assert_eq!(rows_of(&host, "host_owner"), owner_rows);
     host.stop().await;
 }

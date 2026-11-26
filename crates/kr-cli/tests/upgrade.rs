@@ -3985,7 +3985,7 @@ async fn a_plugin_host_the_release_before_started_serves_the_sessions_of_both_re
 /// own host, the worker registers with it, and when the host ends under the running program the
 /// daemon starts another of this release's. Each host serves both protocols, each on an endpoint
 /// of its own and under a descriptor of its own: the worker of the release before reads the third's
-/// alone, speaks the third protocol on its endpoint and its observation arrives (U2).
+/// alone, speaks the third protocol on its endpoint and its observation arrives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daemon_starts() {
     let updated = Updated::prepare(Setup {
@@ -4045,7 +4045,7 @@ async fn a_session_of_the_release_before_gets_the_plugin_host_this_releases_daem
 /// The host is published under both protocols, and the daemon of the release before knows the
 /// third's alone. When the host ends and that daemon starts one of its own, the descriptor of the
 /// fourth protocol is left naming a process that is gone, and a client of this release reads past
-/// it and speaks the third protocol (U3). The sessions of this release cannot be kept across the
+/// it and speaks the third protocol. The sessions of this release cannot be kept across the
 /// rollback, which waits for them, so a client of this release stands in for a worker's next
 /// connection.
 #[tokio::test(flavor = "multi_thread")]
@@ -4193,7 +4193,7 @@ fn a_position() -> kr_plugin_service::protocol4::Through {
     }
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U1): a plugin host the release before
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035: a plugin host the release before
 /// started speaks the third protocol alone and publishes no descriptor of the fourth. After the
 /// update the daemon of this release adopts it, a client of this release meets it on the third
 /// protocol, and a session of this release binds a component in it. When it ends under both
@@ -4278,14 +4278,14 @@ async fn a_plugin_host_of_the_third_protocol_alone_is_met_on_it_and_the_next_hos
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U4h, the host half): a plugin host that replaces one
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035, the host half: a plugin host that replaces one
 /// that crashed, started by the daemon of this release, answers a restore that carries a position
 /// as not set, and a checkpoint of either host names no position.
 ///
 /// This build's host writes no consumed positions, because a level it retains does not speak the
 /// fourth protocol (`replay_writer_open`). So a first host's checkpoint holds no position to carry
-/// to the next, and the answer to a restore that carries a position, a set record and a checkpoint that
-/// names the same events, is not reachable from this suite today: the case holds what is true
+/// to the next, and the answer to a restore that carries a position, a set record and a checkpoint
+/// that names the same events, is not reachable from this suite today: the case holds what is true
 /// with the writer closed, and fails where the writer opens, so that the half it cannot hold yet
 /// is built beside it. The worker's side of the case, a held state trusted across connections, is
 /// the worker's own.
@@ -4351,13 +4351,13 @@ async fn a_host_that_replaces_a_crashed_one_answers_a_restore_with_a_position_as
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U5h, the host half): a plugin host of both protocols
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035, the host half: a plugin host of both protocols
 /// with its writer closed, adopted by the next daemon, names no position in a checkpoint, and a
 /// restore that carries one is answered as not set and leaves the instance as it was.
 ///
-/// The case would use a host that an older release's daemon started; no release before this one starts a
-/// host of the fourth protocol, so the host here is this release's, adopted by a daemon that
-/// starts again. The worker's reset after the answer is the worker's own.
+/// The case would use a host that an older release's daemon started; no release before this one
+/// starts a host of the fourth protocol, so the host here is this release's, adopted by a daemon
+/// that starts again. The worker's reset after the answer is the worker's own.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_host_the_next_daemon_adopts_answers_a_restore_with_a_position_as_not_set_and_keeps_its_instance()
  {
@@ -4426,7 +4426,7 @@ async fn a_host_the_next_daemon_adopts_answers_a_restore_with_a_position_as_not_
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035 (U6h, the host half): a worker of this release is
+/// KR-REQ-24.24, KR-REQ-26.06, KR-ACC-035, the host half: a worker of this release is
 /// served over the fourth protocol by a host whose writer is closed, across a kill of the host. The
 /// host the worker recovers on writes no consumed position, so the worker has none to read.
 ///
@@ -4483,7 +4483,7 @@ async fn a_worker_recovers_on_the_fourth_protocol_across_a_kill_and_the_host_nam
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U7, the Unix half): a plugin host of both
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035, the Unix half: a plugin host of both
 /// protocols that outlives its daemon is adopted by the next one as the process it is. Both
 /// descriptors are left as they were, nothing is started or published again, a client of this
 /// release meets the host on the fourth protocol, and a session that binds afterwards is served by
@@ -4562,7 +4562,7 @@ async fn a_plugin_host_of_both_protocols_is_adopted_by_the_next_daemon_as_the_pr
     host.end_the_plugin_host().await;
 }
 
-/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035 (U8, the Unix half): the daemon of this
+/// KR-REQ-05.06, KR-REQ-26.06, KR-REQ-20.23, KR-ACC-035, the Unix half: the daemon of this
 /// release starts the plugin host beside itself, from its own release, and publishes it under both
 /// protocols. A client of this release meets it on the fourth protocol, a kill is recovered by
 /// another host of the same release, published under both again, and the worker binds on it. The

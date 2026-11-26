@@ -128,12 +128,12 @@ fn client_window() -> InputWindow {
 /// came was never read and is not among them.
 ///
 /// The limit: a new stream of the same attachment in the same epoch starts with an empty record.
-/// A client that follows the documented order opens a new stream only after a new acquire, which is a new epoch, and never
-/// meets it. A device that does open one in the same epoch can make the host forward its own
-/// request with a count that the worker did not accept (a frame refused on the stream before, a
-/// later one accepted on the new stream, a barrier that counts both), and the host then acted on
-/// that device's own word about its own typing; and it is refused a count that the worker did
-/// accept on the stream before, until the new stream has had typing accepted past it.
+/// A client that follows the documented order opens a new stream only after a new acquire, which is
+/// a new epoch, and never meets it. A device that does open one in the same epoch can make the host
+/// forward its own request with a count that the worker did not accept (a frame refused on the
+/// stream before, a later one accepted on the new stream, a barrier that counts both), and the host
+/// then acted on that device's own word about its own typing; and it is refused a count that the
+/// worker did accept on the stream before, until the new stream has had typing accepted past it.
 #[derive(Debug, Default)]
 struct Record {
     lease: Lease,

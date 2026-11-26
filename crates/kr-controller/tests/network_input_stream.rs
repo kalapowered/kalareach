@@ -328,7 +328,7 @@ fn counters(n: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// C1: a burst of typing reaches the worker whole while the control handler is held with a request
+/// A burst of typing reaches the worker whole while the control handler is held with a request
 /// in service, and the control stream answers once the handler is let go.
 async fn a_burst_with_the_handler_held(n: usize) {
     let rig = Rig::start().await;
@@ -389,7 +389,7 @@ async fn a_burst_of_4096_frames_reaches_the_worker_whole_while_the_handler_is_he
     a_burst_with_the_handler_held(4096).await;
 }
 
-/// C2: typing goes on while a second attach that claims no input waits at the worker, and the
+/// Typing goes on while a second attach that claims no input waits at the worker, and the
 /// attach is answered once afterwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn typing_continues_while_an_attach_that_claims_no_input_is_held_at_the_worker() {
@@ -2441,7 +2441,7 @@ async fn full_stages() -> (Rig, DataStream, Vec<Vec<u8>>) {
     (rig, stream, frames)
 }
 
-/// C6: with every stage at its bound, an end of the stream resets it at once, nothing is accepted or
+/// With every stage at its bound, an end of the stream resets it at once, nothing is accepted or
 /// passed on afterwards, every count falls to zero, and none was ever above its bound.
 async fn full_stages_then(ending: Ending) {
     let (rig, mut stream, _frames) = full_stages().await;
@@ -2582,7 +2582,7 @@ async fn the_frames_and_the_record_a_stream_held_are_let_go_when_it_is_replaced_
     rig.stop().await;
 }
 
-/// C7, the host's half: a worker that does not answer or give credit stops the host reading, control
+/// The host's half: a worker that does not answer or give credit stops the host reading, control
 /// is answered throughout, and when the worker goes on every byte arrives once and in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_does_not_answer_stops_the_reading_and_control_goes_on() {
@@ -2619,7 +2619,7 @@ async fn a_worker_that_does_not_answer_stops_the_reading_and_control_goes_on() {
     rig.stop().await;
 }
 
-/// C9: a flood of control requests behind a held handler still ends the connection, and typing
+/// A flood of control requests behind a held handler still ends the connection, and typing
 /// accepted before the flood was delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_flood_ends_the_connection_and_the_typing_before_it_was_delivered() {
@@ -2831,7 +2831,7 @@ async fn the_other_device_keeps_typing(
     rig.stop().await;
 }
 
-/// C16a, the host's half: a restriction that names a holder by its device only.
+/// The host's half: a restriction that names a holder by its device only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restriction_that_names_a_device_ends_its_stream_and_leaves_the_other_typing() {
     let rig = Rig::start().await;
@@ -2849,7 +2849,7 @@ async fn a_restriction_that_names_a_device_ends_its_stream_and_leaves_the_other_
     the_other_device_keeps_typing(rig, named, named_stream, unaffected).await;
 }
 
-/// C16c, the host's half: a restriction that reaches the whole host takes every remote stream, and
+/// The host's half: a restriction that reaches the whole host takes every remote stream, and
 /// nothing more of any remote typing reaches the lane.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
@@ -2880,7 +2880,7 @@ async fn a_restriction_that_reaches_the_whole_host_ends_every_remote_stream() {
     rig.stop().await;
 }
 
-/// C16d, the host's half: a daemon that has restarted serves the device that comes back, and a
+/// The host's half: a daemon that has restarted serves the device that comes back, and a
 /// restriction that reaches the whole host takes the new stream as it takes any remote stream. The
 /// stream the old daemon served ended with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5059,8 +5059,8 @@ async fn a_frame_waiting_to_be_called_is_not_called_after_the_connections_releas
 
 // What a new stream of the same attachment in the same epoch starts from. The host's record belongs
 // to one stream, so the new stream starts with an empty record: the limit that the record's
-// documentation names. A client that follows the documented order opens a new stream only after a new acquire, which is a
-// new epoch, and never meets it.
+// documentation names. A client that follows the documented order opens a new stream only after a
+// new acquire, which is a new epoch, and never meets it.
 
 /// The worker refuses the frame at sequence 0 for room, which an older worker counts as a sequence
 /// taken, and a device that is not honest then opens a new stream for the same attachment in the
@@ -5133,9 +5133,9 @@ async fn a_new_stream_in_the_same_epoch_forwards_a_count_that_includes_a_frame_t
     rig.stop().await;
 }
 
-/// The path of a client that follows the documented order, which the limit above never touches: after a refusal in one epoch it
-/// takes the lease again, which is a new epoch, and opens a new stream. A new epoch counts from
-/// nothing, so a refusal in the older bounds nothing of the newer.
+/// The path of a client that follows the documented order, which the limit above never touches:
+/// after a refusal in one epoch it takes the lease again, which is a new epoch, and opens a new
+/// stream. A new epoch counts from nothing, so a refusal in the older bounds nothing of the newer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
     let rig = Rig::start_withholding_the_lane().await;
@@ -5196,9 +5196,9 @@ async fn a_newer_epoch_counts_from_nothing_after_a_refusal_in_an_older_one() {
 /// starts with an empty record, because the host carries no count from one stream to the next. A
 /// barrier for the typing that the worker accepted on the stream before is refused by the host,
 /// though the worker would take it, and the device answers by sending the ending again with no
-/// position, until the new stream has had typing accepted past it. A client that follows the documented order opens a new
-/// stream only after a new acquire, which is a new epoch, and never meets the limit. For a worker
-/// with the lane and one without.
+/// position, until the new stream has had typing accepted past it. A client that follows the
+/// documented order opens a new stream only after a new acquire, which is a new epoch, and never
+/// meets the limit. For a worker with the lane and one without.
 async fn a_new_stream_in_the_same_epoch_starts_with_an_empty_record(serial: bool) {
     let (rig, _older) = if serial {
         typed_serial(3).await

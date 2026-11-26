@@ -2271,7 +2271,7 @@ async fn typed(lane: &mut Lane, frames: &[&[u8]]) {
     }
 }
 
-/// KR-REQ-23.36, C21: a release or a detach that names a position the live epoch has not reached
+/// KR-REQ-23.36: a release or a detach that names a position the live epoch has not reached
 /// is a definite refusal with nothing applied, and both go through once the position is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothing() {
@@ -2346,7 +2346,7 @@ async fn a_release_or_a_detach_beyond_the_position_of_a_live_epoch_applies_nothi
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C21: a release or a detach whose barrier names another attachment than its own is
+/// KR-REQ-23.36: a release or a detach whose barrier names another attachment than its own is
 /// a definite refusal with nothing applied, whatever position the barrier counts: a request orders
 /// itself after its own typing and no one else's. The refusal leaves no outcome behind, so the
 /// resend with no position is taken.
@@ -2401,7 +2401,7 @@ async fn a_release_or_a_detach_whose_barrier_names_another_attachment_applies_no
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C21: after a takeover the old epoch accepts no more frames, so there is no
+/// KR-REQ-23.36: after a takeover the old epoch accepts no more frames, so there is no
 /// position to wait for. The old view's release is a lost lease, as it is today, and its detach
 /// succeeds whatever position it names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2531,7 +2531,7 @@ async fn the_fenced_count_is_exact_in_the_answer_and_in_the_notice() {
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C21: a launch whose barrier names an epoch the attachment no longer holds, or an
+/// KR-REQ-23.36: a launch whose barrier names an epoch the attachment no longer holds, or an
 /// attachment that is not the holder, is a lost lease with nothing reserved, and a position the
 /// live epoch has not reached is a definite refusal. A refusal of the barrier is the launch's
 /// whole answer: it writes no marker on the lane and leaves no outcome that holds the next launch
@@ -2575,7 +2575,7 @@ async fn a_launch_is_checked_against_the_holder_the_epoch_and_the_position() {
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C26: the worker writes the launch marker when it has dealt with the launch, also
+/// KR-REQ-23.36: the worker writes the launch marker when it has dealt with the launch, also
 /// when the machine refused the launch at once, and the marker is the launch's own number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
@@ -2598,7 +2598,7 @@ async fn an_immediate_refusal_of_a_launch_writes_the_marker() {
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C26: a launch that the machine has reserved for its reader is marked on the lane
+/// KR-REQ-23.36: a launch that the machine has reserved for its reader is marked on the lane
 /// while it is still unanswered, and the marker comes behind the acceptance of every frame before
 /// the barrier. The lane's writer stands before the ready frame and the terminal's writer holds the
 /// first batch, so the three answers and the marker wait in the lane's queue, and the link shows
@@ -3449,7 +3449,7 @@ async fn the_fenced_count_includes_the_delimiter_prefix_the_framer_dropped_at_ev
     rig.finish().await;
 }
 
-/// KR-REQ-23.36, C21: the session refuses a position its live epoch has not reached in the hold of
+/// KR-REQ-23.36: the session refuses a position its live epoch has not reached in the hold of
 /// the action itself, for a release, a detach and a launch, so a caller that did not ask before
 /// the marker still changes nothing and starts nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
