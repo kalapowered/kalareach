@@ -290,7 +290,10 @@ fn read_info(
         return Ok(Some(record(git, child, name, MAX_FILE_BYTES, holds)?));
     }
     let info = open_folder(git, child)?;
-    for inner in info.children()? {
+    let Some(inside) = info.children_up_to(MAX_OBJECTS)? else {
+        return Err(Failure::TooLarge);
+    };
+    for inner in inside {
         if inner.display().eq_ignore_ascii_case("attributes") {
             let relative = format!("{name}\\{}", inner.display());
             let limit = MAX_ATTRIBUTES_BYTES as u64;
@@ -328,7 +331,10 @@ fn take_by(
 ) -> Result<RepositoryListing, Failure> {
     let mut hooks = Vec::new();
     let mut info_attributes = None;
-    for child in git.children()? {
+    let Some(inside) = git.children_up_to(MAX_OBJECTS)? else {
+        return Err(Failure::TooLarge);
+    };
+    for child in inside {
         let name = child.display();
         if name.eq_ignore_ascii_case("hooks") {
             list_hooks(git, &child, &mut hooks, holds.as_deref_mut())?;

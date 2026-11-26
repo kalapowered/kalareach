@@ -533,6 +533,17 @@ impl DirHandle {
     ///
     /// Returns an error when the platform refuses the listing.
     pub fn children(&self) -> Result<Vec<Child>> {
+        Ok(self.children_up_to(usize::MAX)?.unwrap_or_default())
+    }
+
+    /// As [`DirHandle::children`], but reads no further than the one child that shows the
+    /// directory holds more than `limit`: the answer is then `None`, and no list of the rest is
+    /// ever made.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform refuses the listing.
+    pub fn children_up_to(&self, limit: usize) -> Result<Option<Vec<Child>>> {
         // 64 KiB, aligned for the records' 64-bit fields.
         let mut buffer = vec![0_u64; 8192];
         let mut class = FileIdExtdDirectoryRestartInfo;
@@ -552,7 +563,7 @@ impl DirHandle {
                 // SAFETY: reads the calling thread's last error.
                 let code = unsafe { GetLastError() };
                 if code == ERROR_NO_MORE_FILES {
-                    return Ok(children);
+                    return Ok(Some(children));
                 }
                 // text: walk_children-1
                 return Err(error(code, "listing a directory"));
@@ -573,6 +584,9 @@ impl DirHandle {
                 };
                 let dots = name == [u16::from(b'.')] || name == [u16::from(b'.'), u16::from(b'.')];
                 if !dots {
+                    if children.len() >= limit {
+                        return Ok(None);
+                    }
                     children.push(Child {
                         name: name.to_vec(),
                         key: FileKey {
@@ -763,7 +777,13 @@ fn walk_directory(
     visit: &mut dyn FnMut(&Entry<'_>) -> Result<Verdict>,
     report: &mut Report,
 ) -> std::result::Result<(), WalkError> {
-    for child in dir.children()? {
+    // No more children are read than the walk may still visit: a folder of millions of names is
+    // refused at the first name over the bound, not listed whole.
+    let room = bounds.objects.saturating_sub(report.visited);
+    let Some(children) = dir.children_up_to(room)? else {
+        return Err(WalkError::TooLarge(bounds.objects));
+    };
+    for child in children {
         report.visited += 1;
         if report.visited > bounds.objects {
             return Err(WalkError::TooLarge(bounds.objects));

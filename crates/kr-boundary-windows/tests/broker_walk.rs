@@ -396,6 +396,55 @@ fn a_tree_past_the_bounds_is_refused_not_walked_without_end() {
     drop(guard);
 }
 
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn the_children_of_one_folder_are_read_no_further_than_the_bound_and_never_listed_whole() {
+    let scratch = Scratch::new();
+    let tree = scratch.path("many");
+    std::fs::create_dir_all(&tree).unwrap();
+    for index in 0..10 {
+        std::fs::write(tree.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let start = anchor(&tree);
+    let guard = privilege::enter().unwrap();
+    let counted = |limit: usize| {
+        start
+            .children_up_to(limit)
+            .expect("the folder lists")
+            .map(|found| found.len())
+    };
+    assert_eq!(
+        counted(10),
+        Some(10),
+        "a folder at the bound is listed whole"
+    );
+    assert_eq!(counted(9), None, "a folder over the bound is not listed");
+    assert_eq!(counted(0), None, "a folder with a name has more than none");
+    assert_eq!(start.children().expect("the folder lists").len(), 10);
+
+    // A walk reads the folder under the room the bound leaves, so that no name of a folder that is
+    // over the bound is visited, and not only the names up to it.
+    let visited = RefCell::new(0_usize);
+    let over = walk(
+        &start,
+        Bounds {
+            objects: 9,
+            depth: 4,
+        },
+        &mut |_| {
+            *visited.borrow_mut() += 1;
+            Ok(Verdict::Descend)
+        },
+    );
+    assert!(matches!(over, Err(WalkError::TooLarge(9))), "{over:?}");
+    assert_eq!(
+        *visited.borrow(),
+        0,
+        "no name of a folder over the bound is visited"
+    );
+    drop(guard);
+}
+
 /// Makes a small virtual disk with the file system given, mounted on a letter, and removes it
 /// when dropped.
 struct Disk {
