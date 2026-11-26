@@ -11,6 +11,9 @@
 //! * Whether a host still owes a checkpoint is derived, never written beforehand: an owner pairing
 //!   with no `told` entry owes one. The file says only that a read of that pairing completed, and
 //!   what it answered.
+//! * A host's answer is taken only when the host proves it: each ask carries a fresh challenge and
+//!   key, and the host's box must open under the key its pairing declares and hold this challenge,
+//!   the host's endpoint and the checkpoint named beside it. See [`read_checkpoint`].
 //! * Every operation takes an operating-system lock on `checkpoints.lock` for its own file work and
 //!   never holds it across a wait on the network. The work is synchronous: a caller on a runtime
 //!   runs it on a blocking task.
@@ -21,13 +24,17 @@ use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use kr_crypto::keys::StoredEnvelopeKeyPair;
+use kr_crypto::sealed::open_stored_envelope;
+use kr_crypto::sign::SigningTranscript;
 use kr_protocol::backup_checkpoint::{
-    BackupCheckpointParams, BackupCheckpointResult, HostCheckpoint,
+    BackupCheckpointParams, BackupCheckpointResult, HOST_CHECKPOINT_PROOF_DOMAIN, HostCheckpoint,
+    HostCheckpointProof,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, DeviceId};
 use kr_protocol::method::Method;
-use kr_protocol::scalars::Digest256;
+use kr_protocol::scalars::{Digest256, Nonce256};
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -706,15 +713,30 @@ pub enum ReadCause {
     HostLacksIt,
     /// The host refused for another reason.
     Refused(ErrorCode),
-    /// The answer is not one this release reads, an answer of generation 0 among them.
+    /// The answer is not one this release reads: an answer of generation 0 or a box longer than
+    /// any honest host makes among them.
     Malformed,
+    /// The host's box does not show that the host made this answer for this ask: it does not open
+    /// under the key the pairing declares for the host and the key this device drew for the ask, or
+    /// it holds another challenge, another endpoint or another answer than the ones this device
+    /// expects. No random value could be drawn for the ask is the same cause.
+    NotProven,
     /// The connection failed or ended.
     Lost,
     /// The host did not answer in time.
     TimedOut,
 }
 
-/// Asks the host `session` is connected to for its checkpoint, once.
+/// Asks the host `session` is connected to for its checkpoint, once, and takes the answer only when
+/// the host's box proves it.
+///
+/// Each ask carries a fresh challenge and a fresh key whose secret half stays in this function. The
+/// host answers with a box from its own stored-envelope key to that key, and the answer counts only
+/// when the box opens under the key `host` declares and holds exactly the challenge, the endpoint
+/// of `host` and the checkpoint that came with it. `host` is the record the session was made from:
+/// the session dials the endpoint that record names and authenticates it, and a session has no
+/// accessor that says which endpoint it reached. A host that relays the ask to another host gets
+/// that other host's box, which names that other host's endpoint, and the comparison refuses it.
 ///
 /// The read does not signal the session's standing: a host of an earlier release refuses the
 /// method as one it does not serve at each ask, and that is no sign the host withdrew the
@@ -724,9 +746,15 @@ pub enum ReadCause {
 /// # Errors
 ///
 /// Returns why the host gave no answer this release reads.
-pub async fn read_checkpoint(session: &Session) -> Result<Answer, ReadCause> {
+pub async fn read_checkpoint(session: &Session, host: &PairedHost) -> Result<Answer, ReadCause> {
+    let challenge = kr_transport::random::fresh_nonce().map_err(|_| ReadCause::NotProven)?;
+    let reply = StoredEnvelopeKeyPair::generate().map_err(|_| ReadCause::NotProven)?;
+    let ask = BackupCheckpointParams {
+        challenge,
+        reply_key: *reply.public(),
+    };
     let result: BackupCheckpointResult = session
-        .read_unsignalled(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .read_unsignalled(Method::BackupCheckpoint, &ask)
         .await
         .map_err(|error| match error {
             ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. } => {
@@ -739,12 +767,48 @@ pub async fn read_checkpoint(session: &Session) -> Result<Answer, ReadCause> {
             ClientError::Cbor(_) => ReadCause::Malformed,
             _ => ReadCause::Lost,
         })?;
+    if !proves(&reply, challenge, host, &result) {
+        return Err(ReadCause::NotProven);
+    }
     Ok(result
         .checkpoint
         .as_ref()
         .map_or(Answer::NothingPublished, |held| {
             Answer::Checkpoint(held.clone())
         }))
+}
+
+/// Whether the box of `result` shows that `host` made this answer for the ask that carried
+/// `challenge` and the public half of `reply`.
+///
+/// The box must open under the key `host` declares and `reply`'s secret, and its plaintext must be
+/// exactly the bytes this device writes from its own values: the challenge it drew, the endpoint
+/// `host` names and the checkpoint beside the box. One comparison covers the three.
+fn proves(
+    reply: &StoredEnvelopeKeyPair,
+    challenge: Nonce256,
+    host: &PairedHost,
+    result: &BackupCheckpointResult,
+) -> bool {
+    let Ok(opened) = open_stored_envelope(
+        reply,
+        &host.host_keys.stored_envelope,
+        &result.proof.nonce,
+        result.proof.ciphertext.as_slice(),
+    ) else {
+        return false;
+    };
+    let Ok(expected) = SigningTranscript::from_object(
+        HOST_CHECKPOINT_PROOF_DOMAIN,
+        &HostCheckpointProof {
+            challenge,
+            host_endpoint_id: host.host_endpoint_id,
+            checkpoint: result.checkpoint.clone(),
+        },
+    ) else {
+        return false;
+    };
+    opened.expose() == expected.as_bytes()
 }
 
 #[cfg(test)]

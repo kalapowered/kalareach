@@ -1408,7 +1408,7 @@ impl Pairing {
                     None => Err(LinkError::lost(Shown::said("the recovery's time ran out"))),
                 };
             let answer = if host.is_owner() {
-                self.read_answer(&session, pending, reserve).await
+                self.read_answer(&session, &host, pending, reserve).await
             } else {
                 None
             };
@@ -1457,13 +1457,15 @@ impl Pairing {
     async fn read_answer(
         &self,
         session: &Session,
+        host: &PairedHost,
         pending: &PendingAttempt,
         reserve: Option<tokio::time::Instant>,
     ) -> Option<Answer> {
         let step = self.recovery_step(pending, reserve)?;
-        let read = tokio::time::timeout(step.min(CHECKPOINT_WITHIN), read_checkpoint(session))
-            .await
-            .unwrap_or(Err(ReadCause::TimedOut));
+        let read =
+            tokio::time::timeout(step.min(CHECKPOINT_WITHIN), read_checkpoint(session, host))
+                .await
+                .unwrap_or(Err(ReadCause::TimedOut));
         match read {
             Ok(answer) => Some(answer),
             Err(cause) => {
@@ -2304,6 +2306,7 @@ mod tests {
     use super::super::checkpoint::{Acquisition, Held, PairedCheckpoint, SnapshotCause};
     use super::super::paired::{HostCredentials, read_hosts};
     use super::*;
+    use kr_crypto::keys::StoredEnvelopeKeyPair;
     use kr_protocol::scalars::Uuid;
     use std::path::{Path, PathBuf};
     use tokio::sync::mpsc;
@@ -3149,6 +3152,9 @@ mod tests {
         /// The host names this checkpoint under another request identifier than the one it was
         /// asked under.
         WrongId(kr_protocol::backup_checkpoint::HostCheckpoint),
+        /// The host names this checkpoint, and the box that comes with it was sealed by another
+        /// key than the one the pairing declares for the host.
+        Unproven(kr_protocol::backup_checkpoint::HostCheckpoint),
     }
 
     /// What the host answers to `environment.list` on every scripted connection.
@@ -3188,7 +3194,7 @@ mod tests {
     struct Earlier {
         directory: tempfile::TempDir,
         keys: DeviceKeys,
-        host_keys: kr_protocol::pairing::DevicePublicKeys,
+        host_keys: DeviceKeys,
     }
 
     /// What the device's store held when a request reached the host.
@@ -3223,6 +3229,7 @@ mod tests {
     #[derive(Serialize)]
     struct ZeroBody {
         checkpoint: ZeroEntry,
+        proof: kr_protocol::backup_checkpoint::SealedCheckpointProof,
     }
 
     #[derive(Serialize)]
@@ -3252,9 +3259,59 @@ mod tests {
         /// The device's store, and what it held at each request.
         watch: PathBuf,
         seen: Arc<Mutex<Vec<Seen>>>,
+        /// The host's stored-envelope key pair and the endpoint its record names.
+        host_pair: Arc<StoredEnvelopeKeyPair>,
+        host_endpoint: EndpointKey,
     }
 
     impl PairedSession {
+        /// The host's answer to `backup.checkpoint` for `held`, with a box from `sender` to the key
+        /// the ask carried: the challenge, this host's endpoint and `held`.
+        fn sealed(
+            &self,
+            request: &kr_protocol::envelope::Request,
+            held: Option<kr_protocol::backup_checkpoint::HostCheckpoint>,
+            sender: &StoredEnvelopeKeyPair,
+        ) -> kr_protocol::envelope::Outcome {
+            use kr_protocol::backup_checkpoint::{
+                BackupCheckpointParams, BackupCheckpointResult, HOST_CHECKPOINT_PROOF_DOMAIN,
+                HostCheckpointProof, SealedCheckpointProof,
+            };
+            use kr_protocol::envelope::{Outcome, ParamsValue};
+            let Ok(ask) = request.params.to_typed::<BackupCheckpointParams>() else {
+                return Outcome::Error(kr_protocol::error::ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "the question names no challenge and no reply key",
+                ));
+            };
+            let checkpoint = kr_protocol::scalars::Nullable(held);
+            let plaintext = kr_crypto::sign::SigningTranscript::from_object(
+                HOST_CHECKPOINT_PROOF_DOMAIN,
+                &HostCheckpointProof {
+                    challenge: ask.challenge,
+                    host_endpoint_id: self.host_endpoint,
+                    checkpoint: checkpoint.clone(),
+                },
+            )
+            .expect("the bytes");
+            let (nonce, ciphertext) = kr_crypto::sealed::seal_stored_envelope(
+                sender,
+                &ask.reply_key,
+                plaintext.as_bytes(),
+            )
+            .expect("a box");
+            Outcome::Ok(
+                ParamsValue::from_typed(&BackupCheckpointResult {
+                    checkpoint,
+                    proof: SealedCheckpointProof {
+                        nonce,
+                        ciphertext: kr_protocol::scalars::Bytes::new(ciphertext),
+                    },
+                })
+                .expect("a value"),
+            )
+        }
+
         fn answer(
             &self,
             request: &kr_protocol::envelope::Request,
@@ -3313,24 +3370,21 @@ mod tests {
                     Checkpoint::Refuse(code) => Outcome::Error(
                         kr_protocol::error::ProtocolError::new(*code, "the question is refused"),
                     ),
-                    Checkpoint::Null => Outcome::Ok(
-                        ParamsValue::from_typed(
-                            &kr_protocol::backup_checkpoint::BackupCheckpointResult {
-                                checkpoint: kr_protocol::scalars::Nullable::null(),
-                            },
-                        )
-                        .expect("a value"),
-                    ),
-                    Checkpoint::Published(held) | Checkpoint::WrongId(held) => Outcome::Ok(
-                        ParamsValue::from_typed(
-                            &kr_protocol::backup_checkpoint::BackupCheckpointResult {
-                                checkpoint: kr_protocol::scalars::Nullable::some(held.clone()),
-                            },
-                        )
-                        .expect("a value"),
+                    Checkpoint::Null => self.sealed(request, None, &self.host_pair),
+                    Checkpoint::Published(held) | Checkpoint::WrongId(held) => {
+                        self.sealed(request, Some(held.clone()), &self.host_pair)
+                    }
+                    Checkpoint::Unproven(held) => self.sealed(
+                        request,
+                        Some(held.clone()),
+                        &StoredEnvelopeKeyPair::generate().expect("a key pair"),
                     ),
                     Checkpoint::Zero => Outcome::Ok(
                         ParamsValue::from_typed(&ZeroBody {
+                            proof: kr_protocol::backup_checkpoint::SealedCheckpointProof {
+                                nonce: kr_protocol::scalars::Nonce192::from_bytes([0; 24]),
+                                ciphertext: kr_protocol::scalars::Bytes::new(Vec::new()),
+                            },
                             checkpoint: ZeroEntry {
                                 service_origin: kr_protocol::service::GatewayOrigin::new(
                                     "https://reach.kala.to",
@@ -3499,6 +3553,10 @@ mod tests {
         /// The device's store, and what it held at each request.
         watch: PathBuf,
         seen: Arc<Mutex<Vec<Seen>>>,
+        /// The host's stored-envelope key pair and the endpoint its record names: what its box to
+        /// the device is made of.
+        host_pair: Arc<StoredEnvelopeKeyPair>,
+        host_endpoint: EndpointKey,
     }
 
     impl HostLink for Dropping {
@@ -3611,6 +3669,8 @@ mod tests {
                 requests: Arc::clone(&self.requests),
                 watch: self.watch.clone(),
                 seen: Arc::clone(&self.seen),
+                host_pair: Arc::clone(&self.host_pair),
+                host_endpoint: self.host_endpoint,
             };
             Box::pin(async move {
                 Ok(Arc::new(transport) as Arc<dyn crate::transport::ControlTransport>)
@@ -3742,7 +3802,7 @@ mod tests {
         /// can go on with.
         directory: tempfile::TempDir,
         keys: DeviceKeys,
-        host_keys: kr_protocol::pairing::DevicePublicKeys,
+        host_keys: DeviceKeys,
     }
 
     impl Waited {
@@ -3781,8 +3841,9 @@ mod tests {
         } = script.again.take().unwrap_or_else(|| Earlier {
             directory: tempfile::tempdir().expect("a directory on the internal disk"),
             keys: DeviceKeys::generate().expect("keys"),
-            host_keys: DeviceKeys::generate().expect("keys").public_keys(),
+            host_keys: DeviceKeys::generate().expect("keys"),
         });
+        let host_public = host.public_keys();
         let watch = directory.path().join("pairing");
         let value = "f3c146fd".to_owned();
         let waiting = PairStatusResult {
@@ -3793,16 +3854,19 @@ mod tests {
             },
             owner: kr_protocol::scalars::Nullable::null(),
         };
-        let host_endpoint_id = script.opening.as_ref().map_or(host.transport, |opening| {
-            ConnectionPeer::of(&opening.1).endpoint()
-        });
+        let host_endpoint_id = script
+            .opening
+            .as_ref()
+            .map_or(host_public.transport, |opening| {
+                ConnectionPeer::of(&opening.1).endpoint()
+            });
         let pending = PendingAttempt {
             mode: AttemptMode::Direct,
             invitation_id: InvitationId::new(Uuid::from_bytes([4; 16])),
             host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
             host_key_revision: DeviceKeyRevision::new(1),
             host_endpoint_id,
-            host_keys: host,
+            host_keys: host_public,
             network_config: kr_protocol::pairing::NetworkConfig::empty(),
             proposed_grant: kr_protocol::pairing::ProposedGrant {
                 parent_grant_id: kr_protocol::scalars::Nullable::null(),
@@ -3859,6 +3923,8 @@ mod tests {
                 requests: Arc::clone(&requests),
                 watch: watch.clone(),
                 seen: Arc::clone(&seen),
+                host_pair: Arc::new(host.stored_envelope.clone()),
+                host_endpoint: host_endpoint_id,
             }),
             hosts: Arc::new(PairedHosts::open(&watch).expect("a store")),
         };
@@ -4777,6 +4843,10 @@ mod tests {
             (
                 "an answer under another request identifier",
                 Checkpoint::WrongId(named(7)),
+            ),
+            (
+                "a box that another key sealed",
+                Checkpoint::Unproven(named(7)),
             ),
         ];
         for (name, checkpoint) in cases {
