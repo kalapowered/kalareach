@@ -3103,9 +3103,25 @@ impl TerminalInput {
     }
 
     /// Rings the doorbell: the terminal has shown something. A bell that is already rung and not
-    /// yet heard needs no second ring, so a full one is left as it is.
+    /// yet heard needs no second ring, so a full one is left as it is. A ring that a signal
+    /// interrupted is made again, since a wait that slept through it would wake only at its
+    /// deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics, on the thread that reads the terminal, when the bell cannot be rung for any other
+    /// reason: a wait that is never woken is no wait the case can rely on.
     fn ring(&self) {
-        let _ = (&self.bell_rung).write(&[1]);
+        loop {
+            match (&self.bell_rung).write(&[1]) {
+                Ok(_) => return,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+                Err(error) => {
+                    panic!("the doorbell for what the terminal shows cannot be rung: {error}")
+                }
+            }
+        }
     }
 
     /// Takes the rings so far, so that the next wait sleeps until the next one.

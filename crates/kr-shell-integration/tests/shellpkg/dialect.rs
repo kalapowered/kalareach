@@ -118,16 +118,24 @@ pub struct Dialect {
     /// The line that gives an interrupt this editor's shell keeps something to be spent on, or none
     /// where the shell keeps no interrupt.
     ///
-    /// The shell takes an interrupt up straight away only when it arrives while the editor waits
-    /// for a key. One that arrives while it is reading an earlier key, or while the editor serves
-    /// a request of the host's, is kept, and the next line the shell accepts is cut short at its
-    /// first character, the rest of it running as a command of its own. Nothing the editor
-    /// reports shows an interrupt kept: its queues are empty before the shell takes it up and
-    /// after. This line goes in before the command that proves the shell works.
+    /// The shell takes an interrupt up straight away when it arrives while the editor waits for a
+    /// key, and when it arrives while the shell runs a built-in command. One that it takes in a
+    /// short window of its own is kept: after it has run the signals queued while it was busy,
+    /// which it does before it draws a prompt, and before the first byte of the next line has
+    /// been read. The next line the shell accepts is cut short at its first byte, the rest of it
+    /// running as a command of its own. Nothing the editor reports shows an interrupt kept: its
+    /// queues are empty before the shell takes it up and after. This line goes in before the
+    /// command that proves the shell works.
     ///
     /// Zsh spends a kept interrupt on the first byte of its next read, so its line is one space:
     /// the space is cut and the newline behind it is accepted. An empty line would give the
     /// interrupt the newline, the line would be cancelled, and no reader would hand a line back.
+    ///
+    /// The byte is lost only while the terminal is still in line mode, which lasts until the
+    /// editor first draws. There the terminal takes the line-kill key among the recovery keys as
+    /// its own, so the first byte the shell reads is the first byte of the line typed after them.
+    /// Once the terminal is in the editor's raw mode that key reaches the shell as a byte, the
+    /// kept interrupt takes it, and the space is accepted as a line that holds nothing.
     pub kept_interrupt_line: Option<&'static str>,
 }
 

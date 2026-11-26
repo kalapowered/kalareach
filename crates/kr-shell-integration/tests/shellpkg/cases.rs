@@ -3488,7 +3488,10 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         // No condition shows that a reader took this key: Fish keeps the operator's pending keys
         // after it, so a fence about the reader is answered as not drained for as long as it is
         // asked, and the keys that follow are asked about by their own fences below. What the
-        // interrupt can cost a command is spent by the empty line before the closing command.
+        // interrupt can cost a command is spent by the dialect's line before the closing command.
+        // The sleep gives the shell time to take the interrupt before the next key goes in, so
+        // it could hide an interrupt that a slow shell keeps and spends on that key. It stays
+        // because no condition shows the key read, and the keys that follow are each asked about.
         std::thread::sleep(Duration::from_millis(150));
 
         // A count being accumulated for the command that follows it is the same kind of state.
@@ -7624,67 +7627,188 @@ pub fn a_program_that_names_no_application_has_no_line_in_powershell_and_the_pre
     );
 }
 
+/// What the kernel says of one task that decides whether the idle scheduling class holds it back
+/// against another task: where it may run, the policy it runs under, and the scheduling group it
+/// is counted in.
+#[derive(Debug)]
+struct Placement {
+    /// The processors the task may run on, as the kernel lists them.
+    allowed: String,
+    /// The scheduling policy, as the kernel numbers it.
+    policy: String,
+    /// The task's control-group lines.
+    groups: String,
+    /// Whether its scheduling group is a control group's, and not the root group that the kernel
+    /// splits by session where it groups tasks automatically.
+    in_a_control_group: bool,
+}
+
+/// The idle scheduling class, as the kernel numbers it.
+const IDLE_POLICY: &str = "5";
+
+/// Whether the scheduling group of a task with these control-group lines is a control group's.
+///
+/// A control group is a scheduling group only where it has the processor controller. A group
+/// without one is counted in the nearest one above it that has it, and in the root group where
+/// none has: the root group is the one the kernel splits by session where it groups tasks
+/// automatically. `controllers_of` gives the controllers a control group has, read from the path
+/// the lines name, and nothing where they cannot be read.
+fn is_in_a_control_group_that_schedules(
+    groups: &str,
+    controllers_of: impl Fn(&str) -> Option<String>,
+) -> bool {
+    groups.lines().any(|line| {
+        let mut fields = line.splitn(3, ':');
+        let (_, Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        if !controllers.is_empty() {
+            // A line of the first version of control groups: the hierarchy's own controllers.
+            return path != "/" && controllers.split(',').any(|name| name == "cpu");
+        }
+        let mut group = path.trim_end_matches('/').to_owned();
+        while !group.is_empty() {
+            let has_it = controllers_of(&group)
+                .is_some_and(|list| list.split_whitespace().any(|name| name == "cpu"));
+            if has_it {
+                return true;
+            }
+            group.truncate(group.rfind('/').unwrap_or(0));
+        }
+        false
+    })
+}
+
+/// Why the premise of the slow-shell case does not hold for these readings, or `None` where it
+/// does.
+///
+/// The shell and the thread may run on processor `cpu` alone, the shell is in the idle class and
+/// the thread is not, and both are in one scheduling group: the idle class holds a task back
+/// only against the tasks of its own group. The groups are the same where the control-group lines
+/// are, and, where the kernel groups tasks by session (`autogroup`), where both lie in a control
+/// group that schedules: the shell leads a session of its own, so outside one it has a group of
+/// its own.
+fn why_the_premise_fails(
+    cpu: usize,
+    autogroup: bool,
+    shell: &Placement,
+    thread: &Placement,
+) -> Option<String> {
+    let alone = cpu.to_string();
+    let in_one_group = shell.groups == thread.groups
+        && (!autogroup || (shell.in_a_control_group && thread.in_a_control_group));
+    if shell.allowed == alone
+        && shell.policy == IDLE_POLICY
+        && thread.allowed == alone
+        && thread.policy != IDLE_POLICY
+        && in_one_group
+    {
+        return None;
+    }
+    Some(format!(
+        "the premise of this case does not hold, so a pass would show nothing: the shell may run \
+         on processors {:?} in scheduling policy {} and in control groups {:?}, and this thread \
+         on {:?} in policy {} and in {:?}; the kernel's automatic grouping by session is {} and \
+         the scheduling group is a control group's for the shell: {}, for this thread: {}; the \
+         case needs both on processor {cpu} alone, the shell in policy {IDLE_POLICY} (the idle \
+         class) and this thread in another, and both in one scheduling group: the same \
+         control-group lines, and where the kernel groups by session, a control group with the \
+         processor controller",
+        shell.allowed,
+        shell.policy,
+        shell.groups,
+        thread.allowed,
+        thread.policy,
+        thread.groups,
+        if autogroup { "on" } else { "off" },
+        shell.in_a_control_group,
+        thread.in_a_control_group,
+    ))
+}
+
 /// A line typed straight after the keys that put a reader back keeps its first byte, with the
 /// shell slow to run.
 ///
 /// [`Session::recover`] types an interrupt among its keys, and the line that proves the shell
 /// works follows. The terminal raises the interrupt as the key goes in. A shell that the scheduler
-/// has not yet run takes the interrupt and the keys behind it together and keeps the interrupt for
+/// has not yet run takes the interrupt and the keys behind it together, and one that takes the
+/// interrupt in the short window of its own (see [`Dialect::kept_interrupt_line`]) keeps it for
 /// the next line it reads: that line is cut short at its first byte, and the rest of it runs as a
 /// command of its own. Where a shell does so, a line goes in first for the interrupt to be spent
-/// on, and the reader's return from it is awaited (see [`Dialect::kept_interrupt_line`]).
+/// on, and the reader's return from it is awaited.
 ///
-/// Here the shell and this thread share one processor, and the shell is in the idle scheduling
-/// class, so it runs only when this thread waits, whatever the priority of this thread or of the
-/// machine's other work. The wait for the command that ends in the prompt wakes at the terminal's
-/// own write, through a doorbell that the thread reading the terminal rings after each read, so
-/// the shell is still between that write and its next read when the keys go in.
+/// Here the shell and this thread share one processor and one scheduling group, and the shell is
+/// in the idle scheduling class. That class gives a task a weight of 3, against 15 for the
+/// lowest priority of the ordinary class (nice 19) and 1024 for the default, so the shell is held
+/// back and not stopped: it runs when this thread waits, and takes a small share while both can
+/// run. It holds a task back only against the tasks of its own scheduling group, which is why the
+/// case reads the groups back too. The wait for the command that ends in the prompt wakes at the
+/// terminal's own write, through a doorbell that the thread reading the terminal rings after each
+/// read, so the shell is still between that write and its next read when the keys go in.
 ///
-/// The case is a race, and it is red by likelihood and not by certainty. Without the line, a round
-/// lost the byte in 37 of 96 rounds (2 to 6 of 12 in a run) on a busy Linux host at a load of 26 to 44,
-/// and in 21 of 96 on another run of the same kind at a load of 25 to 30. A shell at nice 19 and
-/// not in the idle class, beside a thread at nice 19, lost it in 1 of 48 rounds, so the class
-/// matters; a wait that polls the bridge beside a thread at nice 10 lost it in 1 of 60 rounds and
-/// one that spins in 9 of 60. No form loses it in every round. A run is red unless every round
-/// keeps the byte, so 48 rounds at 15 per cent a round leave 0.85^48, about 4 in 10,000, of a
-/// green run, and fewer at the rates measured. The rate moves with the load of the machine, and a
-/// machine that loses the byte less often needs more rounds. With a bare newline as the line, the
-/// wait for the reader's return failed in 4 of 4 runs, because the shell spent the interrupt on
-/// the newline and cancelled it; with a space, 128 of 128 rounds came back, 89 of them in the
-/// order that holds the shell back.
+/// The case is a race, and it is red by likelihood and not by certainty: no form of the wait
+/// makes every round lose the byte, and the rate moves with the load of the machine, so a machine
+/// that loses it less often needs more rounds. On a busy Linux host at a load of 26 to 44, with the
+/// shell in the idle class and no line, the proof line did not run in 37 of 96 rounds (2 to 6 of
+/// 12 in a run), and in 26 of 96 on another run of the same kind at a load of 25 to 30. With the
+/// shell at nice 19 and not in the idle class, beside a thread at nice 19, it did not run in 1
+/// of 48 rounds, so the class matters; a wait that polls the bridge beside a thread at nice 10
+/// failed in 1 of 60 rounds and one that spins in 12 of 60. These count rounds that did not
+/// answer. The transcripts of three runs of this case with no line show the proof command without
+/// its first letter, run as a command of its own, in the round that failed. A run is red unless
+/// every round keeps the byte. With a bare newline as the line, the wait for the reader's return
+/// failed in 4 of 4 runs, because the shell spent the interrupt on the newline and cancelled it;
+/// with a space, 128 of 128 rounds came back, 89 of them in the order that holds the shell back.
 ///
 /// The case asserts its premise, read back from the kernel for the shell and for this thread:
-/// both on the one processor, the shell in the idle class and this thread not. Where the shell
-/// cannot be put in the class, or the read-back differs, the case fails with the premise's
-/// words, and does not pass. It prints in how many rounds the shell had not yet entered its
-/// reader when the keys went in, and does not assert the count. It runs on Linux only, where
-/// the processor and the class can be set.
+/// both on the one processor and in one scheduling group, the shell in the idle class and this
+/// thread not. Where the shell cannot be put in the class, or the read-back differs, the case
+/// fails with the premise's words, and does not pass. It writes one line with what it read to the
+/// process's own error stream, which a test that passes does not hold back, and prints in how
+/// many rounds the first reader event after the keys was an entry, without asserting the count:
+/// it counts the order in which events arrived, and does not show where the shell was when the
+/// keys went in. A round whose proof line does not run is followed by a second line that the shell
+/// must answer: a shell that answers it was reading, and the first line was cut or cancelled. It
+/// runs on Linux only, where the processor and the class can be set.
 ///
 /// # Panics
 ///
 /// Panics when the premise does not hold, when the shell does not answer the command that ends
-/// in the prompt the recovery keys are typed at, and when it does not answer a line typed after
-/// them.
+/// in the prompt the recovery keys are typed at, when it does not answer the line typed after
+/// them, and when it answers a line typed after that one but not the one before it.
 #[cfg(target_os = "linux")]
 pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slow_to_run(
     kind: ShellKind,
 ) {
     use rustix::process::{Pid, setpriority_process};
     use rustix::thread::{CpuSet, sched_getaffinity, sched_setaffinity};
+    use std::io::Write as _;
 
-    /// Puts this thread back on the processors it was allowed, whichever way the case ends: a run
-    /// with one test thread runs every case on the same thread.
+    /// Puts this thread back on the processors it was allowed, whichever way the case ends. The
+    /// harness runs each case on a thread of its own, so the pin ends with the thread; the guard
+    /// keeps a harness that ran the cases on one thread from leaving the next one pinned.
     struct Unpinned(CpuSet);
 
     impl Drop for Unpinned {
         fn drop(&mut self) {
-            let _ = sched_setaffinity(None, &self.0);
+            if let Err(error) = sched_setaffinity(None, &self.0) {
+                let words = format!(
+                    "the processors this thread was allowed could not be put back after the \
+                     case: {error}; a case that runs on it next keeps one processor"
+                );
+                // A panic while another unwinds ends the program, so that one is printed.
+                if std::thread::panicking() {
+                    let _ = writeln!(std::io::stderr(), "{words}");
+                } else {
+                    panic!("{words}");
+                }
+            }
         }
     }
 
-    /// The processors a task may run on and the scheduling policy it runs under, as the kernel
-    /// reports them for `task`, which is `/proc/<number>` or `/proc/thread-self`.
-    fn kernel_says_of(task: &str) -> (String, String) {
+    /// What the kernel reports for `task`, which is `/proc/<number>` or `/proc/thread-self`.
+    fn kernel_says_of(task: &str) -> Placement {
         let status = std::fs::read_to_string(format!("{task}/status")).expect("the task's status");
         let allowed = status
             .lines()
@@ -7701,14 +7825,26 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
             .and_then(|after| after.split_whitespace().nth(38))
             .expect("the task's scheduling policy")
             .to_owned();
-        (allowed, policy)
+        let groups =
+            std::fs::read_to_string(format!("{task}/cgroup")).expect("the task's control groups");
+        let in_a_control_group = is_in_a_control_group_that_schedules(&groups, |path| {
+            std::fs::read_to_string(format!(
+                "/sys/fs/cgroup{}/cgroup.controllers",
+                path.trim_end_matches('/')
+            ))
+            .ok()
+        });
+        Placement {
+            allowed,
+            policy,
+            groups,
+            in_a_control_group,
+        }
     }
 
     // The shell loses the line's first byte in many rounds of this kind and not in all of them, so
     // the case makes enough rounds that one of them loses it.
     const ROUNDS: u8 = 48;
-    // The idle scheduling class, as the kernel numbers it.
-    const IDLE: &str = "5";
 
     let package = Package::built(kind);
     // The harness's own threads are started by this one and keep the processor it is on.
@@ -7737,18 +7873,28 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
     );
     session.first_prompt();
     session.forget_events();
-    let (shell_allowed, shell_policy) = kernel_says_of(&format!("/proc/{pid}"));
-    let (thread_allowed, thread_policy) = kernel_says_of("/proc/thread-self");
-    assert!(
-        shell_allowed == cpu.to_string()
-            && shell_policy == IDLE
-            && thread_allowed == cpu.to_string()
-            && thread_policy != IDLE,
-        "the premise of this case does not hold, so a pass would show nothing: the shell ({pid}) \
-         may run on processors {shell_allowed:?} in scheduling policy {shell_policy}, and this \
-         thread on {thread_allowed:?} in policy {thread_policy}; the case needs both on processor \
-         {cpu} alone, the shell in policy {IDLE} (the idle class) and this thread in another"
+    let shell_reads = kernel_says_of(&format!("/proc/{pid}"));
+    let thread_reads = kernel_says_of("/proc/thread-self");
+    let autogroup = std::fs::read_to_string("/proc/sys/kernel/sched_autogroup_enabled")
+        .is_ok_and(|text| text.trim() == "1");
+    // One line of plain facts, written past the capture of a passing test so that a gate's log
+    // shows what the premise read; it names no path.
+    let _ = writeln!(
+        std::io::stderr(),
+        "slow-shell premise read back: shell in policy {} and this thread in policy {}, both \
+         allowed on one processor: {}, control-group lines equal: {}, scheduling group a control \
+         group's for the shell: {} and for this thread: {}, automatic grouping by session: {}",
+        shell_reads.policy,
+        thread_reads.policy,
+        shell_reads.allowed == thread_reads.allowed && shell_reads.allowed == cpu.to_string(),
+        shell_reads.groups == thread_reads.groups,
+        shell_reads.in_a_control_group,
+        thread_reads.in_a_control_group,
+        if autogroup { "on" } else { "off" },
     );
+    if let Some(words) = why_the_premise_fails(cpu, autogroup, &shell_reads, &thread_reads) {
+        panic!("{words}");
+    }
     let ready = dialect(kind)
         .ignore_eof_on
         .map_or_else(|| print_assembled(kind, "kr-ready"), ToOwned::to_owned);
@@ -7767,10 +7913,24 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
         let seen = session.commands.arrivals.len();
         // The recovery keys, and the line that proves the shell works typed behind them.
         let outcome = session.fenced_after_a_command_or_the_screen(30 + round);
+        if let Err(screen) = &outcome {
+            // The line did not run. A shell that answers a second line was reading all the time,
+            // so a wait that ran out and a shell that stopped are told apart from a line that
+            // was cut or cancelled.
+            let reading = session.answered("kr-after-the-line");
+            assert!(
+                reading,
+                "round {} of {ROUNDS}: the shell answered neither the line typed after the \
+                 recovery keys nor a second line typed after it, so it stopped reading; the \
+                 terminal showed:\n{screen}",
+                round + 1
+            );
+        }
         assert!(
             outcome.is_ok(),
-            "round {} of {ROUNDS}: the line typed after the recovery keys did not run, so the \
-             shell may have lost its first byte; the terminal showed:\n{}",
+            "round {} of {ROUNDS}: the line typed after the recovery keys did not run, and the \
+             shell answered a second line typed after it, so it was reading and the first line \
+             was cut or cancelled; the terminal showed:\n{}",
             round + 1,
             outcome.as_ref().err().map_or("", String::as_str)
         );
@@ -7785,9 +7945,106 @@ pub fn a_line_after_the_recovery_keys_keeps_its_first_byte_when_the_shell_is_slo
         }
     }
     eprintln!(
-        "rounds in which the shell had not yet entered its reader when the recovery keys went in: \
+        "rounds in which the first reader event after the recovery keys was an entry: \
          {held} of {ROUNDS}"
     );
+}
+
+#[cfg(test)]
+mod premise_guards {
+    use super::{
+        IDLE_POLICY, Placement, is_in_a_control_group_that_schedules, why_the_premise_fails,
+    };
+
+    /// A reading of a task on processor 7 whose control-group lines are `groups`.
+    fn reading(policy: &str, groups: &str, in_a_control_group: bool) -> Placement {
+        Placement {
+            allowed: "7".to_owned(),
+            policy: policy.to_owned(),
+            groups: groups.to_owned(),
+            in_a_control_group,
+        }
+    }
+
+    const SESSION: &str = "0::/user.slice/session-1.scope\n";
+
+    /// The premise of the slow-shell case holds only where the shell and the thread are in one
+    /// scheduling group, and the case fails with the premise's words where they are not: a shell
+    /// in a group of its own is not held back by the idle class, whichever policy it reads.
+    #[test]
+    fn the_slow_shell_premise_is_refused_where_the_shell_and_the_thread_are_in_different_groups() {
+        let thread = reading("0", SESSION, true);
+        let held_back = reading(IDLE_POLICY, SESSION, true);
+        assert_eq!(why_the_premise_fails(7, false, &held_back, &thread), None);
+        assert_eq!(why_the_premise_fails(7, true, &held_back, &thread), None);
+
+        let apart = reading(IDLE_POLICY, "0::/user.slice/session-2.scope\n", true);
+        let words = why_the_premise_fails(7, false, &apart, &thread);
+        assert!(
+            words.as_ref().is_some_and(|words| {
+                words.contains("the premise of this case does not hold")
+                    && words.contains("one scheduling group")
+            }),
+            "control groups that differ are two scheduling groups: {words:?}"
+        );
+    }
+
+    /// Where the kernel groups tasks by session, tasks outside a control group that schedules are
+    /// in a group per session, and the shell leads a session of its own.
+    #[test]
+    fn the_slow_shell_premise_is_refused_where_the_kernel_groups_by_session() {
+        let thread = reading("0", SESSION, false);
+        let shell = reading(IDLE_POLICY, SESSION, false);
+        assert!(why_the_premise_fails(7, true, &shell, &thread).is_some());
+        assert_eq!(why_the_premise_fails(7, false, &shell, &thread), None);
+        let one_controlled = reading("0", SESSION, true);
+        assert!(why_the_premise_fails(7, true, &shell, &one_controlled).is_some());
+    }
+
+    /// The other parts of the premise are still refused: a shell that is not in the idle class, a
+    /// thread that is, and a processor that is not the one.
+    #[test]
+    fn the_slow_shell_premise_is_refused_where_the_class_or_the_processor_is_wrong() {
+        let thread = reading("0", SESSION, true);
+        assert!(why_the_premise_fails(7, false, &reading("0", SESSION, true), &thread).is_some());
+        let idle_thread = reading(IDLE_POLICY, SESSION, true);
+        assert!(
+            why_the_premise_fails(7, false, &reading(IDLE_POLICY, SESSION, true), &idle_thread)
+                .is_some()
+        );
+        assert!(
+            why_the_premise_fails(3, false, &reading(IDLE_POLICY, SESSION, true), &thread)
+                .is_some()
+        );
+    }
+
+    /// A control group schedules where it, or the nearest one above it, has the processor
+    /// controller, and the root group does not.
+    #[test]
+    fn a_control_group_schedules_only_where_it_has_the_processor_controller_below_the_root() {
+        let controllers = |path: &str| match path {
+            "/user.slice/session-1.scope" => Some("memory pids".to_owned()),
+            "/user.slice" => Some("cpu memory pids".to_owned()),
+            "/bare.slice" => Some("memory pids".to_owned()),
+            "/bare.slice/job.scope" => Some("pids".to_owned()),
+            _ => None,
+        };
+        assert!(is_in_a_control_group_that_schedules(SESSION, controllers));
+        assert!(!is_in_a_control_group_that_schedules(
+            "0::/bare.slice/job.scope\n",
+            controllers
+        ));
+        assert!(!is_in_a_control_group_that_schedules("0::/\n", controllers));
+        assert!(!is_in_a_control_group_that_schedules("", controllers));
+        assert!(is_in_a_control_group_that_schedules(
+            "4:cpu,cpuacct:/user.slice\n3:memory:/\n",
+            controllers
+        ));
+        assert!(!is_in_a_control_group_that_schedules(
+            "4:cpu,cpuacct:/\n",
+            controllers
+        ));
+    }
 }
 
 #[cfg(test)]
