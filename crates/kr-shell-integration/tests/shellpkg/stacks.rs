@@ -1605,8 +1605,8 @@ impl Session {
     /// Every key of the teardown goes in only once the reader has said it read the one before it,
     /// and the command only once it has said it read the last: see
     /// [`Session::recover_one_key_at_a_time`] for what a key typed sooner can do. Where a shell
-    /// keeps an interrupt it was too busy to take up, an empty line goes in before the command
-    /// (see [`Dialect::late_interrupt_waits_for_a_line`]).
+    /// keeps an interrupt it was too busy to take up, a line for it to be spent on goes in before
+    /// the command (see [`Dialect::kept_interrupt_line`]).
     ///
     /// # Errors
     ///
@@ -1639,7 +1639,7 @@ impl Session {
                 )
             })?;
         let left = format!("the teardown left {}", typing.describe());
-        if dialect(self.package_kind).late_interrupt_waits_for_a_line {
+        if let Some(line) = dialect(self.package_kind).kept_interrupt_line {
             // A return runs whatever is on the line, so it is only an empty line's when the line
             // is empty.
             if !typing.buffer_empty {
@@ -1648,10 +1648,10 @@ impl Session {
                      was typed; {left}"
                 ));
             }
-            self.give_a_kept_interrupt_a_line().map_err(|why| {
+            self.give_a_kept_interrupt_a_line(line).map_err(|why| {
                 format!(
-                    "an empty line did not come back to a reader, so no command was typed: {why}; \
-                     {left}"
+                    "the line for a kept interrupt did not come back to a reader, so no command \
+                     was typed: {why}; {left}"
                 )
             })?;
         }
@@ -1667,17 +1667,23 @@ impl Session {
     /// request of the host's, reached the shell when the terminal took the key that raised it, and
     /// this line is typed after: the terminal hands the shell its bytes in order, so the shell has
     /// the interrupt before it reads the line. It has either acted on it or keeps it for the next
-    /// line it accepts, and nothing the reader reports says which. An empty line costs nothing in
-    /// the second case, and in the first it is an empty command. The command that proves the shell
-    /// works goes to a shell that holds no interrupt.
+    /// line it accepts, and nothing the reader reports says which. The line costs nothing in the
+    /// second case, and in the first it is a command that does nothing. The command that proves the
+    /// shell works goes to a shell that holds no interrupt.
+    ///
+    /// A shell that spends a kept interrupt on the first byte it reads and cancels the line takes
+    /// an empty line's return that way: the reader leaves by a cancellation and enters again, and
+    /// no reader hands a line back. Such a shell is given a line of one space instead (see
+    /// [`Dialect::kept_interrupt_line`]): the space is cut and the return behind it is accepted, so
+    /// in every order the reader ends with exactly one acceptance, which is what this waits for.
     ///
     /// # Errors
     ///
-    /// Returns which of the two the reader never reported: the empty line handed back, or a reader
+    /// Returns which of the two the reader never reported: the line handed back, or a reader
     /// entering after it.
-    fn give_a_kept_interrupt_a_line(&mut self) -> Result<(), String> {
+    fn give_a_kept_interrupt_a_line(&mut self, line: &str) -> Result<(), String> {
         let lifecycle = self.reader_lifetime;
-        self.type_line("");
+        self.type_line(line);
         let deadline = self.deadline_for(REPLY);
         self.return_from_a_command(lifecycle, deadline)
             .map(|_| ())
@@ -2145,6 +2151,55 @@ impl Session {
         }
     }
 
+    /// Waits for `needle` in what the terminal showed after `start`, asleep on the terminal and
+    /// the bridge together, so that it wakes when either has something.
+    ///
+    /// The waits above sleep on the bridge for up to 20 ms at a time, so output that reaches the
+    /// terminal while they sleep is noticed when they wake, and a shell that has gone on to read
+    /// by then meets whatever is typed next as a shell that is reading. A case that has to type at
+    /// the moment a command's output appears, with the shell still between the end of the command
+    /// and its read, waits here: the thread that reads the terminal rings a doorbell after each
+    /// read, and this wait sleeps on the doorbell beside the bridge. What the bridge has sent is
+    /// still taken in and acknowledged on every turn, so a shell that waits for an answer is not
+    /// left waiting.
+    pub(super) fn wait_for_output_after_at_once_by(
+        &mut self,
+        start: usize,
+        needle: &str,
+        deadline: Deadline,
+    ) -> bool {
+        loop {
+            // The bell is taken before the transcript is read, and the reading thread rings it
+            // after it has added to the transcript, so output that arrives after the read below
+            // finds the bell rung and the sleep below ends at once.
+            self.terminal.hear();
+            {
+                let output = self.output.lock().expect("the output lock");
+                let from = start.min(output.len());
+                if find(&output[from..], needle.as_bytes()) {
+                    return true;
+                }
+            }
+            if deadline.passed() {
+                return false;
+            }
+            self.take_in_what_has_arrived();
+            let left = deadline.left();
+            let timeout = Timespec {
+                tv_sec: i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: left.subsec_nanos().into(),
+            };
+            let mut watched = vec![PollFd::new(&self.terminal.bell_heard, PollFlags::IN)];
+            if !(self.peer_read_gone || self.shut) {
+                watched.push(PollFd::new(&self.stream, PollFlags::IN));
+            }
+            match poll(&mut watched, Some(&timeout)) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(error) => panic!("waiting for the terminal or the endpoint: {error}"),
+            }
+        }
+    }
+
     /// Takes the reader to a fenced empty prompt that nothing before this has a claim on.
     ///
     /// A check that has just run commands leaves reader entries in this session's own event
@@ -2156,13 +2211,30 @@ impl Session {
     ///
     /// Panics when the shell does not answer, which is a shell that has stopped reading.
     pub fn fenced_after_a_command(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
+        match self.fenced_after_a_command_or_the_screen(index) {
+            Ok(fenced) => fenced,
+            Err(screen) => {
+                panic!("the shell did not answer before a fence was asked for:\n{screen}")
+            }
+        }
+    }
+
+    /// [`Session::fenced_after_a_command`], giving back what the terminal showed when the shell did
+    /// not answer, for a case that decides on the outcome itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the terminal's output when the shell does not answer the command that makes the
+    /// prompt the fence is about, which is a shell that has stopped reading.
+    pub fn fenced_after_a_command_or_the_screen(
+        &mut self,
+        index: u8,
+    ) -> Result<(RootEditorEnterParams, EditorFence), String> {
         self.recover();
         self.forget_events();
-        assert!(
-            self.answered("kr-fence-ready"),
-            "the shell did not answer before a fence was asked for:\n{}",
-            self.terminal_output()
-        );
+        if !self.answered("kr-fence-ready") {
+            return Err(self.terminal_output());
+        }
         let published = self.fenced_latest(index);
         // An editor that reaches its own queue only when the reader steps has not taken the
         // publication frame yet, and a gesture sent before it does is decided against the fence
@@ -2180,7 +2252,7 @@ impl Session {
             }));
             let _ = self.answer(barrier);
         }
-        published
+        Ok(published)
     }
 
     /// Waits for the hooks the guarded entry activates and the first primary reader, patiently.
@@ -2440,12 +2512,12 @@ impl Session {
     /// The terminal hands the shell its keys in the order they were typed, so none is held back
     /// for the one before it. What is not in that order is the interrupt the second key raises: a
     /// shell that is still busy with the first can keep it for the next line it accepts, and that
-    /// line loses its first character. Where a shell does so, an empty line goes in last and its
-    /// return is awaited: see [`Session::spend_a_kept_interrupt`].
+    /// line loses its first character. Where a shell does so, a line for the interrupt to be spent
+    /// on goes in last and its return is awaited: see [`Session::spend_a_kept_interrupt`].
     ///
     /// # Panics
     ///
-    /// Panics when the shell keeps interrupts and no reader came back from the empty line.
+    /// Panics when the shell keeps interrupts and no reader came back from that line.
     pub fn recover(&mut self) {
         for bytes in self.recovery_keys().iter().copied() {
             self.type_bytes(bytes);
@@ -2459,19 +2531,19 @@ impl Session {
     ///
     /// What is typed after this goes to a shell that keeps no interrupt. Nothing the reader
     /// reports shows one being kept, so the line is the only way to know: see
-    /// [`Dialect::late_interrupt_waits_for_a_line`].
+    /// [`Dialect::kept_interrupt_line`].
     ///
     /// # Panics
     ///
-    /// Panics when the reader did not come back from the empty line, naming what the terminal
-    /// showed.
+    /// Panics when the reader did not come back from the line, naming what the terminal showed.
     pub fn spend_a_kept_interrupt(&mut self) {
-        if !dialect(self.package_kind).late_interrupt_waits_for_a_line {
+        let Some(line) = dialect(self.package_kind).kept_interrupt_line else {
             return;
-        }
-        if let Err(why) = self.give_a_kept_interrupt_a_line() {
+        };
+        if let Err(why) = self.give_a_kept_interrupt_a_line(line) {
             panic!(
-                "an empty line did not come back to a reader after an interrupt: {why}:\n{}",
+                "the line for a kept interrupt did not come back to a reader after an interrupt: \
+                 {why}:\n{}",
                 self.terminal_output()
             );
         }
@@ -2496,7 +2568,7 @@ impl Session {
     /// interrupt before it hands on the key that follows, so an interrupt has reached the shell by
     /// the time the key after it has been read. Keys typed with no such wait are read together by a
     /// shell that has fallen behind, and the interrupt can arrive while the shell is busy with the
-    /// key before it: see [`Dialect::late_interrupt_waits_for_a_line`] for what that leaves.
+    /// key before it: see [`Dialect::kept_interrupt_line`] for what that leaves.
     ///
     /// `said` is what the reader last said of itself, if it has said anything since the drive
     /// began. Returns what it said of itself once it had read the last key.
