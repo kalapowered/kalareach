@@ -168,6 +168,9 @@ rusqlite = { workspace = true, features = ["bundled"] }
 # paired host.
 kr-worker = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
+# Where a test run keeps its evidence: a wait of the phone's connection that took longer than a
+# minute leaves the times of its tries there.
+kr-test-artifacts.workspace = true
 # Paused time, so the phone session's waits run in a test without taking that long, and the
 # pairing suite's multi-threaded runtime.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "test-util"] }

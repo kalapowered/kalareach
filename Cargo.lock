@@ -1318,6 +1318,7 @@ dependencies = [
  "kr-protocol",
  "kr-service-stand-in",
  "kr-shell-integration",
+ "kr-test-artifacts",
  "kr-transfer",
  "kr-transport",
  "kr-width",

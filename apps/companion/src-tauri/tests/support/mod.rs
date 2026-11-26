@@ -53,6 +53,33 @@ pub const fn through_rounds(rounds: u32) -> Duration {
         .saturating_add(WATCHDOG)
 }
 
+/// Appends `line` to the record of the phone-session waits that took longer than the ordinary
+/// watchdog, in the run's evidence folder (the one the hosted jobs keep), and prints it. A line that
+/// cannot be kept is printed with why and fails nothing: the wait it records came or failed on its
+/// own account.
+pub fn keep_wait(line: &str) {
+    use std::io::Write as _;
+
+    eprintln!("{line}");
+    let path = kr_test_artifacts::directory().join("companion-phone-session-waits.txt");
+    let write = || -> std::io::Result<()> {
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        writeln!(file, "{line}")
+    };
+    if let Err(error) = write() {
+        eprintln!(
+            "this wait's record could not be kept at {}: {error}",
+            path.display()
+        );
+    }
+}
+
 pub fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().expect("loopback")
 }
@@ -950,7 +977,7 @@ impl Companion {
     }
 
     /// What the connection control saw of the tries to a paired host since `since`, in words for a
-    /// wait that ran out: when each was asked for, against the wait's start.
+    /// wait that ran out or took long: when each was asked for, against the wait's start.
     pub fn tries_since(&self, since: std::time::Instant) -> String {
         self.control.as_ref().map_or_else(
             || "this phone's connections are not governed, so no try was recorded".to_owned(),
@@ -1625,8 +1652,9 @@ impl LinkControl {
     }
 
     /// When the connections asked for since `since` were asked for, with the last one before it,
-    /// each against `since`: a try that stalled shows as a long gap after it, and a try that never
-    /// came as no entry.
+    /// each against `since`. It records when a try began, not when it ended or what it came to: a
+    /// long gap between two entries is a slow try or a long delay, and the connection's own reason
+    /// says what the last try came to.
     pub fn tries_since(&self, since: std::time::Instant) -> String {
         let asked_at = self.asked_at.lock().expect("the record");
         let from = asked_at.iter().rposition(|at| *at < since).unwrap_or(0);

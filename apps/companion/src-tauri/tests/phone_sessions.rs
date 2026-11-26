@@ -72,7 +72,7 @@ async fn reconnected(companion: &Companion) {
 /// Waits until the phone's main connection is up, for at most `wait`.
 async fn connected_within(companion: &Companion, wait: Duration) {
     let began = Instant::now();
-    tokio::time::timeout(wait, async {
+    let outcome = tokio::time::timeout(wait, async {
         loop {
             let state = companion
                 .call("connection_state", json!({}))
@@ -83,13 +83,8 @@ async fn connected_within(companion: &Companion, wait: Duration) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the connection comes up within {wait:?}; {}",
-            companion.tries_since(began)
-        )
-    });
+    .await;
+    wait_ended("the connection comes up", companion, began, wait, outcome);
 }
 
 /// Calls a command that opens, leaves or reads about a session, as the page does.
@@ -3846,12 +3841,48 @@ fn connection_reason(companion: &Companion) -> (bool, Option<String>) {
     )
 }
 
+/// What the end of a wait for the main connection leaves behind. A wait that took longer than the
+/// ordinary watchdog, whether it came or ran out, writes one line to the run's evidence folder: how
+/// long it took, what the connection says of itself, and when the tries to the host were asked for.
+/// A wait that ran out fails with the same words.
+fn wait_ended<T>(
+    what: &str,
+    companion: &Companion,
+    began: Instant,
+    wait: Duration,
+    outcome: Result<T, tokio::time::error::Elapsed>,
+) -> T {
+    let took = began.elapsed();
+    let stood = |how: &str| {
+        let (up, reason) = connection_reason(companion);
+        format!(
+            "{what}: {how} after {took:.1?} of {wait:?}; the connection is {}{}; {}",
+            if up { "up" } else { "down" },
+            reason.map_or_else(String::new, |reason| format!(" and says: {reason}")),
+            companion.tries_since(began)
+        )
+    };
+    match outcome {
+        Ok(value) => {
+            if took > WATCHDOG {
+                support::keep_wait(&stood("came"));
+            }
+            value
+        }
+        Err(_) => {
+            let words = stood("ran out");
+            support::keep_wait(&words);
+            panic!("{words}")
+        }
+    }
+}
+
 /// Waits until the main connection is down with a reason that `holds`. It waits through two
-/// reconnect rounds: a try that stalls to its bound, and the next one, which tells the reason.
+/// reconnect rounds: a try that stalls at its bounds, and the next one, which tells the reason.
 async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bool) -> String {
     let wait = through_rounds(2);
     let began = Instant::now();
-    tokio::time::timeout(wait, async {
+    let outcome = tokio::time::timeout(wait, async {
         loop {
             if let (false, Some(reason)) = connection_reason(companion)
                 && holds(&reason)
@@ -3861,13 +3892,14 @@ async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bo
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the connection's reason is told within {wait:?}; {}",
-            companion.tries_since(began)
-        )
-    })
+    .await;
+    wait_ended(
+        "the connection's reason is told",
+        companion,
+        began,
+        wait,
+        outcome,
+    )
 }
 
 /// Waits until the page is told a standing of `opening` that `holds`, among those it was told after
