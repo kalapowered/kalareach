@@ -1160,3 +1160,90 @@ fn kr_req_11_26_the_start_file_names_are_the_launchs_own_list() {
         ])
     );
 }
+
+/// What a refused constant value is told, after the character that breaks the rule.
+const VALUE_RULE: &str =
+    "a value is {private_home} alone, or only letters, digits, '_', '.' and '-'";
+
+/// The example launch with one constant, `name` set to `value`.
+fn with_constant(name: &str, value: &str) -> Value {
+    let mut launch = declaration();
+    launch["constants"] = json!([{"name": name, "value": value}]);
+    manifest_with(&launch, &GRANTS)
+}
+
+/// KR-REQ-11.26: a constant's value is the host's private-home word alone, or only letters,
+/// digits, `_`, `.` and `-`: a path, an address, a command line, a space, a slash and a
+/// character outside ASCII are each refused, with the first character that breaks the rule.
+#[test]
+fn kr_req_11_26_a_constant_value_that_is_not_plain_is_refused() {
+    for (what, value, shown) in [
+        ("a path", "/etc/ssl/openssl.cnf", '/'),
+        ("a relative path", "conf/x.cnf", '/'),
+        ("an address", "https://index.example/simple", ':'),
+        ("a command line", "less -R", ' '),
+        ("a space", "a b", ' '),
+        ("a slash", "a/b", '/'),
+        ("a character outside ASCII", "caf\u{e9}", '\u{e9}'),
+    ] {
+        let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
+        let reason =
+            format!("constant: the value of \"EXAMPLE_VALUE\" holds '{shown}'; {VALUE_RULE}");
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "{what} ({value:?}) is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: a value of dots only names a place, not a word, and is refused in its own
+/// sentence.
+#[test]
+fn kr_req_11_26_a_constant_value_of_dots_only_is_refused() {
+    for value in [".", "..", "..."] {
+        let findings = findings_of(&with_constant("EXAMPLE_VALUE", value));
+        let reason = format!(
+            "constant: the value of \"EXAMPLE_VALUE\" is made only of dots, which name a place, \
+             not a word; {VALUE_RULE}"
+        );
+        assert!(
+            has(&findings, FindingCode::AcpLaunchInvalid, &reason),
+            "{value:?} is refused: {findings:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.26: every constant of the two real launches meets the value rule, and so do the
+/// private-home word alone and a value of every kind of character the rule allows.
+#[test]
+fn kr_req_11_26_the_constants_of_the_two_real_launches_pass_the_value_rule() {
+    let mut constants: Vec<Value> = Vec::new();
+    for fixture in ["acp-launch-gemini-cli.json", "acp-launch-qoder-cli.json"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let launch: Value =
+            serde_json::from_slice(&std::fs::read(path).expect("the fixture reads"))
+                .expect("a launch");
+        constants.extend(launch["constants"].as_array().expect("constants").clone());
+    }
+    constants.push(json!({"name": "EXAMPLE_PLAIN", "value": "Ab_1.2-c"}));
+    assert!(
+        constants
+            .iter()
+            .any(|constant| constant["value"] == "{private_home}"),
+        "the real launches set the private-home word: {constants:?}"
+    );
+    for constant in &constants {
+        let findings = findings_of(&with_constant(
+            constant["name"].as_str().expect("a name"),
+            constant["value"].as_str().expect("a value"),
+        ));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.detail.starts_with("constant: the value of")),
+            "{constant}: {findings:?}"
+        );
+    }
+}

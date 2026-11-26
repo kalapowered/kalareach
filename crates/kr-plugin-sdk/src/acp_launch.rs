@@ -26,9 +26,9 @@
 //!   [`LOADER_NAMES`]. Three data names of Node.js begin that way and may be
 //!   passed ([`DATA_NAMES`]). A constant is also none of [`COPIED_NAMES`], [`DATA_NAMES`] or
 //!   [`START_FILE_NAMES`].
-//! * A constant is a name and a value on one line. The one value that is not literal is
-//!   [`PRIVATE_HOME_PLACEHOLDER`], which stands alone as a whole value and which the host replaces
-//!   with the path of a folder it makes new and empty for each start.
+//! * A constant is a name and a value on one line. A value is [`PRIVATE_HOME_PLACEHOLDER`] alone,
+//!   which the host replaces with the path of a folder it makes new and empty for each start, or
+//!   only ASCII letters, digits, `_`, `.` and `-`, and not dots only.
 //! * The declaration has no argument member: the host passes [`AGENT_ARGUMENT`] and nothing else.
 
 use schemars::JsonSchema;
@@ -434,7 +434,8 @@ fn name_problem(name: &str, role: Role) -> Option<String> {
         })
 }
 
-/// Returns why a constant's value is not one a declaration may set, where it is not.
+/// Returns why a constant's value is not one a declaration may set, where it is not: a value is
+/// the private-home word alone, or only ASCII letters, digits, `_`, `.` and `-`.
 fn value_problem(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("is empty".to_owned());
@@ -457,7 +458,26 @@ fn value_problem(value: &str) -> Option<String> {
              whole value"
         ));
     }
-    None
+    if value == PRIVATE_HOME_PLACEHOLDER {
+        return None;
+    }
+    if value.chars().all(|c| c == '.') {
+        return Some(format!(
+            "is made only of dots, which name a place, not a word; {}",
+            value_rule()
+        ));
+    }
+    value
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+        .map(|character| format!("holds '{character}'; {}", value_rule()))
+}
+
+/// What a value may be, as a refused value is told.
+fn value_rule() -> String {
+    format!(
+        "a value is {PRIVATE_HOME_PLACEHOLDER} alone, or only letters, digits, '_', '.' and '-'"
+    )
 }
 
 /// Why a host does not start an agent in ACP mode, in the order the host checks.
