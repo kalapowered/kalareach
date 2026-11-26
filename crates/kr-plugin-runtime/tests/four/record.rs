@@ -724,6 +724,19 @@ async fn session(served: &Served, open: bool) -> Option<Session> {
             }),
         )
         .await;
+    // What the host has not written of a registration's notices when it is unbound stays unwritten,
+    // so the documents the record holds of the two registrations are read before either is unbound:
+    // the observation of the second event on the first, and the bind of the second.
+    for (registration, call, document) in [(7, "observe", 3), (8, "bind", 1)] {
+        raw.until(|notice| {
+            matches!(
+                notice,
+                Notice4::Document { registration: of, call: drew, document: number, .. }
+                    if *of == registration && drew == call && *number == document
+            )
+        })
+        .await;
+    }
     raw.unbind(&saved_from).await;
     raw.unbind(&moved_into).await;
     drop(raw);
