@@ -8,9 +8,17 @@
 //! bound the limits design states for it, and they do not look at a clock.
 //!
 //! The closure, the reduced record and the notification that replaces a frame are built here by
-//! hand, because the constructors that will build them are not in the tree yet; the figures are the
-//! design's allowances checked against the real encoding, and a constructor's own test holds them
-//! once it exists.
+//! hand, because the constructors that will build them are not in the tree yet; they are models of
+//! what those constructors will make, and their figures are the design's allowances checked against
+//! the real encoding, which a constructor's own test holds once it exists.
+//!
+//! Every input that a figure calls the widest is built from the limit of its type, by that limit's
+//! constant where the code has one ([`LINK_BYTES`], `kr_term::title::MAX_TITLE_BYTES`,
+//! `kr_term::title::MAX_DEPTH`, `kr_protocol::ids::MAX_OPAQUE_ID_LEN`, `MAX_UPSTREAM_REQUEST_ID_LEN`,
+//! `kr_protocol::error::MAX_ERROR_MESSAGE_LEN`, `kr_worker::service::MAX_OUTPUT_EVENT_BYTES`, the
+//! page's own [`PAGE_BYTES`] and [`PAGE_ITEMS`]), and each case says which. Every frame a case
+//! prints has passed the transport's own encoder at the compiled bound, with its collection, item,
+//! depth and string limits and not only its length.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -20,7 +28,7 @@ use kr_cbor::{Limits, encoded_len, to_canonical_value, to_canonical_vec_within};
 use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Response};
 use kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN;
 use kr_protocol::ids::{
-    ActorId, AgentBindingRevision, ApplicationInstanceId, AttachmentId, DiagnosticId,
+    ActorId, AgentBindingRevision, ApplicationInstanceId, AttachmentId, ConnectionId, DiagnosticId,
     EventSequence, EventType, GatewayConnectionId, InputLeaseEpoch, LaunchProfileId,
     PendingResourceId, PluginId, RequestId, SessionEpoch, SessionId, SourceGeneration, StreamId,
     UpstreamMethod, UpstreamRequestId,
@@ -28,10 +36,10 @@ use kr_protocol::ids::{
 use kr_protocol::projection::{
     AGENT_INSTANCE_EVENT, AGENT_RESOURCE_EVENT, AgentInstanceEvent, AgentInstanceList,
     AgentInstanceSummary, AgentResourceCause, AgentResourceContentClass, AgentResourceEvent,
-    AgentResourceSnapshot, PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
-    PROJECTION_SNAPSHOT_EVENT, PaletteOverride, ProjectedBuffer, ProjectedHyperlink, ProjectedRow,
-    ProjectionDelta, ProjectionEvent, ProjectionReset, ProjectionResetReason, ProjectionSnapshot,
-    SavedTitleEntry,
+    AgentResourceSnapshot, KittyKeyboardState, PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT,
+    PROJECTION_ROWS_EVENT, PROJECTION_SNAPSHOT_EVENT, PaletteOverride, ProjectedBuffer,
+    ProjectedHyperlink, ProjectedKeyboard, ProjectedRow, ProjectionEvent, ProjectionReset,
+    ProjectionResetReason, ProjectionSnapshot, SavedCursorState, SavedTitleEntry,
 };
 use kr_protocol::recovery::{
     AgentInstancesResult, EventsSubscribeResult, HistoryGap, HistoryGapCause, OutputEvent,
@@ -44,8 +52,8 @@ use kr_protocol::session::{
     SESSION_CLOSED_EVENT, SessionCloseResult, SessionState, SessionSummary, ShellMode,
     SurvivingResource,
 };
-use kr_worker::output::{OutputDelivery, RESYNC_MARKER_BYTES};
-use kr_worker::snapshot::{Outgoing, PAGE_BYTES, PAGE_ITEMS, install, wire};
+use kr_worker::output::{OutputDelivery, OutputHub, Presentation, RESYNC_MARKER_BYTES};
+use kr_worker::snapshot::{Outgoing, Owed, PAGE_BYTES, PAGE_ITEMS, advance, install, wire};
 use serde::Serialize;
 
 use super::super::device_errors::{fits, frame_for_a_device};
@@ -85,20 +93,32 @@ const AGENT_INSTANCE_BOUND: usize = 2_048;
 /// What the design's census estimated for an agent resource event, whole. The measurement is
 /// larger, and the figures below are what it found.
 const AGENT_RESOURCE_ESTIMATE: usize = 2_200;
-/// The payload of the widest agent resource event the type allows.
+/// The payload of the widest agent resource event the type allows. An exact pin: when the event's
+/// type changes and this moves, read the design's row for the event and the floor it is held
+/// against, then change the figure and the row together.
 const AGENT_RESOURCE_PAYLOAD: usize = 2_147;
-/// The complete frame of the widest agent resource event the type allows.
+/// The complete frame of the widest agent resource event the type allows. An exact pin, as above.
 const AGENT_RESOURCE_FRAME: usize = 2_247;
 /// What the design derives for the longest causal root: 20 digits, a colon and the longest upstream
-/// identifier.
+/// identifier. An exact pin: when the identifier's bound moves, change this with the design.
 const CAUSAL_ROOT_BOUND: usize = 1_559;
 /// What the input stream's floor of 1,024 bytes leaves for a message, its length prefix out.
 const INPUT_PAYLOAD_FLOOR: usize = 1_024 - FRAME_LENGTH_PREFIX_LEN;
 
 /// What the worker's send queue charges for a closure notice today: nothing, by the `Closed` arm of
-/// `OutputDelivery::len`. A notice is built only inside the worker's hub, so the figure is read from
-/// that arm and not measured here; the design charges the notice's encoding to the reserve instead.
+/// `OutputDelivery::len`. The sources case compares it with the charge of a real closed delivery that
+/// a hub makes; when that case fails, the arm has changed and the design's reserve must change with
+/// it.
 const CLOSED_NOTICE_CHARGE: usize = 0;
+/// The bound of a hyperlink, its target and its parameters together, as the engine's own budget
+/// holds it.
+const LINK_BYTES: usize = kr_term::budget::BudgetLimits::DEFAULT.link_bytes;
+/// The depth of one buffer's keyboard flag stack. The engine keeps it in a private constant
+/// (`KITTY_STACK_DEPTH` of its modes module) and cuts a longer stack to it.
+const KEYBOARD_STACK_DEPTH: usize = 16;
+/// The length of a path in a session summary, which no limit in the code holds: the figure is an
+/// assumption, not a bound (a Windows path can be about 32,767 UTF-16 units).
+const PATH_ASSUMED: usize = 4_096;
 
 /// The size of `payload` as the codec encodes it, which is what a stream charges before its frame.
 fn payload_len(payload: &impl Serialize) -> usize {
@@ -134,6 +154,11 @@ fn answer(payload: &impl Serialize) -> ControlFrame {
 }
 
 /// The candidate whose encoding is the longest.
+///
+/// A candidate list is the type's own list of its variants (`ALL`) where the type has one. For
+/// `ResyncReason`, `EditorBusyReason`, `HistoryGapCause`, `AgentResourceContentClass`,
+/// `AgentResourceCause`, `CommandBypassReason` and `ClosureReason` the type has none, so those lists
+/// are written by hand and a variant added later is not seen here.
 fn widest<T: Serialize>(candidates: Vec<T>) -> T {
     candidates
         .into_iter()
@@ -141,8 +166,42 @@ fn widest<T: Serialize>(candidates: Vec<T>) -> T {
         .expect("a candidate")
 }
 
-/// One line of a case's table: the three figures of a frame, and where it came from.
-fn line(name: &str, payload: usize, frame: &ControlFrame, charge: Option<usize>) -> String {
+/// The limits the transport's encoder holds a frame to at the compiled bound: the message length and
+/// the collection, item, depth and string limits.
+fn encoder_limits() -> Limits {
+    Limits::DEFAULT.with_max_message_len(COMPILED - FRAME_LENGTH_PREFIX_LEN)
+}
+
+/// Whether the transport's encoder writes `frame` at the compiled bound.
+fn encoder_accepts(frame: &ControlFrame) -> bool {
+    to_canonical_vec_within(frame, &encoder_limits()).is_ok()
+}
+
+/// The size of the payload `frame` carries as the codec encodes it: a notification's payload, a
+/// result, or an error.
+fn payload_of(frame: &ControlFrame) -> usize {
+    match frame {
+        ControlFrame::Notification(notification) => encoded_len(notification.payload.as_value()),
+        ControlFrame::Response(Response {
+            outcome: Outcome::Ok(result),
+            ..
+        }) => encoded_len(result.as_value()),
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => payload_len(error),
+        _ => panic!("a case prints only notifications and responses"),
+    }
+}
+
+/// One line of a case's table: the three figures of a frame, and where it came from. The payload is
+/// the payload of the very frame printed, and the frame must pass the transport's encoder.
+fn line(name: &str, frame: &ControlFrame, charge: Option<usize>) -> String {
+    assert!(
+        encoder_accepts(frame),
+        "{name}: the transport's encoder refuses this frame at the compiled bound"
+    );
+    let payload = payload_of(frame);
     let complete = frame_len(frame);
     let charge = charge.map_or_else(|| "n/a".to_owned(), |charge| charge.to_string());
     format!(
@@ -161,6 +220,8 @@ struct Measured {
     payload: usize,
     /// What the worker's send queue charges for it, where it charges anything.
     charge: Option<usize>,
+    /// How many values its payload counts against the codec's item limit.
+    items: usize,
 }
 
 impl Measured {
@@ -175,6 +236,7 @@ impl Measured {
             frame: notice(name, payload),
             payload: size,
             charge: charge(size),
+            items: wire::measure(payload).map_or(0, |cost| cost.items),
         }
     }
 }
@@ -208,13 +270,7 @@ fn editor_busy() -> EditorBusyEvent {
             EditorBusyReason::LaunchReservationTimedOut,
         ]),
         released_input_bytes: U64::new(u64::MAX),
-        state: widest(vec![
-            FenceState::Outside,
-            FenceState::Unfenced,
-            FenceState::Fenced,
-            FenceState::LaunchReserved,
-            FenceState::Closing,
-        ]),
+        state: widest(FenceState::ALL.to_vec()),
     }
 }
 
@@ -270,17 +326,53 @@ fn reset() -> ProjectionReset {
 /// An agent instance with every member at its widest: both identifiers at their protocol bound,
 /// and the refusal at the 512 bytes the worker cuts it to.
 fn instance(refusal: usize) -> AgentInstanceSummary {
+    instance_with(Some("r".repeat(refusal)))
+}
+
+/// A live instance, one the session still holds: it has not ended, because the list of live
+/// instances leaves an ended one out.
+fn live_instance(refusal: Option<String>) -> AgentInstanceSummary {
+    let mut one = instance_with(refusal);
+    one.ended_at = Nullable::null();
+    one
+}
+
+/// The refusal text, of the 512 bytes the worker cuts it to, that the door shows longest. The door
+/// replaces a command in backticks by a fixed phrase and a text that names the host by a clause and
+/// a reason, so a text can be longer once shown; the candidates here are the plain text and texts of
+/// short quotations, and the door's own function picks the longest.
+fn longest_refusal_shown() -> String {
+    const CUT: usize = 512;
+    let shown_len = |text: &str| {
+        frame_len(&shown(&notice(
+            AGENT_INSTANCE_EVENT,
+            &instance_event_of(instance_with(Some(text.to_owned()))),
+        )))
+    };
+    let mut best = "r".repeat(CUT);
+    for quoted in ["``", "`x`", "`ls`", "`a command`"] {
+        for count in 1..=CUT / quoted.len() {
+            let text = format!(
+                "{}{}",
+                quoted.repeat(count),
+                "r".repeat(CUT - count * quoted.len())
+            );
+            if shown_len(&text) > shown_len(&best) {
+                best = text;
+            }
+        }
+    }
+    best
+}
+
+fn instance_with(refusal: Option<String>) -> AgentInstanceSummary {
     AgentInstanceSummary {
         application_instance_id: ApplicationInstanceId::new(kr_ipc::new_uuid()),
         plugin_id: Nullable::some(PluginId::new("p".repeat(256)).expect("a plugin identifier")),
         profile_id: Nullable::some(
             LaunchProfileId::new("l".repeat(256)).expect("a launch profile identifier"),
         ),
-        mode: widest(vec![
-            kr_protocol::broker::IntegrationMode::NativeTerminal,
-            kr_protocol::broker::IntegrationMode::Gateway,
-            kr_protocol::broker::IntegrationMode::NativeBridge,
-        ]),
+        mode: widest(kr_protocol::broker::IntegrationMode::ALL.to_vec()),
         bypass: Nullable::some(widest(vec![
             kr_protocol::root::CommandBypassReason::NotIntegrated,
             kr_protocol::root::CommandBypassReason::Disabled,
@@ -293,15 +385,19 @@ fn instance(refusal: usize) -> AgentInstanceSummary {
         ])),
         started_at: TimestampMs::new(u64::MAX),
         ended_at: Nullable::some(TimestampMs::new(u64::MAX)),
-        refusal: Nullable::some("r".repeat(refusal)),
+        refusal: refusal.map_or_else(Nullable::null, Nullable::some),
     }
 }
 
 fn instance_event(refusal: usize) -> AgentInstanceEvent {
+    instance_event_of(instance(refusal))
+}
+
+fn instance_event_of(instance: AgentInstanceSummary) -> AgentInstanceEvent {
     AgentInstanceEvent {
         session_id: session_id(),
         sequence: U64::new(u64::MAX),
-        instance: instance(refusal),
+        instance,
     }
 }
 
@@ -336,14 +432,7 @@ fn resource_event() -> AgentResourceEvent {
         session_id: session_id(),
         application_instance_id: ApplicationInstanceId::new(kr_ipc::new_uuid()),
         resource_id: PendingResourceId::new(kr_ipc::new_uuid()),
-        state: widest(vec![
-            kr_protocol::gateway::PendingState::Pending,
-            kr_protocol::gateway::PendingState::Claimed,
-            kr_protocol::gateway::PendingState::Resolved,
-            kr_protocol::gateway::PendingState::Cancelled,
-            kr_protocol::gateway::PendingState::Expired,
-            kr_protocol::gateway::PendingState::Uncertain,
-        ]),
+        state: widest(kr_protocol::gateway::PendingState::ALL.to_vec()),
         content: widest(vec![
             AgentResourceContentClass::Metadata,
             AgentResourceContentClass::TerminalContent,
@@ -383,11 +472,7 @@ fn pending_resource() -> kr_protocol::gateway::PendingResource {
         resource_id: PendingResourceId::new(kr_ipc::new_uuid()),
         application_instance_id: ApplicationInstanceId::new(kr_ipc::new_uuid()),
         request: DownstreamRequestId::new(GatewayConnectionId::new(u64::MAX), widest_upstream_id()),
-        kind: widest(vec![
-            PendingKind::Approval,
-            PendingKind::ReverseRpc,
-            PendingKind::UpstreamAction,
-        ]),
+        kind: widest(PendingKind::ALL.to_vec()),
         method: UpstreamMethod::new("m".repeat(256)).expect("a method"),
         classification: NativeClassification {
             class: NativeMethodClass::CredentialOrConfiguration,
@@ -420,7 +505,19 @@ fn closure(survivors: usize, detail: &str, note: usize, signal: usize) -> Closur
     ClosureRecord {
         session_id: session_id(),
         session_epoch: SessionEpoch::V1,
-        reason: ClosureReason::RootSignal,
+        // The type has no list of its variants, so a variant added later is not seen here.
+        reason: [
+            ClosureReason::CloseRequested,
+            ClosureReason::RootExit,
+            ClosureReason::RootSignal,
+            ClosureReason::RootLaunchFailed,
+            ClosureReason::WorkerCrash,
+            ClosureReason::DesktopLost,
+            ClosureReason::HostShutdown,
+        ]
+        .into_iter()
+        .max_by_key(|reason| reason.as_str().len())
+        .expect("a reason"),
         root_exit_code: Nullable::some(U64::new(u64::MAX)),
         root_signal: if signal == 0 {
             Nullable::null()
@@ -435,7 +532,8 @@ fn closure(survivors: usize, detail: &str, note: usize, signal: usize) -> Closur
     }
 }
 
-/// A session summary as a worker answers it, with the two paths at the 4,096 bytes of a path.
+/// A session summary as a worker answers it, with the two paths at [`PATH_ASSUMED`], a length no
+/// limit in the code holds.
 fn summary(closure: Option<ClosureRecord>) -> SessionSummary {
     SessionSummary {
         session_id: session_id(),
@@ -444,8 +542,8 @@ fn summary(closure: Option<ClosureRecord>) -> SessionSummary {
         display_number: DisplayNumber::new(u64::MAX),
         state: SessionState::Closed,
         shell_mode: ShellMode::NativeCompat,
-        shell_path: "s".repeat(4_096),
-        cwd: "c".repeat(4_096),
+        shell_path: "s".repeat(PATH_ASSUMED),
+        cwd: "c".repeat(PATH_ASSUMED),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         desktop: kr_protocol::identity::DesktopBinding::none(),
         created_at_ms: TimestampMs::new(u64::MAX),
@@ -549,44 +647,139 @@ fn crowded_script(cols: u32) -> Vec<u8> {
     ] {
         write!(script, "\x1b[?{mode}h").expect("a string takes a write");
     }
-    write!(script, "\x1b]8;;h://{}\x07", "u".repeat(2_000)).expect("a string takes a write");
+    script.push_str("\x1b[38;2;1;2;3;48;2;4;5;6;58;2;7;8;9;1;3;4m");
+    write!(
+        script,
+        "\x1b]8;;h://{}\x07",
+        "u".repeat(LINK_BYTES - "h://".len())
+    )
+    .expect("a string takes a write");
     script.into_bytes()
+}
+
+/// One cell with every colour set, so that it is a run of its own.
+fn styled_cell(cell: u32) -> String {
+    format!(
+        "\x1b[38;2;{};{};{};48;2;{};{};{};58;2;{};{};{};1;3;4mx",
+        cell % 251,
+        (cell / 3) % 251,
+        (cell / 7) % 251,
+        (cell + 1) % 251,
+        (cell / 5) % 251,
+        (cell / 11) % 251,
+        (cell + 2) % 251,
+        (cell / 13) % 251,
+        (cell / 17) % 251,
+    )
 }
 
 /// A script that writes `cells` cells, each with every colour set so that it is a run of its own.
 fn styled_cells(cells: u32) -> Vec<u8> {
-    let mut script = String::new();
-    for cell in 0..cells {
-        write!(
-            script,
-            "\x1b[38;2;{};{};{};48;2;{};{};{};58;2;{};{};{};1;3;4mx",
-            cell % 251,
-            (cell / 3) % 251,
-            (cell / 7) % 251,
-            (cell + 1) % 251,
-            (cell / 5) % 251,
-            (cell / 11) % 251,
-            (cell + 2) % 251,
-            (cell / 13) % 251,
-            (cell / 17) % 251,
-        )
-        .expect("a string takes a write");
-    }
-    script.into_bytes()
+    (0..cells).map(styled_cell).collect::<String>().into_bytes()
 }
 
-/// A script that fills `rows` rows with `cols` styled cells each, every cell a run of its own. The
-/// engine holds at most 262,144 cells, so a screen cannot fill a page of the compiled bound with
-/// text; a row of runs fills a page to its value limit instead, which is the widest page there is.
+/// The target of one of two hyperlinks, each of [`LINK_BYTES`] bytes.
+fn link_target(which: u32) -> String {
+    let mut target = String::from("h://");
+    target.push(if which.is_multiple_of(2) { 'a' } else { 'b' });
+    target.push_str(&"u".repeat(LINK_BYTES - target.len()));
+    target
+}
+
+/// A script that writes `cells` styled cells, each under a hyperlink of [`LINK_BYTES`] bytes. The
+/// link alternates from one cell to the next, so every cell is a run of its own, and a run carries
+/// its own copy of its link.
+fn linked_cells(cells: u32) -> Vec<u8> {
+    let targets = [link_target(0), link_target(1)];
+    (0..cells)
+        .map(|cell| {
+            format!(
+                "\x1b]8;;{}\x07{}",
+                targets[usize::from(cell % 2 == 1)],
+                styled_cell(cell)
+            )
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// A script that fills `rows` rows with `cols` linked cells each, every cell a run of its own. The
+/// engine holds at most 262,144 cells, so a screen cannot fill a page with text; a row of runs that
+/// each carry a link of the largest size fills a page to its byte bound instead.
 fn packed_script(cols: u32, rows: u32) -> Vec<u8> {
     let mut script = Vec::new();
     for row in 0..rows {
         if row > 0 {
             script.extend_from_slice(b"\r\n");
         }
-        script.extend_from_slice(&styled_cells(cols));
+        script.extend_from_slice(&linked_cells(cols));
     }
     script
+}
+
+/// The widest delta the worker's own builder makes: the engine's delta of a screen that changed
+/// every table a header carries and `cells` linked cells since a snapshot, passed through `advance`.
+/// `None` when the change is too large for one update and the builder asks for a snapshot instead.
+fn product_delta(cells: u32) -> Option<Outgoing> {
+    use kr_term::budget::GridSize;
+    use kr_term::engine::{Engine, EngineConfig};
+    use kr_term::snapshot::{ActiveBuffer, Viewport};
+
+    let cols = 2_048;
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize { cols, rows: 24 },
+        ..EngineConfig::DEFAULT
+    })
+    .expect("an engine");
+    let window = Viewport {
+        top_row: 0,
+        rows: 24,
+        left_col: 0,
+        cols,
+    };
+    let (base, _) = engine.snapshot(window, 0);
+    engine.feed(&crowded_script(cols), 0);
+    engine.feed(&linked_cells(cells), 0);
+    let delta = engine
+        .delta(base.output_cursor, base.projection_generation)
+        .expect("the base is inside the window");
+    match advance(
+        &delta,
+        ActiveBuffer::Primary,
+        window,
+        window.top_row,
+        0,
+        true,
+        true,
+        kr_worker::render::Scope::WholeScreen,
+        Some(window),
+    )
+    .expect("an answer")
+    {
+        Owed::Update(update) => update
+            .events
+            .into_iter()
+            .find(|outgoing| matches!(outgoing.event, ProjectionEvent::Delta(_))),
+        _ => None,
+    }
+}
+
+/// The widest delta the builder sends as an update: the most linked cells a change can carry before
+/// the builder asks for a snapshot. The cost of the message grows with the cells and stops at the
+/// row's cut, so the search takes the largest count that is still an update.
+fn widest_product_delta() -> Outgoing {
+    let (mut low, mut high) = (1_u32, 2_048_u32);
+    let mut widest = product_delta(low).expect("a delta of one cell and the tables is an update");
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if let Some(outgoing) = product_delta(middle) {
+            widest = outgoing;
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    widest
 }
 
 /// What the worker's send queue charges for a projection event: the encoded size of the payload it
@@ -611,9 +804,10 @@ fn projection_charge(event: &ProjectionEvent) -> usize {
 fn widest_events() -> Vec<Measured> {
     let events = installed(2_048, 24, &crowded_script(2_048));
     let header = header_of(&events);
-    // The pages of a screen of three rows of styled cells, the widest of which is the widest page: a
-    // row of runs reaches the limit of values on a page before the limit of bytes. The first page
-    // of an installation is the buffer that is not showing, and it is empty.
+    // The pages of a screen of three rows of linked cells, the widest of which is the widest page: a
+    // run carries its own copy of its link, so a page of runs that each hold a link of the largest
+    // size reaches the byte bound of a page before the limit of its values. The first page of an
+    // installation is the buffer that is not showing, and it is empty.
     let packed = installed(2_048, 3, &packed_script(2_048, 3));
     let page = widest(
         packed
@@ -624,38 +818,24 @@ fn widest_events() -> Vec<Measured> {
             })
             .collect(),
     );
-    let delta = ProjectionDelta {
-        base_cursor: U64::new(u64::MAX),
-        next_cursor: U64::new(u64::MAX),
-        projection_generation: U64::new(u64::MAX),
-        buffer: ProjectedBuffer::Primary,
-        viewport: header.viewport,
-        rows: page.rows.iter().take(4).cloned().collect(),
-        cursor: header.cursor,
-        modes: header.modes.clone(),
-        margins: Nullable::some(header.margins),
-        rendition: Nullable::some(header.rendition),
-        tab_stops: Nullable::some(header.tab_stops.clone()),
-        charsets: Nullable::some(header.charsets.clone()),
-        hyperlinks: Vec::new(),
-        hyperlink: Nullable::null(),
-        title: Nullable::some(header.title.clone()),
-        title_stack: Nullable::some(header.title_stack.clone()),
-        keyboard: Nullable::some(header.keyboard.clone()),
-        palette: Nullable::some(header.palette.clone()),
-        dimensions: Nullable::some(header.dimensions),
-        saved_cursors: Nullable::some(header.saved_cursors.clone()),
-        oldest_retained_row: U64::new(u64::MAX),
-        evicted: true,
-        degraded: true,
+    // The widest delta is the one the worker's own builder makes, not one built by hand: a delta
+    // that carries more than a page of values is a snapshot's work and is never sent.
+    let delta_outgoing = widest_product_delta();
+    let ProjectionEvent::Delta(delta) = &delta_outgoing.event else {
+        unreachable!("the builder's update carries a delta");
     };
+    let delta = delta.as_ref().clone();
     let output = OutputEvent {
         cursor: U64::new(u64::MAX),
         bytes: Bytes::new(vec![0xa5; kr_worker::service::MAX_OUTPUT_EVENT_BYTES]),
     };
     // The worker's own charge for the events of an installation is the figure to hold the
     // measurement to: the same payload measured here must be what the worker recorded.
-    for outgoing in events.iter().chain(&packed) {
+    for outgoing in events
+        .iter()
+        .chain(&packed)
+        .chain(std::iter::once(&delta_outgoing))
+    {
         assert_eq!(
             projection_charge(&outgoing.event),
             outgoing.bytes,
@@ -787,14 +967,69 @@ fn median_ns(runs: usize, mut work: impl FnMut()) -> u128 {
     samples[samples.len() / 2]
 }
 
-/// What the guard's extra test costs a device-bound frame, and that the guard and the transport's
-/// writer count one unit.
+/// That the guard and the transport's writer count one unit, and what the guard accepts.
 ///
-/// The times are recorded and carry no assertion. The assertions hold what does not depend on a
-/// clock: the guard's length is the writer's, the compiled-bound frame is what it says, and a frame
-/// of 4,097 members passes today's check and fails the encoder's own.
+/// The guard is the encoder's own test of a frame: its length and its collection, item, depth and
+/// string limits. The assertions hold what does not depend on a clock: the guard's length is the
+/// writer's, the compiled-bound frame is what it says, and a frame of 4,097 members passes today's
+/// check and fails the encoder's own. What the test costs is the ignored case below.
 #[test]
-fn the_guards_extra_cost_is_recorded_and_its_unit_is_the_encoders() {
+fn the_guards_unit_is_the_encoders() {
+    let bound = COMPILED - FRAME_LENGTH_PREFIX_LEN;
+    let limits = Limits::DEFAULT.with_max_message_len(bound);
+    let widest_frame = output_frame_of(bound);
+    let many = members_frame(4_096);
+    let small = notice("session.resync", &marker());
+
+    for (name, frame) in [
+        ("a frame of the compiled bound", &widest_frame),
+        ("a frame of 4,096 members", &many),
+        ("a small frame", &small),
+    ] {
+        let value = to_canonical_value(frame).expect("a frame converts");
+        let guard_accepts = value.check_limits(&limits).is_ok() && encoded_len(&value) <= bound;
+        let written = to_canonical_vec_within(frame, &limits).expect("the transport encodes it");
+        assert!(guard_accepts, "{name}: the guard's test accepts it");
+        assert_eq!(
+            encoded_len(&value),
+            written.len(),
+            "{name}: the guard counts what the transport writes"
+        );
+        assert!(fits(frame, bound), "{name}: today's check accepts it");
+    }
+
+    // The compiled-bound frame is the compiled bound, prefix excluded.
+    assert_eq!(frame_len(&widest_frame), bound);
+    // Four thousand and ninety-seven members: today's check passes it and the encoder refuses it.
+    let over = members_frame(4_097);
+    let over_value = to_canonical_value(&over).expect("converts");
+    assert!(
+        over_value.check_limits(&limits).is_err(),
+        "the encoder's own check refuses 4,097 members"
+    );
+    assert!(
+        to_canonical_vec_within(&over, &limits).is_err(),
+        "the transport's writer refuses 4,097 members"
+    );
+    // This holds today's fault: the check the door makes of a rewritten frame passes the 4,097
+    // members that the writer refuses. The change that adds the encoder's own test to that check
+    // turns this assertion red, and replaces it with one that the check refuses them.
+    assert!(
+        fits(&over, bound),
+        "today's check passes the 4,097 members the writer refuses"
+    );
+}
+
+/// What the guard's extra test costs a device-bound frame, by a clock. It asserts nothing, so it is
+/// not part of an ordinary run: run it by name in a release build, with `--ignored --nocapture`.
+///
+/// Today's check runs only on a frame the door's rewrite changed; for an unchanged frame the door
+/// makes no check at all, so the whole of the guard's test is new cost there. The line of each frame
+/// gives the guard's test whole, the encoder's limit test alone, the transport's own encode of the
+/// frame, and the first as a share of the last.
+#[test]
+#[ignore = "a timing run: run it by name in a release build with --ignored --nocapture"]
+fn the_guards_cost_is_recorded() {
     let bound = COMPILED - FRAME_LENGTH_PREFIX_LEN;
     let limits = Limits::DEFAULT.with_max_message_len(bound);
     let widest_frame = output_frame_of(bound);
@@ -813,15 +1048,7 @@ fn the_guards_extra_cost_is_recorded_and_its_unit_is_the_encoders() {
         ("a small frame", &small),
     ] {
         let value = to_canonical_value(frame).expect("a frame converts");
-        let guard_accepts = value.check_limits(&limits).is_ok() && encoded_len(&value) <= bound;
         let written = to_canonical_vec_within(frame, &limits).expect("the transport encodes it");
-        assert!(guard_accepts, "{name}: the guard's test accepts it");
-        assert_eq!(
-            encoded_len(&value),
-            written.len(),
-            "{name}: the guard counts what the transport writes"
-        );
-        assert!(fits(frame, bound), "{name}: today's check accepts it");
 
         let runs = match written.len() {
             0..=10_000 => 20_001,
@@ -843,30 +1070,13 @@ fn the_guards_extra_cost_is_recorded_and_its_unit_is_the_encoders() {
         });
         writeln!(
             table,
-            "MEASURE | {name} | frame {} | today's check {today} ns | guard's test {guarded} ns | check_limits alone {check_alone} ns | the transport's encode {transport} ns | runs {runs}",
-            written.len()
+            "MEASURE | {name} | frame {} | today's check, on a frame the door changed {today} ns | guard's test whole, all new cost on an unchanged frame {guarded} ns | check_limits alone {check_alone} ns | the transport's encode {transport} ns | the guard is {}% of the encode | runs {runs}",
+            written.len(),
+            guarded * 100 / transport.max(1)
         )
         .expect("a string takes a write");
     }
     println!("{table}");
-
-    // The compiled-bound frame is the compiled bound, prefix excluded.
-    assert_eq!(frame_len(&widest_frame), bound);
-    // Four thousand and ninety-seven members: today's check passes it and the encoder refuses it.
-    let over = members_frame(4_097);
-    let over_value = to_canonical_value(&over).expect("converts");
-    assert!(
-        over_value.check_limits(&limits).is_err(),
-        "the encoder's own check refuses 4,097 members"
-    );
-    assert!(
-        to_canonical_vec_within(&over, &limits).is_err(),
-        "the transport's writer refuses 4,097 members"
-    );
-    assert!(
-        fits(&over, bound),
-        "today's check passes the 4,097 members the writer refuses"
-    );
 }
 
 /// What a device is shown of the frames a worker cuts to its bound, against what the worker built.
@@ -894,10 +1104,14 @@ fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it(
         let after = frame_len(&shown(&measured.frame));
         let growth = signed_difference(after, before);
         overhead_max = overhead_max.max(growth);
+        assert!(
+            encoder_accepts(&shown(&measured.frame)),
+            "{name}: the transport's encoder accepts the frame at the compiled bound"
+        );
         writeln!(
             table,
             "MEASURE | {name} | payload {} | frame before {before} | frame after {after} | growth {growth} | queue charge {}",
-            measured.payload,
+            payload_of(&shown(&measured.frame)),
             measured
                 .charge
                 .map_or_else(|| "n/a".to_owned(), |charge| charge.to_string())
@@ -926,9 +1140,10 @@ fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it(
         .find(|measured| measured.name == PROJECTION_ROWS_EVENT)
         .expect("a page is measured");
     let page_frame = frame_len(&shown(&page.frame));
+    let page_items = page.items;
     writeln!(
         table,
-        "MEASURE | the widest page: payload {} | PAGE_BYTES {PAGE_BYTES} | frame {page_frame} | the compiled frame without its prefix {}",
+        "MEASURE | the widest page: payload {} | values {page_items} of PAGE_ITEMS {PAGE_ITEMS} | PAGE_BYTES {PAGE_BYTES} | frame {page_frame} | the compiled frame without its prefix {}",
         page.payload,
         COMPILED - FRAME_LENGTH_PREFIX_LEN
     )
@@ -936,10 +1151,16 @@ fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it(
     println!("{table}");
 
     // A full page, the most the worker builds, is whole in the compiled frame once the notification
-    // around it is added.
+    // around it is added. A run carries its own copy of its link, so a page of runs that each hold a
+    // link of the largest size is cut by the page's byte bound within a few runs of it.
     assert!(
         page.payload <= PAGE_BYTES,
         "a page is at most {PAGE_BYTES} bytes of payload, found {}",
+        page.payload
+    );
+    assert!(
+        page.payload + 4 * LINK_BYTES > PAGE_BYTES,
+        "a page of linked runs reaches the page's byte bound, found {} of {PAGE_BYTES}",
         page.payload
     );
     assert!(
@@ -980,12 +1201,7 @@ fn the_small_records_and_the_reserve_they_make() {
     let mut table = String::from("MEASURE | the small records\n");
     for record in &records {
         let frame = frame_len(&shown(&record.frame));
-        table.push_str(&line(
-            record.name,
-            record.payload,
-            &shown(&record.frame),
-            record.charge,
-        ));
+        table.push_str(&line(record.name, &shown(&record.frame), record.charge));
         assert!(
             frame < 512,
             "{}: the complete frame is under 512 bytes, found {frame}",
@@ -997,7 +1213,6 @@ fn the_small_records_and_the_reserve_they_make() {
     let produced_frame = frame_len(&shown(&notice("session.detached", &produced)));
     table.push_str(&line(
         "session.detached, as the worker's one producer writes it",
-        produced_payload,
         &shown(&notice("session.detached", &produced)),
         Some(OutputDelivery::Detached.len()),
     ));
@@ -1014,13 +1229,16 @@ fn the_small_records_and_the_reserve_they_make() {
     // The same reserve with the detach notification as the one producer writes it.
     let produced_reserve =
         reserve_of(busy.payload, produced_payload).max(reserve_of(busy_frame, produced_frame));
+    // The same reserve with every record at its complete frame and none at a charge. The marker's
+    // queue charge is a constant that is not its frame, so the design's formula above mixes units.
+    let frames_only = 2 * (marker_frame + busy_frame + detach_frame);
     let usable = QUEUE_FLOOR
         .checked_sub(CLOSURE_ROOM + reserve_small)
         .expect("the reserve is smaller than the queue the floor allows");
     let margin = signed_difference(usable, PAGE_BYTES);
     writeln!(
         table,
-        "MEASURE | RESERVE_SMALL, detach with every member the type has: by payloads {by_payload} | by frames {by_frame} | taken {reserve_small} | against the allowance {RESERVE_SMALL_BOUND}: {} | against the trigger {STOP_LINE}: {}",
+        "MEASURE | RESERVE_SMALL, detach with every member the type has: by payloads {by_payload} | by frames with the marker at its charge of {RESYNC_MARKER_BYTES} {by_frame} | by complete frames only {frames_only} | taken {reserve_small} | against the allowance {RESERVE_SMALL_BOUND}: {} | against the trigger {STOP_LINE}: {}",
         signed_difference(reserve_small, RESERVE_SMALL_BOUND),
         signed_difference(reserve_small, STOP_LINE)
     )
@@ -1071,15 +1289,29 @@ fn the_small_records_and_the_reserve_they_make() {
         reserve_small <= STOP_LINE,
         "the three small records cost at most the trigger of {STOP_LINE}, found {reserve_small}"
     );
+    assert!(
+        frames_only <= STOP_LINE,
+        "the three small records, each at its complete frame, cost at most the trigger of {STOP_LINE}, found {frames_only}"
+    );
 }
 
 /// The widest projection header and row, from a real screen driven to fill every table a header
 /// carries, and from the header with each table stuffed to its bound.
+///
+/// The stuffed header is built from the limits of the engine's tables: ten title pairs of
+/// `kr_term::title::MAX_TITLE_BYTES` and `MAX_DEPTH`, a tab stop in each of 2,048 columns, a
+/// palette override for each of 256 indices, three hyperlinks of [`LINK_BYTES`] (the open link and
+/// the link of each buffer's saved cursor), a saved cursor for each buffer, and a flag stack of
+/// [`KEYBOARD_STACK_DEPTH`] for each buffer's keyboard.
 #[test]
 fn the_widest_projection_header_and_row() {
     let cols = 2_048;
     let events = installed(cols, 24, &crowded_script(cols));
     let driven = header_of(&events);
+    let link = ProjectedHyperlink {
+        uri: "u".repeat(LINK_BYTES),
+        params: String::new(),
+    };
     let mut stuffed = driven.clone();
     stuffed.title_stack = (0..kr_term::title::MAX_DEPTH)
         .map(|depth| SavedTitleEntry {
@@ -1100,15 +1332,37 @@ fn the_widest_projection_header_and_row() {
             colour: stuffed.palette.foreground,
         })
         .collect();
-    stuffed.hyperlink = Nullable::some(ProjectedHyperlink {
-        uri: "u".repeat(2_048),
-        params: String::new(),
-    });
+    stuffed.hyperlink = Nullable::some(link.clone());
+    let saved = |buffer: ProjectedBuffer| SavedCursorState {
+        buffer,
+        column: U64::new(u64::MAX),
+        row: U64::new(u64::MAX),
+        pending_wrap: true,
+        rendition: stuffed.rendition,
+        charsets: stuffed.charsets.clone(),
+        origin_mode: true,
+        style: U64::new(u64::MAX),
+        hyperlink: Nullable::some(link.clone()),
+    };
+    stuffed.saved_cursors = vec![
+        saved(ProjectedBuffer::Primary),
+        saved(ProjectedBuffer::Alternate),
+    ];
+    let flags = KittyKeyboardState {
+        flags: Nullable::some(U64::new(u64::MAX)),
+        stack: vec![U64::new(u64::MAX); KEYBOARD_STACK_DEPTH],
+    };
+    stuffed.keyboard = ProjectedKeyboard {
+        modify_other_keys: U64::new(u64::MAX),
+        primary: flags.clone(),
+        alternate: flags,
+    };
     let mut bare = stuffed.clone();
     bare.title_stack = Vec::new();
     bare.tab_stops = Vec::new();
     bare.palette.overrides = Vec::new();
     bare.hyperlink = Nullable::null();
+    bare.saved_cursors = Vec::new();
 
     let mut table = String::from("MEASURE | the projection header\n");
     for (name, header) in [
@@ -1116,12 +1370,11 @@ fn the_widest_projection_header_and_row() {
         ("every table at its bound", &stuffed),
         ("modes, keys and framing alone", &bare),
     ] {
-        let payload = payload_len(header);
         let frame = notice(PROJECTION_SNAPSHOT_EVENT, header);
         let charge = wire::measure(header)
             .expect("the codec represents a projection header")
             .bytes;
-        table.push_str(&line(name, payload, &shown(&frame), Some(charge)));
+        table.push_str(&line(name, &shown(&frame), Some(charge)));
     }
     writeln!(
         table,
@@ -1143,6 +1396,24 @@ fn the_widest_projection_header_and_row() {
         signed_difference(stuffed_frame + FRAME_LENGTH_PREFIX_LEN, TRANSPORT_FLOOR)
     )
     .expect("a string takes a write");
+    assert_eq!(
+        stuffed.saved_cursors.len(),
+        2,
+        "each buffer saves a cursor, and the header carries both"
+    );
+    assert!(
+        stuffed.saved_cursors.iter().all(|cursor| cursor
+            .hyperlink
+            .0
+            .as_ref()
+            .is_some_and(|link| link.uri.len() + link.params.len() == LINK_BYTES)),
+        "each saved cursor carries a link of {LINK_BYTES} bytes"
+    );
+    assert!(
+        stuffed.keyboard.primary.stack.len() == KEYBOARD_STACK_DEPTH
+            && stuffed.keyboard.alternate.stack.len() == KEYBOARD_STACK_DEPTH,
+        "each buffer's keyboard stack is at its depth of {KEYBOARD_STACK_DEPTH}"
+    );
     assert!(
         stuffed_frame + FRAME_LENGTH_PREFIX_LEN <= FLOOR,
         "the header with every table at its bound is whole at the floor of {FLOOR}, found {stuffed_frame}"
@@ -1190,11 +1461,15 @@ fn the_widest_projection_header_and_row() {
     let (few, many) = (first_row(&styled(20)), first_row(&styled(120)));
     let styled_run_items = (wire::row_cost(&many).items - wire::row_cost(&few).items) / 100;
     let styled_run_bytes = (wire::row_cost(&many).bytes - wire::row_cost(&few).bytes) / 100;
+    // A run under a link of the largest size: each run carries its own copy of the link.
+    let (few, many) = (first_row(&linked_cells(20)), first_row(&linked_cells(120)));
+    let linked_run_items = (wire::row_cost(&many).items - wire::row_cost(&few).items) / 100;
+    let linked_run_bytes = (wire::row_cost(&many).bytes - wire::row_cost(&few).bytes) / 100;
     let wide = first_row(&styled(cols));
     let plain_wide = first_row(b"xxxxxxxxxx");
     writeln!(
         table,
-        "MEASURE | a run with default colours costs {default_run_items} values and {default_run_bytes} bytes; a run with every colour set costs {styled_run_items} values and {styled_run_bytes} bytes"
+        "MEASURE | a run with default colours costs {default_run_items} values and {default_run_bytes} bytes; a run with every colour set costs {styled_run_items} values and {styled_run_bytes} bytes; a run with every colour set under a link of {LINK_BYTES} bytes costs {linked_run_items} values and {linked_run_bytes} bytes"
     )
     .expect("a string takes a write");
     writeln!(
@@ -1213,6 +1488,10 @@ fn the_widest_projection_header_and_row() {
     assert!(
         default_run_items >= 37,
         "a run with default colours costs at least 37 values, found {default_run_items}"
+    );
+    assert!(
+        linked_run_bytes > LINK_BYTES,
+        "a run carries its own copy of its link, so it costs more than the link's {LINK_BYTES} bytes, found {linked_run_bytes}"
     );
     assert!(
         usize::try_from(cols).expect("a column count") * default_run_items > PAGE_ITEMS,
@@ -1300,33 +1579,43 @@ fn the_widest_pairing_answer_and_the_widest_refusal() {
 
     let mut table = String::from("MEASURE | the pairing answers and the refusal\n");
     let mut widest_answer = 0;
-    for (name, frame, payload) in [
-        (
-            "pair.redeem, a challenge",
-            answer(&challenge),
-            payload_len(&challenge),
-        ),
-        ("pair.redeem, locked", answer(&locked), payload_len(&locked)),
-        ("pair.finish", answer(&finished), payload_len(&finished)),
-        (
-            "pair.status, awaiting approval",
-            answer(&status),
-            payload_len(&status),
-        ),
+    for (name, frame) in [
+        ("pair.redeem, a challenge", answer(&challenge)),
+        ("pair.redeem, locked", answer(&locked)),
+        ("pair.finish", answer(&finished)),
+        ("pair.status, awaiting approval", answer(&status)),
     ] {
         widest_answer = widest_answer.max(frame_len(&frame));
-        table.push_str(&line(name, payload, &frame, None));
+        table.push_str(&line(name, &frame, None));
     }
+    // Before a peer has said hello the door writes a bare `Response`, not a control frame around
+    // one, which is a few bytes smaller; the widest answer then is an error answer.
+    let bare = |outcome: Outcome| {
+        encoded_len(
+            &to_canonical_value(&Response {
+                request_id: RequestId::new(u64::MAX),
+                outcome,
+            })
+            .expect("a response"),
+        )
+    };
+    let bare_challenge = bare(Outcome::Ok(
+        ParamsValue::from_typed(&challenge).expect("encodes"),
+    ));
+    let bare_refusal = bare(Outcome::Error(widest_error.clone()));
+    writeln!(
+        table,
+        "MEASURE | before hello, a bare Response: a challenge {bare_challenge} | the widest error answer {bare_refusal}"
+    )
+    .expect("a string takes a write");
     let refusal_frame = frame_len(&refusal);
     table.push_str(&line(
         "the connection's refusal, as the door writes it",
-        payload_len(&widest_error),
         &refusal,
         None,
     ));
     table.push_str(&line(
         "a refusal by its type, with a diagnostic identifier and the fence flag",
-        payload_len(&typed_error),
         &typed_refusal,
         None,
     ));
@@ -1336,15 +1625,11 @@ fn the_widest_pairing_answer_and_the_widest_refusal() {
         epoch,
         sequence,
         accepted_through: Nullable::some(sequence),
-        error: {
-            let mut error = kr_protocol::error::ProtocolError::new(
-                kr_protocol::error::ErrorCode::InvalidArgument,
-                "m".repeat(kr_protocol::error::MAX_ERROR_MESSAGE_LEN),
-            )
-            .with_diagnostic_id(DiagnosticId::new("d".repeat(256)).expect("a diagnostic"));
-            error.link_fenced = true;
-            error
-        },
+        // The widest code with the longest message and a diagnostic identifier; the door removes the
+        // fence flag before a device is shown the error, so it is not set.
+        error: widest_error
+            .clone()
+            .with_diagnostic_id(DiagnosticId::new("d".repeat(256)).expect("a diagnostic")),
     };
     let small = [
         kr_protocol::input::InputAck::Ready {
@@ -1395,6 +1680,11 @@ fn the_widest_pairing_answer_and_the_widest_refusal() {
         refusal_frame <= REFUSAL_BOUND,
         "the widest refusal is under {REFUSAL_BOUND} bytes, found {refusal_frame}"
     );
+    assert!(
+        bare_challenge.max(bare_refusal) < TRANSPORT_FLOOR,
+        "the widest answer before hello is under the transport's floor of {TRANSPORT_FLOOR}, found {}",
+        bare_challenge.max(bare_refusal)
+    );
 }
 
 /// The two agent events at their widest.
@@ -1409,6 +1699,8 @@ fn the_widest_agent_events() {
     };
     let resource = resource_event();
     let root = causal_root();
+    // The worker holds the refusal at its cut of 512 bytes; the door can show a longer one.
+    let instance_longest = instance_event_of(instance_with(Some(longest_refusal_shown())));
     let mut table = String::from("MEASURE | the agent events\n");
     for (name, event) in [
         (
@@ -1418,6 +1710,10 @@ fn the_widest_agent_events() {
         (
             "agent instance, plugin identifier as the SDK builds it",
             &instance_sdk,
+        ),
+        (
+            "agent instance, the refusal of 512 bytes that the door shows longest",
+            &instance_longest,
         ),
     ] {
         // The worker's charge for the event is the cost it measures when it builds it.
@@ -1430,7 +1726,6 @@ fn the_widest_agent_events() {
         .len();
         table.push_str(&line(
             name,
-            payload_len(event),
             &shown(&notice(AGENT_INSTANCE_EVENT, event)),
             Some(charge),
         ));
@@ -1445,7 +1740,6 @@ fn the_widest_agent_events() {
     .len();
     table.push_str(&line(
         "agent resource",
-        payload_len(&resource),
         &shown(&resource_frame),
         Some(resource_charge),
     ));
@@ -1465,6 +1759,11 @@ fn the_widest_agent_events() {
             && instance_frame < AGENT_INSTANCE_BOUND,
         "an agent instance event is under {AGENT_INSTANCE_BOUND} bytes, payload {} and frame {instance_frame}",
         payload_len(&instance_widest)
+    );
+    let longest_frame = frame_len(&shown(&notice(AGENT_INSTANCE_EVENT, &instance_longest)));
+    assert!(
+        longest_frame < AGENT_INSTANCE_BOUND,
+        "an agent instance event with the refusal the door shows longest is under {AGENT_INSTANCE_BOUND} bytes, found {longest_frame}"
     );
     assert_eq!(
         root.len(),
@@ -1523,25 +1822,21 @@ fn the_widest_close_answer_of_a_closed_session() {
     let mut table = String::from("MEASURE | the closure and the close answer\n");
     table.push_str(&line(
         "session.closed, as the worker builds it",
-        payload_len(&record),
         &notification,
         Some(CLOSED_NOTICE_CHARGE),
     ));
     table.push_str(&line(
         "session.closed, as a device is shown it",
-        payload_len(&record),
         &shown(&notification),
         Some(CLOSED_NOTICE_CHARGE),
     ));
     table.push_str(&line(
         "session.close answer, the record once",
-        payload_len(&record),
         &shown(&once),
         None,
     ));
     table.push_str(&line(
         "session.close answer, the record twice (as the worker builds it today)",
-        payload_len(&record),
         &shown(&twice),
         None,
     ));
@@ -1570,6 +1865,10 @@ fn the_widest_close_answer_of_a_closed_session() {
         frame_len(&shown(&notification))
     );
     assert!(
+        payload_of(&shown(&notification)) > payload_len(&record),
+        "the payload a device is shown is the rewritten record's, wider than the record the worker holds"
+    );
+    assert!(
         frame_len(&shown(&once)) < FLOOR - FRAME_LENGTH_PREFIX_LEN,
         "the close answer with the record once is whole at the floor, found {}",
         frame_len(&shown(&once))
@@ -1592,19 +1891,16 @@ fn the_marker_and_the_reduced_record() {
     let mut table = String::from("MEASURE | the replacements\n");
     table.push_str(&line(
         "the marker",
-        payload_len(&marker()),
         &shown(&marker_frame),
         Some(OutputDelivery::Resync(marker()).len()),
     ));
     table.push_str(&line(
         "the reduced record",
-        payload_len(&reduced),
         &shown(&reduced_frame),
         Some(CLOSED_NOTICE_CHARGE),
     ));
     table.push_str(&line(
         "the reduced record with a root_signal of 4,096 bytes",
-        payload_len(&long_signal),
         &shown(&notice(SESSION_CLOSED_EVENT, &long_signal)),
         Some(CLOSED_NOTICE_CHARGE),
     ));
@@ -1625,88 +1921,235 @@ fn the_marker_and_the_reduced_record() {
     );
 }
 
+/// A pending resource at its smallest: a one-byte upstream identifier and method, and nothing set
+/// that is optional.
+fn small_resource() -> kr_protocol::gateway::PendingResource {
+    use kr_protocol::gateway::DownstreamRequestId;
+    let mut resource = pending_resource();
+    resource.request = DownstreamRequestId::new(
+        GatewayConnectionId::new(1),
+        UpstreamRequestId::new("1".to_owned()).expect("an upstream identifier"),
+    );
+    resource.method = UpstreamMethod::new("m".to_owned()).expect("a method");
+    resource.source_generation = SourceGeneration::new(1);
+    resource.deadline_ms = Nullable::null();
+    resource.recorded_at = TimestampMs::new(1);
+    resource
+}
+
+/// `count` copies of `template`, with identifiers in the order a recovery copy is taken in.
+fn resources_of(
+    template: &kr_protocol::gateway::PendingResource,
+    count: usize,
+) -> Vec<kr_protocol::gateway::PendingResource> {
+    (1..=count)
+        .map(|index| {
+            let mut bytes = [0_u8; 16];
+            bytes[8..].copy_from_slice(&u64::try_from(index).expect("a count").to_be_bytes());
+            let mut resource = template.clone();
+            resource.resource_id =
+                PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes(bytes));
+            resource
+        })
+        .collect()
+}
+
+/// What the worker measures a recovery answer with before a resource is in it: no resource, and
+/// every counter and the continuation at its widest. A copy of the worker's private constructor of
+/// the same page.
+fn no_resources() -> AgentResourceSnapshot {
+    AgentResourceSnapshot {
+        snapshot_id: U64::new(u64::MAX),
+        stream_generation: U64::new(u64::MAX),
+        cursor: U64::new(u64::MAX),
+        resources: Vec::new(),
+        continue_after: Nullable::some(PendingResourceId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0xff; 16]),
+        )),
+    }
+}
+
+/// The first page of a recovery, cut by the worker's own routine to `bytes` of resource.
+fn cut_page(
+    resources: Vec<kr_protocol::gateway::PendingResource>,
+    bytes: usize,
+) -> kr_worker::recovery::RecoveryPage {
+    use kr_transport::clock::{ContinuousClock, ManualClock};
+    kr_worker::recovery::RecoveryCopies::new().begin(
+        ConnectionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        kr_worker::broker::ReplayCursor {
+            generation: u64::MAX,
+            sequence: u64::MAX,
+        },
+        resources,
+        ManualClock::new().now(),
+        kr_worker::recovery::PageBounds {
+            resources: kr_worker::broker::MAX_SNAPSHOT_RESOURCES,
+            bytes,
+        },
+        &|| true,
+    )
+}
+
+/// How many live instances an answer carries at the floor before the door's frame is over, with the
+/// page cut as the worker cuts it, and where the worker itself refuses the peer.
+struct Fit {
+    /// The most instances for which a device receives the answer.
+    fit: usize,
+    /// The most instances for which the worker still answers: one more and it refuses the peer
+    /// because its frame cannot hold the answer and one resource.
+    worker_limit: usize,
+    /// The resources the page carries at `fit`.
+    carried: usize,
+    /// The frame at `fit` and at one more instance, as a device is shown it.
+    frames: (usize, usize),
+}
+
+/// The largest count in `0..=4_096` for which `holds` is true, taking it to be true up to a count
+/// and false beyond.
+fn largest_count(holds: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0_usize, 4_096_usize);
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if holds(middle) {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    low
+}
+
+/// The answer a worker builds for `count` live instances of `one` and the resources `resources`,
+/// with the page cut to what is left of the frame the peer declared at the floor, the way the
+/// worker works it out: the frame less the stream header, less the answer measured with no resource
+/// in it. `None` where the worker refuses the peer.
+fn worker_answer<T: Serialize>(
+    make: &dyn Fn(AgentResourceSnapshot, AgentInstanceList) -> T,
+    one: &AgentInstanceSummary,
+    resources: &[kr_protocol::gateway::PendingResource],
+    count: usize,
+) -> Option<(ControlFrame, usize)> {
+    let frame = FLOOR - kr_protocol::limits::MAX_STREAM_HEADER_LEN;
+    let list = || AgentInstanceList {
+        sequence: U64::new(u64::MAX),
+        instances: vec![one.clone(); count],
+    };
+    // A count the codec cannot represent is measured as unbounded, as the worker measures it, and the
+    // worker refuses the peer.
+    let empty = wire::measure(&make(no_resources(), list()))?.bytes;
+    if frame < empty.saturating_add(kr_worker::recovery::MAX_RECOVERY_RESOURCE_BYTES) {
+        return None;
+    }
+    let page = cut_page(resources.to_vec(), frame - empty);
+    let carried = page.resources.len();
+    let result = make(
+        AgentResourceSnapshot {
+            snapshot_id: U64::new(page.snapshot),
+            stream_generation: U64::new(page.cursor.generation),
+            cursor: U64::new(page.cursor.sequence),
+            resources: page.resources,
+            continue_after: Nullable(page.continue_after),
+        },
+        list(),
+    );
+    let measured = wire::measure(&result).map_or(usize::MAX, |cost| cost.bytes);
+    (measured <= frame).then(|| (answer(&result), carried))
+}
+
+fn fit_at_the_floor<T: Serialize>(
+    make: &dyn Fn(AgentResourceSnapshot, AgentInstanceList) -> T,
+    one: &AgentInstanceSummary,
+    resources: &[kr_protocol::gateway::PendingResource],
+) -> Fit {
+    let bound = FLOOR - FRAME_LENGTH_PREFIX_LEN;
+    let shown_len = |count: usize| {
+        worker_answer(make, one, resources, count)
+            .map(|(frame, carried)| (frame_len(&shown(&frame)), carried))
+    };
+    let fits = |count: usize| shown_len(count).is_some_and(|(frame, _)| frame <= bound);
+    let fit = largest_count(fits);
+    let worker_limit = largest_count(|count| shown_len(count).is_some());
+    let (frame, carried) = shown_len(fit).expect("the worker answers at the fit");
+    let over = shown_len(fit + 1).map_or(0, |(frame, _)| frame);
+    Fit {
+        fit,
+        worker_limit,
+        carried,
+        frames: (frame, over),
+    }
+}
+
 /// The subscribe and agent-instances answers as a device receives them, and where they stop fitting.
 ///
-/// Nothing caps the live instances a session has. The case builds the answers with instances whose
-/// refusal is at its cut, whose refusal is one byte that names the host, and whose refusal is
-/// absent, and records how many fit at the floor.
+/// Nothing caps the live instances a session has. The answer carries the instances, and beside them
+/// a page of the agent resources that the worker cuts to what is left of the frame the peer
+/// declared, measured with each refusal at the length the worker holds. The door then shows a
+/// refusal at its own length, which can be longer, and checks the frame against the bound at the
+/// floor. The case builds both answers with the page cut by the worker's own routine
+/// (`RecoveryCopies::begin` with the bounds the service works out), for three forms of refusal and
+/// for the widest and the smallest resources, with live instances, and records how many fit.
 #[test]
 fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
-    let bound = FLOOR - FRAME_LENGTH_PREFIX_LEN;
-    let subscribe = |instances: Vec<AgentInstanceSummary>| {
-        answer(&EventsSubscribeResult {
+    let subscribe = |agent_resources: AgentResourceSnapshot, agent_instances: AgentInstanceList| {
+        EventsSubscribeResult {
             stream_id: StreamId::new(kr_worker::service::OUTPUT_STREAM).expect("a stream"),
             from_cursor: U64::new(u64::MAX),
             oldest_retained_cursor: U64::new(u64::MAX),
             gap: Nullable::some(gap()),
-            agent_resources: AgentResourceSnapshot {
-                snapshot_id: U64::new(u64::MAX),
-                stream_generation: U64::new(u64::MAX),
-                cursor: U64::new(u64::MAX),
-                resources: Vec::new(),
-                continue_after: Nullable::some(PendingResourceId::new(kr_ipc::new_uuid())),
-            },
-            agent_instances: AgentInstanceList {
-                sequence: U64::new(u64::MAX),
-                instances,
-            },
-        })
+            agent_resources,
+            agent_instances,
+        }
     };
-    let listing = |instances: Vec<AgentInstanceSummary>| {
-        answer(&AgentInstancesResult {
-            agent_resources: AgentResourceSnapshot {
-                snapshot_id: U64::new(u64::MAX),
-                stream_generation: U64::new(u64::MAX),
-                cursor: U64::new(u64::MAX),
-                resources: Vec::new(),
-                continue_after: Nullable::some(PendingResourceId::new(kr_ipc::new_uuid())),
-            },
-            agent_instances: AgentInstanceList {
-                sequence: U64::new(u64::MAX),
-                instances,
-            },
-        })
+    let listing = |agent_resources: AgentResourceSnapshot, agent_instances: AgentInstanceList| {
+        AgentInstancesResult {
+            agent_resources,
+            agent_instances,
+        }
     };
-    let with_refusal = |text: Option<&str>| {
-        let mut one = instance(0);
-        one.refusal = text.map_or_else(Nullable::null, |text| Nullable::some(text.to_owned()));
-        one
-    };
+    // Enough resources to cut a page at the worker's count limit or at its bytes.
+    let supply = kr_worker::broker::MAX_SNAPSHOT_RESOURCES + 44;
+    let widest_resources = resources_of(&pending_resource(), supply);
+    let smallest_resources = resources_of(&small_resource(), supply);
+    let forms = [
+        (
+            "refusal of the cap, as the door shows it longest",
+            Some(longest_refusal_shown()),
+        ),
+        ("short refusal that names the host", Some("/".to_owned())),
+        ("no refusal", None),
+    ];
     let mut table = String::from("MEASURE | the subscribe and agent.instances answers\n");
-    let mut fitting = Vec::new();
-    for (name, one) in [
-        (
-            "refusal at its cut of 512 bytes",
-            with_refusal(Some(&"r".repeat(512))),
-        ),
-        (
-            "refusal of one byte that names the host",
-            with_refusal(Some("/")),
-        ),
-        ("no refusal", with_refusal(None)),
-    ] {
-        for (kind, build) in [
-            (
-                "subscribe",
-                &subscribe as &dyn Fn(Vec<AgentInstanceSummary>) -> ControlFrame,
-            ),
-            ("agent.instances", &listing),
+    let mut at_the_cap = Vec::new();
+    for (form, refusal) in &forms {
+        let one = live_instance(refusal.clone());
+        for (resources_name, resources) in [
+            ("widest resources", &widest_resources),
+            ("smallest resources", &smallest_resources),
         ] {
-            let sized = |count: usize| frame_len(&shown(&build(vec![one.clone(); count])));
-            let (none, single) = (sized(0), sized(1));
-            let per_instance = single - none;
-            let fit = (bound - none) / per_instance;
-            let at_64 = sized(64);
-            writeln!(
-                table,
-                "MEASURE | {kind}, {name} | empty answer {none} | one instance adds {per_instance} | 64 instances {at_64} | fit at the floor {fit}"
-            )
-            .expect("a string takes a write");
-            assert!(
-                sized(fit) <= bound && sized(fit + 1) > bound,
-                "{kind}, {name}: {fit} instances fit and one more does not"
-            );
-            fitting.push((kind, name, fit, at_64));
+            for (kind, found) in [
+                ("subscribe", fit_at_the_floor(&subscribe, &one, resources)),
+                (
+                    "agent.instances",
+                    fit_at_the_floor(&listing, &one, resources),
+                ),
+            ] {
+                writeln!(
+                    table,
+                    "MEASURE | {kind}, {form}, {resources_name} | fit at the floor {} | the worker refuses the peer from {} instances | page carries {} resources at the fit | frame at the fit {} | frame at one more {}",
+                    found.fit,
+                    found.worker_limit + 1,
+                    found.carried,
+                    found.frames.0,
+                    found.frames.1
+                )
+                .expect("a string takes a write");
+                if refusal.as_ref().is_some_and(|text| text.len() == 512)
+                    && resources_name == "widest resources"
+                {
+                    at_the_cap.push((kind, found.fit, found.carried));
+                }
+            }
         }
     }
     let resource = pending_resource();
@@ -1723,11 +2166,20 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
         resource_payload <= kr_worker::recovery::MAX_RECOVERY_RESOURCE_BYTES,
         "a pending resource is within the worker's bound, found {resource_payload}"
     );
+    // The page was cut by the worker's routine and not by running out of resources.
     assert!(
-        fitting
+        at_the_cap
             .iter()
-            .all(|(_, _, fit, at_64)| *fit >= 64 && *at_64 <= bound),
-        "64 instances fit at the floor for every refusal: {fitting:?}"
+            .all(|(_, _, carried)| *carried < supply && *carried > 0),
+        "the page is cut by the bytes of the frame: {at_the_cap:?}"
+    );
+    // This holds today's fault: the worker cuts the page against each refusal at the length it
+    // holds, and the door then shows a longer one, so with a page that fills the frame fewer than 64
+    // instances fit at the floor. The change that makes the worker charge each refusal at the length
+    // the door shows turns this assertion red, and replaces it with the figure that change gives.
+    assert!(
+        at_the_cap.iter().all(|(_, fit, _)| *fit < 64),
+        "fewer than 64 instances fit at the floor beside a full page of resources with refusals of the cap: {at_the_cap:?}"
     );
 }
 
@@ -1747,6 +2199,9 @@ fn the_sources_of_root_signal_and_a_terminated_process_name() {
     use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
     use kr_protocol::session::TerminatedProcess;
 
+    // The three names are copies of the sentences the worker's ownership module and the daemon's
+    // close path write inline; neither has a constant to compare with. When a producer's sentence
+    // changes or a producer is added, add it here: this case measures only the sentences it lists.
     let names = [
         "the session's root shell",
         "the session's worker",
@@ -1787,6 +2242,24 @@ fn the_sources_of_root_signal_and_a_terminated_process_name() {
         "MEASURE | the sources of closure text | TerminatedProcess.name: three fixed producers, longest {longest_name} bytes | root_signal: the platform's text, no bound in its type | smallest terminated entry {smallest_terminated} bytes, widest {widest_terminated} | smallest surviving entry as shown {smallest_surviving} | entries the budget of {CLOSURE_LISTS_BOUND} holds at the smaller {by_budget} against the member cap of 4,096"
     );
 
+    // The queue's charge for a closure notice, read from a real closed delivery that a hub makes: a
+    // hub that has closed delivers the closure to an attachment that subscribes afterwards.
+    let mut hub = OutputHub::new();
+    let attachment = AttachmentId::new(kr_ipc::new_uuid());
+    hub.close(&closure(1, "/", 0, 0), [attachment]);
+    let mut stream = hub.subscribe(attachment, QUEUE_FLOOR, Presentation::Direct);
+    let delivery = stream
+        .try_recv()
+        .expect("a hub that has closed delivers the closure");
+    assert!(
+        matches!(delivery, OutputDelivery::Closed(_)),
+        "the delivery is the closure"
+    );
+    assert_eq!(
+        delivery.len(),
+        CLOSED_NOTICE_CHARGE,
+        "the queue charges a closure notice {CLOSED_NOTICE_CHARGE} bytes"
+    );
     assert!(
         longest_name < CLOSURE_TEXT_BYTES,
         "the fixed names are far under the cut of {CLOSURE_TEXT_BYTES} bytes, found {longest_name}"
