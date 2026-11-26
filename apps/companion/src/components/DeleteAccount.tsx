@@ -818,7 +818,7 @@ export function DeleteAccount({
             )}
           </div>
           {body}
-          <div className="account-actions">{actions}</div>
+          <div className="row wrap">{actions}</div>
         </div>
       </Card>
     </>

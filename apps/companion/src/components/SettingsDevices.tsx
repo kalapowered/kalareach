@@ -189,7 +189,7 @@ export function SettingsDevices({
           {text}
         </p>
       ))}
-      <div className="account-actions">
+      <div className="row wrap">
         <Button
           data-testid="settings-devices-look"
           disabled={busy}

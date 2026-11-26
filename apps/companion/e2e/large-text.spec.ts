@@ -398,3 +398,100 @@ test.describe('The rows of the terminal footer stand one distance apart', () => 
     expect(gaps.some((gap) => Math.abs(gap - own) > 0.5)).toBe(true)
   })
 })
+
+/** The card of the account's devices with everything it can say, among it an outcome the person can dismiss. */
+const EVERYTHING = {
+  state: 'on',
+  kept_at: 'reach.kala.to',
+  devices: {
+    can_confirm: true,
+    out: false,
+    waiting: true,
+    members: [
+      { reference: 'me', name: 'This computer', this_computer: true, vouched: true },
+      { reference: 'b', name: 'the-phone', this_computer: false, vouched: true }
+    ],
+    candidates: [{ reference: 'c', name: 'the-tablet-in-the-kitchen' }],
+    held_out: [],
+    offers: [],
+    outcomes: [{ what: 'addition', ended: 'refused', name: 'the-tablet-in-the-kitchen' }]
+  }
+} as const
+
+async function atTheDevices(page: Page, form: Form, size: number): Promise<void> {
+  await atTheAccount(page, form, size)
+  await page.evaluate((view) => {
+    window.krTestHost?.settings.change({ sync: view })
+  }, EVERYTHING)
+  await expect(page.getByTestId('settings-devices-dismiss')).toBeVisible()
+  await settled(page)
+}
+
+/** Where each of two buttons stands in the box that holds them, and whether the second is under the first. */
+interface Standing {
+  readonly first: { readonly left: number; readonly width: number }
+  readonly second: { readonly left: number; readonly width: number }
+  readonly stacked: boolean
+}
+
+/**
+ * How a pair of buttons stands, read twice: as the interface draws it, and as the box that the
+ * product's other choices stand in would hold the same two buttons (a row that wraps, the first
+ * choice first), put beside it in the same card.
+ */
+async function pairBesideItsSiblings(page: Page, first: string, second: string): Promise<{ readonly drawn: Standing; readonly siblings: Standing }> {
+  return page.evaluate(
+    ([one, two]) => {
+      const a = document.querySelector(`[data-testid="${one}"]`)
+      const b = document.querySelector(`[data-testid="${two}"]`)
+      const holder = a?.parentElement
+      if (a === null || b === null || b === undefined || !holder?.parentElement) throw new Error('the pair is not on the page')
+      const standing = (x: Element, y: Element, within: Element): Standing => {
+        const box = within.getBoundingClientRect()
+        const p = x.getBoundingClientRect()
+        const q = y.getBoundingClientRect()
+        const round = (value: number): number => Math.round(value * 2) / 2
+        return {
+          first: { left: round(p.left - box.left), width: round(p.width) },
+          second: { left: round(q.left - box.left), width: round(q.width) },
+          stacked: q.top >= p.bottom - 0.5
+        }
+      }
+      const drawn = standing(a, b, holder)
+      // The settings choice's own classes: a row that wraps, as every other choice of this kind stands.
+      const sibling = document.createElement('div')
+      sibling.className = 'row choice-actions'
+      for (const original of [a, b]) {
+        const copy = document.createElement('button')
+        copy.type = 'button'
+        copy.className = original.className
+        copy.textContent = original.textContent
+        sibling.append(copy)
+      }
+      holder.after(sibling)
+      const siblings = standing(sibling.children[0], sibling.children[1], sibling)
+      sibling.remove()
+      return { drawn, siblings }
+    },
+    [first, second] as const
+  )
+}
+
+const PAIRS = [
+  { name: 'the deletion step: "Send code" and "Cancel"', first: 'delete-account-send-code', second: 'delete-account-cancel', open: atTheDeletion },
+  { name: 'the devices card: "Look for my devices" and "Dismiss"', first: 'settings-devices-look', second: 'settings-devices-dismiss', open: atTheDevices }
+] as const
+
+test.describe('A pair of buttons stands as the other choices of the product do', () => {
+  for (const pair of PAIRS) {
+    for (const form of [PHONE, DESKTOP]) {
+      for (const size of [1, LARGEST]) {
+        test(`${pair.name}, ${form.name}, text ${size === 1 ? 'ordinary' : 'largest'}`, async ({ page }) => {
+          await pair.open(page, form, size)
+          const { drawn, siblings } = await pairBesideItsSiblings(page, pair.first, pair.second)
+          expect(drawn).toEqual(siblings)
+        })
+      }
+    }
+  }
+})

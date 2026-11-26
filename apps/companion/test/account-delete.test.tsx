@@ -309,7 +309,7 @@ describe('the code', () => {
   it('offers the dangerous control last but for Cancel', async () => {
     const setup = await phone()
     await atTheField(setup)
-    const actions = within(setup.panel).getByTestId('delete-account').querySelector('.account-actions')
+    const actions = within(setup.panel).getByTestId('delete-account-confirm').parentElement
     const order = Array.from(actions?.querySelectorAll('button') ?? []).map((button) =>
       button.getAttribute('data-testid')
     )
