@@ -2782,9 +2782,11 @@ jobs:
   # after it still has its time. A step that installs or builds has twice the longest it took in the
   # 59 to 65 hosted runs of 16 to 24 November, all of them with no cache, since the job restores
   # none, rounded up: the NDK, emulator and system image 5 (1.6 at most), the debug build 26 (13.0,
-  # run 45345872273) and the minified build 47 (23.2, run 44759162215). The steps that only set up
-  # or read, none of which took more than 1.5 minutes, have 5, or 6 for the disk, as the other
-  # jobs' do; the evidence upload has 3, its pause 2 and its second try 3, as in the macOS jobs.
+  # run 45345872273) and the minified build 47 (23.2, run 44759162215). The wait of five minutes and
+  # the second run of a build after a refusal are inside those two limits, not added to them (the
+  # steps say when the second run fits). The steps that only set up or read, none of which took
+  # more than 1.5 minutes, have 5, or 6 for the disk, as the other jobs' do; the evidence upload
+  # has 3, its pause 2 and its second try 3, as in the macOS jobs.
   # The step that fetches the Gradle distribution has 12: five tries, each of which downloads one
   # file, and the waits between them, 30, 60, 90 and 120 seconds, 300 in all. The step that sets
   # Gradle's waits has 5, as the steps that only set up. The step that starts the emulator has 65:
@@ -2943,9 +2945,40 @@ jobs:
       # The package is built the way a person builds it, and the script reads it back: the classes
       # the system resolves by name, among them the Tauri plugin, and the application identifier in
       # the manifest, the code and the libraries.
+      #
+      # A build that fails with the package repository's refusal in its own output (the line Gradle
+      # prints, "Received status code 429 from server: Too Many Requests") waits five minutes and runs
+      # once more, since runs of this job met that refusal again eight to nine minutes after the
+      # first, past what Gradle's own tries wait for. A second failure fails the step. A build that
+      # fails for any other reason fails the step at once: a missing module, a wrong address, a
+      # compile error and a failed check are never tried again. The step keeps its limit of 26
+      # minutes, with the wait and the second run inside it: the longest build seen took 13.0 minutes,
+      # so a second run after the five-minute wait fits only when the first one failed within
+      # 26 - 5 - 13.0 = 8.0 minutes; after a later failure the limit ends the second run if it does
+      # not finish, and the step fails at its limit. A refused jar does not disable the repository, so
+      # a long refusal of jars ends at the limit with no refusal line, and then there is no second
+      # run. The wait is 300 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
+      # and a local run of this text sets it to shorten the wait.
       - name: Build the debug application
         timeout-minutes: 26
-        run: pnpm -C apps/companion android --debug --apk --target aarch64 x86_64
+        run: |
+          set -euo pipefail
+          build() { pnpm -C apps/companion android --debug --apk --target aarch64 x86_64; }
+          log="$RUNNER_TEMP/debug-build.log"
+          status=0
+          build 2>&1 | tee "$log" || status=$?
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if ! grep -qF 'Received status code 429 from server: Too Many Requests' "$log"; then
+            echo "the build failed, and not with the package repository's refusal: not trying again"
+            exit "$status"
+          fi
+          wait_seconds="${REFUSAL_WAIT_SECONDS:-300}"
+          echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
+          sleep "$wait_seconds"
+          echo "the second run of the build"
+          build
 
       # GitHub's documented way to give a hosted Linux runner's user the virtual machine device.
       - name: Let the emulator use the runner's virtual machine device
@@ -3026,14 +3059,42 @@ jobs:
       # are unsigned and nothing is installed from them. The build only needs Firebase's
       # configuration to exist, so it is given a file that holds no project of the repository's own.
       # It runs whatever the emulator step did, so that each answer is read on its own.
+      #
+      # The build is tried once more after the package repository's refusal, as the debug build is
+      # (see that step): a failure with "Received status code 429 from server: Too Many Requests" in
+      # the build's own output waits five minutes and runs the build again, any other failure fails
+      # the step at once, and a second failure fails it too. The step keeps its limit of 47 minutes,
+      # with the wait and the second run inside it: the longest build seen took 23.2 minutes, so a
+      # second run after the five-minute wait fits only when the first one failed within
+      # 47 - 5 - 23.2 = 18.8 minutes; after a later failure the limit ends the second run if it does
+      # not finish, and the step fails at its limit. A refused jar does not disable the repository,
+      # so a long refusal of jars ends at the limit with no refusal line, and then there is no second
+      # run. The wait is 300 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
+      # and a local run of this text sets it to shorten the wait.
       - name: Build the minified application and read its libraries back
         if: ${{ !cancelled() }}
         timeout-minutes: 47
         env:
           KR_GOOGLE_SERVICES_JSON: ${{ runner.temp }}/google-services.json
         run: |
+          set -euo pipefail
           printf '%s\n' '{"project_info":{"project_number":"000000000000","project_id":"throwaway-minified-build"},"client":[{"client_info":{"mobilesdk_app_id":"1:000000000000:android:0000000000000000","android_client_info":{"package_name":"to.kala.reach"}},"api_key":[{"current_key":"throwaway-not-a-key"}]}]}' > "$KR_GOOGLE_SERVICES_JSON"
-          pnpm -C apps/companion android --apk --aab --target aarch64 x86_64
+          build() { pnpm -C apps/companion android --apk --aab --target aarch64 x86_64; }
+          log="$RUNNER_TEMP/minified-build.log"
+          status=0
+          build 2>&1 | tee "$log" || status=$?
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if ! grep -qF 'Received status code 429 from server: Too Many Requests' "$log"; then
+            echo "the build failed, and not with the package repository's refusal: not trying again"
+            exit "$status"
+          fi
+          wait_seconds="${REFUSAL_WAIT_SECONDS:-300}"
+          echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
+          sleep "$wait_seconds"
+          echo "the second run of the build"
+          build
 
       # What a cache of this job would hold, which the job saves none of: the target directory, the
       # registries and the package store as the disk report lists them, and Gradle's home.
