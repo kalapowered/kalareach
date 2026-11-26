@@ -755,6 +755,9 @@ fn broker_sources_a_view_that_a_process_of_another_account_keeps_writes_after_th
     }
     prepare();
     let person = Person::new("krhap");
+    // The peer is a second ordinary account with no right of its own on the tree's file: what it
+    // writes after the release, it writes through the right that the view kept.
+    let other = Person::new("krsec");
     let siblings = Siblings::new();
     let scratch = Scratch::on_drive();
     let boundary = &siblings.checkout;
@@ -784,7 +787,7 @@ fn broker_sources_a_view_that_a_process_of_another_account_keeps_writes_after_th
         talk.join("peer.ps1").display(),
         talk.display()
     );
-    let (peer, pid) = match start_as(&person.primary, &line, &talk) {
+    let (peer, pid) = match start_as(&other.primary, &line, &talk) {
         Ok(started) => started,
         Err(reason) => {
             println!(
@@ -795,7 +798,7 @@ fn broker_sources_a_view_that_a_process_of_another_account_keeps_writes_after_th
     };
 
     // (1) A handle for the peer's process, which a duplicate could be put into: the process's own
-    // list is the person's and the system's, and the boundary token is refused.
+    // list is its account's and the system's, and the boundary token is refused.
     let (opened, why) = acting_as(Some(&boundary.primary), || {
         // SAFETY: opens a process by number for one right; the result is checked below.
         let raw = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
