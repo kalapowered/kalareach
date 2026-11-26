@@ -21,15 +21,21 @@ use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_protocol::backup_checkpoint::HostCheckpoint;
+use kr_protocol::backup_checkpoint::{
+    BackupCheckpointParams, BackupCheckpointResult, HostCheckpoint,
+};
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ArchiveId, BackupGeneration, DeviceId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::Digest256;
 use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
 use super::failure::{FailureKind, PairingFailure};
 use super::paired::{PairedHost, read_hosts};
+use crate::error::ClientError;
 use crate::recovery::Standing;
+use crate::session::Session;
 use crate::shown::Shown;
 
 /// The version of the file this release writes and reads.
@@ -661,6 +667,55 @@ fn parse(bytes: &[u8]) -> Result<CheckpointsFile, (SnapshotCause, Shown)> {
         return Err(unreadable(Shown::said("it names one pairing twice")));
     }
     Ok(file)
+}
+
+/// Why a read of a host's checkpoint did not give an answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadCause {
+    /// The host refused the method as one it does not serve, which is how a host of an earlier
+    /// release answers, or the right to read it was withdrawn since the connection was made.
+    HostLacksIt,
+    /// The host refused for another reason.
+    Refused(ErrorCode),
+    /// The answer is not one this release reads, an answer of generation 0 among them.
+    Malformed,
+    /// The connection failed or ended.
+    Lost,
+    /// The host did not answer in time.
+    TimedOut,
+}
+
+/// Asks the host `session` is connected to for its checkpoint, once.
+///
+/// The read does not signal the session's standing: a host of an earlier release refuses the
+/// method as one it does not serve at each ask, and that is no sign the host withdrew the
+/// connection. The caller bounds the wait, and a read cut at its bound can leave the session's
+/// control stream marked, so the caller gives it a session that nothing else uses.
+///
+/// # Errors
+///
+/// Returns why the host gave no answer this release reads.
+pub async fn read_checkpoint(session: &Session) -> Result<Answer, ReadCause> {
+    let result: BackupCheckpointResult = session
+        .read_unsignalled(Method::BackupCheckpoint, &BackupCheckpointParams {})
+        .await
+        .map_err(|error| match error {
+            ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. } => {
+                if refusal.code == ErrorCode::PermissionDenied {
+                    ReadCause::HostLacksIt
+                } else {
+                    ReadCause::Refused(refusal.code)
+                }
+            }
+            ClientError::Cbor(_) => ReadCause::Malformed,
+            _ => ReadCause::Lost,
+        })?;
+    Ok(result
+        .checkpoint
+        .as_ref()
+        .map_or(Answer::NothingPublished, |held| {
+            Answer::Checkpoint(held.clone())
+        }))
 }
 
 #[cfg(test)]

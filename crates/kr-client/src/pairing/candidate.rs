@@ -64,11 +64,13 @@ use serde::Serialize;
 use tokio::sync::{oneshot, watch};
 
 use super::BoxFuture;
+use super::checkpoint::{Answer, Outcome, PairingId, ReadCause, read_checkpoint};
 use super::failure::{FailureKind, PairingFailure, consumed, refused_by_host};
 use super::invitation::origin_host;
 use super::link::{ConnectionPeer, HostLink, LinkError, Preauth};
 use super::paired::{AttemptMode, PairedHost, PairedHosts, PendingAttempt};
 use super::room::{RoomConnector, RoomError, RoomRole, RoomSocket};
+use crate::session::Session;
 use crate::shown::{Said, Shown};
 
 /// How long a candidate waits for the room's first frame once its socket is open.
@@ -121,6 +123,11 @@ const PAIRED_CONNECT_TRIES: usize = 4;
 /// How long one question to the host, or one dial of it, may take while the device waits for the
 /// owner. A host that answers nothing is asked again, and the attempt's own deadline still holds.
 pub const WAIT_STEP: Duration = Duration::from_secs(10);
+
+/// How long the read of a host's backup checkpoint may take as the device is committed. It is
+/// shorter than [`WAIT_STEP`]: the last screen of a pairing is not held for a host that answers
+/// nothing, and the companion asks the host again later.
+pub const CHECKPOINT_WITHIN: Duration = Duration::from_secs(3);
 
 /// How far past an invitation's expiry, by this device's clock, it keeps asking. Two clocks never
 /// agree exactly, and the host decides expiry on its own.
@@ -1398,6 +1405,11 @@ impl Pairing {
                     }
                     None => Err(LinkError::lost(Shown::said("the recovery's time ran out"))),
                 };
+            let answer = if host.is_owner() {
+                self.read_answer(&session, pending, reserve).await
+            } else {
+                None
+            };
             session.close();
             if let Some(label) = environments.ok().and_then(|listed| {
                 listed
@@ -1409,6 +1421,9 @@ impl Pairing {
                 host.name = Some(label);
             }
             self.hosts.record(host.clone())?;
+            if let Some(answer) = answer {
+                self.settle_answer(&host, answer).await;
+            }
             self.hosts.clear_attempt()?;
             progress.send_replace(AttemptState::Paired {
                 host: HostView::of(&host),
@@ -1430,6 +1445,61 @@ impl Pairing {
                     ),
                 ))
             }
+        }
+    }
+
+    /// Asks the host of an owner device for its backup checkpoint on `session`, once, for no longer
+    /// than [`CHECKPOINT_WITHIN`] and no longer than the recovery has. A host that cannot answer
+    /// leaves the device owed: its refusal is logged and does not fail the pairing.
+    async fn read_answer(
+        &self,
+        session: &Session,
+        pending: &PendingAttempt,
+        reserve: Option<tokio::time::Instant>,
+    ) -> Option<Answer> {
+        let step = self.recovery_step(pending, reserve)?;
+        let read = tokio::time::timeout(step.min(CHECKPOINT_WITHIN), read_checkpoint(session))
+            .await
+            .unwrap_or(Err(ReadCause::TimedOut));
+        match read {
+            Ok(answer) => Some(answer),
+            Err(cause) => {
+                tracing::warn!(cause = ?cause, "the host's backup checkpoint could not be read");
+                None
+            }
+        }
+    }
+
+    /// Keeps what the host answered for the pairing `host` holds, on a blocking thread, since the
+    /// file's lock can take two seconds. A failure is logged and never fails the pairing: the host
+    /// stays owed, or, after an earlier answer of nothing, not owed and still asked.
+    async fn settle_answer(&self, host: &PairedHost, answer: Answer) {
+        let checkpoints = self.hosts.checkpoints();
+        let id = PairingId::of(host);
+        let now_ms = self.clock.wall_clock_ms();
+        let settled =
+            tokio::task::spawn_blocking(move || checkpoints.settle_checkpoint(id, &answer, now_ms))
+                .await;
+        match settled {
+            Ok(Ok(settled)) => match settled.outcome {
+                Outcome::Lower => tracing::warn!(
+                    "a host named a lower backup generation than this device holds, and the held checkpoint stands"
+                ),
+                Outcome::Disagrees => tracing::warn!(
+                    "a host named another manifest than this device holds for the same backup generation, and the held checkpoint stands"
+                ),
+                Outcome::Uncertain => tracing::warn!(
+                    "the host's backup checkpoint was saved, and the directory could not be confirmed to hold it"
+                ),
+                Outcome::New | Outcome::Raised | Outcome::Same | Outcome::NothingPublished => {}
+            },
+            Ok(Err(cause)) => tracing::warn!(
+                cause = ?cause,
+                "the host's backup checkpoint could not be saved, and the pairing stands"
+            ),
+            Err(_) => tracing::warn!(
+                "the host's backup checkpoint could not be saved, and the pairing stands"
+            ),
         }
     }
 
@@ -2218,6 +2288,7 @@ pub fn room_failure(error: &RoomError) -> FailureKind {
 
 #[cfg(test)]
 mod tests {
+    use super::super::checkpoint::{Acquisition, Held, SnapshotCause};
     use super::super::paired::HostCredentials;
     use super::*;
     use kr_protocol::scalars::Uuid;
@@ -3044,6 +3115,40 @@ mod tests {
         Silent,
     }
 
+    /// What the host answers to `backup.checkpoint` on every scripted connection.
+    #[derive(Clone, Debug)]
+    enum Checkpoint {
+        /// The host of an earlier release: it refuses the method as one it does not serve.
+        Unserved,
+        /// The host refuses with this code.
+        Refuse(ErrorCode),
+        /// The host has accepted no generation.
+        Null,
+        /// The host names this checkpoint.
+        Published(kr_protocol::backup_checkpoint::HostCheckpoint),
+        /// The host names a checkpoint of generation 0, which no host publishes.
+        Zero,
+        /// The host never answers.
+        Silent,
+    }
+
+    /// The body of an answer that names generation 0, as a host that broke the rule would send it.
+    #[derive(Serialize)]
+    struct ZeroBody {
+        checkpoint: ZeroEntry,
+    }
+
+    #[derive(Serialize)]
+    struct ZeroEntry {
+        service_origin: kr_protocol::service::GatewayOrigin,
+        archive_id: kr_protocol::ids::ArchiveId,
+        backup_generation: kr_protocol::ids::BackupGeneration,
+        encrypted_manifest_hash: kr_protocol::scalars::Digest256,
+    }
+
+    /// Each request a scripted connection received: the connection's number and the method.
+    type Requests = Arc<Mutex<Vec<(usize, String)>>>;
+
     /// A control connection whose host answers each request as its script says, with no socket.
     #[derive(Debug)]
     struct PairedSession {
@@ -3053,6 +3158,9 @@ mod tests {
             std::sync::Mutex<Option<mpsc::UnboundedSender<kr_protocol::envelope::ControlFrame>>>,
         frames: tokio::sync::Mutex<mpsc::UnboundedReceiver<kr_protocol::envelope::ControlFrame>>,
         closed: Arc<Mutex<usize>>,
+        checkpoint: Checkpoint,
+        connection: usize,
+        requests: Requests,
     }
 
     impl PairedSession {
@@ -3061,6 +3169,59 @@ mod tests {
             request: &kr_protocol::envelope::Request,
         ) -> Option<kr_protocol::envelope::Response> {
             use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+            self.requests
+                .lock()
+                .expect("the log")
+                .push((self.connection, request.method.as_str().to_owned()));
+            if request.method.as_str() == Method::BackupCheckpoint.entry().name {
+                let outcome = match &self.checkpoint {
+                    Checkpoint::Silent => return None,
+                    Checkpoint::Unserved => Outcome::Error(kr_protocol::error::ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "the method is not served",
+                    )),
+                    Checkpoint::Refuse(code) => Outcome::Error(
+                        kr_protocol::error::ProtocolError::new(*code, "the question is refused"),
+                    ),
+                    Checkpoint::Null => Outcome::Ok(
+                        ParamsValue::from_typed(
+                            &kr_protocol::backup_checkpoint::BackupCheckpointResult {
+                                checkpoint: kr_protocol::scalars::Nullable::null(),
+                            },
+                        )
+                        .expect("a value"),
+                    ),
+                    Checkpoint::Published(held) => Outcome::Ok(
+                        ParamsValue::from_typed(
+                            &kr_protocol::backup_checkpoint::BackupCheckpointResult {
+                                checkpoint: kr_protocol::scalars::Nullable::some(held.clone()),
+                            },
+                        )
+                        .expect("a value"),
+                    ),
+                    Checkpoint::Zero => Outcome::Ok(
+                        ParamsValue::from_typed(&ZeroBody {
+                            checkpoint: ZeroEntry {
+                                service_origin: kr_protocol::service::GatewayOrigin::new(
+                                    "https://reach.kala.to",
+                                )
+                                .expect("an origin"),
+                                archive_id: kr_protocol::ids::ArchiveId::new(Uuid::from_bytes(
+                                    [1; 16],
+                                )),
+                                backup_generation: kr_protocol::ids::BackupGeneration::new(0),
+                                encrypted_manifest_hash:
+                                    kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+                            },
+                        })
+                        .expect("a value"),
+                    ),
+                };
+                return Some(Response {
+                    request_id: request.request_id,
+                    outcome,
+                });
+            }
             let outcome = if request.method.as_str() != Method::PairStatus.entry().name {
                 Outcome::Error(kr_protocol::error::ProtocolError::new(
                     ErrorCode::InvalidArgument,
@@ -3197,6 +3358,8 @@ mod tests {
         connects: Arc<Mutex<Vec<tokio::time::Instant>>>,
         sessions: Arc<Mutex<usize>>,
         closed: Arc<Mutex<usize>>,
+        checkpoint: Checkpoint,
+        requests: Requests,
     }
 
     impl HostLink for Dropping {
@@ -3291,7 +3454,11 @@ mod tests {
                 Paired::Blocks => return Box::pin(std::future::pending()),
                 other => other,
             };
-            *self.sessions.lock().expect("the count") += 1;
+            let connection = {
+                let mut sessions = self.sessions.lock().expect("the count");
+                *sessions += 1;
+                *sessions
+            };
             let (sender, frames) = mpsc::unbounded_channel();
             let transport = PairedSession {
                 script: session,
@@ -3299,6 +3466,9 @@ mod tests {
                 sender: std::sync::Mutex::new(Some(sender)),
                 frames: tokio::sync::Mutex::new(frames),
                 closed: Arc::clone(&self.closed),
+                checkpoint: self.checkpoint.clone(),
+                connection,
+                requests: Arc::clone(&self.requests),
             };
             Box::pin(async move {
                 Ok(Arc::new(transport) as Arc<dyn crate::transport::ControlTransport>)
@@ -3360,6 +3530,12 @@ mod tests {
         /// opened later has its last call later, so a case that needs the device to go on asking
         /// on it past a minute has it opened as late as it needs.
         held_opened: Duration,
+        /// Whether the grant the host committed lets the device manage the host.
+        owner: bool,
+        /// How the host answers `backup.checkpoint`.
+        checkpoint: Checkpoint,
+        /// What `checkpoints.json` holds before the run, when it holds anything.
+        file: Option<Vec<u8>>,
     }
 
     impl Script {
@@ -3372,6 +3548,9 @@ mod tests {
                 deadline: Duration::from_secs(300),
                 paired: Vec::new(),
                 held_opened: Duration::ZERO,
+                owner: false,
+                checkpoint: Checkpoint::Unserved,
+                file: None,
             }
         }
     }
@@ -3397,6 +3576,13 @@ mod tests {
         record: bool,
         /// The identity the device derived for itself.
         derived: DeviceId,
+        /// Each request the paired connections received: the connection's number and the method.
+        requests: Vec<(usize, String)>,
+        /// How long the run took on the paused clock.
+        elapsed: Duration,
+        /// The records the run wrote, which stay while this does.
+        hosts: Arc<PairedHosts>,
+        _directory: tempfile::TempDir,
     }
 
     /// Runs the waiting loop for `run` on a paused clock, on a connection the device began to open
@@ -3415,6 +3601,7 @@ mod tests {
         let sessions = Arc::new(Mutex::new(0));
         let closed = Arc::new(Mutex::new(0));
         let fresh_answered = Arc::new(Mutex::new(Vec::new()));
+        let requests: Requests = Arc::new(Mutex::new(Vec::new()));
         let directory = tempfile::tempdir().expect("a directory on the internal disk");
         let host = DeviceKeys::generate().expect("keys").public_keys();
         let value = "f3c146fd".to_owned();
@@ -3441,7 +3628,11 @@ mod tests {
                 parent_grant_id: kr_protocol::scalars::Nullable::null(),
                 environment_selector: kr_protocol::grant::EnvironmentSelector::Any,
                 session_selector: kr_protocol::grant::SessionSelector::Any,
-                actions: [ActionRight::SessionView].into_iter().collect(),
+                actions: if script.owner {
+                    [ActionRight::HostManage].into_iter().collect()
+                } else {
+                    [ActionRight::SessionView].into_iter().collect()
+                },
                 history: kr_protocol::grant::HistoryScope {
                     lower_bound_ms: kr_protocol::scalars::Nullable::null(),
                     include_live_screen: true,
@@ -3483,9 +3674,18 @@ mod tests {
                 connects: Arc::clone(&connects),
                 sessions: Arc::clone(&sessions),
                 closed: Arc::clone(&closed),
+                checkpoint: script.checkpoint.clone(),
+                requests: Arc::clone(&requests),
             }),
             hosts: Arc::new(PairedHosts::open(directory.path().join("pairing")).expect("a store")),
         };
+        if let Some(bytes) = &script.file {
+            kr_ipc::paths::write_owner_only_file(
+                &pairing.hosts.directory().join("checkpoints.json"),
+                bytes,
+            )
+            .expect("a file");
+        }
         let held = Unpaired::scripted(
             Box::new(Scripted {
                 reply: script.held,
@@ -3500,6 +3700,7 @@ mod tests {
         let outcome = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
             .await
             .ok();
+        let elapsed = start.elapsed();
         let asked = asked
             .lock()
             .expect("the record")
@@ -3540,6 +3741,10 @@ mod tests {
             fresh_answered,
             record,
             derived,
+            requests: requests.lock().expect("the log").clone(),
+            elapsed,
+            hosts: Arc::clone(&pairing.hosts),
+            _directory: directory,
         }
     }
 
@@ -4105,6 +4310,9 @@ mod tests {
                     Paired::Lost,
                 ],
                 held_opened: Duration::ZERO,
+                owner: false,
+                checkpoint: Checkpoint::Unserved,
+                file: None,
             },
             Duration::from_secs(120),
         )
@@ -4169,6 +4377,207 @@ mod tests {
             run.asked
         );
         kept_question_was_asked_and_its_answer_kept(&run);
+    }
+
+    fn published(generation: u64) -> Checkpoint {
+        Checkpoint::Published(kr_protocol::backup_checkpoint::HostCheckpoint {
+            service_origin: kr_protocol::service::GatewayOrigin::new("https://reach.kala.to")
+                .expect("an origin"),
+            archive_id: kr_protocol::ids::ArchiveId::new(Uuid::from_bytes([1; 16])),
+            backup_generation: kr_protocol::ids::BackupGeneration::new(generation),
+            encrypted_manifest_hash: kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+        })
+    }
+
+    /// Runs a recovery on a paused clock for a device the host committed, whose host answers
+    /// `backup.checkpoint` as `checkpoint` says. A `told` commitment is the one the host named, and
+    /// the other is the one the device derived for itself.
+    async fn committing(
+        told: bool,
+        owner: bool,
+        checkpoint: Checkpoint,
+        file: Option<Vec<u8>>,
+    ) -> Waited {
+        let held = if told {
+            Reply::CommittedFrom(tokio::time::Instant::now())
+        } else {
+            Reply::Refused(ErrorCode::PermissionDenied)
+        };
+        waited(
+            Script {
+                held,
+                deadline: Duration::from_secs(300),
+                paired: vec![Paired::Committed, Paired::Committed],
+                held_opened: Duration::from_secs(1000),
+                owner,
+                checkpoint,
+                file,
+                ..Script::waiting(Duration::ZERO, Duration::ZERO)
+            },
+            Duration::from_secs(60),
+        )
+        .await
+    }
+
+    fn paired_host(run: &Waited) -> PairedHost {
+        match &run.outcome {
+            Some(Ok(host)) => host.clone(),
+            other => panic!("the attempt ends paired: {other:?}"),
+        }
+    }
+
+    fn methods(run: &Waited) -> Vec<(usize, &str)> {
+        run.requests
+            .iter()
+            .map(|(connection, method)| (*connection, method.as_str()))
+            .collect()
+    }
+
+    /// KR-REQ-20.12: an owner device the host committed reads the host's checkpoint once, after the
+    /// name and on the connection that proved the commitment, and keeps it, whether the host named
+    /// the commitment or the device derived it.
+    #[tokio::test(start_paused = true)]
+    async fn an_owner_reads_the_hosts_checkpoint_after_the_name_on_the_proofs_connection() {
+        for told in [false, true] {
+            let run = committing(told, true, published(7), None).await;
+            assert!(
+                ended_paired(&run),
+                "the attempt ends paired: {:?}",
+                run.outcome
+            );
+            let host = paired_host(&run);
+            assert_eq!(
+                methods(&run),
+                vec![
+                    (1, "pair.status"),
+                    (1, "environment.list"),
+                    (1, "backup.checkpoint")
+                ],
+                "told {told}"
+            );
+            let checkpoints = run.hosts.checkpoints();
+            let held = checkpoints.held_checkpoints();
+            assert!(
+                matches!(&held, Held::Read { entries, owed: 0 } if entries.len() == 1
+                    && entries[0].backup_generation.get() == 7),
+                "told {told}: {held:?}"
+            );
+            assert_eq!(
+                checkpoints.acquisition(&host),
+                Ok(Acquisition::Told),
+                "told {told}"
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: a device that does not manage the host sends no checkpoint request and keeps
+    /// no file.
+    #[tokio::test(start_paused = true)]
+    async fn a_device_that_does_not_manage_the_host_asks_it_nothing() {
+        let run = committing(false, false, published(7), None).await;
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
+        let host = paired_host(&run);
+        assert!(
+            methods(&run)
+                .iter()
+                .all(|(_, method)| *method != "backup.checkpoint"),
+            "{:?}",
+            run.requests
+        );
+        assert!(!run.hosts.directory().join("checkpoints.json").exists());
+        assert_eq!(
+            run.hosts.checkpoints().acquisition(&host),
+            Ok(Acquisition::NotAnOwner)
+        );
+    }
+
+    /// KR-REQ-20.12: a host that has accepted no generation says so, and is not owed but is asked
+    /// again later.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_with_nothing_published_is_not_owed_and_is_asked_again() {
+        let run = committing(false, true, Checkpoint::Null, None).await;
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
+        let host = paired_host(&run);
+        let checkpoints = run.hosts.checkpoints();
+        assert_eq!(
+            checkpoints.acquisition(&host),
+            Ok(Acquisition::NothingPublished)
+        );
+        assert!(matches!(
+            checkpoints.held_checkpoints(),
+            Held::Read { ref entries, owed: 0 } if entries.is_empty()
+        ));
+    }
+
+    /// KR-REQ-20.12: a host that cannot answer, refuses, answers wrongly or answers nothing leaves
+    /// the pairing complete and the host owed, the read is attempted once, and a read that gets no
+    /// answer is cut at its own bound and not the longer one of a recovery step.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_gets_no_answer_leaves_the_pairing_complete_and_the_host_owed() {
+        let cases = [
+            ("a host of an earlier release", Checkpoint::Unserved),
+            ("a refusal", Checkpoint::Refuse(ErrorCode::InvalidArgument)),
+            ("generation 0", Checkpoint::Zero),
+            ("no answer", Checkpoint::Silent),
+        ];
+        for (name, checkpoint) in cases {
+            let run = committing(false, true, checkpoint, None).await;
+            assert!(
+                ended_paired(&run),
+                "the attempt ends paired: {:?}",
+                run.outcome
+            );
+            let host = paired_host(&run);
+            let asked = methods(&run)
+                .iter()
+                .filter(|(_, method)| *method == "backup.checkpoint")
+                .count();
+            assert_eq!(asked, 1, "{name}: the read is attempted once");
+            assert_eq!(
+                run.hosts.checkpoints().acquisition(&host),
+                Ok(Acquisition::Owed),
+                "{name}"
+            );
+            assert!(
+                !run.hosts.directory().join("checkpoints.json").exists(),
+                "{name}: nothing is written"
+            );
+            assert!(
+                run.elapsed < Duration::from_secs(8),
+                "{name}: the read is cut at its own bound: {:?}",
+                run.elapsed
+            );
+        }
+    }
+
+    /// KR-REQ-20.12: a file this release cannot read stops the checkpoint from being kept and
+    /// does not fail the pairing.
+    #[tokio::test(start_paused = true)]
+    async fn a_checkpoint_that_cannot_be_kept_does_not_fail_the_pairing() {
+        let run = committing(false, true, published(7), Some(b"{".to_vec())).await;
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
+        let host = paired_host(&run);
+        assert_eq!(
+            run.hosts.checkpoints().acquisition(&host),
+            Err(SnapshotCause::Unreadable)
+        );
+        assert_eq!(
+            std::fs::read(run.hosts.directory().join("checkpoints.json")).expect("the file"),
+            b"{".to_vec(),
+            "the file is as it was"
+        );
     }
 
     /// An attempt says its stage and when it expires, and never the verification value, a host's
