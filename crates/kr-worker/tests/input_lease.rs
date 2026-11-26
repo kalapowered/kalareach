@@ -2651,6 +2651,116 @@ async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
 const STATUS_QUESTION: &[u8] = b"\x1b[5n";
 const STATUS_ANSWER: &[u8] = b"\x1b[0n";
 
+/// Says what the terminal's writer has written, for the message of a case that waits for answers
+/// to reach the application and does not see them.
+///
+/// Each record is what one write call took. A terminal that takes only part of an answer, as a
+/// pseudo-terminal whose input queue is nearly full does, leaves the answer in two records, so the
+/// report counts answers in each record and over the records joined in order, and names every
+/// record that ends inside an answer.
+fn writes_report(writes: &[kr_worker::testing::TerminalWrite]) -> String {
+    let stream: Vec<u8> = writes
+        .iter()
+        .flat_map(|write| write.bytes.iter().copied())
+        .collect();
+    let in_each_write: usize = writes
+        .iter()
+        .map(|write| count(&write.bytes, STATUS_ANSWER))
+        .sum();
+    let over_the_stream = count(&stream, STATUS_ANSWER);
+    let mut ends_inside_an_answer = Vec::new();
+    let mut other_lengths = Vec::new();
+    let mut end = 0_usize;
+    for (index, write) in writes.iter().enumerate() {
+        end += write.bytes.len();
+        if write.bytes.len() != STATUS_ANSWER.len() {
+            other_lengths.push((index, write.bytes.len()));
+        }
+        // An answer that begins `back` bytes before this record's end and ends after it.
+        let straddled = (1..STATUS_ANSWER.len()).any(|back| {
+            end.checked_sub(back).is_some_and(|start| {
+                stream.get(start..start + STATUS_ANSWER.len()) == Some(STATUS_ANSWER)
+            })
+        });
+        if straddled {
+            ends_inside_an_answer.push(index);
+        }
+    }
+    format!(
+        "{} writes took {} bytes; answers counted in each write {in_each_write}, over the joined \
+         stream {over_the_stream}; writes that end inside an answer {ends_inside_an_answer:?}; \
+         writes of another length than an answer {:?}",
+        writes.len(),
+        stream.len(),
+        &other_lengths[..other_lengths.len().min(8)],
+    )
+}
+
+/// The report counts an answer that the terminal took in two parts once over the joined records,
+/// and names the record that ends inside it.
+#[test]
+fn the_writes_report_finds_an_answer_that_two_records_split() {
+    let record = |bytes: &[u8]| kr_worker::testing::TerminalWrite {
+        at: Instant::now(),
+        bytes: bytes.to_vec(),
+        of_a_lease: false,
+    };
+    let report = writes_report(&[record(b"\x1b[0n\x1b["), record(b"0n\x1b[0n")]);
+    assert!(
+        report.contains("answers counted in each write 2, over the joined stream 3"),
+        "{report}"
+    );
+    assert!(
+        report.contains("end inside an answer [0]"),
+        "the first record ends inside an answer: {report}"
+    );
+}
+
+/// Says where the response lane, the room and the pump's flag stand, for the message of a case
+/// that waits for an answer to come out of the lane.
+///
+/// The deadline is the lane's own reading of when its first answer lapses, which is what the pump
+/// is told; the pump's own record of it is not readable from here. The room's counts are atomic,
+/// so a pass of the pump that holds the input domain does not keep them from being read, and what
+/// takes the domain or the session is read after, one lock at a time.
+fn lane_and_room_report(
+    runtime: &Arc<SessionRuntime>,
+    room: &kr_worker::input_room::InputRoom,
+    clock: &kr_ipc::clock::ManualSharedClock,
+) -> String {
+    let flag = runtime.input().lock().replies_waiting();
+    let gate = runtime.input().lock().lane_gate();
+    let writer_dropped = runtime.input().lock().replies_dropped();
+    let unwritten = runtime
+        .input()
+        .lock()
+        .unwritten_replies()
+        .load(std::sync::atomic::Ordering::Acquire);
+    let pump_stop_armed = runtime.input().pump_hold().is_armed();
+    let writer_stop_armed = runtime.input().writer_hold().is_armed();
+    let (pending, deadline, lane_dropped) = {
+        let session = runtime.session();
+        let engine = session.engine();
+        (
+            engine.replies_pending(),
+            engine.next_reply_expiry_ms(),
+            engine.replies_expired(),
+        )
+    };
+    format!(
+        "the flag says answers wait: {flag}; the gate {gate:?} allows a write: {}; the lane \
+         holds an answer: {pending}, its first deadline {deadline:?} at the lane clock {}; the \
+         room holds {:?}, of it {} answers, promises {:?}; answers unwritten {unwritten}; \
+         dropped by the writer {writer_dropped}, by the lane {lane_dropped}; the pump's stop is \
+         armed: {pump_stop_armed}, the writer's stop: {writer_stop_armed}",
+        gate.allows_write(),
+        kr_ipc::clock::SharedClock::boot_elapsed_ms(clock),
+        room.held(),
+        room.held_replies(),
+        room.promised(),
+    )
+}
+
 /// A running session whose application echoes its input, with its continuous clock in the test's
 /// hands, and the attachment that holds its input lease.
 async fn echoing_session() -> (
@@ -3103,6 +3213,16 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
         .await
         .expect("the pump reads the room")
         .expect("the pump's stop fires");
+    // What the room counted when the pass stood. The pass owns the input domain and the session
+    // until it is let go, so nothing here may take either: the counts are atomic. Frames beyond the
+    // 256 answers say that the timer had forwarded the held bytes, so that the pass that stands
+    // is the one after the gate opened.
+    let at_the_stop = format!(
+        "held {:?}, of it {} answers, promises {:?}",
+        room.held(),
+        room.held_replies(),
+        room.promised()
+    );
     drop(release_writer);
     // The writer writes every answer and the forwarded bytes, and gives back what each held.
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -3132,8 +3252,11 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
     .await
     .unwrap_or_else(|_| {
         panic!(
-            "the writer wrote {} of the 257 answers, and the room is free",
-            written()
+            "the writer wrote {} of the 257 answers, and the room is free. Now: {}. {}. When the \
+             pump's pass stood: {at_the_stop}",
+            written(),
+            writes_report(&runtime.input().terminal_writes()),
+            lane_and_room_report(&runtime, &room, &clock),
         )
     });
 }
