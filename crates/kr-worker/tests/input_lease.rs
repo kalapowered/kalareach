@@ -2651,6 +2651,40 @@ async fn what_follows_a_batch_the_writer_abandons_part_way_is_not_written() {
 const STATUS_QUESTION: &[u8] = b"\x1b[5n";
 const STATUS_ANSWER: &[u8] = b"\x1b[0n";
 
+/// Returns how many answers the terminal's writer has written.
+///
+/// A pseudo-terminal whose input queue is nearly full takes part of an answer, and the writer
+/// finishes it in a second write, so each of the two records holds half of it. The answers are
+/// therefore counted over what the writer wrote as one stream, never within each record.
+fn answers_written(writes: &[kr_worker::testing::TerminalWrite]) -> usize {
+    count(&written_stream(writes), STATUS_ANSWER)
+}
+
+/// Returns what the terminal's writer wrote, in the order it wrote it, as one stream.
+fn written_stream(writes: &[kr_worker::testing::TerminalWrite]) -> Vec<u8> {
+    writes
+        .iter()
+        .flat_map(|write| write.bytes.iter().copied())
+        .collect()
+}
+
+/// An answer that the terminal took in two parts is one answer written: the count reads all of
+/// them, where a count within each record reads one fewer.
+#[test]
+fn an_answer_the_terminal_took_in_two_parts_is_counted_once() {
+    let record = |bytes: &[u8]| kr_worker::testing::TerminalWrite {
+        at: Instant::now(),
+        bytes: bytes.to_vec(),
+        of_a_lease: false,
+    };
+    let writes = [record(b"\x1b[0n\x1b[0"), record(b"n"), record(b"\x1b[0n")];
+    assert_eq!(
+        answers_written(&writes),
+        3,
+        "the second answer was taken in two parts and is written"
+    );
+}
+
 /// Says what the terminal's writer has written, for the message of a case that waits for answers
 /// to reach the application and does not see them.
 ///
@@ -2659,15 +2693,12 @@ const STATUS_ANSWER: &[u8] = b"\x1b[0n";
 /// report counts answers in each record and over the records joined in order, and names every
 /// record that ends inside an answer.
 fn writes_report(writes: &[kr_worker::testing::TerminalWrite]) -> String {
-    let stream: Vec<u8> = writes
-        .iter()
-        .flat_map(|write| write.bytes.iter().copied())
-        .collect();
+    let stream = written_stream(writes);
     let in_each_write: usize = writes
         .iter()
         .map(|write| count(&write.bytes, STATUS_ANSWER))
         .sum();
-    let over_the_stream = count(&stream, STATUS_ANSWER);
+    let over_the_stream = answers_written(writes);
     let mut ends_inside_an_answer = Vec::new();
     let mut other_lengths = Vec::new();
     let mut end = 0_usize;
@@ -3128,14 +3159,7 @@ async fn answers_held_behind_a_paste_are_all_written_when_it_ends_though_more_th
     }
     // The last answer is written once the writer has given back a place for it, a moment after
     // the first 256 are written, so the wait is for all of them.
-    let written = || -> usize {
-        runtime
-            .input()
-            .terminal_writes()
-            .iter()
-            .map(|write| count(&write.bytes, STATUS_ANSWER))
-            .sum()
-    };
+    let written = || answers_written(&runtime.input().terminal_writes());
     tokio::time::timeout(Duration::from_secs(20), async {
         while written() < 257 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3236,14 +3260,7 @@ async fn room_given_back_between_the_pumps_reading_and_its_waiting_still_brings_
 
     // The last answer is written once something has brought it out of the lane: the pump's own
     // pass cannot, because it read the room before the writer gave it back.
-    let written = || -> usize {
-        runtime
-            .input()
-            .terminal_writes()
-            .iter()
-            .map(|write| count(&write.bytes, STATUS_ANSWER))
-            .sum()
-    };
+    let written = || answers_written(&runtime.input().terminal_writes());
     tokio::time::timeout(Duration::from_secs(20), async {
         while written() < 257 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3430,14 +3447,7 @@ async fn room_given_back_after_the_pumps_pass_has_ended_brings_the_waiting_answe
     drop(release_pump);
     drop(release_writer);
 
-    let written = || -> usize {
-        runtime
-            .input()
-            .terminal_writes()
-            .iter()
-            .map(|write| count(&write.bytes, STATUS_ANSWER))
-            .sum()
-    };
+    let written = || answers_written(&runtime.input().terminal_writes());
     tokio::time::timeout(Duration::from_secs(20), async {
         while written() < 257 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3538,14 +3548,7 @@ async fn the_room_a_lane_gives_back_when_it_ends_brings_the_waiting_answer_out()
 
     // The writer goes on and writes the answer.
     drop(release_writer);
-    let written = || -> usize {
-        runtime
-            .input()
-            .terminal_writes()
-            .iter()
-            .map(|write| count(&write.bytes, STATUS_ANSWER))
-            .sum()
-    };
+    let written = || answers_written(&runtime.input().terminal_writes());
     tokio::time::timeout(Duration::from_secs(20), async {
         while written() < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3622,25 +3625,21 @@ async fn the_paste_ends_and_the_dropped_answer_was_never_written(
         runtime.flush_input();
     }
     tokio::time::timeout(Duration::from_secs(20), async {
-        while !runtime
-            .input()
-            .terminal_writes()
-            .iter()
-            .any(|write| count(&write.bytes, &b"\x1b[201~"[..]) > 0)
-        {
+        while !contains(
+            &written_stream(&runtime.input().terminal_writes()),
+            b"\x1b[201~",
+        ) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("the end of the paste is written");
     runtime.session().pump_replies();
-    let answers: usize = runtime
-        .input()
-        .terminal_writes()
-        .iter()
-        .map(|write| count(&write.bytes, STATUS_ANSWER))
-        .sum();
-    assert_eq!(answers, 0, "the dropped answer is not written");
+    assert_eq!(
+        answers_written(&runtime.input().terminal_writes()),
+        0,
+        "the dropped answer is not written"
+    );
     assert_eq!(runtime.session().engine().replies_expired(), 1);
 }
 
