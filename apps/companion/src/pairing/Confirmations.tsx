@@ -322,7 +322,6 @@ export function Confirmations({ surface = 'desktop' }: { readonly surface?: Surf
               <span className="small muted tabular">{secondsLeft(request.expires_at_ms, now)}</span>
               {request.checkable && label !== null ? (
                 <CommitButton
-                  data-wraps
                   tone="primary"
                   data-testid="confirm-request"
                   style={target === undefined ? undefined : { minBlockSize: target }}
@@ -335,7 +334,6 @@ export function Confirmations({ surface = 'desktop' }: { readonly surface?: Surf
                 </CommitButton>
               ) : null}
               <Button
-                data-wraps
                 tone="quiet"
                 data-testid="not-now"
                 style={target === undefined ? undefined : { minBlockSize: target }}

@@ -575,7 +575,6 @@ export function DeleteAccount({
 
   const cancel = (
     <Button
-      data-wraps
       data-testid="delete-account-cancel"
       style={{ minBlockSize: target }}
       onClick={flow.cancel}
@@ -597,7 +596,6 @@ export function DeleteAccount({
       actions = (
         <>
           <Button
-            data-wraps
             tone="primary"
             data-testid="delete-account-retry"
             style={{ minBlockSize: target }}
@@ -620,7 +618,6 @@ export function DeleteAccount({
       actions = (
         <>
           <Button
-            data-wraps
             tone="primary"
             data-testid="delete-account-send-code"
             disabled={step.name === 'sending'}
@@ -674,7 +671,6 @@ export function DeleteAccount({
       actions = (
         <>
           <Button
-            data-wraps
             data-testid="delete-account-resend"
             disabled={step.name === 'confirming'}
             style={{ minBlockSize: target }}
@@ -683,7 +679,6 @@ export function DeleteAccount({
             Send another code
           </Button>
           <Button
-            data-wraps
             tone="danger"
             data-testid="delete-account-confirm"
             disabled={code.length !== CODE_DIGITS || step.name === 'confirming'}
@@ -709,7 +704,6 @@ export function DeleteAccount({
       actions = (
         <>
           <Button
-            data-wraps
             tone="danger"
             data-testid="delete-account-acknowledge"
             style={{ minBlockSize: target }}
@@ -718,7 +712,6 @@ export function DeleteAccount({
             Delete anyway
           </Button>
           <Button
-            data-wraps
             data-testid="delete-account-back"
             style={{ minBlockSize: target }}
             onClick={flow.back}
@@ -735,7 +728,6 @@ export function DeleteAccount({
       actions = (
         <>
           <Button
-            data-wraps
             tone="primary"
             data-testid="delete-account-check"
             disabled={checking}
@@ -746,7 +738,6 @@ export function DeleteAccount({
           </Button>
           {code.length === CODE_DIGITS ? (
             <Button
-              data-wraps
               data-testid="delete-account-again"
               disabled={checking}
               style={{ minBlockSize: target }}
@@ -756,7 +747,6 @@ export function DeleteAccount({
             </Button>
           ) : null}
           <Button
-            data-wraps
             data-testid="delete-account-close"
             disabled={checking}
             style={{ minBlockSize: target }}
@@ -782,7 +772,6 @@ export function DeleteAccount({
       )
       actions = (
         <Button
-          data-wraps
           tone="primary"
           data-testid="delete-account-done"
           style={{ minBlockSize: target }}

@@ -1179,7 +1179,6 @@ export function MobileSession({
     !typingToProgram && waiting.length > 0 && waiting.every((each) => each.state === 'unknown') ? (
       <Button
         data-testid="composer-send-anyway"
-        data-wraps
         aria-describedby={describedBy}
         disabled={!submittable(draft, carriesFiles) || !submitOffer.offered || busy || heldForFiles}
         style={{ minBlockSize: target }}
@@ -1848,7 +1847,6 @@ export function MobileSession({
               {offeredCommands.map((command) => (
                 <li key={command.name}>
                   <Button
-                    data-wraps
                     style={{ minBlockSize: target }}
                     onClick={() => {
                       typeInto(`/${command.name} `)

@@ -219,7 +219,6 @@ export function AccountPanel({
             {offersSignIn ? (
               <div className="account-actions">
                 <Button
-                  data-wraps
                   tone="primary"
                   style={{ minBlockSize: target }}
                   aria-describedby={helpId}
@@ -235,7 +234,6 @@ export function AccountPanel({
             {view.state === 'browser_open' ? (
               <div className="account-actions">
                 <button
-                  data-wraps
                   type="button"
                   className="btn"
                   ref={cancelRef}
@@ -248,7 +246,7 @@ export function AccountPanel({
             ) : null}
             {view.state === 'signed_in' ? (
               <div className="account-actions">
-                <Button data-wraps style={{ minBlockSize: target }} onClick={account.signOut}>
+                <Button style={{ minBlockSize: target }} onClick={account.signOut}>
                   Sign out
                 </Button>
               </div>
@@ -289,7 +287,6 @@ export function AccountPanel({
               <div className="account-actions">
                 <p className="account-note">{ENTRY_NOTE}</p>
                 <Button
-                  data-wraps
                   ref={entryRef}
                   data-testid="delete-account-open"
                   style={{ minBlockSize: target }}
@@ -383,7 +380,7 @@ function Usage({
     body = (
       <div className="account-actions">
         <p className="account-note">Usage could not be read.</p>
-        <Button data-wraps style={{ minBlockSize: target }} onClick={onRetry}>
+        <Button style={{ minBlockSize: target }} onClick={onRetry}>
           Try again
         </Button>
       </div>

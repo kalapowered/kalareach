@@ -289,16 +289,6 @@ main {
   transform: scale(0.97);
 }
 
-/* A button whose label can be long wraps it inside the button at a large text size, and the button
-   stays inside the box that holds it. */
-.btn[data-wraps] {
-  white-space: normal;
-  /* A word wider than the button's room is broken, as one in a line of text is. */
-  overflow-wrap: anywhere;
-  max-inline-size: 100%;
-  text-align: center;
-}
-
 .btn:disabled:active,
 .icon-btn:disabled:active {
   transform: none;
@@ -913,15 +903,6 @@ textarea::placeholder {
   padding: 17px 24px;
   border-top: 1px solid var(--line);
   background: var(--raised);
-}
-
-/* A label too long for the footer at a large text size wraps inside its button, whatever face the
-   text is set in, and the button stays inside the footer: the sheet clips what is wider than it,
-   and focus then scrolls the whole sheet sideways to reach it. */
-.dialog-footer .btn {
-  white-space: normal;
-  max-inline-size: 100%;
-  text-align: center;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -151,7 +151,6 @@ export function LaunchSurface({
               <Button
                 key={offer.plugin_id}
                 data-offer={offer.plugin_id}
-                data-wraps
                 aria-pressed={shown === `offer:${offer.plugin_id}`}
                 onClick={() => {
                   setShown(`offer:${offer.plugin_id}`)
@@ -170,7 +169,6 @@ export function LaunchSurface({
                   <Button
                     key={`saved:${offer.label}`}
                     data-named={offer.label}
-                    data-wraps
                     aria-pressed={shown === `saved:${offer.label}`}
                     onClick={() => {
                       setShown(`saved:${offer.label}`)
@@ -265,7 +263,6 @@ export function LaunchSurface({
               <CommitButton
                 key={offer.plugin_id}
                 data-offer={offer.plugin_id}
-                data-wraps
                 disabled={!lit}
                 title={why ?? typed(offer, null)}
                 onCommit={() => {
@@ -285,7 +282,6 @@ export function LaunchSurface({
                   <CommitButton
                     key={`saved:${offer.label}`}
                     data-named={offer.label}
-                    data-wraps
                     disabled={!lit}
                     title={why ?? offer.vector.join(' ')}
                     onCommit={() => {

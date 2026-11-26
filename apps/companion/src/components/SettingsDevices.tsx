@@ -110,7 +110,6 @@ export function SettingsDevices({
                 </div>
                 <Button
                   tone="primary"
-                  data-wraps
                   disabled={busy}
                   aria-label={`Share settings with ${candidate.name}`}
                   style={{ minBlockSize: target }}
@@ -143,7 +142,6 @@ export function SettingsDevices({
                 </div>
                 {held.waiting ? null : (
                   <Button
-                    data-wraps
                     disabled={busy}
                     aria-label={`Share settings with ${held.name} again`}
                     style={{ minBlockSize: target }}
@@ -172,7 +170,6 @@ export function SettingsDevices({
                 </div>
                 <Button
                   tone="primary"
-                  data-wraps
                   disabled={busy}
                   aria-label={offerLabel(offer)}
                   style={{ minBlockSize: target }}
@@ -195,7 +192,6 @@ export function SettingsDevices({
       <div className="account-actions">
         <Button
           data-testid="settings-devices-look"
-          data-wraps
           disabled={busy}
           style={{ minBlockSize: target }}
           onClick={onLook}
@@ -205,7 +201,6 @@ export function SettingsDevices({
         {devices.outcomes.length > 0 ? (
           <Button
             data-testid="settings-devices-dismiss"
-            data-wraps
             disabled={busy}
             style={{ minBlockSize: target }}
             onClick={onDismiss}
@@ -275,7 +270,6 @@ function MemberRow({
         >
           <Button
             tone="danger"
-            data-wraps
             disabled={busy}
             aria-label={`Take ${member.name} out now`}
             style={{ minBlockSize: target }}
@@ -287,7 +281,6 @@ function MemberRow({
             Take out
           </Button>
           <Button
-            data-wraps
             ref={keep}
             aria-label={`Keep ${member.name} in`}
             style={{ minBlockSize: target }}
@@ -298,7 +291,6 @@ function MemberRow({
         </div>
       ) : (
         <Button
-          data-wraps
           ref={trigger}
           disabled={busy}
           aria-label={`Take ${member.name} out`}

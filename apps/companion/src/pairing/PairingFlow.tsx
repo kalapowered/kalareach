@@ -374,7 +374,7 @@ export function PairingFlow({
           </p>
           {view.sources.camera ? (
             <div className="pairing-scan" aria-busy={taking}>
-              <Button data-wraps tone="primary" data-testid="scan-code" disabled={taking} onClick={scan}>
+              <Button tone="primary" data-testid="scan-code" disabled={taking} onClick={scan}>
                 Scan code
               </Button>
             </div>
@@ -422,12 +422,11 @@ export function PairingFlow({
               ) : null}
             </div>
             <div className="row wrap">
-              <Button data-wraps type="submit" tone="primary" data-testid="pair" disabled={!codeComplete(code)}>
+              <Button type="submit" tone="primary" data-testid="pair" disabled={!codeComplete(code)}>
                 Pair
               </Button>
               {view.sources.photo ? (
                 <Button
-                  data-wraps
                   tone="quiet"
                   data-testid="choose-photo"
                   disabled={taking}
@@ -437,7 +436,6 @@ export function PairingFlow({
                 </Button>
               ) : null}
               <Button
-                data-wraps
                 tone="quiet"
                 data-testid="paste-invitation"
                 disabled={taking}
@@ -453,7 +451,7 @@ export function PairingFlow({
             ) : null}
             {pasteFailure === 'camera_denied' ? (
               <div className="row">
-                <Button data-wraps tone="quiet" data-testid="open-settings" onClick={openSettings}>
+                <Button tone="quiet" data-testid="open-settings" onClick={openSettings}>
                   Open Settings
                 </Button>
               </div>
@@ -464,7 +462,7 @@ export function PairingFlow({
               <p className="small">
                 Codes go through <ServiceAddress host={view.origin.host} testId="pairing-service" />
               </p>
-              <Button data-wraps
+              <Button
                 tone="quiet"
                 data-testid="change-service"
                 aria-expanded={changing}
@@ -511,7 +509,7 @@ export function PairingFlow({
                 />
                 <p className="form-hint">An https address, like https://reach.kala.to.</p>
                 <div className="row">
-                  <Button data-wraps type="submit" tone="primary" data-testid="save-service">
+                  <Button type="submit" tone="primary" data-testid="save-service">
                     Use this service
                   </Button>
                 </div>
@@ -568,7 +566,7 @@ export function PairingFlow({
             {view.state.expires_at_ms !== null ? `, ${timeLeft(view.state.expires_at_ms, now)}` : ''}
           </p>
           <div className="row">
-            <Button data-wraps
+            <Button
               data-testid="stop-waiting"
               onClick={() => {
                 setCode('')
@@ -593,7 +591,7 @@ export function PairingFlow({
             Connection lost. Reconnecting.
           </p>
           <div className="row">
-            <Button data-wraps
+            <Button
               data-testid="stop-waiting"
               onClick={() => {
                 setCode('')
@@ -619,7 +617,7 @@ export function PairingFlow({
               : `${capitalised(thisDevice)} can ${view.state.host.authority} on ${view.state.host.name ?? 'your host'}${until(view.state.host.grant_expires_at_ms)}.`}
           </p>
           <div className="row">
-            <Button data-wraps
+            <Button
               tone="primary"
               data-testid="pairing-done"
               onClick={() => {
@@ -708,7 +706,7 @@ function Ended({
         </div>
       ) : null}
       <div className="row">
-        <Button data-wraps
+        <Button
           tone="primary"
           data-testid="failure-action"
           onClick={() => {
@@ -775,10 +773,10 @@ function Pasted({
           </p>
         </div>
         <div className="card-footer">
-          <Button data-wraps onClick={onCancel} data-testid="cancel-invitation">
+          <Button onClick={onCancel} data-testid="cancel-invitation">
             Cancel
           </Button>
-          <Button data-wraps tone="primary" onClick={onPair} data-testid="pair-invitation">
+          <Button tone="primary" onClick={onPair} data-testid="pair-invitation">
             Pair
           </Button>
         </div>
@@ -835,7 +833,6 @@ function HostNotifications({
       {state === 'off' || state === 'needs_attention' ? (
         <div className="row wrap">
           <Button
-            data-wraps
             data-testid="notifications-enable"
             onClick={() => {
               setFailure(null)
@@ -854,7 +851,6 @@ function HostNotifications({
           </Button>
           {row?.settings === true ? (
             <Button
-              data-wraps
               tone="quiet"
               data-testid="notifications-settings"
               onClick={() => {
@@ -988,7 +984,7 @@ function PairedHosts({
                   {host.owner ? ' This phone also stops confirming requests from it.' : ''}
                 </p>
                 <div className="row wrap">
-                  <Button data-wraps
+                  <Button
                     ref={keep}
                     data-testid="keep-host"
                     onClick={() => {
@@ -998,7 +994,7 @@ function PairedHosts({
                   >
                     Keep it
                   </Button>
-                  <Button data-wraps
+                  <Button
                     tone="danger"
                     data-testid="forget-host-confirm"
                     aria-disabled={forgetting !== null}
@@ -1032,7 +1028,7 @@ function PairedHosts({
                     In use
                   </span>
                 ) : (
-                  <Button data-wraps
+                  <Button
                     disabled={using !== null}
                     data-testid="use-host"
                     onClick={() => {
@@ -1051,7 +1047,7 @@ function PairedHosts({
                   </Button>
                 )}
                 {forgetHost === undefined ? null : (
-                  <Button data-wraps
+                  <Button
                     ref={(button) => {
                       if (button === null) forgetButtons.current.delete(host.reference)
                       else forgetButtons.current.set(host.reference, button)

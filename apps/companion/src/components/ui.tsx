@@ -312,7 +312,6 @@ export function TwoPressButton({
         tone={tone}
         disabled={disabled}
         data-armed={armed ? 'true' : undefined}
-        data-wraps=""
         onCommit={(began) => {
           if (!armed) {
             setArmedOn(armKey)

@@ -427,7 +427,6 @@ function DeviceRow({
       {offered && label !== null && name !== null ? (
         <Button
           tone={askAgain ? 'default' : 'danger'}
-          data-wraps
           disabled={revoking !== null}
           aria-label={name}
           style={{ minBlockSize: target }}

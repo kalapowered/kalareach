@@ -168,19 +168,6 @@
   gap: var(--gap-2);
 }
 
-/*
- * A button is as wide as its label, and a long one (the name of what was hidden, after "Show") is
- * wider than the screen at the largest text size. The label wraps inside the button, breaks inside a
- * word where the button ends, and the button stays inside the box that holds it, so every control
- * can be reached whatever the size of the text and the face it is in.
- */
-.sw-group .btn {
-  max-inline-size: 100%;
-  text-align: center;
-  white-space: normal;
-  overflow-wrap: anywhere;
-}
-
 /* ---- The pill for an invitation that arrived above the part of the inbox that is in view ----- */
 
 /*

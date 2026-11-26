@@ -598,7 +598,6 @@ export function Setup(): ReactNode {
           onClick={() => {
             setStep((index) => Math.max(0, index - 1))
           }}
-          data-wraps
         >
           Back
         </Button>
@@ -609,7 +608,6 @@ export function Setup(): ReactNode {
           onClick={() => {
             setStep((index) => Math.min(steps.length - 1, index + 1))
           }}
-          data-wraps
         >
           Continue
         </Button>
@@ -839,7 +837,7 @@ function PermissionsStep({
         title="These are four separate permissions"
         detail={CEILING}
         action={
-          <Button onClick={onExplainChecks} data-testid="setup-explain-checks" data-wraps>
+          <Button onClick={onExplainChecks} data-testid="setup-explain-checks">
             What the checks do
           </Button>
         }
@@ -944,7 +942,6 @@ function PermissionCard({
             onOpenPane(category)
           }}
           data-testid={`setup-open-${category.pane}`}
-          data-wraps
         >
           {visited ? 'Open it again' : 'Open System Settings'}
         </Button>
@@ -1121,7 +1118,7 @@ function CapabilitiesStep({
           ) : null}
         </div>
         <footer className="card-footer setup-route">
-          <Button onClick={onRead} disabled={reading} data-testid="setup-recheck" data-wraps>
+          <Button onClick={onRead} disabled={reading} data-testid="setup-recheck">
             {reading ? 'Reading…' : 'Read again'}
           </Button>
           <Button
@@ -1130,7 +1127,6 @@ function CapabilitiesStep({
             disabled={!runnable}
             aria-describedby={runnable ? undefined : 'setup-run-unavailable'}
             data-testid="setup-run-checks"
-            data-wraps
           >
             Run the checks…
           </Button>
@@ -1588,7 +1584,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
       ) : null}
       <footer className="card-footer setup-route">
         {setup === null ? (
-          <Button data-testid="setup-model-retry" onClick={descriptions.reload} data-wraps>
+          <Button data-testid="setup-model-retry" onClick={descriptions.reload}>
             Ask again
           </Button>
         ) : null}
@@ -1599,7 +1595,6 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
             onClick={() => {
               descriptions.download(fetchButton.action)
             }}
-            data-wraps
           >
             {fetchButton.label}
           </Button>

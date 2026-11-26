@@ -395,7 +395,6 @@ export function SyncPanel({
             {service !== null ? (
               <Button
                 data-testid="change-sync-service"
-                data-wraps
                 aria-expanded={changing}
                 style={{ minBlockSize: target }}
                 onClick={() => {
@@ -407,7 +406,6 @@ export function SyncPanel({
               </Button>
             ) : (
               <Button
-                data-wraps
                 disabled={busy}
                 style={{ minBlockSize: target }}
                 onClick={() => {
@@ -458,7 +456,6 @@ export function SyncPanel({
                   type="submit"
                   tone="primary"
                   data-testid="save-sync-service"
-                  data-wraps
                   disabled={busy}
                   style={{ minBlockSize: target }}
                 >
@@ -522,7 +519,6 @@ export function SyncPanel({
               <div className="account-actions">
                 {settingsProblem !== null ? (
                   <Button
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -540,7 +536,6 @@ export function SyncPanel({
                         : 'primary'
                     }
                     data-testid="settings-sync-turn-on"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -554,7 +549,6 @@ export function SyncPanel({
                   <Button
                     tone="primary"
                     data-testid="settings-sync-choose"
-                    data-wraps
                     aria-expanded={choice !== null}
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -580,7 +574,6 @@ export function SyncPanel({
                 {settings?.sync.state === 'on' ? (
                   <Button
                     data-testid="settings-sync-now"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -781,7 +774,6 @@ export function SyncPanel({
               <div className="account-actions">
                 {recoveryProblem !== null ? (
                   <Button
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -793,7 +785,6 @@ export function SyncPanel({
                 ) : null}
                 {offersTurnOn ? (
                   <Button
-                    data-wraps
                     tone="primary"
                     data-testid="recovery-turn-on"
                     disabled={busy}
@@ -807,7 +798,6 @@ export function SyncPanel({
                 ) : null}
                 {blocker?.reason === 'needs_sign_in' ? (
                   <Button
-                    data-wraps
                     tone="primary"
                     data-testid="recovery-sign-in"
                     disabled={busy}
@@ -821,7 +811,6 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'on' && recovery.settings?.state === 'stopped' ? (
                   <Button
-                    data-wraps
                     data-testid="recovery-resume-settings"
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -834,7 +823,6 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'unsettled' && blocker === null ? (
                   <Button
-                    data-wraps
                     tone="primary"
                     data-testid="recovery-settle"
                     disabled={busy}
@@ -849,7 +837,6 @@ export function SyncPanel({
                 {recovery?.state === 'on' && blocker === null && hostCover?.state !== 'covered' ? (
                   <Button
                     data-testid="recovery-cover-host"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -866,7 +853,6 @@ export function SyncPanel({
                 {recovery?.state === 'on' && offersReplacement(hostCover) && !confirmingReplace ? (
                   <Button
                     data-testid="recovery-replace-host"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -881,7 +867,6 @@ export function SyncPanel({
                     <Button
                       tone="primary"
                       data-testid="recovery-replace-confirm"
-                      data-wraps
                       disabled={busy}
                       style={{ minBlockSize: target }}
                       onClick={() => {
@@ -895,7 +880,6 @@ export function SyncPanel({
                       Start new backups
                     </Button>
                     <Button
-                      data-wraps
                       data-testid="recovery-replace-cancel"
                       disabled={busy}
                       style={{ minBlockSize: target }}
@@ -909,7 +893,6 @@ export function SyncPanel({
                 ) : null}
                 {recovery?.state === 'on' ? (
                   <Button
-                    data-wraps
                     data-testid="recovery-save-kit"
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -929,7 +912,6 @@ export function SyncPanel({
                 {recovery?.state === 'on' ? (
                   <Button
                     data-testid="recovery-save-qr"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -947,7 +929,6 @@ export function SyncPanel({
                 {recovery?.state === 'on' && blocker === null && copies === null ? (
                   <Button
                     data-testid="recovery-export-offline"
-                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -974,7 +955,6 @@ export function SyncPanel({
                       </div>
                       <Button
                         data-testid={`recovery-copy-${archive?.archive_id ?? 'bundle'}`}
-                        data-wraps
                         disabled={busy || (archive !== null && archive.generation === null)}
                         style={{ minBlockSize: target }}
                         onClick={() => {
@@ -992,7 +972,6 @@ export function SyncPanel({
                   ))}
                   <li className="device-row">
                     <Button
-                      data-wraps
                       data-testid="recovery-copies-close"
                       disabled={busy}
                       style={{ minBlockSize: target }}
@@ -1049,7 +1028,6 @@ export function SyncPanel({
                   </div>
                   <div className="account-actions">
                     <Button
-                      data-wraps
                       tone="primary"
                       data-testid="recovery-restore-choose"
                       disabled={busy}

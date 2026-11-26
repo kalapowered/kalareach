@@ -1714,7 +1714,6 @@ function Composer({
           {held === null ? null : (
             <Button
               data-testid="composer-send-anyway"
-              data-wraps
               aria-describedby={reasonId}
               disabled={!canSendAnyway}
               onClick={onSendAnyway}
