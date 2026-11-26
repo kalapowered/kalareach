@@ -28,9 +28,9 @@ pub const STABLE_CONNECTION: Duration = Duration::from_millis(INACTIVITY_THRESHO
 
 /// Jittered exponential backoff between connection attempts.
 ///
-/// The jitter is full jitter: each delay is drawn uniformly from zero to the current ceiling. A
-/// fleet of devices that lost the same relay therefore spreads its retries instead of returning in
-/// step, which is the failure mode backoff without jitter produces.
+/// The jitter is full jitter: each delay is drawn uniformly from the minimum to the current
+/// ceiling. A fleet of devices that lost the same relay therefore spreads its retries instead of
+/// returning in step, which is the failure mode backoff without jitter produces.
 #[derive(Clone, Debug)]
 pub struct Backoff {
     ceiling: Duration,
@@ -64,8 +64,8 @@ impl Backoff {
         let span = millis.saturating_sub(floor).saturating_add(1);
         // Full jitter, held at the minimum so a failing endpoint is never retried immediately. The
         // draw comes from the same generator as everything else in this crate rather than from a
-        // second random source; a failed draw falls back to the ceiling, which delays rather than
-        // hurries the retry.
+        // second random source; a failed draw falls back to the minimum, the shortest delay of the
+        // schedule.
         let offset = crate::random::fresh_u64().map_or(0, |value| value % span);
         Duration::from_millis(floor.saturating_add(offset))
     }
