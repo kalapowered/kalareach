@@ -1377,14 +1377,15 @@ mod unix {
         #[cfg(test)]
         mod tests {
             use std::collections::{BTreeMap, BTreeSet};
-            use std::path::PathBuf;
-            use std::sync::{Mutex, MutexGuard, PoisonError};
+            use std::path::{Path, PathBuf};
+            use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 
             use notify::Event;
-            use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RenameMode};
+            use notify::event::{CreateKind, EventKind, Flag, ModifyKind, RemoveKind, RenameMode};
 
             use super::{
-                AuthorisedDirectory, Held, NameWatch, Places, Shared, WATCHES, budget, take,
+                AuthorisedDirectory, Budget, Duration, Held, Instant, MARK, NameWatch, Places,
+                Shared, WATCHES, budget, take,
             };
 
             /// A copy at `/work/run/copy`, in the directory `/work/run`, with a declared output
@@ -1569,6 +1570,252 @@ mod unix {
                     started.err().as_deref(),
                     Some("the copy is no longer where it was opened"),
                     "the host's own step did not come first"
+                );
+            }
+
+            /// The directories above the declared outputs `out` at the copy's root and
+            /// `target/debug`.
+            fn parents_of_outputs() -> BTreeMap<String, BTreeSet<String>> {
+                BTreeMap::from([
+                    (String::new(), BTreeSet::from(["out".to_owned()])),
+                    ("target".to_owned(), BTreeSet::from(["debug".to_owned()])),
+                ])
+            }
+
+            /// A copy with the directories above its declared outputs, the directory beside it
+            /// where the host writes its markers, and a watch with no stream: what a stream would
+            /// report is delivered by the case, through `take`, the way the watcher's handler
+            /// delivers it.
+            struct Place {
+                _root: tempfile::TempDir,
+                copy: PathBuf,
+                watch: NameWatch,
+                places: Arc<Places>,
+                shared: Arc<Mutex<Shared>>,
+                tell: mpsc::Sender<PathBuf>,
+            }
+
+            /// A watcher that holds no stream, held with a cost of nothing from a budget of its own.
+            fn no_stream() -> Held<'static, notify::RecommendedWatcher> {
+                static NO_STREAM: Budget = Budget::new();
+                let started = NO_STREAM.admit(0, None, || {
+                    notify::recommended_watcher(|_: notify::Result<Event>| {})
+                        .map_err(|error| format!("a watcher with no stream: {error}"))
+                });
+                match started {
+                    Ok(held) => held,
+                    Err(why) => panic!("a watch that costs nothing is admitted: {why}"),
+                }
+            }
+
+            fn a_place() -> Place {
+                let root = tempfile::TempDir::new().expect("a directory to work in");
+                let root_path = std::fs::canonicalize(root.path()).expect("the directory resolves");
+                let beside_path = root_path.join("materialisations");
+                let copy = beside_path.join("copy");
+                std::fs::create_dir_all(copy.join("target/debug")).expect("the directories above");
+                let beside = AuthorisedDirectory::open_root(
+                    kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                    &beside_path,
+                )
+                .expect("the directory beside the copy opens");
+                let places = Arc::new(Places::new(copy.clone(), parents_of_outputs()));
+                let shared = Arc::new(Mutex::new(Shared::default()));
+                let (tell, reported) = mpsc::channel();
+                let watch = NameWatch {
+                    _watcher: no_stream(),
+                    shared: Arc::clone(&shared),
+                    reported: Mutex::new(reported),
+                    beside,
+                    beside_path,
+                    copy_path: copy.clone(),
+                };
+                Place {
+                    _root: root,
+                    copy,
+                    watch,
+                    places,
+                    shared,
+                    tell,
+                }
+            }
+
+            fn report(kind: EventKind, path: &Path) -> Event {
+                Event::new(kind).add_path(path.to_path_buf())
+            }
+
+            /// What the run does: removes the directory an output is in and makes it again, with
+            /// the output in it again.
+            fn replace_the_parent(copy: &Path) {
+                std::fs::remove_dir_all(copy.join("target")).expect("the run removes the parent");
+                std::fs::create_dir_all(copy.join("target/debug")).expect("and makes it again");
+                std::fs::write(copy.join("target/debug/artefact"), "built again\n")
+                    .expect("and the output with it");
+            }
+
+            /// Delivers `before`, waits for the host's marker to be written and runs `at_marker`,
+            /// delivers the report of the marker, and delivers `after` once the host has decided,
+            /// which the returned sender says.
+            fn deliver(
+                place: &Place,
+                before: Vec<Event>,
+                at_marker: impl FnOnce() + Send + 'static,
+                after: Vec<Event>,
+            ) -> (std::thread::JoinHandle<()>, mpsc::Sender<()>) {
+                let (places, shared, tell) = (
+                    Arc::clone(&place.places),
+                    Arc::clone(&place.shared),
+                    place.tell.clone(),
+                );
+                let beside = place.watch.beside_path.clone();
+                let (decided, decision) = mpsc::channel::<()>();
+                let tell_of = move |event: Event| {
+                    let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(path) = take(&places, &mut shared, Ok(event)) {
+                        let _ = tell.send(path);
+                    }
+                };
+                let thread = std::thread::spawn(move || {
+                    for event in before {
+                        tell_of(event);
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let marker = loop {
+                        let found = std::fs::read_dir(&beside)
+                            .expect("the directory beside the copy reads")
+                            .filter_map(Result::ok)
+                            .map(|entry| entry.path())
+                            .find(|path| {
+                                path.file_name()
+                                    .is_some_and(|name| name.to_string_lossy().starts_with(MARK))
+                            });
+                        if let Some(path) = found {
+                            break path;
+                        }
+                        assert!(Instant::now() < deadline, "the host wrote no marker");
+                        std::thread::sleep(Duration::from_millis(1));
+                    };
+                    at_marker();
+                    tell_of(report(EventKind::Create(CreateKind::File), &marker));
+                    let _ = decision.recv_timeout(Duration::from_secs(10));
+                    for event in after {
+                        tell_of(event);
+                    }
+                });
+                (thread, decided)
+            }
+
+            /// The paths the watch says were written, when the stream reports `before` ahead of
+            /// the host's marker and `after` once the host has decided, and `at_marker` runs as the
+            /// marker is reported.
+            fn written_with(
+                place: &Place,
+                before: Vec<Event>,
+                at_marker: impl FnOnce() + Send + 'static,
+                after: Vec<Event>,
+            ) -> Vec<String> {
+                let (platform, decided) = deliver(place, before, at_marker, after);
+                let written = place.watch.drain().expect("the watch is up to date");
+                decided.send(()).expect("the platform waits");
+                platform.join().expect("the platform ends");
+                written
+            }
+
+            /// Control: a directory an output is in that is removed and made again, which the
+            /// stream reports at the directory's own path ahead of the marker, is a write.
+            #[test]
+            fn a_parent_replaced_and_reported_before_the_marker_is_a_write() {
+                let place = a_place();
+                replace_the_parent(&place.copy);
+                let parent = place.copy.join("target");
+                let before = vec![
+                    report(EventKind::Create(CreateKind::Folder), &parent),
+                    report(EventKind::Remove(RemoveKind::Folder), &parent),
+                ];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert_eq!(written, vec!["target".to_owned()]);
+            }
+
+            /// Control: an output that is removed and made again in its directory is the run's to
+            /// write, and the directory is not written by it.
+            #[test]
+            fn an_output_made_again_in_its_parent_is_no_write() {
+                let place = a_place();
+                std::fs::remove_dir_all(place.copy.join("target/debug"))
+                    .expect("the run removes it");
+                std::fs::create_dir_all(place.copy.join("target/debug"))
+                    .expect("and makes it again");
+                let output = place.copy.join("target/debug");
+                let before = vec![
+                    report(EventKind::Remove(RemoveKind::Folder), &output),
+                    report(EventKind::Create(CreateKind::Folder), &output),
+                ];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert!(
+                    written.is_empty(),
+                    "only the output was made again, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that is removed and made again is a
+            /// write, also when the stream reports it only after the marker the host waits for: the
+            /// host decides when the marker is reported, and the copy shows the directory is
+            /// another.
+            #[test]
+            fn a_parent_replaced_and_reported_after_the_marker_is_a_write() {
+                let place = a_place();
+                replace_the_parent(&place.copy);
+                let parent = place.copy.join("target");
+                let after = vec![
+                    report(EventKind::Create(CreateKind::Folder), &parent),
+                    report(EventKind::Remove(RemoveKind::Folder), &parent),
+                ];
+                let written = written_with(&place, Vec::new(), || {}, after);
+                assert!(
+                    written.iter().any(|path| path == "target"),
+                    "the directory was removed and made again, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that is removed and made again is a
+            /// write, also when the stream reports only what is beneath it: the output, which is
+            /// the run's to write, and the file in it.
+            #[test]
+            fn a_parent_replaced_and_reported_only_by_what_is_beneath_it_is_a_write() {
+                let place = a_place();
+                replace_the_parent(&place.copy);
+                let output = place.copy.join("target/debug");
+                let before = vec![
+                    report(EventKind::Create(CreateKind::Folder), &output),
+                    report(EventKind::Remove(RemoveKind::Folder), &output),
+                    report(EventKind::Create(CreateKind::Folder), &output),
+                    report(
+                        EventKind::Create(CreateKind::File),
+                        &output.join("artefact"),
+                    ),
+                ];
+                let written = written_with(&place, before, || {}, Vec::new());
+                assert!(
+                    written.iter().any(|path| path == "target"),
+                    "the directory was removed and made again, and the watch says it wrote {written:?}"
+                );
+            }
+
+            /// KR-REQ-14.34: a directory an output is in that is removed and made again while the
+            /// host waits for its marker is a write, though the stream reports nothing of it.
+            #[test]
+            fn a_parent_replaced_while_the_host_waits_for_its_marker_is_a_write() {
+                let place = a_place();
+                let copy = place.copy.clone();
+                let written = written_with(
+                    &place,
+                    Vec::new(),
+                    move || replace_the_parent(&copy),
+                    Vec::new(),
+                );
+                assert!(
+                    written.iter().any(|path| path == "target"),
+                    "the directory was removed and made again, and the watch says it wrote {written:?}"
                 );
             }
         }
