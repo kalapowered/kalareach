@@ -690,20 +690,20 @@ A test result is what this host observed, and nothing a caller reports.
   the process's limit of open files, read when the watcher starts, and half of 2560 where that limit
   is higher or there is none, since nothing was measured past it. A watcher uses one open file for
   each component of the copy's path and of the path of the directory beside it, and eight more. That
-  was measured on macOS 27.2.1 with notify 9.0.0 at 11, 12 and 16 components, where it is 29, 31 and
-  39, with the limit at 256 and at 2560, and not otherwise. A copy of a standard home directory is
-  11 components deep. The host does not count the other open files of the process, nor the one
-  directory that each watcher reopens beside its copy: the other half of the limit is an allowance
-  for them and not a reservation, so a process that holds more of them can still reach the limit.
-  Once the first FSEvents stream has raised a limit of 256 to 2560, a process admits 44 watchers of
-  29 at once; before that, and for good where a hard limit of 256 does not allow the raise, it
-  admits 4. A limit below twice the cost of one watcher, 58 at 11 components, admits none. A suite
-  that starts past the limit has no watcher, so its result is indeterminate and says that too many
-  copies are watched at once. The limit is there because FSEvents, with notify 9.0.0, could not
-  start a stream past 88 of these watchers at that depth, and a start that fails there can end the
-  process. A file the suite adds beside an output is not left out of the comparison and changes the
-  source (an added empty directory leaves the source as it was, unless the reading cannot open or
-  list it, reaches a bound, or the change set's rules keep its path out, which makes the source
+  was measured on macOS 27.2.1 (build 26B131) with notify 9.0.0 at 11, 12 and 16 components, where
+  it is 29, 31 and 39, with the limit at 256 and at 2560, and not otherwise. A copy of a standard
+  home directory is 11 components deep. The host does not count the other open files of the process,
+  nor the one directory that each watcher reopens beside its copy: the other half of the limit is an
+  allowance for them and not a reservation, so a process that holds more of them can still reach the
+  limit. Once the first FSEvents stream has raised a limit of 256 to 2560, a process admits 44
+  watchers of 29 at once; before that, and for good where a hard limit of 256 does not allow the
+  raise, it admits 4. A limit below twice the cost of one watcher, 58 at 11 components, admits none.
+  A suite that starts past the limit has no watcher, so its result is indeterminate and says that
+  too many copies are watched at once. The limit is there because FSEvents, with notify 9.0.0, could
+  not start a stream past 88 of these watchers at that depth, and a start that fails there can end
+  the process. A file the suite adds beside an output is not left out of the comparison and changes
+  the source (an added empty directory leaves the source as it was, unless the reading cannot open
+  or list it, reaches a bound, or the change set's rules keep its path out, which makes the source
   indeterminate, so no version of its own is stored for it; the record sees the new entry all the
   same, and the result attests no version), so a tool that writes beside each source directory (a
   compiled-code cache is the usual one) makes a run of that suite that exits with status zero

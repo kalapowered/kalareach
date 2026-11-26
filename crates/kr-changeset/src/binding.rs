@@ -899,8 +899,10 @@ mod unix {
         }
 
         /// A watch and its cost, held for as long as the watch lives. The watch is dropped first
-        /// and the cost goes back after it, on every path, so that the budget never admits another
-        /// watch while the stream of this one still holds its files.
+        /// and the cost goes back after it, on every path of the host's own code, so that the
+        /// budget never admits another watch while the stream of this one still holds its files.
+        /// The library's own panic is outside that: it can leave the stream open before the cost
+        /// goes back.
         pub(super) struct Held<'a, T> {
             _watch: T,
             _cost: Cost<'a>,
@@ -1203,7 +1205,7 @@ mod unix {
         /// outputs are in, and each change to those directories themselves.
         pub struct NameWatch {
             /// The watcher, held with what its stream costs the process: the cost goes back after
-            /// the stream has stopped, on every path.
+            /// the stream has stopped, on every path of the host's own code.
             _watcher: Held<'static, notify::RecommendedWatcher>,
             shared: Arc<Mutex<Shared>>,
             reported: Mutex<mpsc::Receiver<PathBuf>>,
@@ -1257,7 +1259,8 @@ mod unix {
                     }
                 }
                 // Every step that can fail without the library is made before the admission, so
-                // that nothing after it fails but the library's own calls.
+                // that after it only the library's own calls and the host's own marker file can
+                // fail.
                 let reopened = beside
                     .try_clone()
                     .map_err(|error| format!("the copy's place could not be reopened: {error}"))?;
