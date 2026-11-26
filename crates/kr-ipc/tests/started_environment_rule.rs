@@ -316,8 +316,8 @@ const KEPT: &[Row] = &[
     },
     Row {
         file: "tests/e2e/m1b/src/compare.rs",
-        reason: "its case table names a program's file in a compared tree (a string that labels a row) \
-                 and changes that file; it starts no program",
+        reason: "its case table holds the name of a program's file in a compared tree (the string is \
+                 that file's name, which a row changes); it starts no program",
         removal: "none while the file starts no program; the row goes when it does",
     },
     Row {
