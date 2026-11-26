@@ -41,9 +41,9 @@ use serde_json::json;
 pub const WATCHDOG: Duration = Duration::from_secs(60);
 
 /// How long one reconnect round can take by the product's own bounds: the longest delay the client
-/// library draws before a try, and the longest a try may run (it dials within [`CONNECT_WITHIN`] and
-/// is told who the host is within as long again).
-pub const RECONNECT_ROUND: Duration = BACKOFF_MAX.saturating_add(CONNECT_WITHIN.saturating_mul(2));
+/// library draws before a try, and the longest a try may run. A try dials, asks the host who it is
+/// and opens the session, and [`CONNECT_WITHIN`] bounds each of those three steps.
+pub const RECONNECT_ROUND: Duration = BACKOFF_MAX.saturating_add(CONNECT_WITHIN.saturating_mul(3));
 
 /// How long a test waits for a step that comes after `rounds` reconnect rounds: each round at its
 /// bound, then the ordinary watchdog for the step itself.

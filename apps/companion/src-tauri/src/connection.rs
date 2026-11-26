@@ -28,8 +28,9 @@ use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::state::{AppState, Started};
 
-/// How long a connection to a paired host, and the question that follows it, may take. A test reads
-/// it to bound a wait that passes a reconnect try.
+/// How long each of the three steps of opening a connection to a paired host may take: the dial, the
+/// host's answer to who it is, and the opening of the session. One try can take three times this. A
+/// test reads it to bound a wait that passes a reconnect try.
 pub const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The event the backend publishes each host notification on.

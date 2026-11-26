@@ -3888,37 +3888,47 @@ fn is_the_hosts(reason: &str) -> bool {
 }
 
 /// KR-REQ-19.08: a wait that passes reconnect rounds is longer than those rounds. A round is the
-/// longest delay the client library draws before a try and the longest a try may run, and the
-/// ordinary watchdog is shorter than two of them: a try that stalls to its bound and fails, and
-/// then the next one, ran the main connection's waits out on a slow runner.
+/// longest delay the client library draws before a try and then the longest that try may run: it
+/// dials, asks who the host is and opens the session, and each of the three steps has its own
+/// `CONNECT_WITHIN`. The ordinary watchdog is shorter than one round, so one try that stalls at its
+/// bounds can run a wait that has no round in it out.
 #[test]
 fn kr_req_19_08_a_wait_through_reconnect_rounds_outlasts_them() {
     // The library's own schedule, walked to its top: the longest delay is where the ceiling stops.
+    // The walk is bounded by a count, so a ladder that never stops fails here and does not hang.
+    const STEPS: usize = 32;
     let mut ladder = kr_transport::reconnect::Backoff::default();
     let mut longest = ladder.ceiling();
-    loop {
+    let mut topped = false;
+    for _ in 0..STEPS {
         let _ = ladder.next_delay();
         if ladder.ceiling() == longest {
+            topped = true;
             break;
         }
         longest = ladder.ceiling();
     }
-    // A try dials within `CONNECT_WITHIN` and is told who the host is within as long again.
-    let round = longest + companion_tauri::connection::CONNECT_WITHIN * 2;
+    assert!(
+        topped,
+        "the ceiling still rises after {STEPS} tries, at {longest:?}"
+    );
+    // A try dials, asks who the host is and opens the session, each within `CONNECT_WITHIN`.
+    let round =
+        longest.saturating_add(companion_tauri::connection::CONNECT_WITHIN.saturating_mul(3));
     assert_eq!(
         RECONNECT_ROUND, round,
-        "a round is the longest delay and one try at its bound"
+        "a round is the longest delay and one try at its three bounds"
     );
     for rounds in 1..=3 {
-        assert!(
-            through_rounds(rounds) >= round * rounds + WATCHDOG,
-            "{rounds} rounds of {round:?} and the watchdog {WATCHDOG:?} need more than {:?}",
-            through_rounds(rounds)
+        assert_eq!(
+            through_rounds(rounds),
+            round.saturating_mul(rounds).saturating_add(WATCHDOG),
+            "{rounds} rounds of {round:?} and the watchdog {WATCHDOG:?}"
         );
     }
     assert!(
-        WATCHDOG < round * 2,
-        "the watchdog alone is shorter than two rounds of {round:?}"
+        WATCHDOG < round,
+        "the watchdog alone is shorter than one round of {round:?}"
     );
 }
 
