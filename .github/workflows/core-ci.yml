@@ -2778,19 +2778,21 @@ jobs:
   # distribution is tried again by its own step; Gradle is told to wait longer between the tries of
   # each refused dependency fetch, which survives a refusal that stops within about two minutes
   # for each fetch (a nested lookup can wait about twice that); and a build that still fails with
-  # the refusal in its output is run once more after five minutes. A longer refusal fails the job
-  # as before. The fetches of the Android SDK manager, pnpm, rustup and Cargo are not covered:
-  # they keep their own defaults (see the steps).
+  # the refusal in its output is run once more after ten minutes, which covers about twelve minutes
+  # after the first failure. A refusal that lasts longer than that fails the job as before. The
+  # fetches of the Android SDK manager, pnpm, rustup and Cargo are not covered: they keep their own
+  # defaults (see the steps).
   #
   # Every step has a limit of its own, so that a step that hangs is ended, and the evidence upload
   # after it still has its time. A step that installs or builds has twice the longest it took in the
   # 59 to 65 hosted runs of 16 to 24 November, all of them with no cache, since the job restores
   # none, rounded up: the NDK, emulator and system image 5 (1.6 at most), the debug build 26 (13.0,
-  # run 45345872273) and the minified build 47 (23.2, run 44759162215). The wait of five minutes and
-  # the second run of a build after a refusal are inside those two limits, not added to them (the
-  # steps say when the second run fits). The steps that only set up or read, none of which took
-  # more than 1.5 minutes, have 5, or 6 for the disk, as the other jobs' do; the evidence upload
-  # has 3, its pause 2 and its second try 3, as in the macOS jobs.
+  # run 45345872273) and the minified build 47 (23.2, run 44759162215); the two builds have five
+  # minutes more, 31 and 52, for the longer wait before the second run that a refusal brings. That
+  # wait of ten minutes and the second run are inside those limits, not added to them (the steps
+  # say when the second run fits). The steps that only set up or read, none of which took more than
+  # 1.5 minutes, have 5, or 6 for the disk, as the other jobs' do; the evidence upload has 3, its
+  # pause 2 and its second try 3, as in the macOS jobs.
   # The step that fetches the Gradle distribution has 12: five tries, each of which downloads one
   # file, and the waits between them, 30, 60, 90 and 120 seconds, 300 in all. The step that sets
   # Gradle's waits has 5, as the steps that only set up. The step that starts the emulator has 65:
@@ -2798,13 +2800,13 @@ jobs:
   # of 240 seconds (the install's four, seven waits and the two looks after them) and 30 for its
   # clean-up, and a run that waits that long should still reach its own error line and keep the
   # device's log; the 6.5 minutes over are for the device's creation and the library's cases, which
-  # took 4.7 minutes in all in the longest of 63 runs. All the limits add up to 216 of the job's 219
+  # took 4.7 minutes in all in the longest of 63 runs. All the limits add up to 226 of the job's 229
   # minutes, which leaves 3 for the set-up and clean-up that no step limit counts. The whole job
   # took 42.4 minutes at most (run 45051604117).
   android-app:
     name: android-app
     runs-on: ubuntu-24.04
-    timeout-minutes: 219
+    timeout-minutes: 229
     steps:
       # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
       # emulator and a system image to be added to it.
@@ -2974,20 +2976,23 @@ jobs:
       # the manifest, the code and the libraries.
       #
       # A build that fails with the package repository's refusal in its own output (the line Gradle
-      # prints, "Received status code 429 from server: Too Many Requests") waits five minutes and runs
+      # prints, "Received status code 429 from server: Too Many Requests") waits ten minutes and runs
       # once more, since runs of this job met that refusal again eight to nine minutes after the
-      # first, past what Gradle's own tries wait for. A second failure fails the step. A build that
-      # fails for any other reason fails the step at once: a missing module, a wrong address, a
-      # compile error and a failed check are never tried again. The step keeps its limit of 26
-      # minutes, with the wait and the second run inside it: the longest build seen took 13.0 minutes,
-      # so a second run after the five-minute wait fits only when the first one failed within
-      # 26 - 5 - 13.0 = 8.0 minutes; after a later failure the limit ends the second run if it does
-      # not finish, and the step fails at its limit. A refused jar does not disable the repository, so
-      # a long refusal of jars ends at the limit with no refusal line, and then there is no second
-      # run. The wait is 300 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
-      # and a local run of this text sets it to shorten the wait.
+      # first, past what Gradle's own tries wait for. The second run covers about twelve minutes
+      # after the first failure: the wait of ten and the two minutes that Gradle's own tries then
+      # wait. A refusal that lasts longer than that still fails the step, and so does any second
+      # failure. A build that fails for any other reason fails the step at once: a missing module, a
+      # wrong address, a compile error and a failed check are never tried again. The step's limit is
+      # 31 minutes: twice the longest build seen (13.0 minutes, so 26) and five more for the longer
+      # wait. The wait and the second run are inside it, so a second run after the ten-minute wait
+      # fits only when the first one failed within 31 - 10 - 13.0 = 8.0 minutes; after a later
+      # failure the limit ends the second run if it does not finish, and the step fails at its limit.
+      # A refused jar does not disable the repository, so a long refusal of jars ends at the limit
+      # with no refusal line, and then there is no second run. The wait is 600 seconds unless
+      # REFUSAL_WAIT_SECONDS is set; the workflow never sets it, and a local run of this text sets it
+      # to shorten the wait.
       - name: Build the debug application
-        timeout-minutes: 26
+        timeout-minutes: 31
         run: |
           set -euo pipefail
           build() { pnpm -C apps/companion android --debug --apk --target aarch64 x86_64; }
@@ -3001,7 +3006,7 @@ jobs:
             echo "the build failed, and not with the package repository's refusal: not trying again"
             exit "$status"
           fi
-          wait_seconds="${REFUSAL_WAIT_SECONDS:-300}"
+          wait_seconds="${REFUSAL_WAIT_SECONDS:-600}"
           echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
           sleep "$wait_seconds"
           echo "the second run of the build"
@@ -3089,18 +3094,20 @@ jobs:
       #
       # The build is tried once more after the package repository's refusal, as the debug build is
       # (see that step): a failure with "Received status code 429 from server: Too Many Requests" in
-      # the build's own output waits five minutes and runs the build again, any other failure fails
-      # the step at once, and a second failure fails it too. The step keeps its limit of 47 minutes,
-      # with the wait and the second run inside it: the longest build seen took 23.2 minutes, so a
-      # second run after the five-minute wait fits only when the first one failed within
-      # 47 - 5 - 23.2 = 18.8 minutes; after a later failure the limit ends the second run if it does
+      # the build's own output waits ten minutes and runs the build again, any other failure fails
+      # the step at once, and a second failure fails it too. The second run covers about twelve
+      # minutes after the first failure, and a refusal that lasts longer than that still fails the
+      # step. The step's limit is 52 minutes: twice the longest build seen (23.2 minutes, so 47) and
+      # five more for the longer wait. The wait and the second run are inside it, so a second run
+      # after the ten-minute wait fits only when the first one failed within
+      # 52 - 10 - 23.2 = 18.8 minutes; after a later failure the limit ends the second run if it does
       # not finish, and the step fails at its limit. A refused jar does not disable the repository,
       # so a long refusal of jars ends at the limit with no refusal line, and then there is no second
-      # run. The wait is 300 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
+      # run. The wait is 600 seconds unless REFUSAL_WAIT_SECONDS is set; the workflow never sets it,
       # and a local run of this text sets it to shorten the wait.
       - name: Build the minified application and read its libraries back
         if: ${{ !cancelled() }}
-        timeout-minutes: 47
+        timeout-minutes: 52
         env:
           KR_GOOGLE_SERVICES_JSON: ${{ runner.temp }}/google-services.json
         run: |
@@ -3117,7 +3124,7 @@ jobs:
             echo "the build failed, and not with the package repository's refusal: not trying again"
             exit "$status"
           fi
-          wait_seconds="${REFUSAL_WAIT_SECONDS:-300}"
+          wait_seconds="${REFUSAL_WAIT_SECONDS:-600}"
           echo "the build failed with the package repository's refusal: waiting $wait_seconds seconds, then running it once more"
           sleep "$wait_seconds"
           echo "the second run of the build"
