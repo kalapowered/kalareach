@@ -918,6 +918,48 @@ fn config_hold_a_state_of_an_operation_in_progress_that_is_new_at_the_end_is_see
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_junction_in_the_place_of_a_folder_the_git_writes_into_is_seen_at_the_end() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhcp");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "links");
+    fs::create_dir(project.git.join("info")).unwrap();
+    let hold =
+        hold_tree(project.root.to_str().unwrap(), &ordinary.as_client()).expect("the tree is held");
+    assert_eq!(hold.end_check(), Ok(()), "nothing is changed yet");
+    let elsewhere = scratch.path("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    // The folder is moved away and a junction to a folder that the boundary account cannot write
+    // takes its name; a folder that was not there is made as a junction.
+    for name in ["objects", "refs", "logs", "info"] {
+        let link = project.git.join(name);
+        if link.exists() {
+            fs::rename(&link, project.git.join(format!("{name}-moved"))).unwrap();
+        }
+        run(
+            "cmd",
+            &[
+                "/c",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                elsewhere.to_str().unwrap(),
+            ],
+        );
+        let names = hold
+            .end_check()
+            .expect_err(&format!("a junction in the place of {name}"))
+            .names;
+        assert!(names.iter().any(|seen| seen == name), "{name}: {names:?}");
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {
     if !runs_as_the_system() {
         eprintln!("skipped: the case needs the system's token");

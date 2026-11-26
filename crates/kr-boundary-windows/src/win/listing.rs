@@ -21,8 +21,8 @@ use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FileAttributeTagInfo,
+    FILE_GENERIC_READ, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, FileAttributeTagInfo,
 };
 
 use crate::filekey::FileKey;
@@ -382,6 +382,36 @@ pub(super) fn present_names(git: &DirHandle) -> Vec<String> {
         .filter(|name| is_present(git, name))
         .map(|name| (*name).to_owned())
         .collect()
+}
+
+/// The folders of the Git directory that the person's own Git writes into, by name.
+pub const WRITTEN_FOLDERS: [&str; 4] = ["objects", "refs", "logs", "info"];
+
+/// The names of [`WRITTEN_FOLDERS`] that are a reparse point now. A junction or a link in the place
+/// of one sends what the person's next Git writes, as the person, to a folder where the boundary
+/// account has no right. A folder that is not there is no link; one that cannot be read is named.
+pub(super) fn linked_folders(git: &DirHandle) -> Vec<String> {
+    WRITTEN_FOLDERS
+        .iter()
+        .filter(|name| is_a_link(git, name))
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+fn is_a_link(git: &DirHandle, name: &str) -> bool {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    match DirHandle::open_beneath(git.handle(), &units, FILE_READ_ATTRIBUTES, true, FILE_OPEN) {
+        Ok(handle) => match query::<FILE_ATTRIBUTE_TAG_INFO>(
+            &handle,
+            FileAttributeTagInfo,
+            "reading the attributes of a folder of the Git directory",
+        ) {
+            Ok(tag) => tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            Err(_) => true,
+        },
+        Err(failure) if failure.code == 2 || failure.code == 3 => false,
+        Err(_) => true,
+    }
 }
 
 /// The names of [`STATE_NAMES`] that are present in the held Git directory now: the states of an

@@ -225,6 +225,7 @@ impl TreeHold {
             }
         }
         names.extend(listing::present_names(&self.git_dir));
+        names.extend(listing::linked_folders(&self.git_dir));
         names.extend(
             listing::present_states(&self.git_dir)
                 .into_iter()
