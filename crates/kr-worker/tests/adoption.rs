@@ -133,6 +133,11 @@ fn the_exec_helper_program() {
         other => panic!("a hop is to a helper, a stand-in or a sleep, not to {other}"),
     };
     command.env(HOPS, OsStr::from_bytes(later));
+    // The test harness reads its own arguments as text, and a program's first argument is the path
+    // it was executed by unless it is set, so a path that is not text is not given as one.
+    if target.to_str().is_none() {
+        command.arg0("claude");
+    }
     let target = target.to_owned();
     let mut execute = move || {
         let error = command.exec();
@@ -375,6 +380,10 @@ impl Setup {
         let marks = self.marks();
         std::fs::create_dir_all(&marks).expect("a folder for the marks");
         let mut command = Command::new(program);
+        // As the helper does for the programs it executes: the harness reads its arguments as text.
+        if program.to_str().is_none() {
+            command.arg0("claude");
+        }
         command
             .args(hop_arguments("the_exec_helper_program", "hop-a"))
             .env(HOPS, std::ffi::OsString::from_vec(lines.join(&b'\n')))
