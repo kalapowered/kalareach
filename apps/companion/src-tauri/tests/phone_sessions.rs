@@ -56,10 +56,21 @@ async fn phone_under(adopted: &Adopted, grant: kr_protocol::pairing::ProposedGra
     phone
 }
 
-/// Waits until the phone's main connection is up. It waits through two reconnect rounds: a try that
-/// stalls to its bound and fails, and the next one, which makes the connection.
+/// Waits until the phone's main connection is up for the first time: the first try comes with no
+/// delay before it, so the wait is the ordinary watchdog and has no reconnect round in it.
 async fn connected(companion: &Companion) {
-    let wait = through_rounds(2);
+    connected_within(companion, WATCHDOG).await;
+}
+
+/// Waits until the phone's main connection is up again after tries that did not make it. It waits
+/// through two reconnect rounds: a try that stalls at its bounds and fails, and the next one, which
+/// makes the connection.
+async fn reconnected(companion: &Companion) {
+    connected_within(companion, through_rounds(2)).await;
+}
+
+/// Waits until the phone's main connection is up, for at most `wait`.
+async fn connected_within(companion: &Companion, wait: Duration) {
     let began = Instant::now();
     tokio::time::timeout(wait, async {
         loop {
@@ -1464,7 +1475,7 @@ async fn kr_req_13_13_a_draft_outlives_the_host_being_out_of_contact_and_follows
 
     // The host returns, and what the page rebinds the draft from is the same conversation.
     control.unreachable(false);
-    connected(companion).await;
+    reconnected(companion).await;
     open(companion, session, None, "screen-again").expect("the session opens again");
     assert_eq!(
         conversation(companion, session, "screen-again"),
@@ -3105,10 +3116,11 @@ fn told_of(companion: &Companion, opening: &str) -> Vec<Value> {
         .collect()
 }
 
-/// Waits until the host has been asked for `count` connections since `before`. It waits through
-/// `count` reconnect rounds: each try comes after a delay of its own.
-async fn asked_since(control: &LinkControl, before: usize, count: usize) {
-    let wait = through_rounds(u32::try_from(count).expect("a few tries"));
+/// Waits until the host has been asked for `count` connections since `before`, for at most `wait`.
+/// The caller gives the wait: a case that waits for the keeper's tries after a try that did not make
+/// the connection gives one that passes a reconnect round for each, and a case that waits for an
+/// opening's watch gives the ordinary watchdog.
+async fn asked_since(control: &LinkControl, before: usize, count: usize, wait: Duration) {
     let began = Instant::now();
     tokio::time::timeout(wait, async {
         while control.asked() - before < count {
@@ -3142,7 +3154,7 @@ async fn kr_req_19_08_a_refusal_at_admission_that_repeats_leaves_the_opening_sta
     let before = control.asked();
     let standing = open(companion, session, None, "repeated").expect("the first open stands");
     assert_eq!(standing["state"], "reconnecting", "{standing}");
-    asked_since(&control, before, 4).await;
+    asked_since(&control, before, 4, WATCHDOG).await;
     for told in told_of(companion, "repeated") {
         assert_eq!(told["state"], "reconnecting", "never refused: {told}");
         assert!(
@@ -3270,7 +3282,7 @@ async fn kr_req_19_08_a_device_revoked_before_its_admission_is_told_the_hosts_wo
     // Each ask that follows is answered as an unpaired peer's: it does not reach the host, and the
     // words say that and not what the host said to the try before.
     let before = control.asked();
-    asked_since(&control, before, 3).await;
+    asked_since(&control, before, 3, WATCHDOG).await;
     // The watch tells a try after the host was asked, so the first of what it told is waited for.
     let told = tokio::time::timeout(WATCHDOG, async {
         loop {
@@ -3964,7 +3976,7 @@ async fn kr_req_19_08_the_main_connection_says_what_its_last_try_came_to() {
     let silent = connection_down_where(companion, |reason| !is_the_hosts(reason)).await;
     assert!(silent.contains("could not be reached"), "{silent}");
     let before = control.asked();
-    asked_since(&control, before, 3).await;
+    asked_since(&control, before, 3, through_rounds(3)).await;
     assert_eq!(
         connection_reason(companion),
         (false, Some(silent)),
@@ -3973,7 +3985,7 @@ async fn kr_req_19_08_the_main_connection_says_what_its_last_try_came_to() {
 
     // A connection that opens clears them.
     control.unreachable(false);
-    connected(companion).await;
+    reconnected(companion).await;
     assert_eq!(connection_reason(companion), (true, None));
 
     // The host's bound is another cause, and the words are its own.
@@ -4719,7 +4731,7 @@ async fn kr_req_19_08_the_main_link_reconnects_while_other_dials_hold_every_othe
     })
     .await
     .expect("the main link is dialled again though every other place is held");
-    connected(companion).await;
+    reconnected(companion).await;
 
     control.refuse(Some(ErrorCode::PermissionDenied));
     control.release_all();
