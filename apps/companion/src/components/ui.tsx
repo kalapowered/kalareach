@@ -17,7 +17,8 @@ import {
   type ButtonHTMLAttributes,
   type HTMLAttributes,
   type ReactNode,
-  type Ref
+  type Ref,
+  type RefObject
 } from 'react'
 import { createPortal } from 'react-dom'
 
@@ -805,6 +806,66 @@ export function closeSheets(): void {
 }
 
 /**
+ * What a surface that opens over the screen does for the keyboard while it is mounted.
+ *
+ * It takes the focus and keeps it. Without this a keyboard is still operating the session behind a
+ * consequence the person has not answered. The first control inside takes the focus as the surface
+ * comes; Tab goes round inside it; Escape asks it to close; and when it goes, the control that
+ * opened it has the focus again, unless the focus is already somewhere the surface did not take it
+ * from: something put it there on purpose while the surface was going, and the surface's leaving
+ * does not take it away.
+ */
+export function useModalSurface(
+  surface: RefObject<HTMLElement | null>,
+  mounted: boolean,
+  close: () => void
+): void {
+  const restoreFocus = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    if (!mounted) return
+    const element = surface.current
+    if (!element) return
+    restoreFocus.current = document.activeElement as HTMLElement | null
+    const focusable = () => stopsOf(element)
+    focusable()[0]?.focus()
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return
+      const targets = focusable()
+      if (targets.length === 0) return
+      const first = targets[0]
+      const last = targets[targets.length - 1]
+      if (!first || !last) return
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      const active = document.activeElement
+      if (active === null || active === document.body) restoreFocus.current?.focus()
+    }
+  }, [mounted, surface])
+
+  useEffect(() => {
+    if (!mounted) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') close()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [mounted, close])
+}
+
+/**
  * A surface that opens over the screen it belongs to, and can be dragged away.
  *
  * It arrives from the bottom and leaves to the bottom, so the gesture that dismisses it is the
@@ -852,7 +913,6 @@ export function Sheet({
   // gesture caught mid-flight continues from what is on the screen rather than from where the last
   // animation thought it was.
   const presented = useRef({ offset: 0, velocity: 0 })
-  const restoreFocus = useRef<HTMLElement | null>(null)
   const titleId = useId()
   const [mounted, setMounted] = useState(open)
   // Whether the motion this surface is in the middle of has finished. Each run of the effect below
@@ -957,52 +1017,7 @@ export function Sheet({
     }
   }, [open, mounted, place, reduced])
 
-  // A modal surface takes the focus and keeps it. Without this a keyboard is still operating the
-  // session behind a consequence the person has not answered.
-  useEffect(() => {
-    if (!mounted) return
-    const sheet = sheetRef.current
-    if (!sheet) return
-    restoreFocus.current = document.activeElement as HTMLElement | null
-    const focusable = () => stopsOf(sheet)
-    focusable()[0]?.focus()
-
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== 'Tab') return
-      const targets = focusable()
-      if (targets.length === 0) return
-      const first = targets[0]
-      const last = targets[targets.length - 1]
-      if (!first || !last) return
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault()
-        last.focus()
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault()
-        first.focus()
-      }
-    }
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('keydown', onKey)
-      // The control that opened the surface has the focus again, unless the focus is already
-      // somewhere the surface did not take it from: something put it there on purpose while the
-      // surface was going, and the surface's leaving does not take it away.
-      const active = document.activeElement
-      if (active === null || active === document.body) restoreFocus.current?.focus()
-    }
-  }, [mounted])
-
-  useEffect(() => {
-    if (!mounted) return
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') close()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [mounted, close])
+  useModalSurface(sheetRef, mounted, close)
 
   if (!mounted) return null
 
