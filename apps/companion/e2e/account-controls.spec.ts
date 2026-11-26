@@ -716,46 +716,105 @@ for (const form of [...PHONES, ...DESKTOPS]) {
 
 // ---- A control that fits looks as it did ------------------------------------------------------------
 
-for (const form of [
+/** The ordinary size: a phone at the default text size and a wide desktop window, in the default face. */
+const ORDINARY: readonly Form[] = [
   { surface: 'ios', size: 1, width: 390, height: 844, tag: 'ios', name: 'ios, text 1.0x' },
   { surface: 'desktop', size: 1, width: 1280, height: 720, tag: 'desktop-1280', name: 'desktop 1280 wide, text 1.0x' }
-] as const satisfies readonly Form[]) {
-  test(`gives every control of the panels the box it has when its label cannot wrap, ${form.name}`, async ({
-    page
-  }) => {
-    await atTheAccount(
-      page,
-      form,
-      (each) =>
-        each.evaluate((view) => {
-          window.krTestHost?.account.setUsage({ state: 'could_not_read' })
-          window.krTestHost?.account.set(view)
-          window.krTestHost?.recovery.set({
-            state: 'on',
-            kept_at: 'reach.kala.to',
-            blocker: null,
-            settings: { state: 'stopped' }
-          })
-        }, SIGNED_IN),
-      false
-    )
-    const wrapping = await controlsUnder(page, '[data-testid="account-panel"]')
-    await page.addStyleTag({
-      content: '.btn { white-space: nowrap !important; overflow-wrap: normal !important; max-inline-size: none !important }'
-    })
-    const kept = await controlsUnder(page, '[data-testid="account-panel"]')
-    expect(wrapping.length, 'the panel shows its controls').toBeGreaterThan(5)
-    const boxOf = (each: Control): string => `${each.key}: ${each.width}px by ${each.height}px, ${each.lines} line`
-    expect(
-      wrapping.map(boxOf),
-      'the box of each control, wide and high, with and without the rule that lets its label wrap'
-    ).toEqual(kept.map(boxOf))
-    expect(
-      wrapping.filter((each) => each.lines !== 1).map(describe),
-      'controls whose label is on more than one line at the ordinary size'
-    ).toEqual([])
+]
+
+/**
+ * The fourteen controls that this part gave `data-wraps`, by test id or label. Each is
+ * shown by one of the states below, and the cases that follow compare every control of that state.
+ * "Try again" is two controls: the usage's (an account state) and the recovery card's.
+ */
+const CHANGED = [
+  'Sign in',
+  'Cancel',
+  'Sign out',
+  'delete-account-open',
+  'Try again',
+  'recovery-turn-on',
+  'recovery-sign-in',
+  'recovery-resume-settings',
+  'recovery-settle',
+  'recovery-replace-cancel',
+  'recovery-save-kit',
+  'recovery-copies-close',
+  'recovery-restore-choose',
+  'Try again'
+] as const
+
+test('shows each of the fourteen controls that were given the attribute in a state that is compared', () => {
+  const shown = [...ACCOUNT_STATES, ...RECOVERY_STATES].flatMap((state) => state.held.shows)
+  const missing: string[] = []
+  const left = [...shown]
+  for (const key of CHANGED) {
+    const at = left.indexOf(key)
+    if (at === -1) missing.push(key)
+    else left.splice(at, 1)
+  }
+  expect(missing, 'changed controls that no compared state shows').toEqual([])
+})
+
+/** How a control's box is read for the comparison: its size and the lines of its label. */
+function boxOf(each: Control): string {
+  return `${each.key}: ${each.width}px by ${each.height}px, ${each.lines} line`
+}
+
+/** The rule of the attribute widened on purpose: the control of the comparison. */
+const WIDENED_RULE = '.btn[data-wraps] { padding-inline: 1.5rem !important }'
+
+/** Takes the attribute off every control: the page as it was drawn before the attribute was put on any. */
+function withoutTheRule(page: Page): Promise<void> {
+  return page.evaluate(() => {
+    for (const each of document.querySelectorAll('.btn[data-wraps]')) each.removeAttribute('data-wraps')
   })
 }
+
+for (const form of ORDINARY) {
+  const phone = form.surface !== 'desktop'
+  for (const [kind, states] of [
+    ['account', ACCOUNT_STATES],
+    // The recovery card is drawn on the desktop only.
+    ['recovery card', phone ? [] : RECOVERY_STATES]
+  ] as const) {
+    for (const state of states) {
+      test(`gives every control of the ${kind} ${state.name} the box it has without the rule that lets its label wrap, ${form.name}`, async ({
+        page
+      }) => {
+        await atTheAccount(page, form, state.prepare, false)
+        await state.then?.(page)
+        const wrapping = await controlsUnder(page, '[data-testid="account-panel"]')
+        for (const key of state.held.shows) {
+          expect(
+            wrapping.map((each) => each.key),
+            `the panel shows ${key}`
+          ).toContain(key)
+        }
+        // With the attribute taken off every control, whatever the rule gave a box is gone: the width,
+        // the height and the lines of each control are what they are without it.
+        await withoutTheRule(page)
+        const without = await controlsUnder(page, '[data-testid="account-panel"]')
+        expect(wrapping.length, 'the controls of the state are all there without the attribute').toBe(without.length)
+        expect(
+          wrapping.map(boxOf),
+          'the box of each control, wide and high, with the rule that lets its label wrap and without it'
+        ).toEqual(without.map(boxOf))
+      })
+    }
+  }
+}
+
+// The control of the comparison: a rule of the attribute that gave a control a box of its own at the
+// ordinary size would make the same comparison fail.
+test('sees a rule of the attribute that changes the box of a control at the ordinary size', async ({ page }) => {
+  const state = ACCOUNT_STATES[0]
+  await atTheAccount(page, ORDINARY[0], state.prepare, false)
+  const widened = await withStyle(page, WIDENED_RULE, () => controlsUnder(page, '[data-testid="account-panel"]'))
+  await withoutTheRule(page)
+  const without = await controlsUnder(page, '[data-testid="account-panel"]')
+  expect(widened.map(boxOf), 'the comparison sees a widened rule').not.toEqual(without.map(boxOf))
+})
 
 // ---- A control that is added later wraps too ----------------------------------------------------------
 
