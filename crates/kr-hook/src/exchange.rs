@@ -496,4 +496,130 @@ mod tests {
             .await
             .expect("an ordinary message is written");
     }
+
+    /// What a stand-in for the worker does with a connection once it has accepted it.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum WorkerAction {
+        /// Closes it without reading a byte, as a worker does that refuses a connection it cannot
+        /// place before it has looked at what the connection sent.
+        ClosesUnread,
+        /// Takes nothing more from it but keeps it open until the bridge is done.
+        #[cfg(target_os = "linux")]
+        StopsReading,
+        /// Reads the whole hello and closes the connection, as a worker does that refuses the
+        /// bridge after it has checked it.
+        ReadsTheHelloThenCloses,
+    }
+
+    /// Writes a bridge's hello to a stand-in worker that does `action` with its connection, waits
+    /// for the worker's answer, and returns what the exchange made of the two.
+    ///
+    /// The order of the hello's write and the worker's close is made certain here rather than
+    /// waited for. The hello is nearly as large as the exchange allows, which is more than a socket
+    /// holds, so its write cannot complete until the worker reads it. A worker that never reads is
+    /// therefore met by a write that is still waiting when the worker closes, whatever the
+    /// scheduler does, and nothing but the worker's close or shutdown ends that write.
+    #[cfg(unix)]
+    async fn bridge_meets(action: WorkerAction) -> Result<(), ExchangeError> {
+        let host = kr_ipc::testing::TempHost::create();
+        let path = host.root().join("endpoint");
+        let listener = tokio::net::UnixListener::bind(&path).expect("the endpoint binds");
+        let credential = host.root().join("credential");
+        kr_ipc::paths::create_new_owner_only_file(&credential, "0".repeat(64).as_bytes())
+            .expect("the credential is the owner's alone");
+        let paths = crate::registration::Paths {
+            registration: host.root().join("registration"),
+        };
+        kr_ipc::paths::write_owner_only_file(
+            &paths.registration,
+            format!(
+                "endpoint={}\nprofile=p\ninstance=i\npid=1\nstart=1\ncredential={}\n\
+                 framing=json_lines\n",
+                path.display(),
+                credential.display()
+            )
+            .as_bytes(),
+        )
+        .expect("the registration");
+        let registration =
+            Registration::read(&paths, Duration::from_secs(5)).expect("the registration reads");
+        let bridge = Bridge {
+            application: "x".repeat(MAX_MESSAGE_BYTES - 4096).into(),
+            surface: "hook",
+        };
+
+        let bridging = async {
+            let mut exchange = Exchange::open(&registration, bridge).await?;
+            exchange.admitted(Duration::from_secs(10)).await
+        };
+        let worker = async {
+            let (stream, _) = listener.accept().await.expect("the worker accepts");
+            match action {
+                WorkerAction::ClosesUnread => {
+                    drop(stream);
+                    None::<std::os::unix::net::UnixStream>
+                }
+                #[cfg(target_os = "linux")]
+                WorkerAction::StopsReading => {
+                    let stream = stream.into_std().expect("the connection is a plain socket");
+                    stream
+                        .shutdown(std::net::Shutdown::Read)
+                        .expect("the read side shuts");
+                    Some(stream)
+                }
+                WorkerAction::ReadsTheHelloThenCloses => {
+                    let mut reader = BufReader::new(stream);
+                    let mut hello = Vec::new();
+                    reader
+                        .read_until(b'\n', &mut hello)
+                        .await
+                        .expect("the hello arrives");
+                    assert!(hello.starts_with(br#"{"kr_hello":"#));
+                    None
+                }
+            }
+        };
+        let (answer, _held) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(bridging, worker)
+        })
+        .await
+        .expect("the exchange and the worker both finish");
+        answer
+    }
+
+    /// A worker that refuses a connection can close it before it reads the hello, and the hello's
+    /// write then finds the connection gone. The worker closed the connection without admitting the
+    /// bridge, which is what the exchange says of every other order of the same event.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_that_closes_before_it_reads_the_hello_is_a_refusal() {
+        let answer = bridge_meets(WorkerAction::ClosesUnread).await;
+        assert!(
+            matches!(answer, Err(ExchangeError::Refused)),
+            "a close before the hello is read is a refusal: {answer:?}"
+        );
+    }
+
+    /// The same event with the worker's end still open but shut for reading.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_worker_that_stops_reading_before_the_hello_is_read_is_a_refusal() {
+        let answer = bridge_meets(WorkerAction::StopsReading).await;
+        assert!(
+            matches!(answer, Err(ExchangeError::Refused)),
+            "a worker that takes nothing more is a refusal: {answer:?}"
+        );
+    }
+
+    /// A worker that reads the hello and then closes is a refusal too, from the read that follows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_worker_that_reads_the_hello_and_closes_is_a_refusal() {
+        let answer = bridge_meets(WorkerAction::ReadsTheHelloThenCloses).await;
+        assert!(
+            matches!(answer, Err(ExchangeError::Refused)),
+            "a close after the hello is read is a refusal: {answer:?}"
+        );
+    }
 }
