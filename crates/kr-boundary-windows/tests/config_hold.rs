@@ -1058,18 +1058,22 @@ fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {
     fs::create_dir(folders.git.join(format!(r"hooks\{}", "g".repeat(247)))).unwrap();
     refused(&folders, "a folder name of 256 bytes");
     let links = Project::make(&scratch, "links255");
+    fs::create_dir_all(links.git.join("hooks")).unwrap();
+    // `cmd` cannot make a link at a path this long: the junction is made at a short path of the
+    // scratch folder and moved to its place, and the move carries the link and not its target.
     let junction = |name: String| {
-        let link = links.git.join(format!(r"hooks\{name}"));
+        let made = scratch.path(&format!("junction{}", name.len()));
         run(
             "cmd",
             &[
                 "/c",
                 "mklink",
                 "/J",
-                link.to_str().unwrap(),
+                made.to_str().unwrap(),
                 links.root.to_str().unwrap(),
             ],
         );
+        fs::rename(&made, links.git.join(format!(r"hooks\{name}"))).unwrap();
     };
     junction("l".repeat(243));
     held(&links, "a link name of 255 bytes");
