@@ -31,36 +31,51 @@
 //!
 //! A suite may declare paths it writes ([`Outputs`]). Nothing at or beneath a declared path is
 //! recorded, and the host makes the directories above a declared path before it takes the record,
-//! so that writing the output changes no recorded entry except the directory the output is in,
-//! the **parent**. A parent's own record cannot tell the output from anything else written beside
-//! it, so a parent is watched by name instead, from before the command starts to after it has
-//! ended: the platform reports each name created, removed, renamed or changed in it, and a name
-//! other than a declared output makes the result indeterminate, however briefly it existed. The
-//! parent itself is watched too, and so is the copy: a report that the directory was renamed,
-//! removed or changed (its mode, its owner, or any of its metadata but its extended attributes) is
-//! a write, because the record of a parent is the one thing the comparison leaves out. On macOS a
-//! report of a parent can come after the host's own file or not at all, and the file-event service
-//! can report the host's own set-up of the copy a second time, after the watcher is up to date. So
-//! the host also records the device, the inode and the extended attributes (names and values) of
-//! each parent before the command starts, and reads them again at the end, once the watcher has
-//! reported the host's own file. A parent that is gone, is no longer a directory, has another
-//! device or inode, or has an extended attribute added, removed or changed in value is a write
-//! whatever was reported of it. A report that a folder was created at a parent's path, or that
-//! its extended attributes changed, is no write by itself, because what the host read at the
-//! start decides both: a directory that has the inode it had was not made in the run, and
-//! attributes equal to the ones read at the start were not left changed. Every other report of a
-//! parent is a write: a removal, a rename, a change of its mode or owner, any other change of its
-//! metadata, a change of its content, or a creation of another kind, a mount among them. A parent
-//! keeps its device and inode when a suite changes its mode or owner,
-//! whether it puts them back or not, and when a suite moves it away and back, so only the
-//! watcher's reports show such a change; an extended attribute that a suite changes and puts back
-//! is not seen at all. The record of the directory above a parent shows a move away and back too,
-//! except for the copy itself and for a parent in a directory that is also a parent. A parent
-//! whose full path is longer than the 1,024 bytes that macOS allows for a path cannot be read, nor
-//! can a parent with more than 64 extended attributes, names that take more than 8,192 bytes or a
-//! value of more than 4,096 bytes, and every result of that suite is indeterminate. A watcher the
-//! host cannot start, or whose reports it cannot be sure it has all of, makes the result
-//! indeterminate too.
+//! so that writing the output changes no recorded entry except the directory the output is in, the
+//! **parent**. A parent's own record cannot tell the output from anything else written beside it,
+//! so a parent is watched by name instead, from before the command starts to after it has ended:
+//! the platform reports each name created, removed, renamed or changed in it, and a name other than
+//! a declared output makes the result indeterminate, however briefly it existed. The parent itself
+//! is watched too, and so is the copy: a report that the directory was renamed, removed or changed
+//! (its mode, its owner, or any of its metadata but its extended attributes) is a write, because
+//! the record of a parent is the one thing the comparison leaves out. On macOS a report of any path
+//! can come after the host's own file or not at all, and the file-event service can report the
+//! host's own set-up of the copy a second time, after the watcher is up to date. So the host also
+//! records what it reads at the start: of each parent, its device, inode and extended attributes
+//! (names and values, as the listing call returns them), and of every other entry of the copy, and
+//! of the copy's own directory when that is no parent, the stamp that the comparison holds (kind,
+//! device, inode, size and the times of modification and change). It reads each parent again and
+//! takes the stamp of every other entry again at the end, once the watcher has reported the host's
+//! own file, and compares them. A parent that is gone, is no longer a directory, has another device
+//! or inode, or has an extended attribute added, removed or changed in value is a write whatever
+//! was reported of it, and so is an entry whose stamp differs. On macOS a report that a recorded
+//! folder or file was created, with the kind that fits what it is, or that its extended attributes
+//! changed, is no write by itself, because what the host recorded decides both: an entry with the
+//! inode it had was not made in the run, and a change of an attribute moves the time of change that
+//! the stamp holds (measured on APFS for a file, a folder and a link, an attribute put back
+//! included), while a parent's attributes are compared themselves. A name that the host did not
+//! record is a write whatever the kind of the report, however briefly it existed, if the watcher
+//! reports it before the end of the wait. Every other report of a recorded path is a write: a
+//! removal, a rename, a change of its mode or owner, any other change of its metadata, a change of
+//! its content, and a creation of another kind, a mount among them. On Linux the watcher is another
+//! module, and a parent's attribute report is a write there. The record of a parent leaves out its
+//! mode, owner, flags, access list and times, and a parent keeps its device and inode when a suite
+//! changes any of them, whether it puts them back or not, and when a suite moves it away and back,
+//! so only the watcher's reports show such a change, and a report that comes late or not at all
+//! leaves it unseen. An extended attribute of a parent that a suite changes and puts back is not
+//! seen when the listing call returns it: that call returns the attributes that the system lets a
+//! process list, so any it keeps back, such as the compression attributes, are not compared, and a
+//! change of Finder information is another kind of report, a write. The host reads a parent by its
+//! path and does not follow a link in the last part of it, and a link in an earlier part is
+//! followed. The record of the directory above a parent shows a move away and back too, except for
+//! the copy itself and for a parent in a directory that is also a parent. A parent whose full path
+//! takes 1,024 bytes or more, which macOS does not allow for a path, cannot be read, nor can a
+//! parent with more than 64 extended attributes, names that take more than 8,192 bytes or a value
+//! of more than 4,096 bytes, and every result of that suite is indeterminate. A name takes at most
+//! 127 bytes and its end, so 64 names fit in 8,192 bytes, and the buffer's range error, which the
+//! call gives, can come before the count's refusal; both end in the same words. A watcher the host
+//! cannot start, or whose reports it cannot be sure it has all of, makes the result indeterminate
+//! too.
 //!
 //! # What this does not establish
 //!
@@ -823,19 +838,19 @@ mod unix {
             }
 
             /// The path of the copy that a report about `path` shows to have been written, if it
-            /// does. A directory a declared output is in, the copy's own directory, a name in
-            /// such a directory and every other entry that the host recorded at the start are
-            /// judged by what the host recorded. FSEvents says nothing of a directory when a name
-            /// is made in it, so a report that names a directory is a rename, a removal or a
-            /// change of its mode, owner or metadata, a creation, or a change of its extended
-            /// attributes. A report that a folder was created, of a recorded directory, or that a
-            /// file was created, of a recorded file, and a report that extended attributes
-            /// changed, are no write by themselves: the end of the run decides them by the
-            /// record, which is a parent's device, inode and attributes and any other entry's
-            /// stamp. Every other report of a recorded path is a write, a mount among them, and
-            /// so is every report of a name the host did not record, whatever its kind. A name in
-            /// such a directory is judged only if it is no declared output, and a path in any
-            /// other directory is judged nothing, since its stamp decides it.
+            /// does. A directory a declared output is in, the copy's own directory, a name in such
+            /// a directory and every other entry that the host recorded at the start are judged by
+            /// what the host recorded. FSEvents says nothing of a directory when a name is made in
+            /// it, so a report that names a directory is a rename, a removal or a change of its
+            /// mode, owner or metadata, a creation, or a change of its extended attributes. A
+            /// report that a folder was created, of a recorded directory, or that a file was
+            /// created, of a recorded file, and a report that extended attributes changed, are no
+            /// write by themselves: the end of the run decides them by the record, which is a
+            /// parent's device, inode and attributes and any other entry's stamp. Every other
+            /// report of a recorded path is a write, a mount among them, and so is every report of
+            /// a name the host did not record, whatever its kind. A name in such a directory is
+            /// judged only if it is no declared output, and a path in any other directory is judged
+            /// nothing, since the stamp decides it.
             fn judge(&self, path: &Path, done: Done) -> Judged {
                 let Some(relative) = path.strip_prefix(&self.copy).ok().map(|rest| {
                     rest.components()
@@ -1616,8 +1631,9 @@ mod unix {
     /// end.
     ///
     /// The stamp of such a directory is not recorded, because making the output changes it. Its
-    /// device and inode, that it is a directory, and its extended attributes do not change when a
-    /// name is made in it. The first three are another when the directory was removed and made
+    /// device and inode, that it is a directory, and its extended attributes did not change in the
+    /// traced runs when the host made a name in it; if the system changed one of them, the result
+    /// would be indeterminate. The first three are another when the directory was removed and made
     /// again, and the attributes are another when one is added, removed or given another value.
     #[cfg(any(target_os = "macos", test))]
     mod record {
@@ -2042,8 +2058,9 @@ mod unix {
                 // often a directory above the copy or the root of the volume. The backend passes
                 // every notice it receives on this stream to the handler whatever path it names,
                 // and the handler takes each as a loss of the copy's reports too. The host cannot
-                // see a loss that FSEvents does not announce: its own marker file, reported in
-                // time, shows only that the watcher has not fallen behind, and nothing more.
+                // see a loss that FSEvents does not announce: the report of its own marker file
+                // shows only that the watcher had reported that file, and a report of any path can
+                // still come after it, or not at all.
                 //
                 // FSEvents holds open files for each stream root, and a start that fails for want
                 // of them can end the process, so the host asks only for a watch that the budget
