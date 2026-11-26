@@ -390,6 +390,75 @@ fn run_tests_stays_refused_on_windows_when_offered() {
     );
 }
 
+/// KR-REQ-25.14: a review node starts the reviewer as the root of a session through the platform's
+/// own launch, which Windows has not for it, so a definition that holds one is refused when it is
+/// offered on Windows, as one that holds a command node is.
+#[cfg(windows)]
+#[test]
+fn a_review_node_is_refused_when_offered_on_windows() {
+    let definition = create_workflow_definition(
+        test_wf_id(1),
+        1,
+        "a review",
+        test_grant_id(1),
+        vec![review_node_asking(
+            "Review the change and report what you find.",
+        )],
+        vec![],
+    );
+    let refusal = validate_definition(&definition, &make_dummy_grant(test_grant_id(1), true))
+        .expect_err("Windows starts no reviewer as the root of a session");
+    assert!(
+        matches!(
+            refusal,
+            AutomationError::ActionUnavailable {
+                action_kind: WorkflowActionKind::RequestReview
+            }
+        ),
+        "{refusal}"
+    );
+}
+
+/// A review node that names the user's own working tree is refused when it is offered, with the
+/// words of the refusal and the node it names, and the same node in the isolated workspace is not.
+#[test]
+fn a_review_node_naming_a_shared_working_tree_is_refused_when_offered() {
+    use kr_protocol::project::WorkspaceKind;
+
+    let grant = make_dummy_grant(test_grant_id(1), false);
+    let offered = |workspace: WorkspaceKind| {
+        let mut review = review_node_asking("Review the change and report what you find.");
+        let mut params: serde_json::Value =
+            serde_json::from_str(&review.action_params).expect("the node's parameters");
+        params["workspace"] = serde_json::to_value(workspace).expect("a kind");
+        review.action_params = params.to_string();
+        validate_definition(
+            &create_workflow_definition(
+                test_wf_id(1),
+                1,
+                "a review",
+                test_grant_id(1),
+                vec![review],
+                vec![],
+            ),
+            &grant,
+        )
+    };
+
+    offered(WorkspaceKind::Isolated).expect("the isolated workspace is accepted");
+    let refusal = offered(WorkspaceKind::SharedExisting)
+        .expect_err("a review node does not review in a shared working tree");
+    assert!(
+        matches!(
+            &refusal,
+            AutomationError::InvalidArgument(message)
+                if message == "node review reviews in a shared working tree, which a review \
+                               node does not do in this release: choose the isolated workspace"
+        ),
+        "{refusal}"
+    );
+}
+
 /// KR-REQ-25.13: a node names a registered action kind.
 ///
 /// A kind nothing registers never becomes a node: the definition naming it is refused when it is

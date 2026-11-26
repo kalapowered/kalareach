@@ -27,7 +27,7 @@ use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ChangeSetId, ChangeSetVersion, EnvironmentId, GrantId, SessionId, WorkflowId, WorkspaceId,
 };
-use kr_protocol::project::InclusionChoice;
+use kr_protocol::project::{InclusionChoice, WorkspaceKind};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::SessionCreateParams;
@@ -58,13 +58,14 @@ pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static 
 /// Whether a node of `action_kind` creates a session of its own, which spends the chain's
 /// session allowance and needs the right to create one.
 ///
-/// `request_review` is not among them: it is refused at dispatch before it creates anything.
+/// A review node does: its reviewer is the root of a session of its own.
 #[must_use]
 pub const fn creates_session(action_kind: WorkflowActionKind) -> bool {
     matches!(
         action_kind,
         WorkflowActionKind::ShellCommand
             | WorkflowActionKind::RunTests
+            | WorkflowActionKind::RequestReview
             | WorkflowActionKind::CreateSession
     )
 }
@@ -80,10 +81,11 @@ pub const fn runs_a_command(action_kind: WorkflowActionKind) -> bool {
 }
 
 /// Whether a node of `action_kind` starts a program of its own as the root of a session it creates,
-/// which this platform must be able to launch for a definition that holds one to be offered.
+/// which this platform must be able to launch for a definition that holds one to be offered: a
+/// command is run through a POSIX shell, and a review starts the reviewer agent.
 #[must_use]
 pub const fn needs_root_program(action_kind: WorkflowActionKind) -> bool {
-    runs_a_command(action_kind)
+    runs_a_command(action_kind) || matches!(action_kind, WorkflowActionKind::RequestReview)
 }
 
 /// What one action of `action_kind` spends of its chain's managed allowance.
@@ -158,8 +160,9 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
 
     let mut shell_nodes = Vec::new();
     for node in &definition.nodes {
-        // A command is run as a session's root through a POSIX shell, which this platform has not.
-        // A definition that holds one is refused when it is offered rather than at each dispatch.
+        // A command is run as a session's root through a POSIX shell, and a reviewer is started as
+        // one by the same launch, which this platform has not. A definition that holds either is
+        // refused when it is offered rather than at each dispatch.
         if cfg!(windows) && needs_root_program(node.action_kind) {
             return Err(AutomationError::ActionUnavailable {
                 action_kind: node.action_kind,
@@ -389,7 +392,13 @@ fn validate_typed_action_params(
             bounded(node_id, "suite", &params.suite, MAX_TEST_SUITE_BYTES)?;
         }
         WorkflowActionKind::RequestReview => {
-            typed_params::<RequestReviewParams>(node_id, action_kind, &parsed)?;
+            let params: RequestReviewParams = typed_params(node_id, action_kind, &parsed)?;
+            if params.workspace == WorkspaceKind::SharedExisting {
+                return Err(AutomationError::InvalidArgument(format!(
+                    "node {node_id} reviews in a shared working tree, which a review node does \
+                     not do in this release: choose the isolated workspace"
+                )));
+            }
         }
         WorkflowActionKind::CreateSession => {
             // Before the parameters are decoded: a decoder's own message quotes the value it could
@@ -906,6 +915,33 @@ mod tests {
         );
 
         assert!(validate_definition(&def, &dummy_grant()).is_ok());
+    }
+
+    /// A command node and a review node start a program of their own as the root of a session they
+    /// create, and every node that creates a session charges one to its chain.
+    #[test]
+    fn the_kinds_that_start_a_root_program_and_that_charge_a_session() {
+        use WorkflowActionKind::{
+            ApplyDiff, AttentionNotice, CaptureChangeset, CreateSession, MaterializeChangeset,
+            RequestReview, RunTests, ShellCommand,
+        };
+        for (kind, root_program, charges_a_session) in [
+            (ShellCommand, true, true),
+            (RunTests, true, true),
+            (RequestReview, true, true),
+            (CreateSession, false, true),
+            (AttentionNotice, false, false),
+            (MaterializeChangeset, false, false),
+            (ApplyDiff, false, false),
+            (CaptureChangeset, false, false),
+        ] {
+            assert_eq!(needs_root_program(kind), root_program, "{kind}");
+            assert_eq!(creates_session(kind), charges_a_session, "{kind}");
+        }
+        assert!(
+            !runs_a_command(RequestReview),
+            "a review's reviewer is not a command typed into a shell account"
+        );
     }
 
     #[test]

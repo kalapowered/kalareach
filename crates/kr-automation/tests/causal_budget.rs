@@ -183,21 +183,26 @@ fn attention_at(path: &std::path::Path, now_ms: u64) -> Attention {
 async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let clock = Arc::new(ManualClock::new(1_000));
-    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let copy = recurring_workflow(
+        1,
+        "copy",
+        "review.completed",
+        WorkflowActionKind::MaterializeChangeset,
+    );
     let review = recurring_workflow(
         2,
         "review",
-        "tests.passed",
+        "changeset.materialized",
         WorkflowActionKind::RequestReview,
     );
 
     // The first trigger is external, so the host mints the root.
     let root = {
         let service = open(journal.path(), &clock);
-        install_and_enable(&service, &tests, 1_000);
+        install_and_enable(&service, &copy, 1_000);
         install_and_enable(&service, &review, 1_000);
         let first = service
-            .submit_run(&run_params(&tests, "external-1"), 1_000)
+            .submit_run(&run_params(&copy, "external-1"), 1_000)
             .await
             .expect("the external trigger runs");
         assert_eq!(first.depth.get(), 1);
@@ -230,7 +235,7 @@ async fn mutually_triggering_workflows_exhaust_one_persistent_budget() {
                 let expected = if runs.is_multiple_of(2) {
                     &review
                 } else {
-                    &tests
+                    &copy
                 };
                 assert_eq!(decision.workflow_id, expected.workflow_id);
                 let run = service
@@ -565,6 +570,46 @@ async fn a_command_node_spends_the_chains_session_allowance_too() {
         "command-maker",
         "command.completed",
         WorkflowActionKind::ShellCommand,
+    )
+    .await;
+}
+
+/// KR-REQ-25.16: a review node starts the reviewer as the root of a session of its own, so its one
+/// action charges one session to its chain, and the chain's default ten are the whole allowance for
+/// reviews as for every other node that creates a session.
+#[tokio::test]
+async fn a_review_node_charges_one_session_to_its_chain() {
+    let clock = Arc::new(ManualClock::new(1_000));
+    let journal = tempfile::tempdir().expect("a journal directory");
+    let service = open(journal.path(), &clock);
+    let def = recurring_workflow(
+        44,
+        "reviewer",
+        "review.completed",
+        WorkflowActionKind::RequestReview,
+    );
+    install_and_enable(&service, &def, 1_000);
+
+    let first = service
+        .submit_run(&run_params(&def, "review-0"), 1_000)
+        .await
+        .expect("the review's run is admitted");
+    let budget = service
+        .store()
+        .get_budget(first.causal_root_id)
+        .unwrap()
+        .expect("a budget exists");
+    assert_eq!(budget.total_actions, 1, "one node, one action");
+    assert_eq!(
+        budget.created_sessions, 1,
+        "the reviewer's session is charged to the chain that asked for it"
+    );
+
+    sessions_are_reserved(
+        45,
+        "reviewer-chain",
+        "review.completed",
+        WorkflowActionKind::RequestReview,
     )
     .await;
 }
@@ -1143,17 +1188,22 @@ async fn a_rearm_continues_its_chain_once_and_late_descendants_stay_refused() {
 #[tokio::test]
 async fn a_rearm_continues_a_chain_its_depth_ceiling_stopped() {
     let service = in_memory();
-    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let copy = recurring_workflow(
+        1,
+        "copy",
+        "review.completed",
+        WorkflowActionKind::MaterializeChangeset,
+    );
     let review = recurring_workflow(
         2,
         "review",
-        "tests.passed",
+        "changeset.materialized",
         WorkflowActionKind::RequestReview,
     );
-    install_and_enable(&service, &tests, 1_000);
+    install_and_enable(&service, &copy, 1_000);
     install_and_enable(&service, &review, 1_000);
     let root = service
-        .submit_run(&run_params(&tests, "external-1"), 1_000)
+        .submit_run(&run_params(&copy, "external-1"), 1_000)
         .await
         .expect("the root runs")
         .causal_root_id;
@@ -1441,19 +1491,24 @@ async fn the_repeat_of_a_rearm_is_recognised_by_a_read_that_changes_nothing() {
 async fn a_rearm_whose_runs_were_not_started_before_a_restart_continues_after_it() {
     let journal = tempfile::tempdir().expect("a journal directory");
     let clock = Arc::new(ManualClock::new(1_000));
-    let tests = recurring_workflow(1, "tests", "review.completed", WorkflowActionKind::RunTests);
+    let copy = recurring_workflow(
+        1,
+        "copy",
+        "review.completed",
+        WorkflowActionKind::MaterializeChangeset,
+    );
     let review = recurring_workflow(
         2,
         "review",
-        "tests.passed",
+        "changeset.materialized",
         WorkflowActionKind::RequestReview,
     );
     let root = {
         let service = open(journal.path(), &clock);
-        install_and_enable(&service, &tests, 1_000);
+        install_and_enable(&service, &copy, 1_000);
         install_and_enable(&service, &review, 1_000);
         let root = service
-            .submit_run(&run_params(&tests, "external-1"), 1_000)
+            .submit_run(&run_params(&copy, "external-1"), 1_000)
             .await
             .expect("the root runs")
             .causal_root_id;

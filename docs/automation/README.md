@@ -130,10 +130,12 @@ it dispatches and once more where the node's effect begins.
   into a shell account, and closes the session when it settles. It therefore requires the
   `terminal.input`, `session.create`, and `session.close` rights. Similarly, `run_tests`
   additionally needs `workspace.manage` because it writes out the version it tests.
-  `create_session`, `request_review`, `capture_changeset`, `materialize_changeset`, and `apply_diff`
-  also need `session.create`, `agent.prompt` and `session.view`, `changeset.create`,
-  `workspace.manage`, and `files.apply_diff` respectively (because those are the rights that the
-  methods which perform those same effects require). The requirement that a composite effect require
+  `request_review` needs `agent.prompt`, `session.view`, `terminal.input`, `session.create`,
+  `session.close` and `workspace.manage`, and a grant that selects every session in the
+  environment. `create_session`, `capture_changeset`, `materialize_changeset`, and `apply_diff`
+  also need `session.create`, `changeset.create`, `workspace.manage`, and `files.apply_diff`
+  respectively (because those are the rights that the methods which perform those same effects
+  require). The requirement that a composite effect require
   the rights for all of the methods that perform the same effect prevents a workflow being used to
   call a method that a given person would not be able to call any other way. For example, a
   view-only invitation cannot obtain terminal input through a workflow. A `create_session` node that
@@ -149,7 +151,8 @@ it dispatches and once more where the node's effect begins.
   under such a grant earlier is refused when a run is admitted, and a run already under way pauses
   its node and itself when dispatch reaches a node its grant does not authorise, with that refusal.
   A `create_session` node that names the shell its session runs is held to the same grant, because a
-  named shell runs a program the definition chose.
+  named shell runs a program the definition chose. A `request_review` node is held to it as well,
+  because it starts the reviewer as the root of a session of its own.
 * **A capture node's session is one the grant selects.** A `capture_changeset` node that names a
   session records its version for that session, and a version recorded for a session is review
   work in it. If the definition's grant does not select that session, the definition is refused at
@@ -291,8 +294,8 @@ version and the materialisation that holds it.
 is dispatched. A refusal is not an uncertain outcome: nothing was dispatched and nothing was made on
 the way to refusing it. Since no work is done, the node is failed, and any node depending on it will
 see a failure rather than a result nobody produced. On a platform without a POSIX shell, a
-definition with a node of a command kind (`shell_command` or `run_tests`) is refused when it is
-installed, so none of its nodes runs.
+definition with a node of a command kind (`shell_command` or `run_tests`) or a `request_review`
+node is refused when it is installed, so none of its nodes runs.
 
 A node that succeeds records its kind's typed output, and a runner that reports an output of
 another kind has not reported this node's success: what its action did is not established, so the
@@ -335,6 +338,10 @@ Install-time validation enforces:
 | `materialize_changeset` | `changeset.materialize`'s own parameters | the version and the materialisation that holds it |
 | `apply_diff` | `diff.apply`'s parameters as earlier releases stored them: an expected reference has no `new_value` | the version applied, its destination, the class it came to and any proposal version |
 | `capture_changeset` | `changeset.capture`'s own parameters | the version captured |
+
+Instructions are plain text: `{{`, `}}`, `${`, `$(`, `<%`, `%>`, `eval(`, `exec(` and a backtick are
+refused when the workflow is offered.
+
 * **No template evaluation.** Parameter values are inspected after JSON decoding, so a marker such
   as `{{ ... }}`, `${ ... }` or `$( ... )` is rejected however it was written. Nothing in a
   definition is evaluated.

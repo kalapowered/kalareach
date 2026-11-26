@@ -1377,6 +1377,135 @@ async fn a_command_that_declares_another_environment_installs_nowhere() {
     assert!(refusal.contains("its own environment"), "{refusal}");
 }
 
+/// The rights a review node needs: it starts the reviewer as the root of a session that it creates
+/// and closes, in a copy of the version that it makes, and prompts it and reads it back.
+const REVIEW_RIGHTS: [ActionRight; 6] = [
+    ActionRight::TerminalInput,
+    ActionRight::SessionCreate,
+    ActionRight::SessionClose,
+    ActionRight::WorkspaceManage,
+    ActionRight::AgentPrompt,
+    ActionRight::SessionView,
+];
+
+/// What the host's check before a dispatch says of a review node under `grant`.
+fn review_dispatch_refusal(grant: &kr_protocol::grant::Grant, workflow: u8) -> Result<(), String> {
+    let review = node("review", WorkflowActionKind::RequestReview);
+    let definition = create_workflow_definition(
+        test_wf_id(workflow),
+        1,
+        "a review",
+        grant.grant_id,
+        vec![review.clone()],
+        vec![],
+    );
+    kr_automation::authority::check_node(grant, &definition, &review, common::environment())
+        .map_err(|refusal| refusal.to_string())
+}
+
+/// Section 23's rule that a composite action intersects every right it needs: a review node starts
+/// the reviewer as the root of a session of its own, which is what a command node does, so it needs
+/// the rights of one and the two rights of a prompt, and a grant missing any one of the six installs
+/// it nowhere and does not authorise its dispatch.
+#[tokio::test]
+async fn a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each() {
+    let grant_id = test_grant_id(23);
+    let mut wanted: Vec<&str> = REVIEW_RIGHTS.iter().map(|right| right.as_str()).collect();
+    wanted.sort_unstable();
+    let mut needed: Vec<&str> =
+        kr_automation::authority::node_rights(WorkflowActionKind::RequestReview)
+            .iter()
+            .map(|right| right.as_str())
+            .collect();
+    needed.sort_unstable();
+    assert_eq!(needed, wanted, "the six rights, and no other");
+
+    for (index, missing) in REVIEW_RIGHTS.iter().enumerate() {
+        let rights: Vec<ActionRight> = REVIEW_RIGHTS
+            .iter()
+            .copied()
+            .filter(|right| right != missing)
+            .collect();
+        let workflow = 23 + u8::try_from(index).expect("six rights");
+        let words = format!("needs {} and grant", missing.as_str());
+
+        let refusal = install_refusal(
+            common::grant_of(grant_id, &rights),
+            vec![node("review", WorkflowActionKind::RequestReview)],
+            workflow,
+        )
+        .expect_err("a grant missing a right of the effect installs nothing");
+        assert!(
+            refusal.contains(&words),
+            "the install refusal names {missing:?}: {refusal}"
+        );
+
+        let refusal = review_dispatch_refusal(&common::grant_of(grant_id, &rights), workflow)
+            .expect_err("a grant missing a right of the effect authorises no dispatch");
+        assert!(
+            refusal.contains(&words),
+            "the dispatch refusal names {missing:?}: {refusal}"
+        );
+    }
+
+    install_refusal(
+        common::grant_of(grant_id, &REVIEW_RIGHTS),
+        vec![node("review", WorkflowActionKind::RequestReview)],
+        29,
+    )
+    .expect("a grant that carries all six installs it");
+    review_dispatch_refusal(&common::grant_of(grant_id, &REVIEW_RIGHTS), 29)
+        .expect("and authorises its dispatch");
+}
+
+/// A review node starts the reviewer as the root of a session of its own, in the selected
+/// environment, so a grant that selects one named session, or none, is refused for it as for a
+/// command node, at install and before each dispatch.
+#[tokio::test]
+async fn a_review_node_needs_a_grant_that_selects_every_session() {
+    use kr_protocol::grant::SessionSelector;
+
+    let grant_id = test_grant_id(30);
+    let named = |selector: SessionSelector| {
+        let mut grant = common::grant_of(grant_id, &REVIEW_RIGHTS);
+        grant.session_selector = selector;
+        grant
+    };
+    let one_session = SessionSelector::These {
+        session_ids: [kr_protocol::ids::SessionId::new(Uuid::from_bytes([5; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    for (workflow, selector) in [(30_u8, one_session), (31, SessionSelector::None)] {
+        let refusals = [
+            install_refusal(
+                named(selector.clone()),
+                vec![node("review", WorkflowActionKind::RequestReview)],
+                workflow,
+            )
+            .expect_err("a grant that does not select every session is refused for a review"),
+            review_dispatch_refusal(&named(selector), workflow)
+                .expect_err("and it authorises no dispatch of one"),
+        ];
+        for refusal in refusals {
+            assert!(
+                refusal.contains(
+                    "node review starts the reviewer as the root of a session of its own, and \
+                     grant"
+                ) && refusal.contains("does not select every session in the environment"),
+                "{refusal}"
+            );
+        }
+    }
+    install_refusal(
+        named(SessionSelector::Any),
+        vec![node("review", WorkflowActionKind::RequestReview)],
+        32,
+    )
+    .expect("the broad grant installs it");
+    review_dispatch_refusal(&named(SessionSelector::Any), 32).expect("and authorises its dispatch");
+}
+
 /// A capture node naming `session`, as `changeset.capture` takes it: the version is recorded for
 /// that session, and it is review work there.
 fn capture_node_for(session: Option<kr_protocol::ids::SessionId>) -> WorkflowNode {

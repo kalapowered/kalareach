@@ -85,9 +85,18 @@ pub const fn node_rights(action_kind: WorkflowActionKind) -> &'static [ActionRig
             ActionRight::SessionClose,
             ActionRight::WorkspaceManage,
         ],
-        // A review asks an agent to do something, which is `agent.prompt`, and it is read back
-        // through the session it ran in.
-        WorkflowActionKind::RequestReview => &[ActionRight::AgentPrompt, ActionRight::SessionView],
+        // A review starts the reviewer, an agent, as the root of a session of its own, which a node
+        // that runs a command does too: it needs the rights of that and of the copy of the version
+        // it reviews. It then asks the agent to do something, which is `agent.prompt`, and reads
+        // it back through the session it ran in, which is `session.view`.
+        WorkflowActionKind::RequestReview => &[
+            ActionRight::TerminalInput,
+            ActionRight::SessionCreate,
+            ActionRight::SessionClose,
+            ActionRight::WorkspaceManage,
+            ActionRight::AgentPrompt,
+            ActionRight::SessionView,
+        ],
         WorkflowActionKind::CreateSession => &[ActionRight::SessionCreate],
         WorkflowActionKind::AttentionNotice => &[ActionRight::SessionView],
         // The three change-set kinds take the rights their methods take: `changeset.materialize`
@@ -154,9 +163,10 @@ pub fn check_scope(
 ///
 /// Returns [`AutomationError::PermissionDenied`] when the grant lacks a right the node's action
 /// kind needs, when the grant does not admit this environment, when it does not admit the
-/// environment a shell node declares, when a session node creates its session in another
-/// environment, when a capture node names a session the grant does not select, or when a node
-/// touches a workspace outside the definition's declared scope.
+/// environment a shell node declares, when a review node's grant does not select every session,
+/// when a session node creates its session in another environment, when a capture node names a
+/// session the grant does not select, or when a node touches a workspace outside the definition's
+/// declared scope.
 pub fn check_node(
     grant: &Grant,
     definition: &WorkflowDefinition,
@@ -183,6 +193,17 @@ pub fn check_node(
         return Err(AutomationError::PermissionDenied(format!(
             "node {} runs a command in a session of its own, and grant {} does not select every \
              session in the environment",
+            node.node_id, grant.grant_id
+        )));
+    }
+    // A review node starts the reviewer, a program of the definition's choosing, as the root of a
+    // session of its own in the selected environment, so it is held to the same grant.
+    if node.action_kind == WorkflowActionKind::RequestReview
+        && !matches!(grant.session_selector, SessionSelector::Any)
+    {
+        return Err(AutomationError::PermissionDenied(format!(
+            "node {} starts the reviewer as the root of a session of its own, and grant {} does \
+             not select every session in the environment",
             node.node_id, grant.grant_id
         )));
     }
