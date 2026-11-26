@@ -17,14 +17,15 @@
 
 #![allow(unsafe_code)]
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_ENCRYPTED, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_CASE_SENSITIVE_INFO, FILE_STANDARD_INFO, FileAttributeTagInfo, FileCaseSensitiveInfo,
     FileStandardInfo,
 };
-use windows_sys::Win32::UI::Shell::GetProfilesDirectoryW;
 
 use crate::filekey::FileKey;
 use crate::frame::Class;
@@ -35,6 +36,7 @@ use crate::refusal::Refusal;
 use super::client::ClientIdentity;
 use super::ffi::{self, Handle};
 use super::hold::{FOLDER_CHANGED_WORDS, RULE_FOLDER_CHANGED, TreeHold};
+use super::registry;
 use super::rights::{
     ImpersonationToken, ObjectKind, PERSON_RIGHTS, REPORT_RIGHT, Right, SYSTEM_RIGHTS, Sd, granted,
     may, probe_token, system_may, write_rights,
@@ -440,26 +442,35 @@ fn case_sensitive(handle: &Handle) -> ffi::Result<bool> {
     Ok(info.Flags & 1 != 0)
 }
 
-/// The folder that holds the users' profile folders, in the platform's spelling.
-fn profiles_directory() -> ffi::Result<String> {
-    let mut buffer = vec![0_u16; 260];
-    loop {
-        let mut size = buffer.len() as u32;
-        // SAFETY: the buffer's length is passed and the call writes at most that many units.
-        let read = unsafe { GetProfilesDirectoryW(buffer.as_mut_ptr(), &raw mut size) };
-        if read != 0 {
-            let length = buffer
-                .iter()
-                .position(|unit| *unit == 0)
-                .unwrap_or(buffer.len());
-            return Ok(String::from_utf16_lossy(&buffer[..length]));
+/// The key under the machine's hive that lists the profile of each account the machine knows.
+const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// Whether the folder with this identity is the profile folder of an account: the folder that the
+/// `ProfileImagePath` of a key of the profile list names, wherever the profile was moved to. The
+/// identities are compared, so a folder that only stands where profiles usually are is not one.
+fn is_a_profile_folder(root: FileKey) -> ffi::Result<bool> {
+    let Some(list) = registry::open(PROFILE_LIST)? else {
+        return Ok(false);
+    };
+    for account in list.subkey_names()? {
+        let Some(key) = registry::open(&format!(r"{PROFILE_LIST}\{account}"))? else {
+            continue;
+        };
+        let Some(path) = key.string("ProfileImagePath")? else {
+            continue;
+        };
+        match DirHandle::open_anchor(Path::new(&path)) {
+            Ok(Ok(folder)) if folder.key() == root => return Ok(true),
+            // A path that is not a folder here, or that no anchor accepts, is not the tree's root:
+            // the root was opened as a folder in the same way.
+            Ok(_) => {}
+            Err(failure)
+                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND => {
+            }
+            Err(failure) => return Err(failure),
         }
-        if (size as usize) <= buffer.len() {
-            // text: admission_profiles_directory-1
-            return Err(ffi::last("reading the folder of the users' profiles"));
-        }
-        buffer.resize(size as usize, 0);
     }
+    Ok(false)
 }
 
 /// An object of the tree as the checks meet it.
@@ -577,9 +588,9 @@ impl Checking<'_> {
         if hold.chain.len() == 1 {
             return Err(object_refusal(RULE_DRIVE, path, DRIVE_WORDS));
         }
-        let profiles = profiles_directory().map_err(|failure| failed(&failure))?;
-        let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
-        if parent.eq_ignore_ascii_case(&profiles) {
+        if let Some(root) = hold.chain.last()
+            && is_a_profile_folder(root.key()).map_err(|failure| failed(&failure))?
+        {
             return Err(object_refusal(RULE_PROFILE, path, PROFILE_WORDS));
         }
         let paths = chain_paths(&hold.path);

@@ -561,6 +561,8 @@ registry_open-1 | opening the key {subkey} | opening the key {subkey}: Windows e
 registry_delete_key-1 | deleting the key {subkey} | deleting the key {subkey}: Windows error N | read: the step that the words name, in `delete_key`, returned an error
 registry_set_dword-1 | setting the value {name} | setting the value {name}: Windows error N | read: the step that the words name, in `set_dword`, returned an error
 registry_dword-1 | reading the value {name} | reading the value {name}: Windows error N | read: the step that the words name, in `dword`, returned an error
+registry_string-1 | reading the value {name} | reading the value {name}: Windows error N | read: RegGetValueW, asked for the size of a text value, returned an error other than a missing value
+registry_string-2 | reading the value {name} | reading the value {name}: Windows error N | read: RegGetValueW, asked for the text of a value, returned an error other than a missing value
 registry_delete_value-1 | deleting the value {name} | deleting the value {name}: Windows error N | read: the step that the words name, in `delete_value`, returned an error
 registry_subkey_names-1 | listing the subkeys | listing the subkeys: Windows error N | read: the step that the words name, in `subkey_names`, returned an error
 sd_from_text-1 | reading the descriptor {text} | reading the descriptor {text}: Windows error N | read: the step that the words name, in `from_text`, returned an error
@@ -745,7 +747,6 @@ HARD_LINK_WORDS | this file has more than one name, and another name may lie out
 RECHECK_IDENTITY_WORDS | this object is not the one the broker admitted | X: this object is not the one the broker admitted | read: the volume and file identifier read from the handle are not those recorded at admission
 RECHECK_PLACE_WORDS | this object is no longer in the folder where the broker admitted it | X: this object is no longer in the folder where the broker admitted it | read: the final path read from the handle of a directory, or of a file with one name, is not the directory's path plus the listed name
 RECHECK_LINKS_WORDS | this file has gained a name since the broker admitted it | X: this file has gained a name since the broker admitted it | read: the link count read from the handle (FileStandardInfo) is not one where the action needs one
-admission_profiles_directory-1 | reading the folder of the users' profiles | reading the folder of the users' profiles: Windows error N | read: GetProfilesDirectoryW returned 0 and asked for no larger buffer
 
 # ---- the places of a form that carry no identifier, counted by file (tests/sentences.rs)
 listed | #[error] | env.rs | 1 | reaches no person: production builds only the proof block, which never lacks a tree
@@ -832,7 +833,7 @@ listed | pub fn | win/install.rs | 2 | names, keys, limits, encodings and paths;
 listed | pub fn | win/job.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person (`unproved_reasons` and `diagnostics` return the words of what the job's own reads reported, which their callers say)
 listed | pub fn | win/journal.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/proof.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
-listed | pub fn | win/registry.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
+listed | pub fn | win/registry.rs | 3 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/sd.rs | 2 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/service.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person
 listed | pub fn | win/verify.rs | 1 | names, keys, limits, encodings and paths; no sentence for a person

@@ -1076,6 +1076,42 @@ fn broker_admission_a_volume_that_is_not_local_ntfs_is_refused_with_its_reason()
     }
 }
 
+/// A key of the profile list that names a folder as an account's profile. The guard removes the
+/// key, so a failed assertion leaves no entry behind.
+struct ProfileEntry(String);
+
+impl ProfileEntry {
+    fn new(folder: &Path, number: u32) -> ProfileEntry {
+        let key = format!(
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\S-1-5-21-7-7-7-{}",
+            9000 + number
+        );
+        run(
+            "reg",
+            &[
+                "add",
+                &key,
+                "/v",
+                "ProfileImagePath",
+                "/t",
+                "REG_EXPAND_SZ",
+                "/d",
+                folder.to_str().unwrap(),
+                "/f",
+            ],
+        );
+        ProfileEntry(key)
+    }
+}
+
+impl Drop for ProfileEntry {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("reg")
+            .args(["delete", &self.0, "/f"])
+            .status();
+    }
+}
+
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn broker_admission_a_profile_folder_and_a_drive_root_are_refused_as_the_tree_root() {
@@ -1089,20 +1125,54 @@ fn broker_admission_a_profile_folder_and_a_drive_root_are_refused_as_the_tree_ro
     let scratch = Scratch::on_drive();
     let who = person.sid.to_text().unwrap();
 
-    // A folder directly in the folder of the users' profiles.
+    // A folder directly in the folder of the users' profiles that no account uses as its profile
+    // is an ordinary folder: it is not refused as a profile.
     let profile = PathBuf::from(format!(r"C:\Users\krprof-{}", &who[who.len() - 8..]));
     fs::create_dir_all(&profile).unwrap();
     grant(&profile, &format!("*{who}"), "(OI)(CI)F");
     repository_at(&profile);
     let hold = held(&person, &profile);
-    let refusal = admit(&hold, &person.as_client(), &siblings.probes())
-        .expect_err("a profile folder is refused");
-    assert_eq!(refusal.rule, RULE_PROFILE);
-    assert_eq!(
-        refusal.detail(),
-        format!("{}: {PROFILE_WORDS}", display(&profile))
+    let outcome = admit(&hold, &person.as_client(), &siblings.probes());
+    assert!(
+        outcome
+            .as_ref()
+            .err()
+            .is_none_or(|refusal| refusal.rule != RULE_PROFILE),
+        "a folder that no profile uses is not refused as one: {outcome:?}"
     );
     drop(hold);
+
+    // The same folder, once the profile list names it as an account's profile, is refused.
+    {
+        let _listed = ProfileEntry::new(&profile, 1);
+        let hold = held(&person, &profile);
+        let refusal = admit(&hold, &person.as_client(), &siblings.probes())
+            .expect_err("a profile folder is refused");
+        assert_eq!(refusal.rule, RULE_PROFILE);
+        assert_eq!(
+            refusal.detail(),
+            format!("{}: {PROFILE_WORDS}", display(&profile))
+        );
+        drop(hold);
+    }
+
+    // A profile that was moved away from the folder of the profiles is refused where it stands.
+    let moved = scratch.path("moved-profile");
+    fs::create_dir_all(&moved).unwrap();
+    grant(&moved, &format!("*{who}"), "(OI)(CI)F");
+    repository_at(&moved);
+    {
+        let _listed = ProfileEntry::new(&moved, 2);
+        let hold = held(&person, &moved);
+        let refusal = admit(&hold, &person.as_client(), &siblings.probes())
+            .expect_err("a moved profile folder is refused");
+        assert_eq!(refusal.rule, RULE_PROFILE);
+        assert_eq!(
+            refusal.detail(),
+            format!("{}: {PROFILE_WORDS}", display(&moved))
+        );
+        drop(hold);
+    }
 
     // The root of a drive.
     let disk = Disk::new(&scratch, "ntfs", 100, 'T').expect("an NTFS disk can be made");

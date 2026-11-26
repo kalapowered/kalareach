@@ -7,8 +7,9 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD,
-    REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegDeleteValueW,
-    RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    REG_OPTION_NON_VOLATILE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteKeyW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 
 use super::ffi::{Result, error, wide};
@@ -152,6 +153,60 @@ impl Key {
             )),
             ERROR_FILE_NOT_FOUND => Ok(None),
             // text: registry_dword-1
+            other => Err(error(other, format!("reading the value {name}"))),
+        }
+    }
+
+    /// Reads a text value, its environment variables expanded, or says there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the platform's error for any failure but a missing value.
+    pub fn string(&self, name: &str) -> Result<Option<String>> {
+        let wide_name = wide(name);
+        let kinds = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        let mut size = 0_u32;
+        // SAFETY: the name is NUL-terminated; a null buffer asks for the size only.
+        let status = unsafe {
+            RegGetValueW(
+                self.0,
+                null(),
+                wide_name.as_ptr(),
+                kinds,
+                null_mut(),
+                null_mut(),
+                &raw mut size,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {}
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            // text: registry_string-1
+            other => return Err(error(other, format!("reading the value {name}"))),
+        }
+        let mut buffer = vec![0_u16; (size as usize).div_ceil(2) + 1];
+        let mut size = (buffer.len() * 2) as u32;
+        // SAFETY: the buffer is the size passed.
+        let status = unsafe {
+            RegGetValueW(
+                self.0,
+                null(),
+                wide_name.as_ptr(),
+                kinds,
+                null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &raw mut size,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {
+                let units = (size as usize / 2).min(buffer.len());
+                let text = &buffer[..units];
+                let end = text.iter().position(|unit| *unit == 0).unwrap_or(units);
+                Ok(Some(String::from_utf16_lossy(&text[..end])))
+            }
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            // text: registry_string-2
             other => Err(error(other, format!("reading the value {name}"))),
         }
     }
