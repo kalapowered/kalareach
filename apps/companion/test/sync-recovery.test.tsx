@@ -435,7 +435,7 @@ describe('recovery', () => {
       controls.recovery.setArchives([
         {
           archive_id: '0a1b2c3d-0000-4000-8000-000000000001',
-          generation: 4,
+          generation: '4',
           published_at_ms: Date.UTC(2026, 9, 12),
           withheld: null,
           held_generation: null,
@@ -498,6 +498,30 @@ describe('recovery', () => {
     expect(within(recovery).queryByTestId('recovery-copies')).toBeNull()
   })
 
+  it('tells two generations apart that differ only above 2^53', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+      controls.recovery.setArchives([
+        {
+          archive_id: '0a1b2c3d-0000-4000-8000-000000000001',
+          generation: null,
+          published_at_ms: null,
+          withheld: 'held_back',
+          held_generation: '9007199254740992',
+          checkpoint_generation: '9007199254740993',
+          checkpoint_source: 'recovery_bundle'
+        }
+      ])
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    await person.click(within(recovery).getByTestId('recovery-export-offline'))
+    expect(await within(recovery).findByTestId('recovery-copies')).toHaveTextContent(
+      'the service holds generation 9007199254740992, older than generation 9007199254740993 that the recovery bundle verified'
+    )
+  })
+
   it('keeps the offline copy of the recovery bundle within reach when the list of archives is refused', async () => {
     const { person, controls, sheet } = await openSheet()
     act(() => {
@@ -540,20 +564,20 @@ describe('recovery', () => {
       controls.recovery.setArchives([
         withheld('1', {
           withheld: 'held_back',
-          held_generation: 3,
-          checkpoint_generation: 5,
+          held_generation: '3',
+          checkpoint_generation: '5',
           checkpoint_source: 'pairing'
         }),
         withheld('2', {
           withheld: 'held_back',
-          held_generation: 4,
-          checkpoint_generation: 6,
+          held_generation: '4',
+          checkpoint_generation: '6',
           checkpoint_source: 'recovery_bundle'
         }),
-        withheld('3', { withheld: 'disagree', checkpoint_generation: 7 }),
+        withheld('3', { withheld: 'disagree', checkpoint_generation: '7' }),
         withheld('4', { withheld: 'refused' }),
         withheld('5', { withheld: 'nothing' }),
-        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: 8 })
+        withheld('6', { withheld: 'bundle_disagree', checkpoint_generation: '8' })
       ])
     })
     const recovery = await within(sheet).findByTestId('recovery')

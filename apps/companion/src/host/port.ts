@@ -583,19 +583,19 @@ export interface KitSaved {
 export interface RecoveryArchive {
   /** The identifier the page gives back to name the archive to export. */
   readonly archive_id: string
-  /** The newest generation the service holds of it, once verified; null when none is offered. */
-  readonly generation: number | null
+  /** The newest generation the service holds of it, once verified, as decimal text; null when none is offered. */
+  readonly generation: string | null
   /** When the writer signed that generation, in UTC milliseconds. */
   readonly published_at_ms: number | null
   /** Why no generation is offered, when none is. */
   readonly withheld: 'nothing' | 'refused' | 'held_back' | 'disagree' | 'bundle_disagree' | null
-  /** The generation the service holds, when it holds only one older than a checkpoint. */
-  readonly held_generation: number | null
+  /** The generation the service holds, when it holds only one older than a checkpoint, as decimal text. */
+  readonly held_generation: string | null
   /**
    * The generation of the checkpoint that holds the archive back, or the one that two checkpoints
-   * name differently.
+   * name differently, as decimal text.
    */
-  readonly checkpoint_generation: number | null
+  readonly checkpoint_generation: string | null
   /** Where the checkpoint that holds the archive back came from. */
   readonly checkpoint_source: 'recovery_bundle' | 'pairing' | null
 }
@@ -605,7 +605,8 @@ export interface ExportSaved {
   readonly path: string
   /** The archive in it, or null for the recovery bundle alone. */
   readonly archive_id: string | null
-  readonly generation: number | null
+  /** The generation exported, as decimal text. */
+  readonly generation: string | null
   readonly bytes: number
 }
 

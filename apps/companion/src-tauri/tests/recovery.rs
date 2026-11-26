@@ -2305,7 +2305,10 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         .call("recovery_archives", json!({}))
         .expect("the archives");
     assert_eq!(listed[0]["archive_id"], archive.to_string());
-    assert_eq!(listed[0]["generation"], 1, "the page lists the generation");
+    assert_eq!(
+        listed[0]["generation"], "1",
+        "the page lists the generation"
+    );
     let archive_path = out.path().join("archive.krexport");
     page.dialog_returns(&archive_path);
     let saved = page
@@ -2315,7 +2318,7 @@ async fn the_kit_the_qr_code_and_the_bundle_export_hold_none_of_the_keys_this_co
         )
         .expect("the archive is exported");
     assert_eq!(saved["archive_id"], archive.to_string());
-    assert_eq!(saved["generation"], 1);
+    assert_eq!(saved["generation"], "1");
     let archive_file = std::fs::read(&archive_path).expect("the archive export file");
     assert_eq!(saved["bytes"], archive_file.len());
     let exported =
@@ -6852,8 +6855,8 @@ async fn an_archive_a_paired_hosts_checkpoint_holds_back_is_listed_so_and_is_not
     assert_eq!(listed[0]["archive_id"], archive.to_string());
     assert_eq!(listed[0]["withheld"], "held_back");
     assert_eq!(listed[0]["generation"], Value::Null);
-    assert_eq!(listed[0]["held_generation"], 1);
-    assert_eq!(listed[0]["checkpoint_generation"], 2);
+    assert_eq!(listed[0]["held_generation"], "1");
+    assert_eq!(listed[0]["checkpoint_generation"], "2");
     assert_eq!(listed[0]["checkpoint_source"], "pairing");
     let archive_path = out.path().join("held-back.krexport");
     page.dialog_returns(&archive_path);

@@ -174,17 +174,19 @@ pub struct KitSaved {
 pub struct ArchiveView {
     /// The archive's identifier, which the page gives back to name the one to export.
     pub archive_id: String,
-    /// The newest generation the service holds of it, once verified as a restore verifies one.
-    pub generation: Option<u64>,
+    /// The newest generation the service holds of it, once verified as a restore verifies one, as
+    /// decimal text: the page's numbers lose the low digits above 2^53.
+    pub generation: Option<String>,
     /// When the writer signed that generation, in UTC milliseconds.
     pub published_at_ms: Option<u64>,
     /// Why the service's newest generation is not offered, when it is not.
     pub withheld: Option<WithheldView>,
-    /// The generation the service holds, when it holds only one older than a checkpoint.
-    pub held_generation: Option<u64>,
+    /// The generation the service holds, when it holds only one older than a checkpoint, as decimal
+    /// text.
+    pub held_generation: Option<String>,
     /// The generation of the checkpoint that holds the archive back, or the one that two
-    /// checkpoints name differently.
-    pub checkpoint_generation: Option<u64>,
+    /// checkpoints name differently, as decimal text.
+    pub checkpoint_generation: Option<String>,
     /// Where the checkpoint that holds the archive back came from.
     pub checkpoint_source: Option<CheckpointSourceView>,
 }
@@ -249,8 +251,8 @@ pub struct ExportSaved {
     pub path: String,
     /// The archive exported, or nothing for the bundle alone.
     pub archive_id: Option<String>,
-    /// The generation exported.
-    pub generation: Option<u64>,
+    /// The generation exported, as decimal text.
+    pub generation: Option<String>,
     /// How many bytes were written.
     pub bytes: u64,
 }
@@ -875,7 +877,7 @@ impl Recovery {
                     let prepared = FilesRestore::prepare(kit, source, Some(archive), None, &held)
                         .await
                         .map_err(said_by_restore)?;
-                    let generation = prepared.plan().generation.get();
+                    let generation = prepared.plan().generation.get().to_string();
                     (
                         prepared.export().await.map_err(said_by_restore)?,
                         Some(generation),
@@ -1346,7 +1348,7 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
     match candidate.newest {
         CandidateState::Newest(newest) => ArchiveView {
             archive_id: candidate.archive_id.to_string(),
-            generation: Some(newest.generation.get()),
+            generation: Some(newest.generation.get().to_string()),
             published_at_ms: Some(newest.published_at_ms.get()),
             withheld: None,
             held_generation: None,
@@ -1364,17 +1366,17 @@ fn archive_view(candidate: Candidate) -> ArchiveView {
             checkpoint,
             source,
         } => ArchiveView {
-            held_generation: Some(held.get()),
-            checkpoint_generation: Some(checkpoint.get()),
+            held_generation: Some(held.get().to_string()),
+            checkpoint_generation: Some(checkpoint.get().to_string()),
             checkpoint_source: Some(source.into()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::HeldBack)
         },
         CandidateState::CheckpointsDisagree { generation } => ArchiveView {
-            checkpoint_generation: Some(generation.get()),
+            checkpoint_generation: Some(generation.get().to_string()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::Disagree)
         },
         CandidateState::BundleCheckpointsDisagree { generation } => ArchiveView {
-            checkpoint_generation: Some(generation.get()),
+            checkpoint_generation: Some(generation.get().to_string()),
             ..ArchiveView::withheld(candidate.archive_id, WithheldView::BundleDisagree)
         },
     }
@@ -1564,7 +1566,7 @@ mod tests {
             generation: BackupGeneration::new(8),
         });
         assert_eq!(in_bundle.withheld, Some(WithheldView::BundleDisagree));
-        assert_eq!(in_bundle.checkpoint_generation, Some(8));
+        assert_eq!(in_bundle.checkpoint_generation.as_deref(), Some("8"));
         assert_eq!(in_bundle.generation, None);
         assert_eq!(in_bundle.checkpoint_source, None);
 
@@ -1572,7 +1574,27 @@ mod tests {
             generation: BackupGeneration::new(8),
         });
         assert_eq!(with_a_host.withheld, Some(WithheldView::Disagree));
-        assert_eq!(with_a_host.checkpoint_generation, Some(8));
+        assert_eq!(with_a_host.checkpoint_generation.as_deref(), Some("8"));
+    }
+
+    /// KR-REQ-20.12: generations reach the page as exact decimal text, so two that differ only above
+    /// 2^53 stay two, as a number in the page's language would round them into one.
+    #[test]
+    fn generations_go_to_the_page_as_exact_decimal_text() {
+        let above = 9_007_199_254_740_993_u64;
+        let held_back = serde_json::to_value(listed(CandidateState::HeldBack {
+            held: BackupGeneration::new(above - 1),
+            checkpoint: BackupGeneration::new(above),
+            source: CheckpointSource::Pairing,
+        }))
+        .expect("the view as the page receives it");
+        assert_eq!(held_back["held_generation"], "9007199254740992");
+        assert_eq!(held_back["checkpoint_generation"], "9007199254740993");
+        let disagreeing = serde_json::to_value(listed(CandidateState::CheckpointsDisagree {
+            generation: BackupGeneration::new(above),
+        }))
+        .expect("the view as the page receives it");
+        assert_eq!(disagreeing["checkpoint_generation"], "9007199254740993");
     }
 
     /// KR-REQ-20.12: the refusal for two checkpoints in the bundle says where both are, and that only
