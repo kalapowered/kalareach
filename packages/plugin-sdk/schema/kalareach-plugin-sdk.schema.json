@@ -2200,7 +2200,7 @@
       ]
     },
     "GrantWords": {
-      "description": "The publisher's own words for a launch grant. One line, no control or bidirectional characters.",
+      "description": "The publisher's own words for a launch grant. One line, no control or bidirectional characters, and no white space but the space.",
       "maxLength": 6000,
       "minLength": 1,
       "type": "string"

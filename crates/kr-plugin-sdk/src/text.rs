@@ -64,8 +64,25 @@ pub fn is_forbidden_text_char(character: char) -> bool {
     )
 }
 
+/// Returns true when a character may not appear in the words a package writes for a launch grant.
+///
+/// These words reach an owner's confirmation, which shows a statement as it is written or not at
+/// all and refuses white space other than the space. So they are held to the text rule of the
+/// owner's client: every character [`is_forbidden_text_char`] refuses, and every white-space
+/// character that is not the plain space (a non-breaking space, an em space, an ideographic
+/// space).
+#[must_use]
+pub fn is_forbidden_statement_char(character: char) -> bool {
+    is_forbidden_text_char(character) || (character.is_whitespace() && character != ' ')
+}
+
 macro_rules! bounded_text {
     ($(#[$meta:meta])* $name:ident, $limit:expr, $kind:literal, $description:literal) => {
+        bounded_text!(
+            $(#[$meta])* $name, $limit, $kind, $description, is_forbidden_text_char
+        );
+    };
+    ($(#[$meta:meta])* $name:ident, $limit:expr, $kind:literal, $description:literal, $forbidden:path) => {
         $(#[$meta])*
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
         #[serde(transparent)]
@@ -90,7 +107,7 @@ macro_rules! bounded_text {
                 if len > $limit {
                     return Err(TextError::TooLong { kind: $kind, len, limit: $limit });
                 }
-                if let Some(character) = value.chars().find(|c| is_forbidden_text_char(*c)) {
+                if let Some(character) = value.chars().find(|c| $forbidden(*c)) {
                     return Err(TextError::ForbiddenCharacter {
                         kind: $kind,
                         codepoint: character as u32,
@@ -198,7 +215,8 @@ bounded_text!(
     GrantWords,
     6000,
     "grant words",
-    "The publisher's own words for a launch grant. One line, no control or bidirectional characters."
+    "The publisher's own words for a launch grant. One line, no control or bidirectional characters, and no white space but the space.",
+    is_forbidden_statement_char
 );
 
 #[cfg(test)]
@@ -243,6 +261,30 @@ mod tests {
     fn counts_characters_not_bytes() {
         let emoji = "\u{1F600}".repeat(Label::LIMIT);
         assert!(Label::new(emoji).is_ok());
+    }
+
+    #[test]
+    fn grant_words_refuse_white_space_that_is_not_the_space() {
+        // An owner's client shows a statement as it is written or not at all, and shows none that
+        // holds white space other than the space.
+        for character in ['\u{00A0}', '\u{2003}', '\u{202F}', '\u{3000}'] {
+            let words = GrantWords::new(format!("Starts it{character}now."));
+            assert!(
+                matches!(
+                    words,
+                    Err(TextError::ForbiddenCharacter { codepoint, .. })
+                        if codepoint == u32::from(character)
+                ),
+                "U+{:04X} is refused: {words:?}",
+                u32::from(character)
+            );
+        }
+    }
+
+    #[test]
+    fn grant_words_accept_ordinary_spaces() {
+        let words = GrantWords::new("Starts the agent.  Then it runs, and a space  stays a space.");
+        assert!(words.is_ok(), "{words:?}");
     }
 }
 

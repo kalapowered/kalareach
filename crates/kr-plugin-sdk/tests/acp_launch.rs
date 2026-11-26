@@ -780,3 +780,19 @@ fn kr_req_11_26_the_names_the_two_agents_need_pass_the_floor() {
         );
     }
 }
+
+/// KR-REQ-11.26: the words of a launch hold only text an owner's confirmation shows. A
+/// non-breaking space passes the check of every other text, and the owner's client refuses it, so
+/// the manifest that holds one in these words is unreadable.
+#[test]
+fn kr_req_11_26_launch_words_with_a_non_breaking_space_are_refused() {
+    let mut launch = declaration();
+    launch["grant_statement"] = json!("Starts the example agent\u{00A0}in ACP mode");
+    let findings = findings_of(&manifest_with(&launch, &GRANTS));
+    assert!(
+        findings.iter().any(|finding| {
+            finding.code == FindingCode::ManifestUnreadable && finding.detail.contains("U+00A0")
+        }),
+        "the manifest is unreadable for U+00A0: {findings:?}"
+    );
+}
