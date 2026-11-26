@@ -17,17 +17,12 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::Win32::Storage::FileSystem::{
-    GetShortPathNameW, GetVolumeNameForVolumeMountPointW,
-};
+use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
 
 use kr_boundary_windows::lifecycle::{LEFTOVER_WORDS, RULE_BUSY, RULE_LEFTOVER};
-use kr_boundary_windows::remedy::REMOTE_VOLUME;
 use kr_boundary_windows::slot::{Blocked, SlotTable};
 use kr_boundary_windows::win::ffi::wide_path;
-use kr_boundary_windows::win::hold::{
-    FOLDER_LINK_WORDS, RULE_FOLDER_CHANGED, RULE_FOLDER_LINK, TreeHold, hold_tree,
-};
+use kr_boundary_windows::win::hold::{FOLDER_FORM_WORDS, RULE_FOLDER_FORM, TreeHold, hold_tree};
 
 use kr_boundary_windows::filekey::FileKey;
 use kr_boundary_windows::frame::Class;
@@ -50,7 +45,7 @@ use kr_boundary_windows::win::walk::INSPECT;
 use common::disk::Disk;
 use common::people::{Person, Siblings, acting_as, prepare, runs_as_the_system};
 use common::project::{Project, repository_at};
-use common::{Scratch, file_described, hostile_file, privileged, run};
+use common::{Scratch, file_described, hostile_file, privileged, run, smb_connections};
 
 const SHARING_VIOLATION: i32 = 32;
 
@@ -180,26 +175,6 @@ fn broker_admission_a_tree_inside_a_held_tree_and_the_tree_around_it_are_busy() 
     drop(beside);
 }
 
-/// A drive letter that names a folder, removed when it is dropped.
-struct Substituted(String);
-
-impl Substituted {
-    fn new(letter: &str, folder: &Path) -> Substituted {
-        common::run("subst", &[letter, folder.to_str().unwrap()]);
-        Substituted(letter.to_owned())
-    }
-}
-
-impl Drop for Substituted {
-    fn drop(&mut self) {
-        // A drive that cannot be removed here is gone with the guest's checkpoint.
-        std::process::Command::new("subst")
-            .args([self.0.as_str(), "/d"])
-            .output()
-            .ok();
-    }
-}
-
 fn from_wide(buffer: &[u16], length: u32) -> String {
     String::from_utf16_lossy(&buffer[..length as usize])
 }
@@ -214,23 +189,6 @@ fn short_form(path: &Path) -> String {
         unsafe { GetShortPathNameW(wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
     assert!(length > 0, "the short form of {path:?} is read");
     from_wide(&buffer, length)
-}
-
-/// The spelling of a path that names the volume by its GUID.
-fn volume_form(path: &Path) -> String {
-    let text = path.to_str().unwrap();
-    let root: Vec<u16> = format!("{}\\", &text[..2])
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut buffer = vec![0_u16; 64];
-    // SAFETY: the root is NUL-terminated and the buffer length is passed.
-    let read = unsafe {
-        GetVolumeNameForVolumeMountPointW(root.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32)
-    };
-    assert_ne!(read, 0, "the volume's name is read");
-    let end = buffer.iter().position(|unit| *unit == 0).unwrap();
-    format!("{}{}", from_wide(&buffer, end as u32), &text[3..])
 }
 
 #[test]
@@ -253,15 +211,13 @@ fn broker_admission_every_spelling_of_one_tree_gives_one_chain_and_one_slot() {
         text.to_lowercase(),
         "the guest's volume makes short names"
     );
-    let substituted = Substituted::new("Z:", &project.base);
+    // The forms that the broker refuses (the volume's name, a substituted drive, a dot-dot) are
+    // refused in `broker_text`; these are the spellings of a path on a local drive.
     let spellings = [
         ("a verbatim path", format!(r"\\?\{text}")),
         ("a short name", short),
         ("capital letters", text.to_uppercase()),
-        ("the volume's name", volume_form(&plain)),
-        ("a substituted drive", r"Z:\t\mid\parent\root".to_owned()),
         ("a trailing backslash", format!(r"{text}\")),
-        ("a dot-dot", format!(r"{text}\..\root")),
     ];
     let reference = hold_tree(&text, &person.as_client()).expect("the plain path is held");
     let table = SlotTable::new();
@@ -283,7 +239,6 @@ fn broker_admission_every_spelling_of_one_tree_gives_one_chain_and_one_slot() {
     slot.free_after_clean_release();
     drop(holds);
     drop(reference);
-    drop(substituted);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -893,15 +848,22 @@ fn broker_admission_a_volume_that_is_not_local_ntfs_is_refused_with_its_reason()
     let scratch = Scratch::on_drive();
     let client = person.as_client();
 
-    // A share of this computer is a remote volume, whatever file system the server reports.
+    // A share of this computer is refused for its form, before anything is opened: the computer
+    // makes no SMB connection for it (`broker_text` holds the other forms and the observables).
     let project = Project::make_private(&scratch, "share", &person.sid);
     let share = format!(
         r"\\localhost\C$\{}",
         project.root.strip_prefix(r"C:\").unwrap().display()
     );
+    let connections = smb_connections();
     let refusal = hold_tree(&share, &client).expect_err("a share is refused");
-    assert_eq!(refusal.detail(), REMOTE_VOLUME);
-    assert_eq!(refusal.rule, RULE_FOLDER_CHANGED);
+    assert_eq!(refusal.rule, RULE_FOLDER_FORM);
+    assert_eq!(refusal.detail(), FOLDER_FORM_WORDS);
+    assert_eq!(
+        smb_connections(),
+        connections,
+        "the share was opened: the computer made an SMB connection"
+    );
 
     // A volume of another file system is refused with the file system's name.
     let fat = Disk::new(&scratch, "fat32", 100, 'R').expect("a FAT32 disk can be made");
@@ -1149,61 +1111,6 @@ fn broker_admission_an_encrypted_object_and_a_cloud_placeholder_are_refused_nami
             format!("{}: {ENCRYPTED_WORDS}", display(&secret))
         );
     }
-}
-
-#[test]
-#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn broker_admission_a_junction_as_the_tree_is_refused_and_one_above_it_leads_to_the_real_tree() {
-    if !runs_as_the_system() {
-        eprintln!("skipped: the case needs the system's token");
-        return;
-    }
-    prepare();
-    let person = Person::new("krhap");
-    let siblings = Siblings::new();
-    let scratch = Scratch::on_drive();
-    let project = Project::make_private(&scratch, "real", &person.sid);
-    let real = held(&person, &project.root);
-
-    let as_root = scratch.path("as-root");
-    run(
-        "cmd",
-        &[
-            "/c",
-            "mklink",
-            "/J",
-            as_root.to_str().unwrap(),
-            project.root.to_str().unwrap(),
-        ],
-    );
-    let refusal = hold_tree(as_root.to_str().unwrap(), &person.as_client())
-        .expect_err("a junction as the tree is refused");
-    assert_eq!(refusal.rule, RULE_FOLDER_LINK);
-    assert!(
-        refusal.detail().starts_with(FOLDER_LINK_WORDS),
-        "{}",
-        refusal.detail()
-    );
-
-    let above = scratch.path("above");
-    run(
-        "cmd",
-        &[
-            "/c",
-            "mklink",
-            "/J",
-            above.to_str().unwrap(),
-            project.parent.to_str().unwrap(),
-        ],
-    );
-    let through = held(&person, &above.join("root"));
-    assert_eq!(
-        through.identity, real.identity,
-        "the real chain, not the junction's"
-    );
-    assert_eq!(through.path, real.path);
-    admit(&through, &person.as_client(), &siblings.probes())
-        .expect("the tree reached through a junction above it is admitted");
 }
 
 #[test]

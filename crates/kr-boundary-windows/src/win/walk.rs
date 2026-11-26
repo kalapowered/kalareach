@@ -39,18 +39,22 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo,
     FileIdExtdDirectoryInfo, FileIdExtdDirectoryRestartInfo, FileIdInfo, FileStandardInfo,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-    OPEN_EXISTING, OpenFileById, VOLUME_NAME_NT,
+    OPEN_EXISTING, OpenFileById, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT, VOLUME_NAME_NT,
 };
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::IO::{DeviceIoControl, IO_STATUS_BLOCK};
 
 use super::ffi::{Handle, Result, error, last, wide_path};
 use crate::filekey::FileKey;
+use crate::reparse::{MOUNT_POINT_TAG, is_volume_mount};
 
 const READ_CONTROL: u32 = 0x0002_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_DEVICE_DISK: u32 = 7;
 const FILE_REMOTE_DEVICE: u32 = 0x10;
 const FILE_REMOVABLE_MEDIA: u32 = 0x01;
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+/// The most bytes of reparse data the platform has for one object.
+const MAX_REPARSE_BYTES: usize = 16 * 1024;
 
 /// The access every object of a walk is opened with at the least: its attributes and identity.
 pub const INSPECT: u32 = FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
@@ -199,6 +203,25 @@ pub enum Lost {
     /// name's length, which no call answered.
     // text: walk-7
     #[error("the object could not be opened ({})", refused_words(*.0))]
+    Refused(u32),
+}
+
+/// Why a name that a client spelled could not be opened as a folder beneath a held one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotFolder {
+    /// There is no such name, or it names an object that is not a folder.
+    Gone,
+    /// The name is a reparse point of this tag; `volume_mount` is true when it leads to a volume
+    /// that is mounted in the folder, and false for a junction or a link of any other kind.
+    Link {
+        /// The reparse tag the platform reported.
+        tag: u32,
+        /// Whether the folder carries a volume mounted in it.
+        volume_mount: bool,
+    },
+    /// The folder's final path is not its parent's path and one name.
+    MovedOut,
+    /// The platform refused the open, with this error number.
     Refused(u32),
 }
 
@@ -352,6 +375,32 @@ pub(super) fn final_path(handle: &Handle) -> Result<Vec<u16>> {
     }
 }
 
+/// The reparse data of an open object that was opened as itself, at most the platform's largest.
+fn reparse_data(handle: &Handle) -> Result<Vec<u8>> {
+    let mut buffer = vec![0_u8; MAX_REPARSE_BYTES];
+    let mut returned = 0_u32;
+    // SAFETY: the handle is open, the output buffer and its length are passed, and the call keeps
+    // neither the buffer nor the count.
+    let read = unsafe {
+        DeviceIoControl(
+            handle.raw(),
+            FSCTL_GET_REPARSE_POINT,
+            null(),
+            0,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            buffer.len() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if read == 0 {
+        // text: walk_reparse_data-1
+        return Err(last("reading where a link leads"));
+    }
+    buffer.truncate((returned as usize).min(MAX_REPARSE_BYTES));
+    Ok(buffer)
+}
+
 /// Opens an object on the volume of `hint` by its identifier, without following a reparse point.
 fn open_by_key(hint: &Handle, key: &FileKey, access: u32, share: u32) -> Result<Handle> {
     let descriptor = FILE_ID_DESCRIPTOR {
@@ -411,7 +460,12 @@ impl DirHandle {
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                // The quality of service asks for identification only: if the path leads to a
+                // server, the server learns who asks and can act as nobody.
+                FILE_FLAG_BACKUP_SEMANTICS
+                    | FILE_FLAG_OPEN_REPARSE_POINT
+                    | SECURITY_SQOS_PRESENT
+                    | SECURITY_IDENTIFICATION,
                 std::ptr::null_mut(),
             )
         };
@@ -889,6 +943,63 @@ impl DirHandle {
             && path[prefix..] == *name;
         if !beneath {
             return Ok(Err(Lost::MovedOut));
+        }
+        let key = key_of(&handle)?;
+        Ok(Ok(DirHandle { handle, key, path }))
+    }
+
+    /// Opens the folder that a client spelled beneath this one, relative to its handle, and holds
+    /// it. The platform finds the name by its own rules (a short name and any case of a name
+    /// find the folder), and the folder's final path must be this folder's path and exactly one
+    /// name. A reparse point is never entered: it is refused with its tag, and a mount point is
+    /// told from a junction by its data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the platform refuses a call that is not a refusal of the name.
+    pub fn open_folder_spelled(
+        &self,
+        name: &[u16],
+        access: u32,
+    ) -> Result<std::result::Result<DirHandle, NotFolder>> {
+        let handle = match self.open_name(name, access, false) {
+            Ok(handle) => handle,
+            Err(failure)
+                if failure.code == ERROR_FILE_NOT_FOUND || failure.code == ERROR_PATH_NOT_FOUND =>
+            {
+                return Ok(Err(NotFolder::Gone));
+            }
+            Err(failure) => return Ok(Err(NotFolder::Refused(failure.code))),
+        };
+        let tag: FILE_ATTRIBUTE_TAG_INFO = query(
+            &handle,
+            FileAttributeTagInfo,
+            "reading a directory's attributes",
+        )?;
+        if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let volume_mount =
+                tag.ReparseTag == MOUNT_POINT_TAG && is_volume_mount(&reparse_data(&handle)?);
+            return Ok(Err(NotFolder::Link {
+                tag: tag.ReparseTag,
+                volume_mount,
+            }));
+        }
+        if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Ok(Err(NotFolder::Gone));
+        }
+        let path = final_path(&handle)?;
+        // A volume's root already ends in a backslash; every other directory's path does not.
+        let prefix = if self.path.last() == Some(&u16::from(b'\\')) {
+            self.path.len()
+        } else {
+            self.path.len() + 1
+        };
+        let beneath = path.len() > prefix
+            && path.starts_with(&self.path)
+            && path[prefix - 1] == u16::from(b'\\')
+            && !path[prefix..].contains(&u16::from(b'\\'));
+        if !beneath {
+            return Ok(Err(NotFolder::MovedOut));
         }
         let key = key_of(&handle)?;
         Ok(Ok(DirHandle { handle, key, path }))

@@ -602,7 +602,10 @@ impl OperateRequest {
                 got: directory.len(),
             });
         }
-        if directory.is_empty() || directory.contains('\0') {
+        if directory.is_empty()
+            || directory.contains('\0')
+            || crate::local_path::parse(directory).is_none()
+        {
             return Err(FieldError::Form { field: "directory" });
         }
         single_line("identity name", &self.identity.name)?;

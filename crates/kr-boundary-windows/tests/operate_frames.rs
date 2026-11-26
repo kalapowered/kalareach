@@ -491,18 +491,38 @@ fn the_directory_is_a_path_of_the_platforms_length() {
         sent.directory = directory;
         sent
     };
-    assert!(read_unchecked(&with("C".repeat(MAX_DIRECTORY_UNITS))).is_ok());
+    // A path of exactly the longest length, in names of 254 letters: each name is within its own bound.
+    let longest = {
+        let mut text = String::from(r"C:\");
+        let mut left = MAX_DIRECTORY_UNITS - text.len();
+        while left > 255 {
+            text.push_str(&"a".repeat(254));
+            text.push('\\');
+            left -= 255;
+        }
+        text.push_str(&"a".repeat(left));
+        text
+    };
+    assert_eq!(longest.encode_utf16().count(), MAX_DIRECTORY_UNITS);
+    assert!(read_unchecked(&with(longest)).is_ok());
     assert!(too_long(
         read_unchecked(&with("C".repeat(MAX_DIRECTORY_UNITS + 1))).unwrap_err(),
         "directory"
     ));
     // The limit counts UTF-16 units: a character outside the basic plane takes two.
-    assert!(read_unchecked(&with("\u{1F600}".repeat(MAX_DIRECTORY_UNITS / 2))).is_ok());
+    assert!(read_unchecked(&with(format!(r"C:\{}", "\u{1F600}".repeat(100)))).is_ok());
     assert!(too_long(
         read_unchecked(&with("\u{1F600}".repeat(MAX_DIRECTORY_UNITS / 2 + 1))).unwrap_err(),
         "directory"
     ));
-    for bad in ["", "C:\\a\0b"] {
+    for bad in [
+        "",
+        "C:\\a\0b",
+        r"\\host\share\x",
+        r"\\.\pipe\x",
+        r"..\x",
+        "C:x",
+    ] {
         let error = read_unchecked(&with(bad.to_owned())).unwrap_err();
         assert!(
             matches!(

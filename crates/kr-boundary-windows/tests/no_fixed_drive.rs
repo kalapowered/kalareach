@@ -31,6 +31,11 @@ fn no_code_of_the_crate_falls_back_to_a_fixed_drive() {
             if line.trim_start().starts_with("//") {
                 continue;
             }
+            // The words of the refusal for a text that is not a path on a local drive show a person
+            // an example path. They open nothing and stand in for nothing.
+            if line.contains(r"such as C:\\Users\\you\\project") {
+                continue;
+            }
             if ["C:\\", "c:\\", "\"C:\"", "\"c:\""]
                 .iter()
                 .any(|fixed| line.contains(fixed))

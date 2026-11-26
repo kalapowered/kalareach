@@ -16,10 +16,8 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read as _;
-use std::os::windows::ffi::OsStringExt as _;
 use std::os::windows::io::BorrowedHandle;
 use std::path::Path;
 use std::ptr::{null, null_mut};
@@ -29,14 +27,15 @@ use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_STANDARD_INFO, FileAttributeTagInfo, FileStandardInfo,
-    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+    FileAttributeTagInfo, FileStandardInfo, GetFinalPathNameByHandleW, OPEN_EXISTING,
+    QueryDosDeviceW, VOLUME_NAME_DOS,
 };
 
 use crate::filekey::FileKey;
 use crate::frame::invocation::RefusedKind;
 use crate::journal::rows::{Row, SnapshotKind};
+use crate::local_path;
 use crate::refusal::Refusal;
 use crate::slot::TreeIdentity;
 
@@ -44,11 +43,18 @@ use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
 use super::listing::{self, Failure, RepositoryListing};
 use super::rights::{Right, Sd};
-use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, check_volume, final_path, key_of, query};
+use super::walk::{AnchorRefusal, DirHandle, LIST, Lost, NotFolder, final_path, key_of, query};
+
+/// The most UTF-16 units of text that the platform answers for where a drive letter leads.
+const MAX_TARGET_UNITS: usize = 32_768;
 
 /// The most bytes the repository's `config` may hold; a larger file is refused before it is read.
 pub const MAX_CONFIG_BYTES: u64 = 262_144;
 
+/// The rule of a refusal for a text that is not a path on a local drive.
+pub const RULE_FOLDER_FORM: &str = "hold-folder-form";
+/// The rule of a refusal for a folder on the way that carries a volume mounted in it.
+pub const RULE_FOLDER_MOUNT: &str = "hold-folder-mount";
 /// The rule of a refusal for a folder that was not found.
 pub const RULE_FOLDER_MISSING: &str = "hold-folder-missing";
 /// The rule of a refusal for a folder that is a link.
@@ -83,6 +89,15 @@ pub const ABSENT_NAME_WORDS: &str =
 /// The reply when the hooks folder or the attributes file is over a bound of the listing.
 // text: LISTING_BOUND_WORDS
 pub const LISTING_BOUND_WORDS: &str = "the repository's hooks folder or info attributes file is larger than the broker reads (at most 256 objects, 4 levels, 128 hook files, 255 bytes a name and 1 MiB a file)";
+
+/// The reply when the text is not a path on a local drive, or names a drive that is not a local disk.
+// text: FOLDER_FORM_WORDS
+pub const FOLDER_FORM_WORDS: &str =
+    "name the project folder by a path on a local drive, such as C:\\Users\\you\\project";
+
+/// The reply when a folder on the way to the project carries a volume mounted in it.
+// text: MOUNT_POINT_WORDS
+pub const MOUNT_POINT_WORDS: &str = "a folder on the way to the project is a volume mounted in a folder, which the broker does not follow; give the volume a drive letter and name the project by it";
 
 /// The reply when the folder is not there.
 // text: FOLDER_MISSING_WORDS
@@ -305,46 +320,19 @@ fn named(words: &str, path: &str) -> String {
     format!("{words}: {path}")
 }
 
-/// Holds the project the request names: resolves the path to the object it names, opens each
-/// directory down to the tree and its `.git`, and opens and reads the repository's `config`.
+/// Holds the project the request names: takes the text apart, opens the drive's root and then each
+/// directory down to the tree, and opens its `.git` and its `config`. The text is never opened as a
+/// whole: nothing is opened before its form is known to be a path on a local drive, and no link
+/// on the way is followed.
 ///
 /// # Errors
 ///
-/// Refuses when the path is not a folder the broker holds (it is missing, a link, on a volume the
-/// broker does not run on, or one the person cannot read), when the project has no `.git` folder
-/// or no `config`, when the `config` has more than one name or is open for writing elsewhere, or
-/// when it is over the bound.
+/// Refuses when the text is not a path on a local drive, when a folder on the way is missing, a
+/// link or a mounted volume, when the drive is not a local disk volume the broker runs on, when the
+/// person cannot read the project, when the project has no `.git` folder or no `config`, when the
+/// `config` has more than one name or is open for writing elsewhere, or when it is over the bound.
 pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusal> {
-    let (target, final_dos) = resolve(path)?;
-    let (root_path, names) = split(&final_dos).ok_or_else(|| {
-        refuse(
-            RefusedKind::Admission,
-            RULE_FOLDER_CHANGED,
-            FOLDER_CHANGED_WORDS,
-        )
-    })?;
-    let display = String::from_utf16_lossy(&final_dos);
-    let root = match DirHandle::open_anchor_with(Path::new(&root_path), LIST) {
-        Ok(Ok(root)) => root,
-        Ok(Err(refusal)) => return Err(refusal_for_anchor(&refusal, &display)),
-        Err(failure) => return Err(failed(&failure)),
-    };
-    let mut chain = vec![root];
-    for name in &names {
-        let parent = chain.last().ok_or_else(|| {
-            refuse(
-                RefusedKind::Admission,
-                RULE_FOLDER_CHANGED,
-                FOLDER_CHANGED_WORDS,
-            )
-        })?;
-        let next = match parent.open_directory_named(name, LIST) {
-            Ok(Ok(next)) => next,
-            Ok(Err(lost)) => return Err(lost_refusal(&lost, &display)),
-            Err(failure) => return Err(failed(&failure)),
-        };
-        chain.push(next);
-    }
+    let chain = open_chain(path)?;
     let tree = chain.last().ok_or_else(|| {
         refuse(
             RefusedKind::Admission,
@@ -352,17 +340,7 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
             FOLDER_CHANGED_WORDS,
         )
     })?;
-    // The directory the request named is the directory that the walk reached.
-    let reached = key_of(tree.handle()).map_err(|failure| failed(&failure))?;
-    let named_key = key_of(&target).map_err(|failure| failed(&failure))?;
-    if reached != named_key {
-        return Err(refuse(
-            RefusedKind::Admission,
-            RULE_FOLDER_CHANGED,
-            FOLDER_CHANGED_WORDS,
-        ));
-    }
-    drop(target);
+    let display = dos_path(tree.handle())?;
     person_reads(client, tree.handle(), &display)?;
     let git_name: Vec<u16> = ".git".encode_utf16().collect();
     let git_dir = match tree.open_directory_named(&git_name, LIST) {
@@ -449,84 +427,122 @@ fn refusal_for_anchor(refusal: &AnchorRefusal, path: &str) -> Refusal {
     }
 }
 
-fn lost_refusal(lost: &Lost, path: &str) -> Refusal {
-    match lost {
-        Lost::Gone => refuse(
+fn not_folder_refusal(refused: &NotFolder, path: &str) -> Refusal {
+    match refused {
+        NotFolder::Gone => refuse(
             RefusedKind::Admission,
             RULE_FOLDER_MISSING,
             FOLDER_MISSING_WORDS,
         ),
-        Lost::IdentityChanged => refuse(
+        NotFolder::Link {
+            volume_mount: true, ..
+        } => refuse(RefusedKind::Admission, RULE_FOLDER_MOUNT, MOUNT_POINT_WORDS),
+        NotFolder::Link { .. } => refuse(
             RefusedKind::Admission,
             RULE_FOLDER_LINK,
             &named(FOLDER_LINK_WORDS, path),
         ),
-        Lost::MovedOut => refuse(
+        NotFolder::MovedOut => refuse(
             RefusedKind::Admission,
             RULE_FOLDER_CHANGED,
             FOLDER_CHANGED_WORDS,
         ),
-        // text: hold_folder-2
-        Lost::Refused(code) => failed(&ffi::error(*code, "opening a directory of the project")),
+        NotFolder::Refused(code) => {
+            // text: hold_folder-2
+            failed(&ffi::error(*code, "opening a directory of the project"))
+        }
     }
 }
-
-/// Opens the path the request names, without following a link in its last part, and reads its
-/// final path in the platform's own spelling. The handle is shared in every way, so it holds
-/// nothing; the caller compares the directory it reaches with it.
-fn resolve(path: &str) -> Result<(Handle, Vec<u16>), Refusal> {
-    let wide = wide_path(Path::new(path));
-    // SAFETY: the path is NUL-terminated and the call keeps nothing of it.
-    let raw = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            null_mut(),
-        )
+/// Opens the folders the text names, one beneath the other, from the root of its drive. The form
+/// and the drive are checked before anything is opened, and the walk goes by names beneath held
+/// folders, so no link on the way is followed.
+fn open_chain(path: &str) -> Result<Vec<DirHandle>, Refusal> {
+    let Some(local) = local_path::parse(path) else {
+        return Err(refuse(
+            RefusedKind::Admission,
+            RULE_FOLDER_FORM,
+            FOLDER_FORM_WORDS,
+        ));
     };
-    // text: hold_resolve-1
-    let handle = Handle::new(raw, "opening the project folder").map_err(|failure| {
-        if failure.code == 2 || failure.code == 3 {
-            refuse(
+    check_drive(local.drive)?;
+    let root_text = format!("{}:\\", local.drive);
+    let root = match DirHandle::open_anchor_with(Path::new(&root_text), LIST) {
+        Ok(Ok(root)) => root,
+        Ok(Err(refusal)) => return Err(refusal_for_anchor(&refusal, path)),
+        Err(failure) if failure.code == 2 || failure.code == 3 => {
+            return Err(refuse(
                 RefusedKind::Admission,
                 RULE_FOLDER_MISSING,
                 FOLDER_MISSING_WORDS,
-            )
-        } else {
-            failed(&failure)
+            ));
         }
-    })?;
-    // The volume first, as the walk's anchor does: a volume of another kind may not answer the
-    // attribute query that follows, and the refusal must name the volume, not that query.
-    match check_volume(&handle) {
-        Ok(Ok(_)) => {}
-        Ok(Err(volume)) => return Err(refusal_for_anchor(&AnchorRefusal::Volume(volume), path)),
         Err(failure) => return Err(failed(&failure)),
+    };
+    let mut chain = vec![root];
+    for name in &local.names {
+        let parent = chain.last().ok_or_else(|| {
+            refuse(
+                RefusedKind::Admission,
+                RULE_FOLDER_CHANGED,
+                FOLDER_CHANGED_WORDS,
+            )
+        })?;
+        let next = match parent.open_folder_spelled(name, LIST) {
+            Ok(Ok(next)) => next,
+            Ok(Err(refused)) => return Err(not_folder_refusal(&refused, path)),
+            Err(failure) => return Err(failed(&failure)),
+        };
+        chain.push(next);
     }
-    let tag: FILE_ATTRIBUTE_TAG_INFO = query(
-        &handle,
-        FileAttributeTagInfo,
-        "reading the project folder's attributes",
-    )
-    .map_err(|failure| failed(&failure))?;
-    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(refuse(
+    Ok(chain)
+}
+
+/// Reads where a drive letter leads, without opening what it leads to, and refuses a letter that
+/// is not a local disk volume. The call reads the link `\??\X:` of the caller's own device names
+/// and answers its target text; it opens no device, so a letter that stands for a share, for a
+/// folder or for any other device reaches nothing.
+fn check_drive(letter: char) -> Result<(), Refusal> {
+    let name: Vec<u16> = format!("{letter}:").encode_utf16().chain([0]).collect();
+    let mut buffer = vec![0_u16; 1024];
+    loop {
+        // SAFETY: the name is NUL-terminated, the buffer length is passed, and the call keeps
+        // neither.
+        let count =
+            unsafe { QueryDosDeviceW(name.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+        if count != 0 {
+            buffer.truncate(count as usize);
+            break;
+        }
+        // text: hold_drive-1
+        let failure = ffi::last("reading where the drive letter leads");
+        if failure.code == 2 {
+            return Err(refuse(
+                RefusedKind::Admission,
+                RULE_FOLDER_MISSING,
+                FOLDER_MISSING_WORDS,
+            ));
+        }
+        if failure.code == 122 && buffer.len() < MAX_TARGET_UNITS {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        return Err(failed(&failure));
+    }
+    // The first text of the answer is the link in force; a letter may carry others beneath it.
+    let target = buffer.split(|unit| *unit == 0).next().unwrap_or(&[]);
+    if local_path::is_local_volume_target(target) {
+        Ok(())
+    } else {
+        Err(refuse(
             RefusedKind::Admission,
-            RULE_FOLDER_LINK,
-            &named(FOLDER_LINK_WORDS, path),
-        ));
+            RULE_FOLDER_FORM,
+            FOLDER_FORM_WORDS,
+        ))
     }
-    if tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
-        return Err(refuse(
-            RefusedKind::Admission,
-            RULE_FOLDER_MISSING,
-            FOLDER_MISSING_WORDS,
-        ));
-    }
+}
+
+/// The path of an open folder in its DOS form (`\\?\C:\a\b`).
+fn dos_path(handle: &Handle) -> Result<String, Refusal> {
     let mut buffer = vec![0_u16; 512];
     loop {
         // SAFETY: the handle is open and the buffer length is passed.
@@ -546,54 +562,9 @@ fn resolve(path: &str) -> Result<(Handle, Vec<u16>), Refusal> {
         }
         if (length as usize) < buffer.len() {
             buffer.truncate(length as usize);
-            return Ok((handle, buffer));
+            return Ok(String::from_utf16_lossy(&buffer));
         }
         buffer.resize(length as usize + 1, 0);
-    }
-}
-
-/// Splits a final path in its DOS form (`\\?\C:\a\b`, `\\?\Volume{...}\a`, `\\?\UNC\s\h\a`) into
-/// the path of the volume's root and the names of the directories below it.
-fn split(path: &[u16]) -> Option<(OsString, Vec<Vec<u16>>)> {
-    let backslash = u16::from(b'\\');
-    let prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
-    let rest = path.strip_prefix(prefix.as_slice())?;
-    let mut parts = rest
-        .split(|unit| *unit == backslash)
-        .filter(|part| !part.is_empty());
-    let first = parts.next()?;
-    let unc: Vec<u16> = "UNC".encode_utf16().collect();
-    let mut root: Vec<u16> = prefix;
-    root.extend_from_slice(first);
-    if first.eq_ignore_ascii_case_units(&unc) {
-        // A network path: server and share, which the volume check refuses.
-        for part in parts.by_ref().take(2) {
-            root.push(backslash);
-            root.extend_from_slice(part);
-        }
-    }
-    root.push(backslash);
-    let names = parts.map(<[u16]>::to_vec).collect();
-    Some((OsString::from_wide(&root), names))
-}
-
-trait UnitsEq {
-    fn eq_ignore_ascii_case_units(&self, other: &[u16]) -> bool;
-}
-
-impl UnitsEq for [u16] {
-    fn eq_ignore_ascii_case_units(&self, other: &[u16]) -> bool {
-        self.len() == other.len()
-            && self.iter().zip(other).all(|(left, right)| {
-                let fold = |unit: u16| {
-                    if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
-                        unit - 32
-                    } else {
-                        unit
-                    }
-                };
-                fold(*left) == fold(*right)
-            })
     }
 }
 

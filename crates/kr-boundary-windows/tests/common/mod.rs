@@ -259,6 +259,42 @@ fn links_of(handle: &Handle) -> u32 {
     info.nNumberOfLinks
 }
 
+/// A drive letter that names a folder, removed when it is dropped.
+pub struct Substituted(String);
+
+impl Substituted {
+    pub fn new(letter: &str, folder: &Path) -> Substituted {
+        run("subst", &[letter, folder.to_str().unwrap()]);
+        Substituted(letter.to_owned())
+    }
+}
+
+impl Drop for Substituted {
+    fn drop(&mut self) {
+        // A drive that cannot be removed here is gone with the guest's checkpoint.
+        std::process::Command::new("subst")
+            .args([self.0.as_str(), "/d"])
+            .output()
+            .ok();
+    }
+}
+
+/// How many SMB connections this computer holds as a client.
+pub fn smb_connections() -> usize {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "@(Get-SmbConnection -ErrorAction SilentlyContinue).Count",
+        ])
+        .output()
+        .expect("PowerShell runs");
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    println!("SMB connections: {text}");
+    text.parse().expect("the count is a number")
+}
+
 /// Runs a command and asserts it succeeded.
 pub fn run(program: &str, arguments: &[&str]) {
     let output = Command::new(program).args(arguments).output().unwrap();
