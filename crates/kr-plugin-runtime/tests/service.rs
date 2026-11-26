@@ -6548,7 +6548,8 @@ mod recorded_session {
                 "notices": session.notices,
             });
             println!(
-                "RECORD-BEGIN\n{}\nRECORD-END",
+                "RECORD-BEGIN\n{}\nRECORD-END\n\
+                 not exercised: this run printed the record and asserted nothing",
                 serde_json::to_string_pretty(&record).expect("the record")
             );
             return;

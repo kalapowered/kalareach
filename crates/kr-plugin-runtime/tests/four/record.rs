@@ -950,7 +950,8 @@ async fn kr_req_24_24_the_fourth_protocol_host_answers_its_sessions_the_way_the_
             "closed": of(&sessions[1]),
         });
         println!(
-            "RECORD-BEGIN\n{}\nRECORD-END",
+            "RECORD-BEGIN\n{}\nRECORD-END\n\
+             not exercised: this run printed the record and asserted nothing",
             serde_json::to_string_pretty(&record).expect("the record")
         );
         return;
