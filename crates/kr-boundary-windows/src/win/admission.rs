@@ -99,7 +99,7 @@ pub const RULE_LABEL: &str = "admission-label";
 /// The end of the reply when a boundary account holds a right on an object; the path and the right
 /// come before it.
 // text: SIBLING_WORDS
-pub const SIBLING_WORDS: &str = "another boundary account has this right";
+pub const SIBLING_WORDS: &str = "the group of another boundary account has this right";
 
 /// The end of the reply when the person's own account lacks a right that the grant needs.
 // text: PERSON_LACKS_WORDS
@@ -127,23 +127,23 @@ pub const UNREAD_ENTRY_WORDS: &str =
 /// administrators can write in the Git folder; the principal's identifier, `on` and the object's
 /// path follow.
 // text: WRITER_WORDS
-pub const WRITER_WORDS: &str = "writer";
+pub const WRITER_WORDS: &str = "another account can write in the Git folder:";
 
 /// The start of the reply when an object of the Git folder is owned by a principal other than the
 /// person, the system and the administrators, which can change its list as its owner; the
 /// principal's identifier, `on` and the object's path follow.
 // text: OWNER_WORDS
-pub const OWNER_WORDS: &str = "owner";
+pub const OWNER_WORDS: &str = "another account owns this and can change its permissions:";
 
 /// The start of the reply when an entry names the group of an invocation that did not finish; `on`
 /// and the object's path follow.
 // text: STALE_WORDS
-pub const STALE_WORDS: &str = "stale grant";
+pub const STALE_WORDS: &str = "a permission entry that an earlier run left behind";
 
 /// The start of the reply when an object carries a mandatory label; `on` and the object's path
 /// follow.
 // text: LABEL_WORDS
-pub const LABEL_WORDS: &str = "label";
+pub const LABEL_WORDS: &str = "a mandatory integrity label is set";
 
 /// The end of the reply when an object is encrypted; the path comes before it.
 // text: ENCRYPTED_WORDS
@@ -337,7 +337,7 @@ fn cut_start(text: &str, room: usize) -> String {
 /// The reply's detail: the path, then the end, with the path cut when the whole would be longer
 /// than a detail may be.
 fn fitted(path: &str, end: &str) -> String {
-    let path = cut_start(path, MAX_DETAIL_BYTES.saturating_sub(end.len()));
+    let path = cut_start(spelled(path), MAX_DETAIL_BYTES.saturating_sub(end.len()));
     format!("{path}{end}")
 }
 
@@ -349,7 +349,7 @@ fn named_last(rule: &'static str, words: &str, sid: &str, path: &str) -> Refusal
     } else {
         format!("{words} {sid} on ")
     };
-    let path = cut_start(path, MAX_DETAIL_BYTES.saturating_sub(start.len()));
+    let path = cut_start(spelled(path), MAX_DETAIL_BYTES.saturating_sub(start.len()));
     Refusal::new(RefusedKind::Admission, rule, &format!("{start}{path}"))
 }
 

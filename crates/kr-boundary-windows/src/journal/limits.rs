@@ -52,11 +52,14 @@ pub const SID_BYTES: usize = 184;
 pub const TEXT_BYTES: usize = 256;
 /// The most directories in the chain of a tree's root.
 pub const CHAIN_KEYS: usize = 256;
-/// The most hooks a snapshot lists.
+/// The most entries of the hooks folder a snapshot lists: each recorded file, folder and link counts
+/// as one.
 pub const HOOKS: usize = 128;
 /// The most names a snapshot lists as absent.
 pub const ABSENT_NAMES: usize = 64;
-/// The most bytes a name in a snapshot takes in a row.
+/// The most bytes a name in a snapshot takes in a row. The name is relative to the Git directory,
+/// each backslash is two bytes of the row's text, a folder's name ends in a backslash and a link's
+/// in `:link`.
 pub const NAME_BYTES: usize = 255;
 
 /// The most objects the grant's walk covers for one invocation: a larger tree is refused at
