@@ -976,8 +976,8 @@ const PATH_PADDING: usize = 8;
 /// Reads macOS's `KERN_PROCARGS2` record: the argument count, the path the program was executed
 /// by, zero bytes, the arguments and then the environment.
 ///
-/// The zero bytes after the path are the padding that brings the path to a multiple of
-/// [`PATH_PADDING`] bytes, and one more for each empty argument at the front, so with that layout
+/// The zero bytes after the path are the padding that brings the path to a multiple of eight
+/// bytes, and one more for each empty argument at the front, so with that layout
 /// every position is known and the arguments are read one after another, empty ones included. A
 /// record with fewer zero bytes than the padding, or with fewer arguments than it counts, is a
 /// layout this reading was not made for: the vector is then what the reading gave before it was
