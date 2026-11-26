@@ -700,6 +700,52 @@ fn broker_admission_another_account_that_can_write_in_the_git_folder_refuses_the
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_admission_an_inherit_only_entry_for_the_creators_group_that_writes_refuses_the_tree() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let scratch = Scratch::on_drive();
+
+    // An empty folder of the Git folder with a template for the creator's primary group: a ref made
+    // in it later inherits the right for that group, which the boundary token neither sets nor
+    // checks, so another boundary account of the group could write the ref. The entry does not
+    // apply to the folder itself, so no access check on the folder shows it.
+    let project = Project::make_private(&scratch, "group", &person.sid);
+    let heads = project.git.join("refs").join("heads");
+    fs::create_dir_all(&heads).unwrap();
+    grant(&heads, "*S-1-3-1", "(OI)(IO)(WD)");
+    let refusal = admit_project(&person, &siblings, &project)
+        .expect_err("a template that gives the creator's group the right to write refuses");
+    assert_eq!(refusal.rule, RULE_WRITER);
+    assert_eq!(
+        refusal.detail(),
+        format!("{WRITER_WORDS} S-1-3-1 on {}", display(&heads))
+    );
+
+    // The template for the creator itself is exempt: an object made later is owned by the account
+    // that makes it, which is the invocation's own.
+    let project = Project::make_private(&scratch, "owner", &person.sid);
+    let heads = project.git.join("refs").join("heads");
+    fs::create_dir_all(&heads).unwrap();
+    grant(&heads, "*S-1-3-0", "(OI)(IO)(WD)");
+    admit_project(&person, &siblings, &project)
+        .expect("a template for the creator owner is admitted");
+
+    // A template for the creator's group that does not write is not a writer.
+    let project = Project::make_private(&scratch, "reads", &person.sid);
+    let heads = project.git.join("refs").join("heads");
+    fs::create_dir_all(&heads).unwrap();
+    grant(&heads, "*S-1-3-1", "(OI)(IO)(RD)");
+    admit_project(&person, &siblings, &project)
+        .expect("a template for the creator's group that only reads is admitted");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn broker_admission_an_owner_other_than_the_person_the_system_or_an_administrator_refuses_the_tree()
 {
     if !runs_as_the_system() {

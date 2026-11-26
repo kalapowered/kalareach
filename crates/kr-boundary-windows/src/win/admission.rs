@@ -734,12 +734,14 @@ const WRITE_BITS: u32 = 0x0000_0002
 /// The flag of an entry that does not apply to the object itself, only to what is made in it later.
 const INHERIT_ONLY: u8 = 0x08;
 
-/// Whether an entry gives its principal a write right. An entry that is only a template for what
-/// the creator will own (creator owner and creator group, for objects made later) names nobody.
+/// Whether an entry gives its principal a write right. An inherit-only entry for creator owner is
+/// only a template for what the creator will own: an object made later is owned by the account that
+/// makes it, the invocation's own. An inherit-only entry for creator group is not exempt: it gives
+/// the creator's primary group the right on every object made later, and the boundary token neither
+/// sets nor checks its primary group, so another boundary account of that group could write it.
 fn gives_writing(entry: &ListEntry) -> bool {
     let allows = entry.kind == 0 || entry.kind == 9;
-    let template =
-        entry.flags & INHERIT_ONLY != 0 && matches!(entry.sid.as_str(), "S-1-3-0" | "S-1-3-1");
+    let template = entry.flags & INHERIT_ONLY != 0 && entry.sid == "S-1-3-0";
     allows && !template && entry.mask & WRITE_BITS != 0
 }
 
