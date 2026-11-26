@@ -37,7 +37,8 @@ use kr_boundary_windows::frame::invocation::{
     read_reply,
 };
 use kr_boundary_windows::lifecycle::{Session, UNCERTAIN_END_WORDS};
-use kr_boundary_windows::win::admission::{RULE_SIBLING, STALE_WORDS, admit};
+use kr_boundary_windows::refusal::Refusal;
+use kr_boundary_windows::win::admission::{RULE_SIBLING, RULE_STALE, STALE_WORDS, admit};
 use kr_boundary_windows::win::boot::BootMarker;
 use kr_boundary_windows::win::client::ClientIdentity;
 use kr_boundary_windows::win::ffi::{Handle, Sid, system_windows_directory, wide};
@@ -46,7 +47,9 @@ use kr_boundary_windows::win::install::Paths;
 use kr_boundary_windows::win::launch::VerifiedPath;
 use kr_boundary_windows::win::lifecycle::fixture::{HeldTrees, Plan};
 use kr_boundary_windows::win::lifecycle::testing as hooks;
-use kr_boundary_windows::win::lifecycle::{ChildPlan, Environment, run_invocation};
+use kr_boundary_windows::win::lifecycle::{
+    ChildPlan, Environment, Slot, TreeHold, Trees, run_invocation,
+};
 use kr_boundary_windows::win::pipe::{
     Connection, Kind, Listener, ServerProcess, Stop, connect_held,
 };
@@ -422,6 +425,132 @@ fn leave_a_group_entry(project: &Project) -> PathBuf {
         .unwrap();
     grant(&left, &format!("*{group}"), "(W)");
     left
+}
+
+/// What the next requests read after a guard was dropped without an end.
+struct AfterADroppedGuard {
+    /// The refusal of a second request for the same tree, when there was one.
+    again: Option<Refusal>,
+    /// The refusal of a request for the tree after it was moved under another parent, when there
+    /// was one.
+    next: Option<Refusal>,
+    /// The tree's path after the move.
+    moved: PathBuf,
+}
+
+/// A request is admitted and its slot taken; the group entry of its unfinished grant is left on a
+/// file of the tree; then `drop_the_guard` drops the hold and the slot without an end. The row
+/// closes as uncertain and holds no handles, so the tree is moved under another parent, where the
+/// row no longer meets it, and a request for the moved tree is made. `None` when the case does not
+/// run here.
+fn after_a_dropped_guard(
+    label: &str,
+    drop_the_guard: impl FnOnce(Box<dyn TreeHold>, Box<dyn Slot>),
+) -> Option<AfterADroppedGuard> {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return None;
+    }
+    prepare();
+    let person = Person::new("krhap");
+    let siblings = Siblings::new();
+    let home = Scratch::new();
+    let scratch = Scratch::on_drive();
+    let project = Project::make_private(&scratch, label, &person.sid);
+    let trees = HeldTrees::new(siblings.probes(), stand_in_plan(&home.dir, &["exit", "0"]));
+    let client = client_of(&person);
+    let (hold, slot) = trees
+        .resolve(&request_for(&project.root), &client)
+        .unwrap_or_else(|refusal| panic!("the first request is admitted: {refusal}"));
+
+    // The grant of that invocation leaves its group's entry on a file of the tree.
+    leave_a_group_entry(&project);
+    drop_the_guard(hold, slot);
+
+    let again = trees.resolve(&request_for(&project.root), &client).err();
+    let elsewhere = scratch.path(&format!("{label}-elsewhere"));
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let moved = elsewhere.join("moved");
+    std::fs::rename(&project.root, &moved).expect("the tree is moved: no handle of it is held");
+    let next = trees.resolve(&request_for(&moved), &client).err();
+    Some(AfterADroppedGuard { again, next, moved })
+}
+
+/// A step that holds the tree and its slot and returns an error before it reaches an end: both are
+/// dropped by the return.
+fn returns_early(hold: Box<dyn TreeHold>, slot: Box<dyn Slot>) -> Result<(), &'static str> {
+    let _slot = slot;
+    let _hold = hold;
+    Err("an early return")
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_sources_a_guard_dropped_by_an_early_return_leaves_a_moved_tree_to_the_left_entry() {
+    let Some(done) = after_a_dropped_guard("early", |hold, slot| {
+        assert!(returns_early(hold, slot).is_err());
+    }) else {
+        return;
+    };
+    // The row is closed as uncertain: the same tree is refused as left unfinished.
+    assert!(
+        done.again.is_some(),
+        "a dropped guard closes the tree: the row stays"
+    );
+    if let Some(refusal) = &done.again {
+        assert_eq!(refusal.kind, RefusedKind::Leftover);
+        assert_eq!(refusal.detail(), UNCERTAIN_END_WORDS);
+    }
+    // The row holds no handle of the tree: it was moved, the next request meets no row, and the
+    // entry that the unfinished grant left refuses it.
+    assert!(
+        done.next.is_some(),
+        "the moved tree is refused: the left entry stands in for the row"
+    );
+    if let Some(refusal) = &done.next {
+        assert_eq!(refusal.rule, RULE_STALE);
+        assert_eq!(
+            refusal.detail(),
+            format!("{STALE_WORDS} on {}", done.moved.join("left.txt").display())
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn broker_sources_a_guard_dropped_by_a_caught_panic_leaves_a_moved_tree_to_the_left_entry() {
+    let Some(done) = after_a_dropped_guard("panic", |hold, slot| {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _slot = slot;
+            let _hold = hold;
+            panic!("a panic that the case catches");
+        }));
+        assert!(caught.is_err(), "the panic was caught");
+    }) else {
+        return;
+    };
+    // The row is closed as uncertain: the same tree is refused as left unfinished.
+    assert!(
+        done.again.is_some(),
+        "a dropped guard closes the tree: the row stays"
+    );
+    if let Some(refusal) = &done.again {
+        assert_eq!(refusal.kind, RefusedKind::Leftover);
+        assert_eq!(refusal.detail(), UNCERTAIN_END_WORDS);
+    }
+    // The row holds no handle of the tree: it was moved, the next request meets no row, and the
+    // entry that the unfinished grant left refuses it.
+    assert!(
+        done.next.is_some(),
+        "the moved tree is refused: the left entry stands in for the row"
+    );
+    if let Some(refusal) = &done.next {
+        assert_eq!(refusal.rule, RULE_STALE);
+        assert_eq!(
+            refusal.detail(),
+            format!("{STALE_WORDS} on {}", done.moved.join("left.txt").display())
+        );
+    }
 }
 
 #[test]

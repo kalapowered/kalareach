@@ -39,7 +39,10 @@ impl TreeIdentity {
 pub enum Blocked {
     /// An object of the tree, the repository or the journal is left unfinished.
     Leftover(String),
-    /// The end of an invocation is not proved.
+    /// The end of an invocation is not proved. A row that closes this way when its guard is dropped
+    /// by an early return or a panic holds no handles of the tree: the tree can then be moved
+    /// under another parent, where no row meets it, and the rule against the entry of an
+    /// unfinished operation's group on an object stands in for the row at the next request.
     Uncertain,
 }
 
@@ -234,6 +237,9 @@ impl SlotGuard {
 }
 
 impl Drop for SlotGuard {
+    /// A guard that is dropped without an end closes its row as uncertain. The guard does not own
+    /// the tree's handles, so the row keeps none on this path: it cannot stop the tree from being
+    /// moved, and the rule against a left group entry stands in for it at the next request.
     fn drop(&mut self) {
         if self.ended {
             return;
