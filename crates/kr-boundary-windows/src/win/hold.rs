@@ -173,6 +173,8 @@ pub struct TreeHold {
     pub identity: TreeIdentity,
     /// What the Git folder held, besides `config`, when the tree was held.
     pub listing: RepositoryListing,
+    /// The states of an operation in progress that the Git folder held when the tree was held.
+    pub states: Vec<String>,
     /// Each listed hook and the attributes file, open for reading and shared for reading only, so
     /// that no account can write, rename or delete one while the tree is held.
     pub listed_files: Vec<Handle>,
@@ -223,6 +225,11 @@ impl TreeHold {
             }
         }
         names.extend(listing::present_names(&self.git_dir));
+        names.extend(
+            listing::present_states(&self.git_dir)
+                .into_iter()
+                .filter(|name| !self.states.contains(name)),
+        );
         match listing::take(&self.git_dir) {
             Ok(now) => names.extend(listing::differences(&self.listing, &now)),
             Err(_) => {
@@ -390,6 +397,7 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
         ));
     }
     let (listing, listed_files) = take_listing(&git_dir)?;
+    let states = listing::present_states(&git_dir);
     let identity = TreeIdentity {
         chain: chain.iter().map(DirHandle::key).collect(),
     };
@@ -399,6 +407,7 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
         config,
         identity,
         listing,
+        states,
         listed_files,
         path: display,
     })

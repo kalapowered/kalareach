@@ -883,6 +883,41 @@ fn config_hold_a_cloud_folder_on_the_way_and_an_encrypted_config_are_refused_say
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_state_of_an_operation_in_progress_that_is_new_at_the_end_is_seen() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhcp");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "states");
+    // A state that was there when the tree was held is the person's own: it is no change.
+    fs::create_dir(project.git.join("rebase-merge")).unwrap();
+    let hold = hold_tree(project.root.to_str().unwrap(), &ordinary.as_client())
+        .expect("a repository with a rebase in progress is held");
+    assert_eq!(
+        hold.end_check(),
+        Ok(()),
+        "a state that was there is no change"
+    );
+    // A state that is new at the end is a change: the person's next `--continue` would run it.
+    plant(&project.git.join("MERGE_HEAD"), b"x");
+    assert_eq!(
+        hold.end_check(),
+        Err(changed(&["MERGE_HEAD"])),
+        "a new state file"
+    );
+    fs::create_dir(project.git.join("sequencer")).unwrap();
+    assert_eq!(
+        hold.end_check(),
+        Err(changed(&["MERGE_HEAD", "sequencer"])),
+        "a new state folder as well"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {
     if !runs_as_the_system() {
         eprintln!("skipped: the case needs the system's token");

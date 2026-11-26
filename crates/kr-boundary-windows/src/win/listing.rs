@@ -28,6 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 use crate::filekey::FileKey;
 use crate::journal::limits::{HOOKS, NAME_BYTES, json_bytes};
 use crate::journal::rows::DigestedFile;
+use crate::operation::state::STATE_NAMES;
 use crate::repository::attributes::MAX_ATTRIBUTES_BYTES;
 
 use super::ffi::{self, Handle};
@@ -377,6 +378,17 @@ fn take_by(
 /// on the way that is a link or not a folder hides what is beyond it.
 pub(super) fn present_names(git: &DirHandle) -> Vec<String> {
     ABSENT_NAMES
+        .iter()
+        .filter(|name| is_present(git, name))
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// The names of [`STATE_NAMES`] that are present in the held Git directory now: the states of an
+/// operation in progress. The admitted commands make none of them, so one that was not there at the
+/// hold is new, and the next `--continue` of the person's own Git would run what it holds.
+pub(super) fn present_states(git: &DirHandle) -> Vec<String> {
+    STATE_NAMES
         .iter()
         .filter(|name| is_present(git, name))
         .map(|name| (*name).to_owned())
