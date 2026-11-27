@@ -5139,11 +5139,17 @@ mod tests {
 
         /// A file made with one explicit descriptor.
         fn described(&self, name: &str, descriptor: &str) -> PathBuf {
-            let path = self.0.join(name);
-            create_file_with_descriptor(&path, descriptor)
-                .unwrap_or_else(|error| panic!("{name} is created with {descriptor}: {error}"));
-            path
+            described_file(&self.0, name, descriptor)
         }
+    }
+
+    /// A file of `directory` made with one explicit descriptor.
+    #[cfg(windows)]
+    fn described_file(directory: &Path, name: &str, descriptor: &str) -> PathBuf {
+        let path = directory.join(name);
+        create_file_with_descriptor(&path, descriptor)
+            .unwrap_or_else(|error| panic!("{name} is created with {descriptor}: {error}"));
+        path
     }
 
     #[cfg(windows)]
@@ -5212,16 +5218,20 @@ mod tests {
         let directory = Inheriting::new("passes-down");
         pass_the_users_group_down(&directory);
         let replaced = directory.0.join("replaced");
-        write_owner_only_file(&replaced, b"kept").expect("the replacing writer writes here");
+        let written = write_owner_only_file(&replaced, b"kept");
+        assert!(
+            written.is_ok(),
+            "the replacing writer writes here: {written:?}"
+        );
         let created = directory.0.join("created");
-        create_new_owner_only_file(&created, b"kept").expect("the creating writer writes here");
+        let made = create_new_owner_only_file(&created, b"kept");
+        assert!(made.is_ok(), "the creating writer writes here: {made:?}");
         for path in [&replaced, &created] {
+            let read = read_owner_only_file(path, 64);
             assert_eq!(
-                read_owner_only_file(path, 64)
-                    .expect("the reader accepts the file")
-                    .expect("present"),
-                b"kept",
-                "{}",
+                read.as_ref().ok(),
+                Some(&Some(b"kept".to_vec())),
+                "the reader accepts {}: {read:?}",
                 path.display()
             );
         }
@@ -5238,12 +5248,15 @@ mod tests {
         let expected =
             access(&directory.described("expected", &the_owner_only_descriptor(&this_account())));
         let replaced = directory.0.join("replaced");
-        write_owner_only_file(&replaced, b"first").expect("writes");
+        let first = write_owner_only_file(&replaced, b"first");
+        assert!(first.is_ok(), "the first write: {first:?}");
         assert_eq!(access(&replaced), expected, "after the first write");
-        write_owner_only_file(&replaced, b"second").expect("replaces");
+        let second = write_owner_only_file(&replaced, b"second");
+        assert!(second.is_ok(), "the replacement: {second:?}");
         assert_eq!(access(&replaced), expected, "after a replacement");
         let created = directory.0.join("created");
-        create_new_owner_only_file(&created, b"first").expect("creates");
+        let made = create_new_owner_only_file(&created, b"first");
+        assert!(made.is_ok(), "the creation: {made:?}");
         assert_eq!(access(&created), expected, "after a creation");
     }
 
@@ -5268,7 +5281,7 @@ mod tests {
         });
         let written = write_owner_only_file(&directory.0.join("file"), b"content");
         AFTER_CREATING.with(|hook| *hook.borrow_mut() = None);
-        written.expect("writes");
+        assert!(written.is_ok(), "the write: {written:?}");
         let seen = seen.take();
         assert_eq!(
             seen.len(),
@@ -5276,8 +5289,8 @@ mod tests {
             "the file was looked at once, when it was made"
         );
         assert_eq!(
-            seen[0].as_ref().expect("the new file is read"),
-            &expected,
+            seen[0].as_ref(),
+            Ok(&expected),
             "what the first look at the new file found"
         );
     }
@@ -5323,6 +5336,121 @@ mod tests {
                 "{what}: nothing is left beside it"
             );
         }
+    }
+
+    /// The variable that names the folder in which the two cases below meet.
+    #[cfg(windows)]
+    const TWO_TOKENS_FOLDER: &str = "KR_TWO_TOKENS_FOLDER";
+
+    /// The integrity level of this process's token, as the system's own tool reports it: an
+    /// administrator's elevated token runs at the high level, and the same account's ordinary token
+    /// at the medium one.
+    #[cfg(windows)]
+    fn token_level() -> &'static str {
+        let groups = run(
+            "whoami.exe",
+            &[
+                "/groups".as_ref(),
+                "/fo".as_ref(),
+                "csv".as_ref(),
+                "/nh".as_ref(),
+            ],
+        );
+        if groups.contains("S-1-16-12288") {
+            "high"
+        } else if groups.contains("S-1-16-8192") {
+            "medium"
+        } else {
+            "other"
+        }
+    }
+
+    /// The folder, under the temporary directory of the account that runs the case, that the
+    /// variable [`TWO_TOKENS_FOLDER`] names. Both tokens of one account reach the same one.
+    #[cfg(windows)]
+    fn two_tokens_folder() -> PathBuf {
+        let name = std::env::var(TWO_TOKENS_FOLDER)
+            .unwrap_or_else(|_| panic!("{TWO_TOKENS_FOLDER} names the folder the cases meet in"));
+        assert!(
+            !name.is_empty() && !name.contains(['\\', '/', ':']),
+            "{TWO_TOKENS_FOLDER} is one folder name: {name}"
+        );
+        std::env::temp_dir().join(name)
+    }
+
+    /// The first of two cases that run by name (`--ignored --exact`), one after the other, where an
+    /// account that is an administrator is disposable. It needs that account's ELEVATED token, and
+    /// asserts so before it does anything, so a run under the ordinary token does not pass. An
+    /// elevated token owns what it makes as the administrators group unless an owner is named, so
+    /// the file the writer makes here must carry the access of a file made beside it with the
+    /// owner-only descriptor spelled out, the account as its owner. The folder stays for the next
+    /// case.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs the elevated token of an administrator account that is disposable; run by name before the case that follows"]
+    fn an_elevated_token_writes_a_first_file_that_names_its_account_as_the_owner() {
+        assert_eq!(
+            token_level(),
+            "high",
+            "this case counts only under an elevated token"
+        );
+        let folder = two_tokens_folder();
+        std::fs::create_dir(&folder).expect("the folder the two cases meet in is new");
+        let expected = access(&described_file(
+            &folder,
+            "expected-elevated",
+            &the_owner_only_descriptor(&this_account()),
+        ));
+        let file = folder.join("file");
+        let written = write_owner_only_file(&file, b"first");
+        assert!(written.is_ok(), "the elevated write: {written:?}");
+        assert_eq!(access(&file), expected, "the file an elevated token wrote");
+    }
+
+    /// The second of the two cases, run by name under the ORDINARY token of the same account, after
+    /// the first. It asserts that token first, so a run under the elevated one does not pass. The
+    /// file the elevated token wrote names the account as its owner, so the ordinary reader accepts
+    /// it, and the ordinary writer replaces it, over the old file, and writes a new one beside it.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs the ordinary token of the account the previous case used; run by name after it"]
+    fn an_ordinary_token_reads_and_replaces_the_file_an_elevated_token_of_its_account_made() {
+        assert_eq!(
+            token_level(),
+            "medium",
+            "this case counts only under an ordinary token"
+        );
+        let folder = two_tokens_folder();
+        let file = folder.join("file");
+        let expected = access(&described_file(
+            &folder,
+            "expected-ordinary",
+            &the_owner_only_descriptor(&this_account()),
+        ));
+        assert_eq!(
+            access(&file),
+            expected,
+            "the file the elevated token wrote names this account as its owner"
+        );
+        let read = read_owner_only_file(&file, 64);
+        assert_eq!(
+            read.as_ref().ok(),
+            Some(&Some(b"first".to_vec())),
+            "the ordinary read of the old file: {read:?}"
+        );
+        let replaced = write_owner_only_file(&file, b"second");
+        assert!(replaced.is_ok(), "the ordinary replacement: {replaced:?}");
+        let read = read_owner_only_file(&file, 64);
+        assert_eq!(
+            read.as_ref().ok(),
+            Some(&Some(b"second".to_vec())),
+            "the read after the replacement: {read:?}"
+        );
+        assert_eq!(access(&file), expected, "after the replacement");
+        let beside = folder.join("beside");
+        let created = create_new_owner_only_file(&beside, b"third");
+        assert!(created.is_ok(), "the ordinary creation: {created:?}");
+        assert_eq!(access(&beside), expected, "the file made beside it");
     }
 
     /// Two files made in one directory have the same access, which records nothing set on either
