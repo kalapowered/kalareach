@@ -494,8 +494,8 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
     // chosen for it. The terminal is all such a program has.
     let elsewhere = setup.host.root().join("bin/kimi").display().to_string();
     assert_eq!(
-        setup.broker.recognise(&elsewhere, None),
-        Recognition::Tied(vec![plugin("kimi-cli"), plugin("kimi-code-cli")]),
+        tied_plugins(&setup.broker.recognise(&elsewhere, None)),
+        Some(vec![plugin("kimi-cli"), plugin("kimi-code-cli")]),
         "a kimi outside the installation location is claimed equally by both profiles"
     );
 }
@@ -520,10 +520,12 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
     for relative in ["bin/opencode", ".opencode/bin/opencode"] {
         let (typed, program) = setup.typed_at(relative, &arguments[1..]);
         assert_eq!(
-            setup
-                .broker
-                .recognise(&program.display().to_string(), Some(&digest_of(&program))),
-            Recognition::Tied(vec![plugin("opencode"), plugin("opencode-attach")]),
+            tied_plugins(
+                &setup
+                    .broker
+                    .recognise(&program.display().to_string(), Some(&digest_of(&program)))
+            ),
+            Some(vec![plugin("opencode"), plugin("opencode-attach")]),
             "{relative}: both profiles claim it equally"
         );
         let told = setup.adopt(&foreground(&typed, &program, reason));
@@ -580,10 +582,12 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
     let (typed, program) = setup.typed_at("named/bin/opencode", &arguments[1..]);
     setup.name_the_build(2, &["opencode", "opencode-attach"], &program, "1.18.31");
     assert_eq!(
-        setup
-            .broker
-            .recognise(&program.display().to_string(), Some(&digest_of(&program))),
-        Recognition::Tied(vec![plugin("opencode"), plugin("opencode-attach")]),
+        tied_plugins(
+            &setup
+                .broker
+                .recognise(&program.display().to_string(), Some(&digest_of(&program)))
+        ),
+        Some(vec![plugin("opencode"), plugin("opencode-attach")]),
         "both profiles cover the version the records name, so neither is preferred"
     );
     let told = setup.adopt(&foreground(&typed, &program, reason));
@@ -602,6 +606,19 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
 /// The digest of the file at `path`.
 fn digest_of(path: &Path) -> Digest256 {
     Digest256::from_bytes(kr_cbor::sha256(&std::fs::read(path).expect("a file")))
+}
+
+/// The packages a decision ties, in the order it names them.
+fn tied_plugins(recognition: &Recognition) -> Option<Vec<PluginId>> {
+    match recognition {
+        Recognition::Tied(tie) => Some(
+            tie.packages
+                .iter()
+                .map(|package| package.plugin_id.clone())
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// The identifier of the shipped package named `name`.

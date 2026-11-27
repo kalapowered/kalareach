@@ -501,7 +501,10 @@ pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resol
 
 /// Whether one publisher published every package of `candidates`, through one repository. The name
 /// of a publisher stands for one publisher only within the repository whose root vouches for it.
-fn from_one_publisher(candidates: &[Candidate]) -> bool {
+/// [`resolve`] ranks by coverage and by installation location only where this holds, and a host
+/// that explains why packages were not ranked asks the same question.
+#[must_use]
+pub fn from_one_publisher(candidates: &[Candidate]) -> bool {
     let publisher = |candidate: &Candidate| {
         candidate
             .plugin_id

@@ -1181,7 +1181,12 @@ fn selected(recognition: &Recognition) -> Option<String> {
 /// The packages a decision ties, in the order it names them.
 fn tied(recognition: &Recognition) -> Option<Vec<String>> {
     match recognition {
-        Recognition::Tied(plugins) => Some(plugins.iter().map(ToString::to_string).collect()),
+        Recognition::Tied(tie) => Some(
+            tie.packages
+                .iter()
+                .map(|package| package.plugin_id.to_string())
+                .collect(),
+        ),
         _ => None,
     }
 }

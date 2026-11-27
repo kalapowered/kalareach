@@ -73,7 +73,7 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use crate::broker::Broker;
-use crate::broker::binder::{MatchedExecutable, Recognition};
+use crate::broker::binder::{MatchedExecutable, Recognition, Tie};
 use crate::broker::image::HashedFiles;
 
 /// How often the foreground is looked at while a look is likely to find something: while a command
@@ -95,10 +95,11 @@ pub const ADOPTED_REFUSAL: &str = "it was not launched through the integration, 
 
 /// Why a tied program's bridges are refused, as its announcement says: the packages that recognise
 /// it equally well, named, and that the host chose none of them.
-fn tie_refusal(plugins: &[kr_protocol::ids::PluginId]) -> String {
-    let names: Vec<&str> = plugins
+fn tie_refusal(tie: &Tie) -> String {
+    let names: Vec<&str> = tie
+        .packages
         .iter()
-        .map(kr_protocol::ids::PluginId::as_str)
+        .map(|package| package.plugin_id.as_str())
         .collect();
     let named = match names.as_slice() {
         [rest @ .., last] if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
@@ -601,7 +602,7 @@ impl Adoptions {
             started_at: now,
             ended_at: Nullable::null(),
             refusal: Nullable::some(match &recognition {
-                Recognition::Tied(plugins) => tie_refusal(plugins),
+                Recognition::Tied(tie) => tie_refusal(tie),
                 _ => ADOPTED_REFUSAL.to_owned(),
             }),
         };
@@ -1215,9 +1216,11 @@ fn bypass_for(
 mod tests {
     use std::time::Duration;
 
+    use kr_plugin_sdk::matching::Coverage;
     use kr_protocol::ids::PluginId;
 
-    use super::{ADOPTED_REFUSAL, IDLE_LOOK, Pace, WATCH_INTERVAL, tie_refusal};
+    use super::{ADOPTED_REFUSAL, IDLE_LOOK, Pace, Tie, WATCH_INTERVAL, tie_refusal};
+    use crate::broker::binder::TiedPackage;
 
     #[test]
     fn a_quiet_watch_waits_a_quarter_of_the_quiet_time_between_the_interval_and_the_idle_look() {
@@ -1277,11 +1280,19 @@ mod tests {
     #[test]
     fn each_refusal_an_adopted_instance_carries_reads_between_the_host_says_and_a_full_stop() {
         let tied = |names: &[&str]| {
-            let plugins: Vec<PluginId> = names
-                .iter()
-                .map(|name| PluginId::new(*name).expect("an identifier"))
-                .collect();
-            tie_refusal(&plugins)
+            tie_refusal(&Tie {
+                packages: names
+                    .iter()
+                    .map(|name| TiedPackage {
+                        plugin_id: PluginId::new(*name).expect("an identifier"),
+                        protocol: None,
+                        ranges: Vec::new(),
+                        version: None,
+                        coverage: Coverage::Neutral,
+                    })
+                    .collect(),
+                one_publisher: true,
+            })
         };
         let refusals = [
             ("an adopted program", ADOPTED_REFUSAL.to_owned()),

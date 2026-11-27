@@ -37,7 +37,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use kr_plugin_sdk::capability::PluginCapability;
-use kr_plugin_sdk::matching::{Candidate, Resolution};
+use kr_plugin_sdk::matching::{Candidate, Coverage, Resolution, from_one_publisher, resolve};
+use kr_plugin_sdk::version::{PackageVersion, VersionRange};
 use kr_protocol::admission::{
     AdmittedBuild, AdmittedPackage, FrameId, LiveRelease, ReleaseOrigin, ReleaseState,
     RevocationPolicy,
@@ -71,54 +72,116 @@ pub(super) struct Admitted {
 }
 
 impl Admitted {
-    /// Returns what the admitted packages make of a program at `path`, with no selection made. The
-    /// worker reads every rule as a guess, so a rule that names the installation location outranks
-    /// one that names only the executable, among the packages of one publisher through one
-    /// repository. Equal claims select nothing, and the packages that make them are named.
-    fn recognise(&self, path: &str, _digest: Option<&Digest256>) -> Recognised {
-        let mut found: Vec<(Candidate, Digest256)> = Vec::new();
-        for (digest, (package, read)) in &self.packages {
+    /// Returns what the admitted packages make of a program at `path`, with no selection made, and
+    /// of the program's version where `digest` is the digest of its bytes. The worker reads every
+    /// rule as a guess, so a package that covers the program's version outranks one that says
+    /// nothing about it, and that one outranks a package that refuses it; then a rule that names
+    /// the installation location outranks one that names only the executable. Both ranks hold
+    /// among the packages of one publisher through one repository only. A package knows a build
+    /// only by its own signed records, so the version is the one each package's own builds name for
+    /// `digest`, and it is read against the rule's range and the range its connector table is
+    /// qualified for. Equal claims select nothing, and the packages that make them are named with
+    /// what was read of each.
+    fn recognise(&self, path: &str, digest: Option<&Digest256>) -> Recognised {
+        let mut found: Vec<Seen> = Vec::new();
+        for (package_digest, (package, read)) in &self.packages {
             let manifest = read.manifest();
             let plugin_id = manifest.plugin_id();
+            let installed = digest
+                .and_then(|digest| {
+                    package
+                        .builds
+                        .iter()
+                        .find(|build| &build.executable_digest == digest)
+                })
+                .and_then(|build| PackageVersion::parse(&build.version).ok());
+            let pin = read.protocol();
+            let pinned: Vec<&VersionRange> = pin.iter().map(|pin| &pin.qualified_range).collect();
             for rule in &manifest.match_rules {
                 // The worker establishes no distribution for a program it finds running, so every
                 // rule recognises the program by its name and location as a guess. A publisher is
                 // vouched for by the enrolment of the repository the package came through.
-                if let Some(candidate) = rule.candidate(
+                let Some(candidate) = rule.candidate(
                     &plugin_id,
                     &package.origin.enrolment_key,
                     path,
                     None,
-                    None,
-                    &[],
-                ) {
-                    found.push((candidate, *digest));
+                    installed.as_ref(),
+                    &pinned,
+                ) else {
+                    continue;
+                };
+                let mut ranges: Vec<String> = Vec::new();
+                for range in rule
+                    .executable
+                    .version_range
+                    .as_ref()
+                    .into_iter()
+                    .chain(pinned.iter().copied())
+                {
+                    let range = range.to_string();
+                    if !ranges.contains(&range) {
+                        ranges.push(range);
+                    }
                 }
+                found.push(Seen {
+                    facts: TiedPackage {
+                        plugin_id: plugin_id.clone(),
+                        protocol: pin.map(|pin| pin.name.clone()),
+                        ranges,
+                        version: installed.as_ref().map(ToString::to_string),
+                        coverage: candidate.coverage,
+                    },
+                    candidate,
+                    package: *package_digest,
+                });
             }
         }
-        let resolution = kr_plugin_sdk::matching::resolve(
-            found
-                .iter()
-                .map(|(candidate, _)| candidate.clone())
-                .collect(),
+        let resolution = resolve(
+            found.iter().map(|seen| seen.candidate.clone()).collect(),
             None,
         );
         match resolution {
             Resolution::Selected(chosen) => found
                 .iter()
-                .find(|(candidate, _)| candidate.plugin_id == chosen.plugin_id)
-                .map_or(Recognised::Nothing, |(_, digest)| Recognised::One(*digest)),
+                .find(|seen| seen.candidate.plugin_id == chosen.plugin_id)
+                .map_or(Recognised::Nothing, |seen| Recognised::One(seen.package)),
             Resolution::None => Recognised::Nothing,
-            Resolution::Conflict(candidates) => Recognised::Tied(
-                candidates
-                    .into_iter()
-                    .map(|candidate| candidate.plugin_id)
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect(),
-            ),
+            Resolution::Conflict(candidates) => {
+                let mut packages: BTreeMap<PluginId, TiedPackage> = BTreeMap::new();
+                for candidate in &candidates {
+                    let Some(seen) = found.iter().find(|seen| {
+                        seen.candidate.plugin_id == candidate.plugin_id
+                            && seen.candidate.rule_id == candidate.rule_id
+                    }) else {
+                        continue;
+                    };
+                    packages
+                        .entry(candidate.plugin_id.clone())
+                        .and_modify(|held| {
+                            for range in &seen.facts.ranges {
+                                if !held.ranges.contains(range) {
+                                    held.ranges.push(range.clone());
+                                }
+                            }
+                            held.coverage = held.coverage.max(seen.facts.coverage);
+                        })
+                        .or_insert_with(|| seen.facts.clone());
+                }
+                Recognised::Tied(Tie {
+                    packages: packages.into_values().collect(),
+                    one_publisher: from_one_publisher(&candidates),
+                })
+            }
         }
     }
+}
+
+/// One rule's candidate, with what the same pass read of its package.
+struct Seen {
+    candidate: Candidate,
+    package: Digest256,
+    facts: TiedPackage,
 }
 
 /// What the admitted packages make of one program, before the package is looked up.
@@ -128,7 +191,7 @@ enum Recognised {
     /// One package does, by its hash.
     One(Digest256),
     /// Several recognise it equally well.
-    Tied(Vec<PluginId>),
+    Tied(Tie),
 }
 
 /// What the packages a worker holds make of a program at one path.
@@ -138,9 +201,36 @@ pub enum Recognition {
     Nothing,
     /// One package does: the one the software development kit's rule selects.
     Package(AdmittedMatch),
-    /// Several packages recognise it equally well, so the host chooses none of them: their
-    /// identifiers, in order. The host does not pick one on a package's behalf.
-    Tied(Vec<PluginId>),
+    /// Several packages recognise it equally well, so the host chooses none of them. The host does
+    /// not pick one on a package's behalf.
+    Tied(Tie),
+}
+
+/// Several packages that recognise a program equally well, as the one decision that tied them read
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tie {
+    /// The packages, in the order of their identifiers.
+    pub packages: Vec<TiedPackage>,
+    /// Whether one publisher published all of them through one repository, which is the test that
+    /// decides whether packages are ranked by what they say of the program's version.
+    pub one_publisher: bool,
+}
+
+/// One package of a tie, with what the decision that tied it read about the package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TiedPackage {
+    /// The package.
+    pub plugin_id: PluginId,
+    /// The name of the protocol its connector table is pinned to, where it has a table.
+    pub protocol: Option<String>,
+    /// The ranges it holds a version to, as written: those of the rule that recognised the program
+    /// and of its connector's pin.
+    pub ranges: Vec<String>,
+    /// The version its own signed records name for the program's bytes, where they name it.
+    pub version: Option<String>,
+    /// How far that version fits those ranges.
+    pub coverage: Coverage,
 }
 
 /// One transition of a package's revocation state that this session's journal records, with the
@@ -343,9 +433,13 @@ impl Broker {
 
     /// Returns what the admitted packages make of a program at `path`: the package the software
     /// development kit's rule selects, with the frame that admits it, or the packages that
-    /// recognise it equally well, or nothing. Of the packages that recognise a program the one
-    /// whose rule names the installation location is selected, among the packages of one
-    /// publisher through one repository, and packages that recognise it equally well select none.
+    /// recognise it equally well, or nothing. `digest` is the digest of the program's bytes, where
+    /// they were read: each package's own signed builds then say which version the program is, and
+    /// of the packages that recognise it the one that covers that version is selected before one
+    /// whose rule names the installation location, among the packages of one publisher through one
+    /// repository. Without a digest no package says anything of the version, so the answer is the
+    /// one a decision by the path alone gives. Packages that recognise a program equally well
+    /// select none.
     #[must_use]
     pub fn recognise(&self, path: &str, digest: Option<&Digest256>) -> Recognition {
         let state = self.state();
@@ -354,7 +448,7 @@ impl Broker {
         };
         match state.admitted.recognise(path, digest) {
             Recognised::Nothing => Recognition::Nothing,
-            Recognised::Tied(plugins) => Recognition::Tied(plugins),
+            Recognised::Tied(tie) => Recognition::Tied(tie),
             Recognised::One(digest) => {
                 let Some((package, _)) = state.admitted.packages.get(&digest) else {
                     return Recognition::Nothing;

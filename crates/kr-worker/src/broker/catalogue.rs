@@ -60,6 +60,15 @@ impl ReadPackage {
             Self::Declarative(manifest) => manifest,
         }
     }
+
+    /// Returns the protocol the package's connector table is pinned to, where it has a table.
+    #[must_use]
+    pub fn protocol(&self) -> Option<&kr_plugin_sdk::connector::ProtocolPin> {
+        match self {
+            Self::Connector(connector) => Some(&connector.table().protocol),
+            Self::Declarative(_) => None,
+        }
+    }
 }
 
 /// Whether a snapshot was applied.
