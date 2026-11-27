@@ -33,6 +33,7 @@
 //! recovery finishes, and the next process's open removes any left. A row confers nothing
 //! meanwhile: no decision reads a binding row back.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -159,12 +160,20 @@ impl Admitted {
                     packages
                         .entry(candidate.plugin_id.clone())
                         .and_modify(|held| {
-                            for range in &seen.facts.ranges {
-                                if !held.ranges.contains(range) {
-                                    held.ranges.push(range.clone());
+                            // A package ranks by its best rules: a rule of higher coverage says
+                            // what the package makes of the version in place of those held, one of
+                            // equal coverage adds its ranges, and one of lower coverage adds nothing.
+                            match seen.facts.coverage.cmp(&held.coverage) {
+                                Ordering::Greater => *held = seen.facts.clone(),
+                                Ordering::Equal => {
+                                    for range in &seen.facts.ranges {
+                                        if !held.ranges.contains(range) {
+                                            held.ranges.push(range.clone());
+                                        }
+                                    }
                                 }
+                                Ordering::Less => {}
                             }
-                            held.coverage = held.coverage.max(seen.facts.coverage);
                         })
                         .or_insert_with(|| seen.facts.clone());
                 }
@@ -224,8 +233,9 @@ pub struct TiedPackage {
     pub plugin_id: PluginId,
     /// The name of the protocol its connector table is pinned to, where it has a table.
     pub protocol: Option<String>,
-    /// The ranges it holds a version to, as written: those of the rule that recognised the program
-    /// and of its connector's pin.
+    /// The ranges it holds a version to, as written: those of the rules that rank the package, which
+    /// are its best rules that recognised the program, each with its connector's pin. A rule that
+    /// ranks lower adds none, so the ranges never contradict `coverage`.
     pub ranges: Vec<String>,
     /// The version its own signed records name for the program's bytes, where they name one that
     /// the decision can compare. It is `None` for one of three reasons: no digest reached the
