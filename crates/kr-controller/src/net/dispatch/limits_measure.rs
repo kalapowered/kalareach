@@ -834,9 +834,9 @@ fn product_delta(cells: u32) -> Option<Outgoing> {
     }
 }
 
-/// A large delta the builder sends as an update: the most linked cells a change can carry before the
-/// builder asks for a snapshot. The cost of the message grows with the cells and stops at the row's
-/// cut, so the search takes the largest count that is still an update. It is a sample and not the
+/// A large delta that the worker sends as an update: the most linked cells a change can carry before
+/// the worker sends a snapshot instead. The cost of the message grows with the cells and stops at the
+/// row's cut, so the search takes the largest count that is still an update. It is a sample and not the
 /// largest delta: it stays under the page's byte bound, and a search over the cells alone does not
 /// try other ways to add bytes to it.
 fn delta_sample() -> Outgoing {
