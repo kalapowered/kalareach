@@ -11,9 +11,13 @@
 //! account's token and the system's own) gets the same answer to each of eighteen operations, and a
 //! control with no hold shows that every operation succeeds without it. The second case runs Git as
 //! a boundary token while the holds stand, and the end check finds nothing that an honest Git
-//! changed. The other four cases are about what the holds do not stop: a name made after the hold,
-//! a hook rewritten with content of the same length, and a hooks folder past the bounds of the
-//! listing.
+//! changed. The cases after those two are about what the holds stop and what they do not: the
+//! names that must be absent, a name made after the hold, a listed hook held for reading only and a
+//! new hook or folder seen at the end, a hook with a writer or a writable view from before the hold,
+//! a reparse point on the configuration or on a held folder, a cloud folder and an encrypted
+//! configuration, a state of an operation that is new at the end, a junction in the place of a
+//! folder, submodules, a hooks folder past the bounds of the listing, and the way a refusal and a
+//! changed folder are named.
 
 #![cfg(all(windows, feature = "testing"))]
 #![allow(unsafe_code)]
@@ -782,12 +786,6 @@ impl Writer {
     fn close_the_file(&mut self) {
         self.file = None;
     }
-
-    fn write_first_byte(&self, byte: u8) {
-        // SAFETY: the view maps at least one byte of the file for writing and lives as long as the
-        // writer.
-        unsafe { self.view.Value.cast::<u8>().write_volatile(byte) };
-    }
 }
 
 impl Drop for Writer {
@@ -799,8 +797,8 @@ impl Drop for Writer {
 
 #[test]
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
-fn config_hold_a_hook_that_a_process_has_open_for_writing_refuses_the_hold_and_a_kept_view_is_seen()
-{
+fn config_hold_a_hook_is_refused_with_a_writer_and_with_its_writable_view_after_the_handle_closes_and_is_held_after_both_are_gone()
+ {
     if !runs_as_the_system() {
         eprintln!("skipped: the case needs the system's token");
         return;
@@ -821,25 +819,11 @@ fn config_hold_a_hook_that_a_process_has_open_for_writing_refuses_the_hold_and_a
     assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
 
     // The writer's handle closes and its section and view stay. A guest refuses the hold in this
-    // state too; a platform that let the hold stand would show a write through the view as a change
-    // at the end, which the second arm asserts.
+    // state too.
     writer.close_the_file();
-    match hold_tree(root, &ordinary.as_client()) {
-        Err(refusal) => {
-            assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
-            println!("the hold refuses a hook whose writable view outlives its handle");
-        }
-        Ok(hold) => {
-            assert_eq!(hold.end_check(), Ok(()), "nothing is written yet");
-            writer.write_first_byte(b'E');
-            assert_eq!(
-                hold.end_check(),
-                Err(changed(&[r"hooks\pre-commit"])),
-                "a write through a view made before the hold is seen at the end"
-            );
-            println!("the hold stands over a hook whose writable view outlives its handle");
-        }
-    }
+    let refusal = hold_tree(root, &ordinary.as_client())
+        .expect_err("a hook whose writable view outlives its handle is not held");
+    assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
 
     // With no writer left, the hook is held.
     drop(writer);
