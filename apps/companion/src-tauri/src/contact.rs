@@ -3726,21 +3726,28 @@ pub mod tests {
     }
 
     /// A slow write for a choice that has been replaced writes nothing: the keeper's timer can run
-    /// once after the commit that ended its choice.
+    /// once after the commit that ended its choice. The new choice's first try has failed with the
+    /// host not reached, so the words stand as those of a lost try and only the choice check keeps
+    /// the late write from taking the mark.
     #[tokio::test]
     async fn a_late_slow_write_after_a_new_choice_writes_nothing() {
         let owner = ContactOwner::new();
         let (choice, _) = marked(&owner, &Target::Local);
-        drop(owner.choose(&Target::Local, "again"));
+        let newer = owner.choose(&Target::Local, "again").value;
+        assert_eq!(
+            crate::connection::failed_try(&owner, newer, None, lost()),
+            Wrote::Applied
+        );
         let before = owner.revision();
         assert_eq!(owner.try_is_slow(choice).value, Wrote::StaleChoice);
         assert_eq!(owner.revision(), before);
         assert_eq!(owner.snapshot().still_reaching, None);
     }
 
-    /// A try that follows any stop of the lease, or the end of a connection, takes no mark: the
-    /// words they leave are the answer of someone, and the standing words of a host that was not
-    /// reached are the only ones a slow try marks.
+    /// A try that follows any stop of the lease takes no mark: the words it leaves are the answer
+    /// of someone, and the standing words of a host that was not reached are the only ones a slow
+    /// try marks. The end of a connection that nothing refused leaves such words, so the try that
+    /// follows it does take the mark.
     #[tokio::test(start_paused = true)]
     async fn a_slow_try_after_any_stop_of_the_lease_takes_no_mark() {
         use kr_client::organisation::LeaseStop;
@@ -3861,7 +3868,9 @@ pub mod tests {
             async move {
                 let _ = crate::connection::tried(&owner, choice, async {
                     tokio::time::sleep(crate::connection::SLOW_TRY + Duration::from_secs(1)).await;
-                    panic!("the attempt panicked")
+                    // The task unwinds with a payload and no panic message, so the one panic this
+                    // case prints is its own assertion's.
+                    std::panic::resume_unwind(Box::new("the attempt panicked"))
                 })
                 .await;
             }
