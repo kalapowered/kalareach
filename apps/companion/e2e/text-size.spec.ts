@@ -932,10 +932,32 @@ test.describe('a passing message', () => {
       }
     })
 
+  /**
+   * Waits until nothing the toast holds is still moving: its own arrival, and anything a press set going
+   * on one of its controls (a control eases into its pressed size and back, `transform` over the press
+   * time). A box read while that runs is a part of a pixel off the control's size, and the case measures
+   * to the pixel, so it reads at rest, not within a tolerance. A page with no motion has nothing running
+   * and this ends at once. Motion that does not end fails here, in these words, and does not pass.
+   */
+  const atRest = (page: Page) =>
+    expect
+      .poll(
+        () =>
+          page.locator('.toast').evaluate((toast) => {
+            // Reading the layout makes the page resolve a style change it has not resolved yet (a press
+            // just let go), so the transition that change starts is running before the count, not after.
+            toast.getBoundingClientRect()
+            return toast.getAnimations({ subtree: true }).length
+          }),
+        { message: 'the toast and its controls come to rest: some motion of them is still running', timeout: 10_000 }
+      )
+      .toBe(0)
+
   /** Lays the toast out once it has come to rest, and says what it takes of the screen. */
   const settledToast = async (page: Page) => {
     // The toast arrives from below the screen: it is measured once it has come to rest on it.
     await expect.poll(async () => (await toastLayout(page))?.onScreen, { timeout: 10_000 }).toBe(true)
+    await atRest(page)
     return await toastLayout(page)
   }
 
@@ -974,7 +996,11 @@ test.describe('a passing message', () => {
       expect(layout?.controls.map((control) => control.name)).toEqual(['Dismiss'])
       await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: PRESENTATION_DEADLINE })
 
-      // The words reach their last line by scrolling the box, and the control stays where it is.
+      // The words reach their last line by scrolling the box, and the control stays where it is. The trial
+      // click above is a real press and release at the control, which the page's handlers are not told of;
+      // the control still takes its pressed size, and eases back when a frame was drawn between the two, so
+      // the box is read once that has ended.
+      await atRest(page)
       const before = await toast.getByRole('button', { name: 'Dismiss' }).boundingBox()
       await toast.locator('.toast-text').evaluate((element) => {
         element.scrollTop = element.scrollHeight
