@@ -142,6 +142,7 @@ write_sentence() {
 left_marker='the owner marker that the check wrote is still in the folder'
 left_folder='the empty folder that the check made is still there'
 left_both='the folder that the check made, with its owner marker, is still there'
+left_unread='the folder that the check made may still be there, since it could not be read'
 
 # What $1 holds at every depth: each entry's name, kind, mode, owner and link target, the folder's
 # own included, and a checksum of each file; or `absent`; or, for a link, where it points and what
@@ -951,6 +952,48 @@ unset -f stand_cd
 said "a folder made by the walk and replaced before it is entered" "$(sentence "$t/idc/mid/state")$changed_clause; $left_folder"
 expect "the folder that took its name is not removed" yes "$([ -d "$t/idc/mid/state" ] && echo yes || echo no)"
 expect "the folder that the walk made is where it was moved" yes "$([ -d "$t/idc/mid/state-aside" ] && echo yes || echo no)"
+
+# A listing that fails in the cleanup does not show that the folder is gone: the folder may remain, and
+# the sentence says so instead of saying that nothing was kept. The stand-in `ls` fails every listing of
+# the entry `./state` from its `unl_from`-th call on (call 1 finds the folder absent, call 2 follows the
+# `mkdir`, and the cleanup's is call 3 where the walk got that far), and where `unl_gone` names a folder
+# it first removes that one folder with `rmdir`: the one folder that the case's own walk made, a literal
+# path under the case's scratch folder, and only in the last of the three cases.
+unl_from=0
+unl_gone=""
+unl_count=""
+stand_ls() {
+  if [ "${3:-}" = ./state ]; then
+    printf x >> "$unl_count"
+    if [ "$(wc -c < "$unl_count" | tr -d ' ')" -ge "$unl_from" ]; then
+      [ -z "$unl_gone" ] || rmdir -- "$unl_gone"
+      return 1
+    fi
+  fi
+  command ls "$@"
+}
+mk "$t/unl/standing" "$t/unl/first" "$t/unl/gone"
+# The mode change fails, then the cleanup's listing fails while the folder still stands.
+stand_chmod() { return 1; }
+unl_from=3 unl_gone="" unl_count="$scratch/unl-count-standing"
+stand_check "$t" "$t/unl/standing/state"
+said "a cleanup listing that fails while the folder stands" "$(write_sentence "$t/unl/standing/state" "$left_unread")"
+expect "the folder whose cleanup listing failed is still there" yes "$([ -d "$t/unl/standing/state" ] && echo yes || echo no)"
+unset -f stand_chmod
+# The first listing after the `mkdir` fails, then the cleanup's listing fails too.
+unl_from=2 unl_gone="" unl_count="$scratch/unl-count-first"
+stand_check "$t" "$t/unl/first/state"
+said "a cleanup listing that fails after the first listing of the made folder failed" "$(sentence "$t/unl/first/state"); $left_unread"
+expect "the folder whose listings failed is still there" yes "$([ -d "$t/unl/first/state" ] && echo yes || echo no)"
+# The folder is gone when the cleanup's listing fails: the name is neither a file nor a link, so nothing
+# is left and the sentence says that nothing was kept.
+stand_chmod() { return 1; }
+unl_from=3 unl_gone="$t/unl/gone/state" unl_count="$scratch/unl-count-gone"
+stand_check "$t" "$t/unl/gone/state"
+unset -f stand_chmod
+said "a cleanup listing that fails after the made folder is gone" "$(write_sentence "$t/unl/gone/state")"
+expect "the folder that was gone is not there" no "$([ -d "$t/unl/gone/state" ] && echo yes || echo no)"
+unset -f stand_ls
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"

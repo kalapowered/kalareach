@@ -243,8 +243,9 @@ e2e_state_folder_mark() {
 
 # e2e_state_folder_fail <status>: ends the walk. It first removes what the walk made and nothing
 # else: the marker (a file of that one name, in the folder the walk is in) and the folder (an empty
-# one, removed from its parent). It ends with the status plus 16 for what it could not remove, so that
-# the check can say what is left: 1 for the marker, 2 for the folder, 3 for both. The mode of a folder
+# one, removed from its parent). It ends with the status plus 16 for what it could not remove or could
+# not show to be gone, so that the check can say what is left: 1 for the marker, 2 for the folder, 4
+# for a folder that could not be read and may still be there (5 with the marker). The mode of a folder
 # that was there is changed last of all and only when nothing can fail after it, so no status leaves a
 # folder that was there with another mode.
 e2e_state_folder_fail() {
@@ -255,20 +256,31 @@ e2e_state_folder_fail() {
       left=1
     fi
   fi
-  if [ -n "$e2e_state_folder_made" ] && ! e2e_state_folder_unmake; then
-    left=$((left | 2))
+  if [ -n "$e2e_state_folder_made" ]; then
+    e2e_state_folder_unmake
+    case $? in
+      0) ;;
+      1) left=$((left | 2)) ;;
+      *) left=$((left | 4)) ;;
+    esac
   fi
   exit $((status + 16 * left))
 }
 
 # e2e_state_folder_unmake: removes the folder that the walk made, from its parent, which it reaches by
 # the parent's physical name and checks by that name; the folder is removed only while its name still
-# has the inode that the walk listed after it made it. It returns 1 where the folder could not be
-# removed: another folder at that name is not the walk's to remove.
+# has the inode that the walk listed after it made it. It returns 0 where the folder is gone, 1 where
+# it is still there (another folder at that name is not the walk's to remove), and 2 where the folder
+# could not be listed and the name is still there: a listing that fails does not show that the folder
+# is gone, so only a name that is neither a file nor a link counts as removed, and nothing is removed
+# without the listing's inode.
 e2e_state_folder_unmake() {
   CDPATH='' cd -P -- "$e2e_state_folder_parent" 2> /dev/null || return 1
   e2e_state_folder_here && [ "$e2e_state_folder_name" = "$e2e_state_folder_parent" ] || return 1
-  e2e_state_folder_list "./$e2e_state_folder_made" || return 0
+  if ! e2e_state_folder_list "./$e2e_state_folder_made"; then
+    [ ! -e "./$e2e_state_folder_made" ] && [ ! -L "./$e2e_state_folder_made" ] && return 0
+    return 2
+  fi
   [ "$e2e_state_folder_ino" = "$e2e_state_folder_made_inode" ] || return 1
   rmdir -- "./$e2e_state_folder_made" 2> /dev/null
   [ ! -e "./$e2e_state_folder_made" ] && [ ! -L "./$e2e_state_folder_made" ]
@@ -412,7 +424,7 @@ e2e_state_folder_ask() {
 # passed. The walk's status carries what it could not remove in its upper bits (see
 # e2e_state_folder_fail).
 e2e_state_folder_report() {
-  local left=$(((e2e_state_folder_code >> 4) & 3)) code=$((e2e_state_folder_code & 15))
+  local left=$(((e2e_state_folder_code >> 4) & 7)) code=$((e2e_state_folder_code & 15))
   local result="$e2e_state_folder_answer"
   case "$code" in
     0) ;;
@@ -483,12 +495,15 @@ e2e_state_folder_kr() {
 }
 
 # e2e_state_folder_left_words <left>: the fixed words that say what the walk made and could not remove
-# (1 the marker, 2 the folder, 3 both); nothing for 0.
+# (1 the marker, 2 the folder, 3 both, 4 a folder that could not be read and may still be there, 5 the
+# same with the marker); nothing for 0.
 e2e_state_folder_left_words() {
   case "$1" in
     1) printf 'the owner marker that the check wrote is still in the folder' ;;
     2) printf 'the empty folder that the check made is still there' ;;
     3) printf 'the folder that the check made, with its owner marker, is still there' ;;
+    4) printf 'the folder that the check made may still be there, since it could not be read' ;;
+    5) printf 'the owner marker that the check wrote is still in the folder, which could not be read to remove it' ;;
   esac
 }
 
