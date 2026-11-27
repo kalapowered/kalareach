@@ -263,9 +263,6 @@ pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> 
 /// `path` as a native call reads a name: wide and NUL-terminated, the way the standard library
 /// gives a name to its own file calls.
 ///
-/// A call that gives the system a name without the standard library's file calls takes it from
-/// here, so that a name is refused or given the same way whichever call reads it.
-///
 /// A name that holds a NUL is refused, because the call would read it only as far as the NUL,
 /// which can name another file. A name already verbatim (`\\?\` or `\??\`) goes as it is.
 /// Any other name is made absolute; one that reaches the old limit is then given the verbatim
