@@ -41,19 +41,31 @@ class QrDecoderTest {
         return Triple(plane, side, side)
     }
 
+    /**
+     * KR-REQ-01.16: the phone reads the picture of the host's direct QR invitation back to the
+     * invitation's text, with no account anywhere in the exchange.
+     */
     @Test
     fun theHostsDirectInvitationReadsBackAsTheFixtureHoldsIt() {
         val image = picture("direct")
         assertEquals(text("direct"), QrDecoder.text(pixels(image), image.width, image.height))
     }
 
+    /**
+     * KR-REQ-01.16: the phone reads the picture of the host's code invitation back to the
+     * invitation's text, with no account anywhere in the exchange.
+     */
     @Test
     fun theHostsCodeInvitationReadsBackAsTheFixtureHoldsIt() {
         val image = picture("code")
         assertEquals(text("code"), QrDecoder.text(pixels(image), image.width, image.height))
     }
 
-    /** A camera frame is far smaller than the picture: the largest code still reads at 1080 pixels. */
+    /**
+     * KR-REQ-01.16: the phone scans the host's direct QR invitation with its camera, which gives
+     * the decoder a luminance plane, not a picture. A camera frame is far smaller than the picture:
+     * the largest code still reads at 1080 pixels.
+     */
     @Test
     fun theLargestCodeReadsFromACameraFrame() {
         val (plane, width, height) = frame(picture("direct"), 1080)
@@ -61,8 +73,9 @@ class QrDecoderTest {
     }
 
     /**
-     * Held at arm's length the code fills a part of the frame: about six pixels to a module is what
-     * the largest code gets from a 640-pixel frame, and it is read.
+     * KR-REQ-01.16: the phone scans the host's direct QR invitation with its camera. Held at arm's
+     * length the code fills a part of the frame: about six pixels to a module is what the largest
+     * code gets from a 640-pixel frame, and it is read.
      */
     @Test
     fun theLargestCodeReadsWhenItGetsAboutSixPixelsToAModule() {
