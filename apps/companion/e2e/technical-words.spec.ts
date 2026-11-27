@@ -6,10 +6,11 @@
  * `reach.co` and `mpanion`, or a pair of hyphens at the end of one line and the option's name on the
  * next. The rule held here: a line ends at a dot (before it where a short part follows, after it where
  * a longer one does), before an at sign and a run of hyphens, and after an underscore, a slash and the
- * other separators; inside a part only when that one part alone is wider than its line; nothing is cut
- * off, clipped by any ancestor or scrolling sideways, a run of hyphens wider than its line included;
- * a quoted word of a command line stays on one line where it fits there; and what a person copies is
- * the source text, character for character.
+ * other separators; inside a part only when that one part alone is wider
+ * than its line; nothing is cut off, clipped by any ancestor or scrolling sideways, a run of hyphens
+ * wider than its line included; a quoted word of a command line stays on one line where it fits there;
+ * a link keeps its underline under a word; and what a person copies is the source text, character for
+ * character.
  *
  * Every reading is of the rendered line boxes (the rectangles of a range over each part), never of a
  * picture. The width is the part's own: each case looks for the width of the real page at which every
@@ -598,6 +599,58 @@ test.describe('a command line quoted word by word', () => {
         { count: split.length, first: split.slice(0, 6) },
         'quoted words a line ends inside although each fits a line'
       ).toEqual({ count: 0, first: [] })
+    })
+  }
+})
+
+/** The underline a text decoration draws, as the browser resolves it, on a link and on the word inside it. */
+interface Underline {
+  readonly line: string
+  readonly thickness: string
+  readonly offset: string
+}
+
+test.describe('a link that holds a technical word', () => {
+  for (const theme of ['light', 'dark'] as const) {
+    test(`keeps its underline under the word, ${theme} theme, at rest and on hover`, async ({ page }) => {
+      await page.addInitScript((mode) => {
+        window.kalareachSettings = { colour_mode: mode }
+      }, theme)
+      await page.setViewportSize({ width: 1280, height: 800 })
+      await page.goto(HARNESS)
+      await page.waitForSelector('.app-shell')
+      await page.getByRole('button', { name: 'Sessions' }).click()
+      await page.getByTestId('session-row-1').click()
+      await page.getByTestId('conversation').waitFor()
+      await page.getByTestId('composer-input').fill('/')
+      const command = page.getByTestId('slash-commands').getByRole('button').first()
+      await expect(command).toBeVisible()
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+      /** The decoration the link draws and the one its word draws: the inner box is what a person sees underlined. */
+      const underlines = (): Promise<{ link: Underline; word: Underline }> =>
+        command.evaluate((button) => {
+          const word = button.querySelector('.technical-word')
+          if (word === null) throw new Error('the command is not drawn by the component')
+          const of = (element: Element): Underline => {
+            const style = getComputedStyle(element)
+            return {
+              line: style.textDecorationLine,
+              thickness: style.textDecorationThickness,
+              offset: style.textUnderlineOffset
+            }
+          }
+          return { link: of(button), word: of(word) }
+        })
+      // At rest, away from the link: the dark theme underlines a link, the light one does not.
+      await page.mouse.move(0, 0)
+      const rest = await underlines()
+      expect(rest.link.line, 'the link at rest').toBe(theme === 'dark' ? 'underline' : 'none')
+      expect(rest.word, 'the word at rest is drawn as the link is').toEqual(rest.link)
+      // On hover both themes underline it.
+      await command.hover()
+      const hovered = await underlines()
+      expect(hovered.link.line, 'the link on hover').toBe('underline')
+      expect(hovered.word, 'the word on hover is drawn as the link is').toEqual(hovered.link)
     })
   }
 })

@@ -385,6 +385,14 @@ main {
   text-underline-offset: 3px;
 }
 
+/* A text decoration does not reach into an inline block, which a technical word is, so the word in a
+   link carries the link's underline itself. */
+:root[data-theme='dark'] .text-link .technical-word {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
 /*
  * Where the tabs do not fit on one line, a narrow window with larger text, the last ones go to the
  * next, with room between the lines for each tab's press area.
@@ -1161,7 +1169,8 @@ textarea::placeholder {
     color: var(--text);
   }
 
-  .text-link:hover {
+  .text-link:hover,
+  .text-link:hover .technical-word {
     text-decoration: underline;
     text-underline-offset: 3px;
   }
