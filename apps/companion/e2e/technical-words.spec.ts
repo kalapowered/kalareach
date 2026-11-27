@@ -572,7 +572,8 @@ for (const kind of KINDS) {
       expect(inside.range, 'the word without its first and its last character').toBe(inside.word.slice(1, -1))
       expect(inside.range).toBe(shown.slice(inside.span.from, inside.span.to))
       expect(inside.spanned, 'the places to end a line that the range crosses').toBe(inside.wordBreakPlaces)
-      // What the engine copies from the drawn word is what it copies from the same text drawn as plain text.
+      // In both engines the text of the selection of the drawn word equals that of the same text drawn as plain
+      // text. Only Chromium gives evidence of a copy: its clipboard is compared below.
       expect(whole.selection).toBe(wholeControl.selection)
       expect(inside.selection).toBe(insideControl.selection)
       if (clipboard) {

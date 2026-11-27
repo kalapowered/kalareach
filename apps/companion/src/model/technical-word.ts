@@ -24,7 +24,8 @@
  * signs: a run of such separators is one place, after its last character. A dot, an at sign or a hyphen
  * that follows such a run starts a part only where a letter or a digit stands further on in the word,
  * past the signs that follow it (`../../x` keeps its places, `a/.`, `a/@` and `--input=-` are not cut),
- * so that no mark is left alone at the end of a line.
+ * so that none of these three marks is left alone at the end of a line. The underscore is not part of
+ * this rule: after a run of separators it may still stand alone (`a/_` gives `a/` and `_`).
  *
  * These never end a line: a separator that opens a word (the slash of a path, the dot of `.local`, the
  * underscores of `__init__`, the at sign of `@types`, of `(@x)`, of `"@x"` and of `--file="@name"`, where
