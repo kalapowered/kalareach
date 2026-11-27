@@ -3300,7 +3300,8 @@ test.describe('the wheel of a raw view in control mode', () => {
   // wheels does not come from the engine's input: the one turned while the button is down is followed
   // by a wheel that the page dispatches with the held button set (buttons 1), because the test tool's
   // wheel function does not send the held buttons. Only that wheel shows a view that reads the held
-  // button from the wheel event; the other two show it with the pointer held and the event without.
+  // button from the wheel event. The other two come from the engine: the first occurs with the button
+  // down and the third after the release, and both omit the button state.
   test('a wheel turned while a pointer button is held and moving goes to the program, and again after the release', async ({
     page
   }) => {
