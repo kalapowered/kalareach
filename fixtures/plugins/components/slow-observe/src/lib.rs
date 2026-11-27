@@ -9,9 +9,10 @@
 //! a call, for as long as the queue lasts, with no fault and no disabling on a host whose epoch no
 //! time advances -- which is what a test about the terminal path needs around it.
 //!
-//! The work is arithmetic on a volatile cell, so no optimiser can decide it does nothing. How much
-//! of it there is was chosen against the fuel a 10 ms observe is given rather than against a clock:
-//! a component has no clock, and fuel is the only bound it can count.
+//! The work is integer arithmetic on a local copy of an atomic cell: a call loads the cell once,
+//! runs the rounds and stores the result back once, so the work leaves a result that the next call
+//! reads. How much of it there is was chosen against the fuel a 10 ms observe is given rather than
+//! against a clock: a component has no clock, and fuel is the only bound it can count.
 
 #![no_std]
 #![no_main]
@@ -43,10 +44,10 @@ static WORK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 
 /// How many rounds one call spends.
 ///
-/// An observe is given 10 ms and a hundred million units of fuel per millisecond of it. This is
-/// enough rounds to spend a good part of that fuel and few enough to leave room to return: a call
-/// that used its whole allowance would be a fault, and a fault is what this component exists not
-/// to be. How many milliseconds the rounds take depends on the machine.
+/// An observe is given 10 ms and a hundred million units of fuel per millisecond of it. The number
+/// of rounds is fixed, so every call runs the same loop. A call that used its whole allowance would
+/// be a fault, and a fault is what this component exists not to be. How many milliseconds the
+/// rounds take depends on the machine.
 const ROUNDS: u64 = 1_000_000;
 
 /// Does one call's fixed amount of work, then returns.

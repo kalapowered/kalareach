@@ -4185,11 +4185,13 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
         return;
     };
     // A host whose epoch no time advances. The component's observations are a fixed amount of work
-    // counted in fuel, and fuel fixes no number of milliseconds. Where an observation takes longer
-    // than ten milliseconds by the clock, time off the processor included, a running epoch stops it
-    // at its deadline and the stop counts as a fault; three faults within a minute disable the
-    // binding, and the call below could then come back as an error this case does not allow. This
-    // case reads what comes back and does not check the ten-millisecond deadline.
+    // counted in fuel, and fuel fixes no number of milliseconds. A running host's epoch stops an
+    // observation when it reaches the call's deadline before the call returns, and the stop counts
+    // as a fault. An observation that takes longer than ten milliseconds by the clock, time off the
+    // processor included, is stopped only if the epoch has reached that deadline before it returns.
+    // Three faults within a minute disable the binding, and the call below could then come back as
+    // an error this case does not allow. This case reads what comes back and does not check the
+    // ten-millisecond deadline.
     let served = Served::start_held().await;
     let client = Arc::new(served.client().await);
     let (path, digest, bytes) = served.install("slow-observe", &wasm);

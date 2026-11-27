@@ -2546,9 +2546,9 @@ fn the_budgets_come_from_the_published_limits() {
     );
 }
 
-// A component that spends a good part of a call and still answers: the shape a test about what
-// happens *while* a component is running needs, because a component that faults is one that is soon
-// disabled and no longer running at all.
+// A component that does a fixed amount of work in each call and still answers: the shape a test
+// about what happens *while* a component is running needs, because a component that faults is one
+// that is soon disabled and no longer running at all.
 //
 // How much a call spends is decided by the fuel it uses, which is the same on every machine, and
 // not by how long it takes, which is the machine's. The engine's epoch is held, so no time a
