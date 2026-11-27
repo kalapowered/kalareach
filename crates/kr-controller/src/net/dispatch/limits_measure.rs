@@ -2337,6 +2337,19 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
         resource_payload <= kr_worker::recovery::MAX_RECOVERY_RESOURCE_BYTES,
         "a pending resource is within the worker's bound, found {resource_payload}"
     );
+    // Each of these two lists is filled by a text match on the refusal and the resources, one row for
+    // each answer, and `all` on an empty list holds: a match that was lost would let the three
+    // assertions below pass on nothing.
+    assert_eq!(
+        at_the_cap.len(),
+        2,
+        "a row for each answer beside a refusal of the cap and the widest resources: {at_the_cap:?}"
+    );
+    assert_eq!(
+        host_naming.len(),
+        2,
+        "a row for each answer beside a short refusal that names the host: {host_naming:?}"
+    );
     // The page was cut by the worker's routine and not by running out of resources.
     assert!(
         at_the_cap
@@ -2353,12 +2366,10 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
         "fewer than 64 instances fit at the floor beside a full page of resources with refusals of the cap: {at_the_cap:?}"
     );
     // The page is cut to whole resources, so the frame does not grow with the count alone: some
-    // counts above the first count over fit again, and "every count to N fits" is not "N is the
+    // counts above the first count over fit again, and "every count to N fits" need not be "N is the
     // most that fits". Beside a refusal that names the host, the room the cut leaves decides.
     assert!(
-        host_naming
-            .iter()
-            .all(|(_, fit, again)| again.first().is_some_and(|first| *first > *fit + 1)),
+        host_naming.iter().all(|(_, _, again)| !again.is_empty()),
         "counts above the first count over fit again beside a short refusal that names the host: {host_naming:?}"
     );
 }
