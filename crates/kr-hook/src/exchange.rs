@@ -42,8 +42,11 @@ pub enum ExchangeError {
     /// worker that refused the bridge, one that could not place the process that connected and one
     /// that died after it accepted the connection all read the same here, and so does the
     /// operating system's own close of what a worker left open. It is the one answer to that event
-    /// whichever side was first: a read of the admission that finds the connection closed, and the
-    /// write of the hello that finds it closed, are the same refusal.
+    /// whichever side was first, for the error kinds that [`kr_ipc::error::peer_has_gone`]
+    /// recognises: a read of the admission that finds the connection closed, and a write of the
+    /// hello that fails with one of those kinds, are the same refusal. A hello write that fails
+    /// with any other kind is [`ExchangeError::Broken`]; [`Exchange::open`] says what that leaves
+    /// out.
     Refused,
     /// The worker did not answer in time.
     TimedOut,
@@ -133,11 +136,22 @@ impl Exchange {
     /// bridge. A write that fails for any other reason stays [`ExchangeError::Broken`] with the
     /// system's words.
     ///
+    /// The rule reads the error's kind, so it reaches only the errors that the standard library
+    /// gives a kind. On Windows, a named pipe's broken-pipe (109) and no-data (232) errors read as
+    /// a broken pipe and are recognised. The "pipe is not connected" error (233) has no kind, and
+    /// it is what a client's write gets after the server forcibly disconnects the pipe, as the
+    /// example for disconnecting a pipe in the Tokio documentation shows. A hello write that fails
+    /// with it is [`ExchangeError::Broken`] with the system's words, not a refusal. No test runs
+    /// this exchange against a Windows pipe, and which of these errors a client's write gets when
+    /// the server end is simply closed has not been measured.
+    ///
     /// # Errors
     ///
     /// Returns [`ExchangeError`] when the registration does not frame as JSON lines, the endpoint
-    /// cannot be reached, or the hello cannot be written, and [`ExchangeError::Refused`] when the
-    /// worker had closed the connection before the hello was written.
+    /// cannot be reached, or the hello cannot be written. The write of the hello is
+    /// [`ExchangeError::Refused`] when it fails with an error that
+    /// [`kr_ipc::error::peer_has_gone`] recognises, which is how a close by the worker before the
+    /// hello was written reads, and [`ExchangeError::Broken`] when it fails with any other.
     pub async fn open(registration: &Registration, bridge: Bridge) -> Result<Self, ExchangeError> {
         if registration.framing != FramingName::JsonLines {
             return Err(ExchangeError::Registration(RegistrationError::Malformed {
