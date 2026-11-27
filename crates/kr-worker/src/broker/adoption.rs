@@ -586,8 +586,11 @@ impl Adoptions {
         // and a profile records is the same path as text, as before.
         let image = crate::questions::binding::executable_path_of(pid)?;
         let executable = image.display().to_string();
-        // Decided by the path alone, which is a superset of any decision with the digest: it says
-        // only whether the program is worth reading.
+        // Decided by the path alone, within one snapshot: a path that no rule recognises here is
+        // one that none recognises with the digest either, so this says only whether the program is
+        // worth reading. It does not say which package the decision with the digest selects: the
+        // digest can change that (a package that covers the version beats one that names an
+        // installation location and refuses it), so the decision is made again below.
         if matches!(
             self.broker.recognise(&executable, None),
             Recognition::Nothing
