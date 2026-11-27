@@ -374,8 +374,9 @@ mod tests {
     use super::*;
 
     /// A request that names no registration token is read, so that the application asks the
-    /// platform for its own; a request that names one carries it, and a key the request does not
-    /// define, or a run name that a result file cannot carry, is still refused.
+    /// platform for its own, whether it is written as an object or as a list that ends before the
+    /// token; a request that names one carries it, and a key the request does not define, or a run
+    /// name that a result file cannot carry, is still refused.
     #[test]
     fn a_request_may_leave_the_registration_token_to_the_platform() {
         let without = parse(
@@ -392,6 +393,13 @@ mod tests {
         assert_eq!(
             with.and_then(|request| request.token).as_deref(),
             Some("a-token")
+        );
+
+        // The decoder also reads a request written as a list in the order of the type's members,
+        // where a member left out of the end needs the explicit default.
+        assert!(
+            parse(r#"["live","http://127.0.0.1:8787"]"#).is_some(),
+            "a request written as a list, with no token, is read"
         );
 
         assert!(
