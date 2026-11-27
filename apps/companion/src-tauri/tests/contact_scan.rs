@@ -211,7 +211,8 @@ fn stray(state: &mut State) {
 
 /// The words a person reads while no connection is held, and what they are the words of, change in
 /// one place: the setter. A writer that assigned the reason by itself would leave the cause of the
-/// words before it.
+/// words before it, and the mark of a slow try, which the setter takes off with them. The mark
+/// itself is set and taken off by two functions and no other place.
 #[test]
 fn the_standing_words_are_written_in_one_place() {
     let text =
@@ -222,6 +223,7 @@ fn the_standing_words_are_written_in_one_place() {
     for (field, allowed) in [
         ("reason", &["set_reason"][..]),
         ("cause", &["set_reason"][..]),
+        ("slow", &["mark", "unmark"][..]),
     ] {
         let writes = writes_of(&text, field);
         for (number, function) in &writes {

@@ -33,6 +33,9 @@ use crate::state::{AppState, Started};
 /// test reads it to bound a wait that passes a reconnect try.
 pub const CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long a try to reach a host may run before the page is told that it is still running.
+pub(crate) const SLOW_TRY: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The event the backend publishes each host notification on.
 pub const HOST_EVENT: &str = "kr://event";
 
@@ -735,6 +738,20 @@ pub struct ConnectionState {
     /// replaced by one it admits. A request refused on the withdrawn connection was answered with a
     /// failure just before the replacement, so the page says so whenever this grows.
     pub replaced: u64,
+    /// While no connection is held and a try to reach a host has run longer than it takes to
+    /// answer, which kind of host that try is for, and null otherwise. The reason is not changed
+    /// while this shows: it keeps the words of the last try that failed.
+    pub still_reaching: Option<Reaching>,
+}
+
+/// Which kind of host a try that is still running is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reaching {
+    /// A host this device is paired with.
+    Paired,
+    /// The host on this machine.
+    Local,
 }
 
 impl ConnectionState {
@@ -749,6 +766,7 @@ impl ConnectionState {
             paired: false,
             organisation: false,
             replaced: 0,
+            still_reaching: None,
         }
     }
 
@@ -763,6 +781,7 @@ impl ConnectionState {
             paired: false,
             organisation: false,
             replaced: 0,
+            still_reaching: None,
         }
     }
 
@@ -782,6 +801,7 @@ impl ConnectionState {
             paired: true,
             organisation,
             replaced: 0,
+            still_reaching: None,
         }
     }
 
@@ -943,7 +963,7 @@ pub async fn keep<R, A, F>(
     loop {
         let owner = Arc::clone(app.state::<AppState>().contact_owner());
         let mut next = None;
-        match attempt().await {
+        match tried(&owner, choice, attempt()).await {
             Attempt::Nothing => return,
             Attempt::Reached(connection) => {
                 let kept = connection.clone();
@@ -1018,6 +1038,50 @@ pub(crate) fn failed_try(
     let cause = Cause::of(&unopened);
     let reason = unopened.into_error().message;
     owner.failed(choice, last, outcome, cause, &reason).value
+}
+
+/// Runs `attempt` for `choice`, and tells the owner when it has run past [`SLOW_TRY`] without an
+/// answer, so that the page can say that the try is still running. The mark comes off when the try
+/// ends with nothing to keep a connection to, and the words and the state a result writes take it
+/// off with them. Nothing here ends the try or waits for it longer than it takes.
+pub(crate) async fn tried<F: std::future::Future<Output = Attempt>>(
+    owner: &ContactOwner,
+    choice: u64,
+    attempt: F,
+) -> Attempt {
+    // Declared before the attempt's future is pinned, so that it is dropped after that future.
+    let _gave_up = GaveUpOnPanic { owner, choice };
+    tokio::pin!(attempt);
+    let done = tokio::select! {
+        biased;
+        done = &mut attempt => done,
+        () = tokio::time::sleep(SLOW_TRY) => {
+            drop(owner.try_is_slow(choice));
+            attempt.await
+        }
+    };
+    if matches!(done, Attempt::Nothing) {
+        drop(owner.try_gave_up(choice));
+    }
+    done
+}
+
+/// Takes the mark of a slow try off the line when the task that runs the try unwinds from a
+/// panic. It acts only in a drop that runs while a panic unwinds: a try that returns and a task that
+/// is aborted drop it with no panic in flight, and an abort comes with the end or the replacement of
+/// the choice, which writes the line itself. Its write goes through the owner's commit, whose lock
+/// recovers a poisoned lock.
+struct GaveUpOnPanic<'a> {
+    owner: &'a ContactOwner,
+    choice: u64,
+}
+
+impl Drop for GaveUpOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            drop(self.owner.try_gave_up(self.choice));
+        }
+    }
 }
 
 /// Supervises one connection the owner holds until it ends, and returns its session.

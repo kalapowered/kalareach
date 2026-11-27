@@ -25,7 +25,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 use tokio::sync::{Notify, broadcast, watch};
 
-use crate::connection::{Asked, CONNECTION_EVENT, Connection, ConnectionState, Unopened};
+use crate::connection::{Asked, CONNECTION_EVENT, Connection, ConnectionState, Reaching, Unopened};
 use crate::error::CommandError;
 use crate::inbox::NumberedSession;
 use crate::state::AppState;
@@ -526,6 +526,9 @@ struct State {
     reason: Option<String>,
     /// What the words of `reason` are the words of.
     cause: Cause,
+    /// Whether the try that runs for the choice has run past the slow mark, and nothing has ended it
+    /// or moved the words since.
+    slow: bool,
     replaced: u64,
     hosts: BTreeMap<HostKey, Record>,
     /// The one source of generations and epochs.
@@ -554,6 +557,7 @@ impl State {
             adoption: None,
             reason: None,
             cause: Cause::Own,
+            slow: false,
             replaced: 0,
             hosts: BTreeMap::new(),
             counter: 0,
@@ -587,10 +591,33 @@ impl State {
     }
 
     /// The ONE write of the words a person reads while no connection is held, and of what they are
-    /// the words of: no other place assigns either.
+    /// the words of: no other place assigns either. The words say what the last try came to, so a
+    /// mark of the try before them is taken off in the same step.
     fn set_reason(&mut self, reason: Option<String>, cause: Cause) {
         self.reason = reason;
         self.cause = cause;
+        self.unmark();
+    }
+
+    /// The try that runs has run past the slow mark.
+    fn mark(&mut self) {
+        self.slow = true;
+    }
+
+    /// Takes the slow mark off.
+    fn unmark(&mut self) {
+        self.slow = false;
+    }
+
+    /// Which host a slow try is reaching, while one is marked and no connection is held.
+    fn reaching(&self) -> Option<Reaching> {
+        if !self.slow || self.slot.is_some() {
+            return None;
+        }
+        self.in_use.map(|key| match key {
+            HostKey::Local => Reaching::Local,
+            HostKey::Paired(_) => Reaching::Paired,
+        })
     }
 
     fn record_of(target: &Target, generation: u64, epoch: u64) -> Record {
@@ -629,6 +656,7 @@ impl State {
                 paired: false,
                 organisation: false,
                 replaced: self.replaced,
+                still_reaching: self.reaching(),
             },
         };
         let in_use = self.in_use.and_then(|key| self.hosts.get(&key));
@@ -877,6 +905,9 @@ pub enum Wrote {
     StaleChoice,
     /// A different connection is held: nothing was written.
     SlotBusy,
+    /// The standing words are not those of a host that was not reached, so a slow try leaves them
+    /// as they are: nothing was written.
+    Kept,
 }
 
 /// What the keeper is given when the connection it supervised has ended.
@@ -1158,6 +1189,38 @@ impl ContactOwner {
             }
         })
         .disposal
+    }
+
+    /// The try for `choice` has run past the slow mark. The page is told that it is still running
+    /// when no connection is held and the standing words are those of a host that was not reached.
+    /// Nothing is written for another choice (`StaleChoice`), while a connection is held
+    /// (`SlotBusy`) or when the standing words are another's (`Kept`).
+    pub fn try_is_slow(&self, choice: u64) -> Applied<Wrote> {
+        self.commit(|state, _| {
+            if state.choice != choice {
+                return Wrote::StaleChoice;
+            }
+            if state.slot.is_some() {
+                return Wrote::SlotBusy;
+            }
+            if state.cause != Cause::Unreached {
+                return Wrote::Kept;
+            }
+            state.mark();
+            Wrote::Applied
+        })
+    }
+
+    /// The try for `choice` ended with no result to write, or its task is unwinding: the mark of a
+    /// slow try comes off while the choice is still the one in force.
+    pub fn try_gave_up(&self, choice: u64) -> Applied<Wrote> {
+        self.commit(|state, _| {
+            if state.choice != choice {
+                return Wrote::StaleChoice;
+            }
+            state.unmark();
+            Wrote::Applied
+        })
     }
 
     /// A host this device no longer holds a record of. The fence moves whether or not a record
@@ -2215,7 +2278,7 @@ pub mod tests {
     use kr_protocol::scalars::{DurationMs, TimestampMs, Uuid};
 
     use super::*;
-    use crate::connection::{HostWords, NotReached, Standing};
+    use crate::connection::{Attempt, HostWords, NotReached, Standing};
 
     /// A connection that takes every frame and never answers one, and says when it is closed. It
     /// sends one frame first when it is given one.
@@ -3221,6 +3284,684 @@ pub mod tests {
             ended_soon(&second_ended).await,
             "the next choice ends the task it replaces"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // A slow try, and the mark that says it is still running.
+    // -----------------------------------------------------------------------------------------
+
+    /// A failure that leaves the words of a host that was not reached.
+    fn lost() -> Unopened {
+        Unopened::unreached(NotReached::NoAnswerInTime)
+    }
+
+    /// Another failure of the same kind, with other words.
+    fn lost_another_way() -> Unopened {
+        Unopened::unreached(NotReached::EnvironmentNotSaid)
+    }
+
+    /// The words of [`lost_another_way`].
+    const ANOTHER_WORDS: &str = "the host did not say which environment it is";
+
+    /// `target` chosen and its try failed with the host not reached: the standing words are a lost
+    /// try's, as they are before a try that follows a failure.
+    fn after_a_lost_try(owner: &ContactOwner, target: &Target) -> u64 {
+        let choice = owner.choose(target, "reaching").value;
+        assert_eq!(
+            crate::connection::failed_try(owner, choice, None, lost()),
+            Wrote::Applied
+        );
+        choice
+    }
+
+    /// An attempt that ends with `result` after `after`.
+    async fn ending(after: Duration, result: Attempt) -> Attempt {
+        tokio::time::sleep(after).await;
+        result
+    }
+
+    /// Lets the tasks that can run do so, moves the paused clock on by `by`, and lets the tasks it
+    /// wakes run.
+    async fn moved_on(by: Duration) {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(by).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The end of a task, within a minute of the paused clock: a task that does not end fails the
+    /// case instead of holding it.
+    async fn joined<T>(task: tokio::task::JoinHandle<T>) -> Result<T, tokio::task::JoinError> {
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("the task ended within a minute")
+    }
+
+    /// The keeper's step for `choice` on a task of its own, as `keep` takes it: the attempt, and what
+    /// it came to written to the owner.
+    fn keeping(
+        owner: &Arc<ContactOwner>,
+        choice: u64,
+        attempt: impl std::future::Future<Output = Attempt> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let owner = Arc::clone(owner);
+        tokio::spawn(async move {
+            match crate::connection::tried(&owner, choice, attempt).await {
+                Attempt::Reached(connection) => drop(owner.reached(choice, None, connection)),
+                Attempt::Failed(unopened) => {
+                    let _ = crate::connection::failed_try(&owner, choice, None, unopened);
+                }
+                Attempt::Nothing => {}
+            }
+        })
+    }
+
+    /// What each publication after `after` showed of the line: the mark, whether a connection was
+    /// held, and the words.
+    fn told_after(
+        owner: &ContactOwner,
+        after: u64,
+    ) -> Vec<(Option<Reaching>, bool, Option<String>)> {
+        owner
+            .since(after)
+            .states
+            .iter()
+            .map(|each| (each.still_reaching, each.connected, each.reason.clone()))
+            .collect()
+    }
+
+    /// A try that ends before the slow mark publishes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_that_ends_before_the_slow_mark_publishes_nothing() {
+        let owner = ContactOwner::new();
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let done = crate::connection::tried(
+            &owner,
+            choice,
+            ending(
+                crate::connection::SLOW_TRY - Duration::from_millis(1),
+                Attempt::Failed(lost()),
+            ),
+        )
+        .await;
+        assert!(matches!(done, Attempt::Failed(_)));
+        assert_eq!(owner.revision(), before, "a fast try publishes nothing");
+        assert_eq!(owner.snapshot().still_reaching, None);
+    }
+
+    /// A try whose result is ready on the mark's own tick wins the tie: the mark is not written
+    /// after a result that was there first. The tie is run 64 times, each on a fresh owner whose
+    /// standing words are a lost try's; without the attempt polled first, each would write the mark
+    /// by chance one half.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_that_ends_on_the_marks_own_tick_wins() {
+        for tie in 0..64 {
+            let owner = ContactOwner::new();
+            let choice = after_a_lost_try(&owner, &Target::Local);
+            let before = owner.revision();
+            let done = crate::connection::tried(
+                &owner,
+                choice,
+                ending(
+                    crate::connection::SLOW_TRY,
+                    Attempt::Failed(lost_another_way()),
+                ),
+            )
+            .await;
+            let Attempt::Failed(unopened) = done else {
+                panic!("tie {tie}: the attempt's own result is answered");
+            };
+            assert_eq!(owner.revision(), before, "tie {tie}: no mark is published");
+            assert_eq!(
+                crate::connection::failed_try(&owner, choice, None, unopened),
+                Wrote::Applied
+            );
+            assert!(
+                told_after(&owner, 0)
+                    .iter()
+                    .all(|(mark, _, _)| mark.is_none()),
+                "tie {tie}: no publication carries a mark"
+            );
+            assert_eq!(
+                owner.snapshot().reason.as_deref(),
+                Some(ANOTHER_WORDS),
+                "tie {tie}: the outcome is written"
+            );
+        }
+    }
+
+    /// A try still running just after the mark publishes it, and the write that ends the try takes
+    /// it off in its own publication: two publications for a try that fails with other words, two
+    /// for one that fails with the same words (which publishes nothing without the mark), and two
+    /// for one that works. A guard that acted when the try returns would add a third where the
+    /// outcome changes the state.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_still_running_just_after_the_mark_publishes_it_once() {
+        let just_after = crate::connection::SLOW_TRY + Duration::from_millis(1);
+
+        // It fails with other words.
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let keeper = keeping(
+            &owner,
+            choice,
+            ending(just_after, Attempt::Failed(lost_another_way())),
+        );
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(
+            owner.snapshot().still_reaching,
+            Some(Reaching::Local),
+            "the mark is published while the try runs"
+        );
+        joined(keeper).await.expect("the keeper ended");
+        assert_eq!(
+            told_after(&owner, before),
+            [
+                (
+                    Some(Reaching::Local),
+                    false,
+                    Some("the host did not answer in time".to_owned())
+                ),
+                (None, false, Some(ANOTHER_WORDS.to_owned())),
+            ],
+            "the mark, then the outcome that takes it off"
+        );
+
+        // It fails with the words the line already has.
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let keeper = keeping(&owner, choice, ending(just_after, Attempt::Failed(lost())));
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        joined(keeper).await.expect("the keeper ended");
+        let words = Some("the host did not answer in time".to_owned());
+        assert_eq!(
+            told_after(&owner, before),
+            [
+                (Some(Reaching::Local), false, words.clone()),
+                (None, false, words)
+            ],
+            "the mark, then its end, though the outcome changes nothing else"
+        );
+
+        // It works.
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let keeper = keeping(
+            &owner,
+            choice,
+            ending(just_after, Attempt::Reached(connection(5).0)),
+        );
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        joined(keeper).await.expect("the keeper ended");
+        assert_eq!(
+            told_after(&owner, before),
+            [
+                (
+                    Some(Reaching::Local),
+                    false,
+                    Some("the host did not answer in time".to_owned())
+                ),
+                (None, true, None),
+            ],
+            "the mark, then the connection in one publication"
+        );
+    }
+
+    /// A choice's first try takes no mark: the standing words are the application's own, with no try
+    /// behind them. After a failure the next slow try does take it.
+    #[tokio::test(start_paused = true)]
+    async fn a_choices_first_try_takes_no_mark() {
+        let slow = Duration::from_secs(10);
+        let owner = Arc::new(ContactOwner::new());
+        let choice = owner.choose(&Target::Local, "reaching").value;
+        let before = owner.revision();
+        let keeper = keeping(&owner, choice, ending(slow, Attempt::Failed(lost())));
+        moved_on(crate::connection::SLOW_TRY + Duration::from_secs(1)).await;
+        assert_eq!(
+            owner.revision(),
+            before,
+            "a first try that runs for seconds publishes nothing"
+        );
+        joined(keeper).await.expect("the keeper ended");
+
+        let keeper = keeping(
+            &owner,
+            choice,
+            ending(slow, Attempt::Failed(lost_another_way())),
+        );
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(
+            owner.snapshot().still_reaching,
+            Some(Reaching::Local),
+            "the second try, which follows a failure, takes the mark"
+        );
+        joined(keeper).await.expect("the keeper ended");
+    }
+
+    /// Each slow try after a failure takes the mark, and the line is back to the words between.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_slow_try_takes_the_mark_again() {
+        let slow = Duration::from_secs(10);
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        for words in [lost_another_way(), lost()] {
+            let keeper = keeping(&owner, choice, ending(slow, Attempt::Failed(words)));
+            moved_on(crate::connection::SLOW_TRY).await;
+            assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+            joined(keeper).await.expect("the keeper ended");
+            assert_eq!(owner.snapshot().still_reaching, None);
+        }
+        let marks = told_after(&owner, before)
+            .iter()
+            .filter(|(mark, _, _)| mark.is_some())
+            .count();
+        assert_eq!(marks, 2, "one mark for each slow try");
+    }
+
+    /// The host's words stay while its refusal is the standing cause: a try after a refusal takes
+    /// no mark. A refusal that the present try returns after its mark replaces the mark in the one
+    /// publication that writes the words.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_keeps_its_words_and_a_refusal_the_present_try_returns_replaces_the_mark() {
+        let slow = Duration::from_secs(10);
+        let refused = || Unopened::Refused(Asked::HostInfo, CommandError::refused("not for you"));
+
+        // After a refusal, the next slow try takes no mark.
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        assert_eq!(
+            crate::connection::failed_try(&owner, choice, None, refused()),
+            Wrote::Applied
+        );
+        let before = owner.revision();
+        let keeper = keeping(&owner, choice, ending(slow, Attempt::Failed(lost())));
+        moved_on(crate::connection::SLOW_TRY + Duration::from_secs(1)).await;
+        assert_eq!(
+            owner.revision(),
+            before,
+            "a try after a refusal publishes nothing while it runs"
+        );
+        joined(keeper).await.expect("the keeper ended");
+
+        // The present try is refused after its mark.
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let keeper = keeping(&owner, choice, ending(slow, Attempt::Failed(refused())));
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(
+            owner.snapshot().still_reaching,
+            Some(Reaching::Local),
+            "the mark is published first"
+        );
+        joined(keeper).await.expect("the keeper ended");
+        let told = told_after(&owner, before);
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert_eq!(
+            told[1],
+            (None, false, Some("not for you".to_owned())),
+            "the host's words and the end of the mark are one publication"
+        );
+    }
+
+    /// A host that was reached and then not, and a try marked as slow: the choice and the revision
+    /// the mark was published as.
+    fn marked(owner: &ContactOwner, target: &Target) -> (u64, u64) {
+        let choice = after_a_lost_try(owner, target);
+        let applied = owner.try_is_slow(choice);
+        assert_eq!(applied.value, Wrote::Applied);
+        (choice, applied.revision)
+    }
+
+    /// A new choice takes the mark off in the publication that writes its words.
+    #[tokio::test]
+    async fn a_new_choice_takes_the_mark_off_with_its_own_write() {
+        let owner = ContactOwner::new();
+        let (_, marked_at) = marked(&owner, &Target::Local);
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        drop(owner.choose(&Target::Local, "again"));
+        assert_eq!(
+            told_after(&owner, marked_at),
+            [(None, false, Some("again".to_owned()))]
+        );
+    }
+
+    /// A forget of the host in use takes the mark off in the publication that writes its words.
+    #[tokio::test]
+    async fn a_forget_takes_the_mark_off_with_its_own_write() {
+        let owner = ContactOwner::new();
+        let (_, marked_at) = marked(&owner, &paired(1, 2));
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Paired));
+        assert!(owner.forget(host(1), "forgotten").value);
+        assert_eq!(
+            told_after(&owner, marked_at),
+            [(None, false, Some("forgotten".to_owned()))]
+        );
+        // With no host in use the line hides a mark, so the flag itself is read.
+        assert!(!owner.lock().slow, "no mark is held with no host in use");
+    }
+
+    /// A connection that reaches the host takes the mark off in the publication that shows it, and no
+    /// mark is held with it: the page never shows one beside a connection, and a later end of the
+    /// connection starts from none.
+    #[tokio::test]
+    async fn a_reach_takes_the_mark_off_with_its_own_write() {
+        let owner = ContactOwner::new();
+        let (choice, marked_at) = marked(&owner, &Target::Local);
+        assert!(matches!(
+            owner.reached(choice, None, connection(1).0).value,
+            Reach::Reached(_)
+        ));
+        assert_eq!(told_after(&owner, marked_at), [(None, true, None)]);
+        assert!(!owner.lock().slow, "no mark is held with a connection");
+    }
+
+    /// A failed try takes the mark off in the publication that writes its words.
+    #[tokio::test]
+    async fn a_failed_try_takes_the_mark_off_with_its_own_write() {
+        let owner = ContactOwner::new();
+        let (choice, marked_at) = marked(&owner, &Target::Local);
+        assert_eq!(
+            crate::connection::failed_try(&owner, choice, None, lost_another_way()),
+            Wrote::Applied
+        );
+        assert_eq!(
+            told_after(&owner, marked_at),
+            [(None, false, Some(ANOTHER_WORDS.to_owned()))]
+        );
+    }
+
+    /// The installing helper of the cases takes the mark off with the words it clears, as every
+    /// writer of the words does.
+    #[tokio::test]
+    async fn the_installing_helper_takes_the_mark_off_with_the_words() {
+        let owner = ContactOwner::new();
+        let (_, marked_at) = marked(&owner, &Target::Local);
+        drop(owner.install(connection(1).0));
+        assert_eq!(told_after(&owner, marked_at), [(None, true, None)]);
+        assert!(!owner.lock().slow, "no mark is held with a connection");
+    }
+
+    /// A try with nothing to keep a connection to ends the keeper, and its mark goes with it: the
+    /// choice is still the one in force, and nobody else would take the mark off.
+    #[tokio::test(start_paused = true)]
+    async fn a_try_that_finds_nothing_to_reach_takes_the_mark_off() {
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let before = owner.revision();
+        let keeper = keeping(
+            &owner,
+            choice,
+            ending(Duration::from_secs(4), Attempt::Nothing),
+        );
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        joined(keeper).await.expect("the keeper ended");
+        assert_eq!(
+            told_after(&owner, before),
+            [
+                (
+                    Some(Reaching::Local),
+                    false,
+                    Some("the host did not answer in time".to_owned())
+                ),
+                (
+                    None,
+                    false,
+                    Some("the host did not answer in time".to_owned())
+                ),
+            ],
+            "the mark, then its end, and the words are the last failure's"
+        );
+    }
+
+    /// A slow write for a choice that has been replaced writes nothing: the keeper's timer can run
+    /// once after the commit that ended its choice.
+    #[tokio::test]
+    async fn a_late_slow_write_after_a_new_choice_writes_nothing() {
+        let owner = ContactOwner::new();
+        let (choice, _) = marked(&owner, &Target::Local);
+        drop(owner.choose(&Target::Local, "again"));
+        let before = owner.revision();
+        assert_eq!(owner.try_is_slow(choice).value, Wrote::StaleChoice);
+        assert_eq!(owner.revision(), before);
+        assert_eq!(owner.snapshot().still_reaching, None);
+    }
+
+    /// A try that follows any stop of the lease, or the end of a connection, takes no mark: the
+    /// words they leave are the answer of someone, and the standing words of a host that was not
+    /// reached are the only ones a slow try marks.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_try_after_any_stop_of_the_lease_takes_no_mark() {
+        use kr_client::organisation::LeaseStop;
+
+        let stops = [
+            LeaseStop::SignIn,
+            LeaseStop::TokenRefused,
+            LeaseStop::NotAMember,
+            LeaseStop::Refused("a rule of the host"),
+            LeaseStop::Unusable,
+            LeaseStop::Later(Duration::from_secs(5)),
+            LeaseStop::Unreachable,
+            LeaseStop::AccountChanged,
+            LeaseStop::Presenting,
+        ];
+        for stop in &stops {
+            let owner = ContactOwner::new();
+            let (choice, session, _) = reaching(&owner, 1);
+            let (outcome, cause) = crate::connection::lease_stop_outcome(&session, stop);
+            assert!(
+                owner
+                    .lease_stopped(choice, &session, outcome, cause, "stopped")
+                    .value,
+                "{stop:?}: the stop is written"
+            );
+            let before = owner.revision();
+            assert_eq!(
+                owner.try_is_slow(choice).value,
+                Wrote::Kept,
+                "{stop:?}: no mark after the stop"
+            );
+            assert_eq!(owner.revision(), before, "{stop:?}: nothing is published");
+            assert_eq!(owner.snapshot().still_reaching, None, "{stop:?}");
+        }
+        // The end of a connection that nothing refused is a loss of contact, whose words are those
+        // of a host that was not reached: its next slow try takes the mark.
+        let owner = ContactOwner::new();
+        let (choice, session, _) = reaching(&owner, 2);
+        let (outcome, cause) = crate::connection::end_outcome(&session);
+        assert_eq!(cause, Cause::Unreached);
+        assert!(owner.ended(&session, outcome, cause, "ended").value);
+        assert_eq!(owner.try_is_slow(choice).value, Wrote::Applied);
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+    }
+
+    /// A pending try, as the keeper's task: it is registered with the owner the way a choice's task
+    /// is, and ends the way one does. The flag says its attempt was dropped.
+    fn pending_try(
+        owner: &Arc<ContactOwner>,
+        choice: u64,
+    ) -> (tokio::task::JoinHandle<()>, Arc<AtomicBool>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = EndedFlag(Arc::clone(&dropped));
+        let owner = Arc::clone(owner);
+        let task = tokio::spawn(async move {
+            let _flag = flag;
+            let _ = crate::connection::tried(
+                &owner,
+                choice,
+                ending(Duration::from_secs(600), Attempt::Failed(lost())),
+            )
+            .await;
+        });
+        (task, dropped)
+    }
+
+    /// The choice that aborts a pending slow try takes the mark off in its own publication: the
+    /// keeper's task is dropped with nothing to clear, and its guard writes nothing.
+    #[tokio::test(start_paused = true)]
+    async fn the_abort_of_a_pending_try_by_a_new_choice_leaves_one_publication() {
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let (task, dropped) = pending_try(&owner, choice);
+        let abort = task.abort_handle();
+        drop(owner.set_task(choice, tauri::async_runtime::JoinHandle::Tokio(task)));
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        let marked_at = owner.revision();
+        drop(owner.choose(&Target::Local, "again"));
+        moved_on(Duration::ZERO).await;
+        assert!(abort.is_finished(), "the new choice ended the try's task");
+        assert!(dropped.load(Ordering::SeqCst), "the attempt was dropped");
+        assert_eq!(
+            told_after(&owner, marked_at),
+            [(None, false, Some("again".to_owned()))],
+            "the choice's own publication, and none after it"
+        );
+    }
+
+    /// An abort that ends no choice leaves the guard silent: it acts only while a panic unwinds. No
+    /// product path makes this abort (the one abort of a keeper is the end of its choice), so the
+    /// mark that stays is no state the person can reach: the case shows that the guard writes
+    /// nothing when a task is aborted.
+    #[tokio::test(start_paused = true)]
+    async fn an_abort_that_ends_no_choice_leaves_the_guard_silent() {
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let (task, dropped) = pending_try(&owner, choice);
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        let marked_at = owner.revision();
+        task.abort();
+        let ended = joined(task).await;
+        assert!(ended.is_err_and(|error| error.is_cancelled()), "aborted");
+        assert!(dropped.load(Ordering::SeqCst), "the attempt was dropped");
+        assert_eq!(owner.revision(), marked_at, "the guard wrote nothing");
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+    }
+
+    /// A keeper that panics inside its try takes the mark off the line: one publication, and the
+    /// words and their cause are the last failure's.
+    #[tokio::test(start_paused = true)]
+    async fn a_keeper_that_panics_in_a_try_clears_the_mark() {
+        let owner = Arc::new(ContactOwner::new());
+        let choice = after_a_lost_try(&owner, &Target::Local);
+        let task = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move {
+                let _ = crate::connection::tried(&owner, choice, async {
+                    tokio::time::sleep(crate::connection::SLOW_TRY + Duration::from_secs(1)).await;
+                    panic!("the attempt panicked")
+                })
+                .await;
+            }
+        });
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        let marked_at = owner.revision();
+        let ended = joined(task).await;
+        assert!(
+            ended.is_err_and(|error| error.is_panic()),
+            "the keeper panicked"
+        );
+        assert_eq!(owner.snapshot().still_reaching, None, "the mark is off");
+        assert_eq!(
+            told_after(&owner, marked_at),
+            [(
+                None,
+                false,
+                Some("the host did not answer in time".to_owned())
+            )],
+            "one publication, with the last failure's words"
+        );
+        assert_eq!(owner.lock().cause, Cause::Unreached);
+    }
+
+    /// A session that ended earlier cannot write during a later slow try: its end and its lease's
+    /// stop answer false and publish nothing, and the later try's mark stays.
+    #[tokio::test(start_paused = true)]
+    async fn an_older_sessions_end_during_a_later_slow_try_writes_nothing() {
+        let owner = Arc::new(ContactOwner::new());
+        let (choice, session, _) = reaching(&owner, 1);
+        assert!(
+            owner
+                .ended(&session, Outcome::Lost, Cause::Unreached, "ended")
+                .value
+        );
+        let keeper = keeping(
+            &owner,
+            choice,
+            ending(Duration::from_secs(10), Attempt::Failed(lost())),
+        );
+        moved_on(crate::connection::SLOW_TRY).await;
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        let marked_at = owner.revision();
+        assert!(
+            !owner
+                .ended(&session, Outcome::Lost, Cause::Unreached, "ended again")
+                .value
+        );
+        assert!(
+            !owner
+                .lease_stopped(choice, &session, Outcome::Lost, Cause::Answered, "stopped")
+                .value
+        );
+        assert_eq!(owner.revision(), marked_at, "nothing was published");
+        assert_eq!(owner.snapshot().still_reaching, Some(Reaching::Local));
+        joined(keeper).await.expect("the keeper ended");
+    }
+
+    /// The mark moves the revision and itself and nothing else, and the page reads it as `null`,
+    /// `"paired"` or `"local"` beside the other fields of the state.
+    #[tokio::test]
+    async fn the_mark_moves_neither_the_epoch_nor_the_contact() {
+        let now = Arc::new(AtomicU64::new(1_000));
+        for (target, mark) in [(paired(1, 2), "paired"), (Target::Local, "local")] {
+            let owner = owner_at(&now);
+            let choice = after_a_lost_try(&owner, &target);
+            let before = owner.snapshot();
+            let before_json = serde_json::to_value(&before).expect("the state");
+            assert!(
+                before_json.as_object().is_some_and(
+                    |state| state.get("still_reaching") == Some(&serde_json::Value::Null)
+                ),
+                "the field is always there, and null without a mark: {before_json}"
+            );
+            assert_eq!(owner.try_is_slow(choice).value, Wrote::Applied);
+            let after = owner.snapshot();
+            assert_eq!(after.revision, before.revision + 1);
+            assert!(after.still_reaching.is_some(), "the mark was published");
+            assert_eq!(after.link, before.link);
+            assert_eq!(after.host, before.host);
+            assert_eq!(after.contact, before.contact);
+            assert_eq!(after.inbox_epoch, before.inbox_epoch);
+            assert_eq!(after.others, before.others);
+            assert_eq!(after.connected, before.connected);
+            assert_eq!(after.environment_id, before.environment_id);
+            assert_eq!(after.reason, before.reason);
+            assert_eq!(after.rights, before.rights);
+            assert_eq!(after.paired, before.paired);
+            assert_eq!(after.organisation, before.organisation);
+            assert_eq!(after.replaced, before.replaced);
+            let mut expected = before_json;
+            expected["revision"] = serde_json::json!(before.revision + 1);
+            expected["still_reaching"] = serde_json::json!(mark);
+            assert_eq!(
+                serde_json::to_value(&after).expect("the state"),
+                expected,
+                "{mark}: the one line, with the mark"
+            );
+        }
     }
 
     #[tokio::test]
