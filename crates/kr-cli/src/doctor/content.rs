@@ -311,9 +311,11 @@ struct SessionRecord {
 /// How a closed session ended. Which processes it stopped and what survived are counted and not
 /// named: their names are text, and a count is what a person reading the file needs.
 ///
-/// A record that was held to a budget lists some of its entries and counts the rest. The listed
-/// counts are the entries the record lists, and the two not-listed counts are the entries it only
-/// counts, so the three together say how many the session had.
+/// A record that was held to a budget lists some of its entries and counts the rest. The counts
+/// come in two pairs. `terminated_count` and `not_listed_ended_processes` together are the ended
+/// processes the record holds, listed and only counted. `surviving_count` and
+/// `not_listed_other_entries` together are the survivors it holds. Neither pair is every process
+/// the session ran.
 #[derive(Serialize)]
 struct ClosureOut {
     reason: ClosureReason,
