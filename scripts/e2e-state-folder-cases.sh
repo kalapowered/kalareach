@@ -685,8 +685,8 @@ for victim in mid state; do
 done
 
 echo "== each folder is listed from inside its parent, and the folder that is entered is the one listed"
-# A case defines `stand_cd`, `stand_ls`, `stand_uname`, `stand_rm`, `stand_chmod` or `stand_rmdir`, which
-# stand in for `cd`, `ls`, `uname`, `rm`, `chmod` and `rmdir` inside the subshell that stand_check runs
+# A case defines `stand_cd`, `stand_ls`, `stand_uname`, `stand_rm`, `stand_chmod`, `stand_rmdir` or
+# `stand_python3`, which stand in for `cd`, `ls`, `uname`, `rm`, `chmod`, `rmdir` and `python3` inside the subshell that stand_check runs
 # the check in (so that no other case sees them), and removes them after the call.
 # stand_check <temporary directory> <state>: sets `out` (what the check said, or `accepted` with the
 # inode and the name it left) and `code`.
@@ -696,7 +696,7 @@ stand_check() {
     # shellcheck source=scripts/lib/e2e-state-folder.sh
 . "$root/scripts/lib/e2e-state-folder.sh"
     local fn
-    for fn in cd ls uname rm chmod rmdir; do
+    for fn in cd ls uname rm chmod rmdir python3; do
       if declare -F "stand_$fn" > /dev/null; then
         eval "$fn() { stand_$fn \"\$@\"; }"
       fi
@@ -941,14 +941,12 @@ stand_check "$t" "$t/rmf/new/state"
 said "a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/rmf/new/state" "$left_both")"
 unset -f stand_chmod stand_rm
 
-# The cleanup takes the names that it looks for from the shell's own read of the directory, never from
-# the text of a listing, which a variable of the environment can change: a quoting style (GNU `ls`) puts
-# quotes round every name, and forced colour (macOS `ls`; the stand-in `ls` here reads CLICOLOR_FORCE and
-# answers `--color=always`) puts colour codes round the name of a directory. A caller can also set
-# GLOBIGNORE to a pattern that matches every name, the option failglob, and no globbing at all (set -f),
-# which change the shell's own read. In each case the removals fail, so the marker (and the folder that the walk made) stand, and the
-# sentence says what was kept instead of saying that nothing was.
-mk "$t/qs/exist/state" "$t/qs/new" "$t/cl/new" "$t/hg/exist/state" "$t/hg/new" "$t/ng/exist/state" "$t/ng/new" "$t/fg/exist/state"
+# The cleanup does not read the text of a listing: a variable of the environment can change it. A
+# quoting style (GNU `ls`) puts quotes round every name, and forced colour (macOS `ls`; the stand-in
+# `ls` here reads CLICOLOR_FORCE and answers `--color=always`) puts colour codes round the name of a
+# directory. In each case the removals fail, so the marker (and the folder that the walk made) stand,
+# and the sentence says what was kept instead of saying that nothing was.
+mk "$t/qs/exist/state" "$t/qs/new" "$t/cl/new"
 stand_chmod() { return 1; }
 stand_rm() { return 1; }
 QUOTING_STYLE=c stand_check "$t" "$t/qs/exist/state"
@@ -965,26 +963,7 @@ stand_ls() {
 CLICOLOR=1 CLICOLOR_FORCE=1 stand_check "$t" "$t/cl/new/state"
 unset -f stand_ls
 said "under forced colour set in the environment, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/cl/new/state" "$left_both")"
-unset -f stand_chmod
-stand_chmod() { GLOBIGNORE='*'; return 1; }
-stand_check "$t" "$t/hg/exist/state"
-said "under a pattern set by the caller that hides every name, a failed removal of the marker is said" "$(write_sentence "$t/hg/exist/state" "$left_marker")"
-stand_check "$t" "$t/hg/new/state"
-said "under a pattern set by the caller that hides every name, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/hg/new/state" "$left_both")"
-unset -f stand_chmod
-stand_chmod() { set -f; return 1; }
-stand_check "$t" "$t/ng/exist/state"
-said "under no globbing set by the caller, a failed removal of the marker is said" "$(write_sentence "$t/ng/exist/state" "$left_marker")"
-stand_check "$t" "$t/ng/new/state"
-said "under no globbing set by the caller, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/ng/new/state" "$left_both")"
 unset -f stand_chmod stand_rm
-# The marker is gone and the folder is empty, so the directory reads as gone and nothing is kept, with the
-# option failglob set by the caller (an unmatched pattern is then an error).
-stand_chmod() { shopt -s failglob; return 1; }
-stand_rm() { command rm -f -- "$t/fg/exist/state/.kr-e2e-owner"; return 1; }
-stand_check "$t" "$t/fg/exist/state"
-unset -f stand_chmod stand_rm
-said "under failglob set by the caller, a marker whose removal reports a failure but that is gone" "$(write_sentence "$t/fg/exist/state")"
 
 # The folder that the walk made is moved aside and another closed folder of the caller's takes its name
 # before the walk enters it: the cleanup does not remove what it did not make, and says that what it made
@@ -1010,8 +989,8 @@ expect "the folder that the walk made is where it was moved" yes "$([ -d "$t/idc
 # it first removes that one folder with `rmdir`: the one folder that the case's own walk made, a literal
 # path under the case's scratch folder, and only in the case that shows a folder that is gone. Where
 # `unl_deny` names a folder (the parent that the cleanup stands in, a literal path under the case's
-# scratch folder) it first takes every permission from it, so that the tests of a name and the read of
-# the directory fail too while the folder stands; the case gives the permissions back, and runs only
+# scratch folder) it first takes every permission from it, so that the lookup of a name fails too (and
+# shows no absence) while the folder stands; the case gives the permissions back, and runs only
 # for an account that a mode stops (root is not).
 unl_from=0
 unl_gone=""
@@ -1041,7 +1020,7 @@ unl_from=2 unl_gone="" unl_count="$scratch/unl-count-first"
 stand_check "$t" "$t/unl/first/state"
 said "a cleanup listing that fails after the first listing of the made folder failed" "$(sentence "$t/unl/first/state"); $left_unread"
 expect "the folder whose listings failed is still there" yes "$([ -d "$t/unl/first/state" ] && echo yes || echo no)"
-# The folder is gone when the cleanup's listing fails: the parent was read and does not hold the name,
+# The folder is gone when the cleanup's listing fails: the lookup of its name in the parent finds no entry,
 # so nothing is left and the sentence says that nothing was kept.
 stand_chmod() { return 1; }
 unl_from=3 unl_gone="$t/unl/gone/state" unl_count="$scratch/unl-count-gone"
@@ -1098,7 +1077,7 @@ stand_check "$t" "$t/pcd/mid/state"
 unset -f stand_chmod stand_cd
 said "a cleanup that cannot enter the parent folder" "$(write_sentence "$t/pcd/mid/state" "$left_unread")"
 expect "the folder whose parent could not be entered is still there" yes "$([ -d "$t/pcd/mid/state" ] && echo yes || echo no)"
-# A marker whose removal command reports a failure but that is not there: the directory shows it gone,
+# A marker whose removal command reports a failure but that is not there: the lookup of its name shows it gone,
 # so nothing is left. The stand-in removes that one marker, a literal path under the case's scratch folder.
 mk "$t/mkg/exist/state"
 stand_chmod() { return 1; }
@@ -1133,6 +1112,102 @@ if [ "$caller" -ne 0 ]; then
 else
   echo "  skipped: a folder without permissions (an account that a mode does not stop)"
 fi
+
+echo "== the absence check is one lookup of the name in the working directory"
+# Direct calls of e2e_state_folder_gone. gone_status <directory> [<argument>...] calls it with the arguments, in
+# a subshell that has the library and stands in <directory>, and sets `gs` to the status that the subshell ends
+# with (the function's own) and `gone_text` to what the call printed on either stream. The settings of one call
+# are given in its environment: `gone_setup` (commands that run after the change of directory), `gone_path` (the
+# PATH of the call: an empty folder, or the folder of a stand-in `python3`) and `gone_errexit` (1: the caller has
+# errexit on).
+gone_status() {
+  local dir="$1"
+  shift
+  (
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    cd -- "$dir" || exit 99
+    [ -z "${gone_setup:-}" ] || eval "$gone_setup"
+    [ -z "${gone_path+x}" ] || PATH="$gone_path"
+    [ "${gone_errexit:-}" != 1 ] || set -e
+    e2e_state_folder_gone ${1+"$@"}
+  ) > "$scratch/gone-text" 2>&1
+  gs=$?
+  gone_text="$(cat "$scratch/gone-text")"
+}
+g="$scratch/gone"
+mk "$g/dir" "$g/removed" "$g/no-python" "$g/py1" "$g/py0" "$g/pyout"
+: > "$g/dir/.kr-e2e-owner"
+ln -s "$o/gone-target-not-there" "$g/dir/dangling"
+line_feed_name="$(printf 'line\nfeed')"
+: > "$g/dir/$line_feed_name"
+bad_name="$(printf 'bad\377name')"
+: > "$g/dir/$bad_name"
+long_name="$(printf '%0300d' 0)"
+printf '#!/bin/sh\nexit 1\n' > "$g/py1/python3"
+printf '#!/bin/sh\nexit 0\n' > "$g/py0/python3"
+printf '#!/bin/sh\necho noise\necho noise >&2\nexit 10\n' > "$g/pyout/python3"
+chmod 755 "$g/py1/python3" "$g/py0/python3" "$g/pyout/python3"
+
+gone_status "$g/dir" absent
+expect "the lookup of a name that is not there reads 0: a plain name" 0 "$gs"
+gone_setup='readonly LC_ALL=C.UTF-8' gone_status "$g/dir" absent
+expect "the lookup of a name that is not there reads 0 under a readonly LC_ALL" 0 "$gs"
+gone_status "$g/dir" .kr-e2e-owner
+expect "the lookup of a name that is there reads 1: the marker's name" 1 "$gs"
+gone_status "$g/dir" "$line_feed_name"
+expect "the lookup of a name that is there reads 1: a name with a line feed" 1 "$gs"
+gone_status "$g/dir" "$bad_name"
+expect "the lookup of a name that is there reads 1: a name with bytes that are not valid text" 1 "$gs"
+gone_status "$g/dir" dangling
+expect "the lookup of a name that is there reads 1: a dangling link" 1 "$gs"
+gone_setup="readonly GLOBIGNORE='*'" gone_status "$g/dir" .kr-e2e-owner
+expect "the lookup of a name that is there reads 1 under a readonly GLOBIGNORE that hides every name" 1 "$gs"
+# A name that is not one name is refused before the lookup: a path would be looked up through other folders,
+# and `.` and `..` are found in every folder.
+gone_status "$g/dir" ""
+expect "the lookup reads 2 for an empty name" 2 "$gs"
+gone_status "$g/dir" .
+expect "the lookup reads 2 for the name '.'" 2 "$gs"
+gone_status "$g/dir" ..
+expect "the lookup reads 2 for the name '..'" 2 "$gs"
+gone_status "$g/dir" absent/state
+expect "the lookup reads 2 for a name with a slash whose first part is not there" 2 "$gs"
+gone_status "$g/dir"
+expect "the lookup reads 2 with no name" 2 "$gs"
+gone_status "$g/dir" absent absent
+expect "the lookup reads 2 with two names" 2 "$gs"
+# A lookup that fails for a reason other than "no such entry" shows no absence. The directory is fine here, so
+# the check of the working directory cannot be what reads 2: the name is longer than the system allows.
+gone_status "$g/dir" "$long_name"
+expect "the lookup reads 2 for a name longer than the system allows" 2 "$gs"
+# A removed working directory holds no name: its lookup says "no such entry" for every name.
+gone_setup='rmdir -- "$dir"' gone_status "$g/removed" absent
+expect "the lookup reads 2 in a working directory that was removed" 2 "$gs"
+# The interpreter's own status is not an answer: only 10 and 11 are.
+gone_path="$g/no-python" gone_status "$g/dir" absent
+expect "the lookup reads 2 with no interpreter on the path" 2 "$gs"
+gone_path="$g/py1" gone_status "$g/dir" absent
+expect "the lookup reads 2 with an interpreter that ends with 1 (errexit off)" 2 "$gs"
+gone_path="$g/py0" gone_status "$g/dir" .kr-e2e-owner
+expect "the lookup reads 2 with an interpreter that ends with 0" 2 "$gs"
+gone_path="$g/py1" gone_errexit=1 gone_status "$g/dir" absent
+expect "the lookup reads 2 with an interpreter that ends with 1 (errexit on)" 2 "$gs"
+# What the interpreter prints is not part of the walk's answer, which is read from standard output.
+gone_path="$g/pyout" gone_status "$g/dir" absent
+expect "the lookup says nothing of what the interpreter prints on either stream" "0|" "$gs|$gone_text"
+
+# Where the interpreter is unavailable the cleanup's sentence says that the marker, and the folder that the walk
+# made, may still be there: the state could not be shown, which is not the same as clean.
+mk "$t/py/exist/state" "$t/py/new"
+stand_chmod() { return 1; }
+stand_rm() { return 1; }
+stand_python3() { return 127; }
+stand_check "$t" "$t/py/exist/state"
+said "a marker whose removal fails while the interpreter is unavailable" "$(write_sentence "$t/py/exist/state" "$left_marker_unread")"
+stand_check "$t" "$t/py/new/state"
+said "a marker and a made folder whose removal fails while the interpreter is unavailable" "$(write_sentence "$t/py/new/state" "$left_both_unread")"
+unset -f stand_chmod stand_rm stand_python3
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"

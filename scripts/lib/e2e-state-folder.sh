@@ -66,7 +66,7 @@
 # listing, or a name that ends in a line feed and was cut there), the refusal adds fixed words after
 # the rule's sentence. A refusal has no effect. The check makes the one folder and the one file it
 # names, and when it cannot finish it removes the marker and the folder that it made, and nothing
-# else; where it cannot remove one of them, or cannot show by reading the directory that one of them is
+# else; where it cannot remove one of them, or cannot show by a lookup of its name that one of them is
 # gone, the refusal says what is left or what may be left, and never that nothing was kept.
 #
 # What the check does not stop. The started program inherits its working directory, and the product
@@ -246,41 +246,63 @@ e2e_state_folder_mark() {
   e2e_state_folder_marker_ok "$owner" || return 3
 }
 
-# e2e_state_folder_gone <name>: tells whether <name>, a name in the working directory, is gone. It reads
-# the directory and compares each name in it, whole and byte for byte, with <name>: a test of the name
-# itself gives the same answer for a name that is not there and for one that cannot be looked at (a
-# folder that cannot be searched, an input or output error), so a failed test shows nothing. The
-# listing command is run only for its exit status, which says whether the directory can be read; its
-# text is never read, since a variable of the environment (a quoting style, forced colour) can change
-# how it prints a name. The names come from the shell's own read of the directory, in a subshell that
-# sets every option that could change that read: patterns are expanded (not left as they are), no
-# pattern hides a name, an unmatched pattern is neither an error nor itself, names that start with a
-# dot count, and the bytes of a name are compared as they are. It returns 0 where the directory was read and does not hold the name, 1 where
-# it holds it, and 2 where it could not be read, which shows neither.
+# e2e_state_folder_gone <name>: tells whether <name>, one name in the working directory, is gone. It
+# returns 0 where the lookup of that name established absence, 1 where the name is there, and 2 where
+# neither could be shown. It makes ONE lookup of the name and nothing else: `python3` runs `lstat` on
+# the name, relative to the working directory, and the system's own error tells "no such entry" (the
+# name is not there) from every other failure (a folder that cannot be searched, an input or output
+# error, a name that is too long), which a test of the name in the shell cannot do. No directory is
+# listed and no pattern is expanded, so no text of a listing, no shell option and no setting of the
+# caller can change the answer. The program is a constant text and the name is an argument after it,
+# never part of it; the flags are -I (the working directory is not on the import path, and the
+# PYTHON variables are ignored), -S (no site files) and -X utf8, and the program gives the lookup
+# the name's bytes as they arrived (os.fsencode), so that a name that is not valid text in the
+# caller's locale is looked up as it is. The program ends with 10 for gone and 11 for found, through
+# os._exit (with -S there is no exit()); every other end of the interpreter (it is absent, it does
+# not start, an exception, a signal, any other status) reads 2, and its output is discarded: the
+# walk's standard output is read as an answer. Where the name is not there, the program also shows
+# that the working directory is still the one it names: `getcwd` must succeed and the working
+# directory and the folder at that path must have the same device and inode, since a removed working
+# directory has no entry of any name; an error or a difference there reads 2, never 0. The name must
+# be one name: exactly one argument, and not empty, `.`, `..` or a name that holds a slash (a path
+# would be looked up through other folders). What this does not do: it gives no guarantee against
+# a change between the lookup and the caller's sentence or during the call (a process of the caller's
+# own account can change the folder); where the interpreter is absent every call reads 2, and the
+# cleanup's sentence then says that the state could not be shown, never that it is clean (a removal
+# that succeeded still counts as gone); a `python3` on the path that is not the interpreter can claim
+# anything, as every command on the path can; and on a network or user-space file system "no such
+# entry" is that file system's own answer, which a cache or a hidden name can give while the name stands.
 e2e_state_folder_gone() {
-  local found=0
-  ls -A -- . > /dev/null 2>&1 || return 2
-  (
-    unset GLOBIGNORE
-    LC_ALL=C
-    set +f
-    shopt -u failglob
-    shopt -s nullglob dotglob
-    for entry in ./*; do
-      [ "${entry#./}" = "$1" ] && exit 1
-    done
-    exit 0
-  ) || found=$?
-  case "$found" in
-    0 | 1) return "$found" ;;
+  local status=0
+  [ "$#" -eq 1 ] || return 2
+  case "$1" in
+    '' | . | .. | */*) return 2 ;;
+  esac
+  python3 -I -S -X utf8 -c '
+import os, sys
+try:
+    os.lstat(os.fsencode(sys.argv[1]))
+except FileNotFoundError:
+    pass
+else:
+    os._exit(11)
+here = os.lstat(".")
+named = os.lstat(os.getcwdb())
+if (here.st_dev, here.st_ino) != (named.st_dev, named.st_ino):
+    os._exit(12)
+os._exit(10)
+' "$1" > /dev/null 2>&1 || status=$?
+  case "$status" in
+    10) return 0 ;;
+    11) return 1 ;;
   esac
   return 2
 }
 
 # e2e_state_folder_fail <status>: ends the walk. It first removes what the walk made and nothing
 # else: the marker (a file of that one name, in the folder the walk is in) and the folder (an empty
-# one, removed from its parent). A removal counts only where its command succeeded or the directory
-# was read and does not hold the name (e2e_state_folder_gone); anything else is left or unresolved. It
+# one, removed from its parent). A removal counts only where its command succeeded or the lookup of
+# the name established absence (e2e_state_folder_gone); anything else is left or unresolved. It
 # ends with the status plus 16 for what it could not remove or could not show to be gone, so that the
 # check can say what is left: 1 for the marker, 2 for the folder, 3 for both, 4 for a folder that could
 # not be read and may still be there, 5 for a marker that is there with such a folder, 6 for a marker
@@ -317,10 +339,10 @@ e2e_state_folder_fail() {
 # e2e_state_folder_unmake: removes the folder that the walk made, from its parent, which it reaches by
 # the parent's physical name and checks by that name; the folder is removed only while its name still
 # has the inode that the walk listed after it made it. It returns 0 where the folder is gone (removed,
-# or the parent was read and does not hold the name), 1 where it is still there (another folder at that
-# name is not the walk's to remove), and 2 where that cannot be told: the parent could not be entered
-# or is not the folder expected, or the folder could not be listed and the parent could not be read to
-# show the name gone. Nothing is removed without the listing's inode.
+# or the lookup of its name in the parent established absence), 1 where it is still there (another
+# folder at that name is not the walk's to remove), and 2 where that cannot be told: the parent could
+# not be entered or is not the folder expected, or the folder could not be listed and the lookup of its
+# name could not show it gone. Nothing is removed without the listing's inode.
 e2e_state_folder_unmake() {
   CDPATH='' cd -P -- "$e2e_state_folder_parent" 2> /dev/null || return 2
   e2e_state_folder_here && [ "$e2e_state_folder_name" = "$e2e_state_folder_parent" ] || return 2
