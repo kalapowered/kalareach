@@ -44,6 +44,25 @@ const ROWS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['_private_name.txt', ['_private_', 'name', '.txt']],
   ['a__b', ['a__', 'b']],
   ['a._b', ['a', '._b']],
+  // A dot after underscores follows the same rule whether the underscores open the word or close a part.
+  ['_.py', ['_', '.py']],
+  ['__.py', ['__', '.py']],
+  ['_.config', ['_.', 'config']],
+  ['main_.py', ['main_', '.py']],
+  ['main_.config', ['main_.', 'config']],
+  // An internal at sign ends a line before it, whatever non-space character stands before it; one that
+  // opens its word or closes it does not.
+  ['"sam"@example.com', ['"sam"', '@example', '.com']],
+  ['(sam)@example.com', ['(sam)', '@example', '.com']],
+  ['sam!@example.com', ['sam!', '@example', '.com']],
+  ['sam+tag@example.com', ['sam+tag', '@example', '.com']],
+  ['_@host.io', ['_', '@host', '.io']],
+  ['@types/node', ['@types/', 'node']],
+  ['"@x"', ['"@x"']],
+  ['(@x)', ['(@x)']],
+  ['sam@', ['sam@']],
+  ['a.@b', ['a.@b']],
+  ['a-@b', ['a-@b']],
   // A run of separators of any kind is one place, after its last character.
   ['a//::==b', ['a//::==', 'b']],
   ['a..b', ['a..b']],

@@ -10,16 +10,17 @@
  * dot is short, four characters or fewer, the line ends before the dot, so that a familiar ending
  * stays whole (`KalaReach` and `.app`, `archive` and `.tar` and `.gz`). Where it is longer, the line
  * ends after the dot: a dot in front would only make the part wider, and a part wider than its line is
- * cut sooner (`com.` and `kalareach.` and `companion`). A line may also end before an at sign (`git`
- * and `@host`) and before a run of hyphens, so that an option keeps its hyphens: `--cache-dir` ends a
- * line at `--cache` and never between `--` and `cache`. It may end after a run of underscores, and
- * after a run of slashes, backslashes, colons and equals signs: a run of such separators is one place,
- * after its last character. These never end a line: a separator that opens a word (the slash of a
- * path, the dot of `.local`, the underscores of `__init__`), a dot that a digit follows (an address,
- * a version or a file's number is not cut, and no line starts with `.1`), a dot that closes a word
- * (the stop of a sentence, the root dot of a host name), and a run of hyphens that opens a word or
- * follows a quote. A word with a space in it keeps its spaces as the places the engine breaks at
- * already.
+ * cut sooner (`com.` and `kalareach.` and `companion`). The dot follows the same rule after underscores,
+ * whether they open the word or close a part (`_` and `.py`). A line may also end before an internal at
+ * sign (`git` and `@host`, `"sam"` and `@example`) and before a run of hyphens, so that an option keeps
+ * its hyphens: `--cache-dir` ends a line at `--cache` and never between `--` and `cache`. It may end
+ * after a run of underscores, and after a run of slashes, backslashes, colons and equals signs: a run of
+ * such separators is one place, after its last character. These never end a line: a separator that opens
+ * a word (the slash of a path, the dot of `.local`, the underscores of `__init__`, the at sign of
+ * `@types`), a dot that a digit follows (an address, a version or a file's number is not cut, and no
+ * line starts with `.1`), a dot or an at sign that closes a word (the stop of a sentence, the root dot of
+ * a host name), and a run of hyphens that opens a word or follows a quote. A word with a space in it
+ * keeps its spaces as the places the engine breaks at already.
  */
 
 /** The longest part after a dot that keeps the dot in front of it. */
@@ -28,10 +29,17 @@ const SHORT_PART = 4
 /** Separators after which a run ends a line when a word follows. */
 const AFTER_RUN = new Set(['/', '\\', ':', '='])
 
-const OPENERS = new Set(['"', "'", '`', '(', '[', '{', '<'])
+const QUOTES = new Set(['"', "'", '`'])
+
+const OPENERS = new Set([...QUOTES, '(', '[', '{', '<'])
 
 function isWordCharacter(character: string | undefined): boolean {
   return character !== undefined && /[\p{L}\p{N}]/u.test(character)
+}
+
+/** Whether `character` can end a part that a dot or an at sign follows: text, or an underscore of any run. */
+function endsStem(character: string | undefined): boolean {
+  return isWordCharacter(character) || character === '_'
 }
 
 function isLetter(character: string | undefined): boolean {
@@ -96,10 +104,8 @@ function endsLineBefore(characters: readonly string[], at: number): boolean {
   const character = characters[at]
   const before = characters[at - 1]
   const after = characters[at + 1]
-  // The character before is a word character, or the last underscore of a run that closes a part.
-  const closesPart = isWordCharacter(before) || (before === '_' && !underscoresOpen(characters, at - 1))
   if (character === '.') {
-    if (!closesPart) return runAfterSeparator(characters, at)
+    if (!endsStem(before)) return runAfterSeparator(characters, at)
     // Before an internal dot that a letter or an underscore follows, where the part after it is short.
     // A dot that opens or closes a word is no place, and neither is one that a digit follows: a line
     // that starts with `.1` reads as a fraction, so `libfoo.so.1` ends a line before `.so` and not
@@ -108,7 +114,10 @@ function endsLineBefore(characters: readonly string[], at: number): boolean {
   }
   // After an internal dot, where the part that follows it is longer.
   if (before === '.' && dotLeavesLine(characters, at - 1)) return true
-  if (character === '@') return closesPart ? isWordCharacter(after) : runAfterSeparator(characters, at)
+  if (character === '@') {
+    if (AFTER_RUN.has(before)) return runAfterSeparator(characters, at)
+    return isWordCharacter(after) && atSignInside(characters, at)
+  }
   if (character === '-') {
     // Before a run of hyphens that follows a letter or a digit, unless a digit stands on both sides.
     if (before === '-' || !isWordCharacter(before)) return runAfterSeparator(characters, at)
@@ -123,9 +132,20 @@ function endsLineBefore(characters: readonly string[], at: number): boolean {
 
 /** Whether the line ends after the dot at `dot`: an internal dot that a letter follows and a long part. */
 function dotLeavesLine(characters: readonly string[], dot: number): boolean {
-  const before = characters[dot - 1]
-  const closesPart = isWordCharacter(before) || (before === '_' && !underscoresOpen(characters, dot - 1))
-  return closesPart && isLetter(characters[dot + 1]) && partLength(characters, dot + 1) > SHORT_PART
+  return endsStem(characters[dot - 1]) && isLetter(characters[dot + 1]) && partLength(characters, dot + 1) > SHORT_PART
+}
+
+/**
+ * Whether the at sign at `at`, which no run of slashes or the like precedes, stands inside its word:
+ * what stands before it is text, a quote that closes the text it follows (`"sam"@example.com`) or
+ * a closing bracket, not the start of the word, an opening quote or bracket, another at sign, or a dot or
+ * a hyphen (a run of those belongs to what follows).
+ */
+function atSignInside(characters: readonly string[], at: number): boolean {
+  const before = characters[at - 1]
+  if (endsStem(before)) return true
+  if (QUOTES.has(before)) return !opensWord(characters[at - 2])
+  return !(opensWord(before) || before === '@' || before === '.' || before === '-')
 }
 
 /**
