@@ -2600,9 +2600,9 @@ mod procargs2 {
 
 /// KR-REQ-12.07: the macOS argument record is read by position. The second argument is the exact
 /// bytes the kernel holds when the record proves its position, and none where an empty first or
-/// second argument or an argument that is not an absolute path leaves it in doubt. A record the
-/// kernel is not seen to lay out as observed is read as nothing, never as a vector. The vector is
-/// exact wherever the record is read.
+/// second argument or an argument that is not an absolute path leaves it in doubt. A record in
+/// which a check fails is read as nothing, never as a vector. The vector is exact wherever the
+/// record is read as the observed layout.
 #[test]
 fn kr_req_12_07_the_macos_argument_record_is_read_by_position() {
     use std::ffi::OsString;

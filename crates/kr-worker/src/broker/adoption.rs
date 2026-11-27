@@ -893,8 +893,9 @@ pub struct Arguments {
     /// kernel holds: present only where the reading proves that these bytes are the second argument
     /// and that they are an absolute path. An empty first argument on macOS, an empty second
     /// argument, a reading of one argument, a relative path or an option leave it absent, and so
-    /// does a Linux reading that does not end where an argument area ends. A reading that cannot
-    /// be made exact, as a macOS record not laid out as observed, gives no `Arguments` at all.
+    /// does a Linux reading with no zero byte, the one string a retitled process leaves. A reading
+    /// in which a check fails, as a macOS record whose zero bytes or strings do not fit its count
+    /// or a Linux reading cut inside a string, gives no `Arguments` at all.
     pub script_argument: Option<OsString>,
 }
 
@@ -916,7 +917,7 @@ pub const FIRST_READING: usize = 64 * 1024;
 /// and environment strings of a program take (`bprm_stack_limits` in `fs/exec.c`, Linux 6.12 line
 /// 528, which also takes eight bytes of that for each string's pointer). The argument area alone is
 /// below that, so no area of a program started in the usual way fills this buffer; one that does,
-/// which a process with the right to move its own area could make, is refused.
+/// which a process that moved its own area could make, is refused.
 #[cfg(any(target_os = "linux", feature = "testing"))]
 pub const LARGEST_AREA: usize = 6 * 1024 * 1024;
 
@@ -924,7 +925,8 @@ pub const LARGEST_AREA: usize = 6 * 1024 * 1024;
 #[cfg(any(target_os = "linux", feature = "testing"))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum CmdlineReading {
-    /// The call gave fewer bytes than its buffer holds, so it gave the whole area.
+    /// The call gave fewer bytes than its buffer holds: the whole area, unless a page of it could
+    /// not be read, which the kernel leaves out of its answer with no mark.
     Whole(Vec<u8>),
     /// The call filled its buffer, so the area may be longer than what it gave.
     Filled,
@@ -1083,12 +1085,16 @@ const PATH_PADDING: usize = 8;
 /// Reads macOS's `KERN_PROCARGS2` record: the argument count, the path the program was executed
 /// by, zero bytes, the arguments and then the environment.
 ///
-/// The zero bytes after the path are the padding that brings the path to a multiple of eight
-/// bytes, and one more for each empty argument at the front, so with that layout every position is
-/// known and the arguments are read one after another, empty ones included. A record that is not
-/// laid out that way, with fewer zero bytes than the padding, more empty arguments at the front
-/// than the count, or fewer arguments than it counts, is read as nothing: the record does not say
-/// where the arguments end, so nothing that follows the path is taken as an argument.
+/// The record is read as macOS 27.2.1 on Apple silicon lays it out: the zero bytes after the path
+/// are the padding that brings the path to a multiple of eight bytes, and one more for each empty
+/// argument at the front, so with that layout every position is known and the arguments are read
+/// one after another, empty ones included. A record in which a check fails, with fewer zero bytes
+/// than the padding, more empty arguments at the front than the count, or fewer arguments than it
+/// counts, is read as nothing: nothing that follows the path is taken as an argument. A valid
+/// record whose first zero run also holds an empty environment string after an empty argument is
+/// refused the same way. The checks cannot see every other layout: a padding surplus of at most
+/// the count, a shorter padding with leading empty arguments, or a string added or removed before
+/// the arguments gives a record that is read as the observed layout, with the positions moved.
 /// The second argument is also left out where an empty first argument or an empty second one means
 /// that it cannot be told from padding or from nothing.
 #[cfg(any(target_os = "macos", feature = "testing"))]
@@ -1153,7 +1159,8 @@ fn running_image(pid: u32, image: &Path) -> std::path::PathBuf {
 /// On Linux that file is the one the process runs, so a replaced image, whose path the kernel
 /// reports with a suffix that says it is deleted, is refused by the first comparison, and a
 /// replacement executed at the same path by the last. On macOS the file is the one the path names
-/// now, which a replacement inside the reading changes.
+/// now, which a replacement inside the reading changes; the path is read from the kernel and its
+/// status is read at two moments, so a path that is changed back between them is not seen.
 fn still_runs(
     pid: u32,
     image: &Path,
