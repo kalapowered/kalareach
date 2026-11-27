@@ -1486,7 +1486,7 @@
     inset-inline-start: 0;
     z-index: 91;
     flex: none;
-    inline-size: min(max(238px, 14.875rem), calc(100vw - 48px));
+    inline-size: min(max(238px, 14.875rem), calc(100% - 48px));
     padding: 14px 16px 18px;
     border-right: 0;
     border-inline-end: 1px solid var(--line);

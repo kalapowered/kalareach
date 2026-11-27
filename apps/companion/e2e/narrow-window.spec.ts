@@ -11,7 +11,7 @@
 
 import { platform } from 'node:os'
 
-import { expect, test, type Locator, type Page } from '@playwright/test'
+import { chromium, expect, test, type Locator, type Page } from '@playwright/test'
 
 import { screenshotPath } from './evidence'
 import { overrunning, stopWrapping } from './layout'
@@ -618,6 +618,33 @@ test.describe('the words in the top bar', () => {
     const state = await shown(page)
     expect(state.mask, 'no fade').toBe('none')
     expect(state.line, 'a plain line at the lower edge').not.toBe('none')
+  })
+})
+
+test.describe('the strip of the page beside the open drawer', () => {
+  test('a classic scrollbar does not narrow it: the drawer is measured from its own box, not from the window', async ({ baseURL }) => {
+    // WebKit on a Mac draws overlay scrollbars, which take no room whatever the style says: only
+    // Chromium can show the classic one that a person on Windows or Linux has.
+    test.skip(test.info().project.name === 'webkit', 'no classic scrollbar in WebKit on this machine')
+    // The browser that the tests drive hides its scrollbars, so this case drives a browser of its own.
+    const browser = await chromium.launch({ ignoreDefaultArgs: ['--hide-scrollbars'] })
+    try {
+      const page = await (await browser.newContext({ baseURL })).newPage()
+      await openWindow(page, 480, LARGEST)
+      await page.addStyleTag({ content: 'html::-webkit-scrollbar { width: 15px; }' })
+      expect(
+        await page.evaluate(() => window.innerWidth - document.documentElement.clientWidth),
+        'the page has a scrollbar that takes room'
+      ).toBeGreaterThan(0)
+      await menuOf(page).click()
+      await expect(drawerOf(page)).toBeVisible()
+      await expect.poll(() => sidebarLeft(page)).toBe(0)
+      const drawer = await rectangleOf(drawerOf(page))
+      const room = await page.evaluate(() => document.documentElement.clientWidth)
+      expect(room - drawer.width, 'the strip of the page that a press closes the drawer from is 48 points').toBeGreaterThanOrEqual(47.5)
+    } finally {
+      await browser.close()
+    }
   })
 })
 
