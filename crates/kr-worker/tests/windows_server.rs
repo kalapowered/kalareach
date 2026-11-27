@@ -392,6 +392,34 @@ async fn dies_with_its_command_running(server: &Server, conversation: &mut Conve
     }
 }
 
+/// What the server's job holds now, by identity and in a fixed order. A console program that is
+/// started with no console of its own is given a console host, which the system starts as the
+/// program's child, inside the job; it lives for as long as a program uses its console, so a server
+/// that dies with its command running leaves that host with the command.
+fn held_by(server: &Server) -> Vec<ProcessStartIdentity> {
+    let job = server.job();
+    let mut held: Vec<ProcessStartIdentity> = job
+        .process_ids()
+        .expect("the server's job is read")
+        .into_iter()
+        .filter_map(|pid| match job.member(pid) {
+            MemberReading::Held(identity) => Some(identity),
+            _ => None,
+        })
+        .collect();
+    held.sort_by_key(|identity| identity.pid.get());
+    held
+}
+
+/// What the ending forced, in the order `held_by` reads.
+fn forced_in_order(
+    retirement: &kr_worker::broker::server::Retirement,
+) -> Vec<ProcessStartIdentity> {
+    let mut forced = retirement.forced.clone();
+    forced.sort_by_key(|identity| identity.pid.get());
+    forced
+}
+
 /// A server that dies with its command running leaves a command no parent names, and the ending
 /// ends it with the job that held it. The command is in no job of its own: a job of its own that
 /// ends its processes when its last handle closes would end the command as the server dies, and
@@ -405,16 +433,19 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
     let command = command_of(&server).await;
     dies_with_its_command_running(&server, &mut conversation).await;
     assert!(!gone(&command), "the command outlived the server");
+    let left = held_by(&server);
+    assert!(left.contains(&command), "{left:?}");
+    assert!(!left.contains(server.identity()), "{left:?}");
 
     let record = Record::default();
     let begun = Instant::now();
     let watching = watch_until_gone(vec![command.clone()]);
     let retirement = server.retire(&record, begun.into()).await;
     assert_eq!(retirement.ended, Ended::Already, "{retirement:?}");
-    assert_eq!(retirement.forced, vec![command.clone()]);
+    assert_eq!(forced_in_order(&retirement), left, "{retirement:?}");
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
-    assert!(gone(&command));
+    assert!(left.iter().all(gone), "{left:?}");
     // KR-REQ-07.53: it was waited for until the five seconds were over, and no longer.
     let went = watching.await.expect("the watch is joined")[0];
     assert!(
@@ -450,15 +481,18 @@ async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_
     assert!(matches!(session.job.member(pid), MemberReading::Held(_)));
     dies_with_its_command_running(&server, &mut conversation).await;
     assert!(!gone(&command), "the command outlived the server");
+    let left = held_by(&server);
+    assert!(left.contains(&command), "{left:?}");
+    assert!(!left.contains(server.identity()), "{left:?}");
 
     let retirement = server
         .retire(&Record::default(), Instant::now().into())
         .await;
     assert_eq!(retirement.ended, Ended::Already, "{retirement:?}");
-    assert_eq!(retirement.forced, vec![command.clone()]);
+    assert_eq!(forced_in_order(&retirement), left, "{retirement:?}");
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
-    assert!(gone(&command));
+    assert!(left.iter().all(gone), "{left:?}");
 }
 
 /// A server is started with the presented environment less the two variables of the launch and
