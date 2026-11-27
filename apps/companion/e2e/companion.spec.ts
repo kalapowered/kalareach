@@ -3174,6 +3174,194 @@ test.describe("moving a raw view's window", () => {
   })
 })
 
+// The wheel of a raw view in control mode, with a modifier held, with a pointer button held, and over
+// a program that does not read the wheel. Each case runs a scripted host in a real browser engine:
+// the events come from the engine's own input path, with no device, no native code and no touchpad.
+test.describe('the wheel of a raw view in control mode', () => {
+  /** How many moves the page has made with its view. */
+  const moves = (page: Page): Promise<number> =>
+    page.evaluate(() => window.krTestHost?.terminalViews[0]?.moves.length ?? -1)
+
+  /** The turns of every wheel the program has been given, in all. */
+  async function turned(page: Page): Promise<number> {
+    return (await programInputs(page)).reduce((sum, input) => sum + (input.kind === 'wheel' ? input.turns : 0), 0)
+  }
+
+  /** Where the session's cells are, and how big one is. */
+  const cellsOf = (page: Page) =>
+    page.getByTestId('terminal-grid').evaluate((element) => {
+      const box = element.getBoundingClientRect()
+      const style = (element as HTMLElement).style
+      return {
+        x: box.x,
+        y: box.y,
+        width: parseFloat(style.width) / Number(element.getAttribute('data-columns')),
+        height: parseFloat(style.lineHeight)
+      }
+    })
+
+  /** The text size the view draws, which a zoom step changes. */
+  const lineHeight = (page: Page) =>
+    page.getByTestId('terminal-grid').evaluate((element) => (element as HTMLElement).style.lineHeight)
+
+  /**
+   * From here on, every wheel event the page sees once the view has handled it: whether a pointer
+   * button was down by the pointer events the page saw (an engine's own wheel event does not carry the
+   * buttons held), and whether the view cancelled the event.
+   */
+  async function recordWheels(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      const seen: { held: boolean; cancelled: boolean }[] = []
+      let held = false
+      Object.assign(window, { wheelsSeen: seen })
+      window.addEventListener(
+        'pointerdown',
+        () => {
+          held = true
+        },
+        true
+      )
+      for (const ended of ['pointerup', 'pointercancel']) {
+        window.addEventListener(
+          ended,
+          () => {
+            held = false
+          },
+          true
+        )
+      }
+      window.addEventListener('wheel', (event) => {
+        seen.push({ held, cancelled: event.defaultPrevented })
+      })
+    })
+  }
+
+  const wheelsSeen = (page: Page) =>
+    page.evaluate(
+      () => (window as unknown as { wheelsSeen: { held: boolean; cancelled: boolean }[] }).wheelsSeen
+    )
+
+  for (const modifier of ['Control', 'Shift'] as const) {
+    // KR-REQ-13.18: a wheel turned with Control held, and one with Shift held, goes to the program at
+    // the session's cell under the pointer with that modifier set and every turn counted; the text size
+    // stays and the window does not move. It shows the view's own handling in a scripted host, not a
+    // mouse or a touchpad of a person's, and not what a program does with the modifier.
+    test(`a wheel with ${modifier} held goes to the program with it, and the view neither zooms nor moves`, async ({
+      page
+    }) => {
+      await openControlledTerminal(page)
+      const surface = page.getByTestId('terminal-surface')
+      await expect(surface).toContainText('$ cargo test -p kr-client')
+      await recordWheels(page)
+      const cell = await cellsOf(page)
+      const size = await lineHeight(page)
+      const moved = await moves(page)
+
+      // Over the session's column 4 and line 2, three rows of wheel towards the person.
+      await page.mouse.move(cell.x + 4.5 * cell.width, cell.y + 2.5 * cell.height)
+      await page.keyboard.down(modifier)
+      await page.mouse.wheel(0, 3 * cell.height)
+      await page.keyboard.up(modifier)
+      await expect.poll(() => turned(page)).toBe(3)
+      const wheels = (await programInputs(page)).filter((input) => input.kind === 'wheel')
+      expect(wheels.length).toBeGreaterThan(0)
+      for (const input of wheels) {
+        expect(input).toMatchObject({
+          kind: 'wheel',
+          take: 1,
+          column: 4,
+          line: 2,
+          control: modifier === 'Control',
+          shift: modifier === 'Shift',
+          alt: false
+        })
+      }
+      await expect(surface).toHaveAttribute('data-wheel-to-application', String(wheels.length))
+      // The view took the event for the program: the page's own zoom or scroll is not left to act.
+      expect(await wheelsSeen(page)).toEqual([{ held: false, cancelled: true }])
+      expect(await lineHeight(page)).toBe(size)
+      expect(await moves(page)).toBe(moved)
+      await expect(page.getByTestId('terminal-position')).toHaveText('')
+    })
+  }
+
+  // KR-REQ-13.18: while a pointer button is held and moving over the surface in control mode, a wheel
+  // turn goes to the program at the cell under the pointer and the window does not move, and the same
+  // wheel after the release goes to it again. It shows a pointer held in a scripted host in a real
+  // engine, not a touchpad's own wheel events, which no browser test of ours can send.
+  test('a wheel turned while a pointer button is held and moving goes to the program, and again after the release', async ({
+    page
+  }) => {
+    await openControlledTerminal(page)
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    await recordWheels(page)
+    const cell = await cellsOf(page)
+    const size = await lineHeight(page)
+    const moved = await moves(page)
+
+    // Down on the session's column 4 and line 1, and three rows down with the button held: the drag
+    // that moves the window in view mode.
+    const x = cell.x + 4.5 * cell.width
+    await page.mouse.move(x, cell.y + 1.5 * cell.height)
+    await page.mouse.down()
+    await page.mouse.move(x, cell.y + 4.5 * cell.height, { steps: 6 })
+    // Two rows of wheel, with the button still down, over column 4 and line 4.
+    await page.mouse.wheel(0, 2 * cell.height)
+    await expect.poll(() => turned(page)).toBe(2)
+    expect(await moves(page)).toBe(moved)
+    await page.mouse.up()
+
+    // The same wheel after the release.
+    await page.mouse.wheel(0, 2 * cell.height)
+    await expect.poll(() => turned(page)).toBe(4)
+    const wheels = (await programInputs(page)).filter((input) => input.kind === 'wheel')
+    for (const input of wheels) {
+      expect(input).toMatchObject({ kind: 'wheel', take: 1, column: 4, line: 4, shift: false, control: false })
+    }
+    await expect(surface).toHaveAttribute('data-wheel-to-application', String(wheels.length))
+    // The first was turned with the button down, the second with none, and the view took both.
+    expect(await wheelsSeen(page)).toEqual([
+      { held: true, cancelled: true },
+      { held: false, cancelled: true }
+    ])
+    expect(await moves(page)).toBe(moved)
+    expect(await lineHeight(page)).toBe(size)
+    await expect(page.getByTestId('terminal-position')).toHaveText('')
+  })
+
+  // KR-REQ-13.18: over a program that does not read the wheel, a wheel turned in control mode sends the
+  // program nothing, and the view neither moves its window nor changes the text size with it. It shows
+  // the view in a scripted host, not what a real program does when it reports no mouse.
+  test('a wheel over a program that does not read it sends nothing and moves nothing', async ({ page }) => {
+    await openSession(page)
+    await page.evaluate(() => {
+      window.krTestHost?.terminalWheel('unreported')
+    })
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await page.getByTestId('raw-terminal').waitFor()
+    await takeControl(page)
+    const surface = page.getByTestId('terminal-surface')
+    await expect(surface).toContainText('$ cargo test -p kr-client')
+    await expect(page.getByTestId('terminal-mode-sentence')).toContainText('not using the wheel')
+    await recordWheels(page)
+    const cell = await cellsOf(page)
+    const size = await lineHeight(page)
+    const moved = await moves(page)
+
+    await page.mouse.move(cell.x + 4.5 * cell.width, cell.y + 2.5 * cell.height)
+    await page.mouse.wheel(0, 3 * cell.height)
+    // The page has the event once the view has had it: nothing is waited for by time.
+    await expect.poll(async () => (await wheelsSeen(page)).length).toBe(1)
+    expect(await turned(page)).toBe(0)
+    expect((await programInputs(page)).filter((input) => input.kind === 'wheel')).toEqual([])
+    await expect(surface).toHaveAttribute('data-wheel-to-application', '0')
+    expect(await moves(page)).toBe(moved)
+    expect(await lineHeight(page)).toBe(size)
+    await expect(page.getByTestId('terminal-position')).toHaveText('')
+  })
+})
+
 // KR-REQ-13.19: a window as narrow as a phone. Nothing runs past the window's edge or the
 // terminal's, the controls keep the size they have in a wide window, and they read in the order the
 // keyboard reaches them: along a row, then down to the next.
