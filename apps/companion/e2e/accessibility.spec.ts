@@ -11,7 +11,7 @@ import { platform } from 'node:os'
 
 import { expect, test, type CDPSession, type Page } from '@playwright/test'
 
-import { CLICK_AWAY, targetOf } from '../src/markdown/link-target'
+import { CLICK_AWAY } from '../src/markdown/link-target'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -3210,15 +3210,14 @@ function expectSameRects(listed: readonly Rectangle[], wanted: readonly Rectangl
   })
 }
 
-/** Whether a point lies at least `margin` outside the target (`targetOf`: the region the press gives a rectangle of words) of a line. */
-function outsideTarget(x: number, y: number, line: Rectangle, size: number, margin: number): boolean {
-  const target = targetOf({ left: line[0], top: line[1], right: line[2], bottom: line[3] }, { least: size, beside: size / 2 })
-  return x < target.left - margin || x > target.right + margin || y < target.top - margin || y > target.bottom + margin
+/** The distance from a point to a rectangle, 0 inside it. */
+function distanceTo(x: number, y: number, rect: Rectangle): number {
+  return Math.hypot(Math.max(rect[0] - x, 0, x - rect[2]), Math.max(rect[1] - y, 0, y - rect[3]))
 }
 
 /**
- * The points inside the stand-in box that lie outside the target of every line of the label's text by at least 3 points, as many as
- * `most`, spread along the box: the blank room at the ends of the lines, which no line's target reaches. The label's own inline box
+ * The points inside the stand-in box that lie farther than half the least size from every line rectangle of the label's text, as many
+ * as `most`, spread along the box: the blank room at the ends of the lines, which no line's reach covers. The label's own inline box
  * spans the stand-in box's whole width on the last row (the box sits on one line of the label, at its baseline) and takes hits there,
  * and the engines send a tap near a link's element to it: the points keep the least size and a margin of 8 points from it.
  */
@@ -3234,7 +3233,7 @@ async function blankPoints(page: Page, href: string, size: number, most: number)
   const found: { x: number; y: number }[] = []
   for (let y = box[1] + 2; y < box[3] - 1; y += 3) {
     for (let x = box[0] + 2; x < box[2] - 1; x += 3) {
-      if (lines.every((line) => outsideTarget(x, y, line, size, 3)) && label.every((own) => Math.max(own[0] - x, 0, x - own[2], own[1] - y, y - own[3]) >= size + 8)) found.push({ x, y })
+      if (lines.every((line) => distanceTo(x, y, line) > size / 2) && label.every((own) => Math.max(own[0] - x, 0, x - own[2], own[1] - y, y - own[3]) >= size + 8)) found.push({ x, y })
     }
   }
   const every = Math.max(1, Math.floor(found.length / most))
@@ -3265,7 +3264,7 @@ test.describe('the words of a link', () => {
       await pressPage(page, surface, { width: 320, only: [PLAIN, PLAIN, WORDS_MESSAGES.boxed, PLAIN, PLAIN] })
       await putInBox(page, WORDS_BOXED, true)
       const points = await blankPoints(page, WORDS_BOXED, FINGER[surface], 6)
-      expect(points.length, 'points of the box that lie outside the target of every line of its text').toBeGreaterThan(0)
+      expect(points.length, 'points of the box that lie farther than half the least size from every line of its text').toBeGreaterThan(0)
       for (const point of points) {
         const there = await page.evaluate(({ x, y }) => {
           const element = document.elementFromPoint(x, y)
