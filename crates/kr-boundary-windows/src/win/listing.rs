@@ -10,8 +10,10 @@
 //! shares it for reading only, so that a write through a handle opened after the hold, a rename and
 //! a deletion of a hook or of either file are refused while the tree is held. A writable open that
 //! a process made before the hold makes the hold refuse, and so does a writable section that the
-//! process keeps with its view after it closed the file's handle (read on a guest). A write that
-//! gets past all of this is a change that the end check sees by digest.
+//! process keeps with its view after it closed the file's handle: the guest case
+//! `config_hold_a_hook_is_refused_with_a_writer_and_with_its_writable_view_after_the_handle_closes_and_is_held_after_both_are_gone`
+//! shows the open with its view, and then the view alone. A write that leaves other bytes at the
+//! end is seen by digest; one that restores the held bytes is not.
 
 #![allow(unsafe_code)]
 

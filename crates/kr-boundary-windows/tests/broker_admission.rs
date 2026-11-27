@@ -521,7 +521,7 @@ fn broker_admission_the_probe_token_of_each_class_is_asked() {
     }
 }
 
-/// The write rights of a file, each with its mask, in the order the plan lists them.
+/// The write rights of a file, each with its mask, in the order of `FILE_WRITE_RIGHTS`.
 const FILE_MASKS: [(Right, u32); 7] = [
     (Right::WriteData, 0x0002),
     (Right::AppendData, 0x0004),
@@ -1396,7 +1396,7 @@ fn broker_admission_a_tree_beyond_the_bounds_of_the_walk_is_refused_as_too_large
     assert_eq!(
         (LIMITS.objects, LIMITS.depth, LIMITS.time),
         (100_000, 64, Duration::from_secs(60)),
-        "the bounds of the plan"
+        "the bounds of the walk"
     );
     // The tree has five objects: .git, config, HEAD, objects and refs, at most two levels deep.
     let project = Project::make_private(&scratch, "small", &person.sid);

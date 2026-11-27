@@ -183,8 +183,8 @@ pub struct TreeHold {
     pub listing: RepositoryListing,
     /// The states of an operation in progress that the Git folder held when the tree was held.
     pub states: Vec<String>,
-    /// Each listed hook and the attributes file, open for reading and shared for reading only, so
-    /// that no account can write, rename or delete one while the tree is held.
+    /// Each listed hook, the attributes file and the exclude file, open for reading and shared for
+    /// reading only, so that no account can write, rename or delete one while the tree is held.
     pub listed_files: Vec<Handle>,
     /// The tree's path as the platform spells it now: what the journal records.
     pub path: String,
@@ -216,8 +216,11 @@ impl TreeHold {
 
     /// Compares what the tree holds now with what the hold took, after the operation has ended: the
     /// configuration opened afresh by its path (the same file, one name, the same size and bytes),
-    /// each held folder (the same identity and final path), the names that must be absent, and the
-    /// hooks and attributes by name, identity, size and digest.
+    /// each held folder (the same identity and final path), the names that must be absent, a
+    /// `modules` folder, a folder that the person's next Git writes into and that is a link now, a
+    /// state of an operation that the hold did not find, and the hooks, the attributes file and
+    /// the exclude file by name, identity, size and digest. The contents of a state that the hold
+    /// found are not compared.
     ///
     /// # Errors
     ///
