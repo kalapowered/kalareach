@@ -521,10 +521,12 @@ fn broker_sources_a_guard_dropped_by_an_early_return_leaves_a_moved_tree_to_the_
 #[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
 fn broker_sources_a_guard_dropped_by_a_caught_panic_leaves_a_moved_tree_to_the_left_entry() {
     let Some(done) = after_a_dropped_guard("panic", |hold, slot| {
+        // The unwind starts without the panic hook, so the run prints no panic line for the stimulus:
+        // the only `panicked at` line of a failed run is the case's own assertion.
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _slot = slot;
             let _hold = hold;
-            panic!("a panic that the case catches");
+            std::panic::resume_unwind(Box::new("a panic that the case catches"));
         }));
         assert!(caught.is_err(), "the panic was caught");
     }) else {

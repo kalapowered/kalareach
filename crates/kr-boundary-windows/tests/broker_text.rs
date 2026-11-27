@@ -48,12 +48,24 @@ use common::people::{Person, prepare, runs_as_the_system};
 use common::project::{Project, repository_at};
 use common::{Scratch, Substituted, run, smb_connections};
 
-/// A named pipe with one server end that waits for a client, and what it saw.
+/// A kernel handle that is closed when the guard is dropped, so an assertion that fails after the
+/// handle was made cannot leave it open.
+struct Owned(HANDLE);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        // SAFETY: the handle is open and closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A named pipe with one server end that waits for a client, and what it saw. The fields close in
+/// their order: the pipe first, which ends the wait for a client, then the event, and the structure
+/// that the kernel writes into when a client connects last.
 struct PipeServer {
-    pipe: HANDLE,
-    event: HANDLE,
-    // The kernel writes into this when a client connects, so it stays put until the pipe closes.
-    _overlapped: Box<OVERLAPPED>,
+    pipe: Owned,
+    event: Owned,
+    overlapped: Box<OVERLAPPED>,
 }
 
 impl PipeServer {
@@ -73,42 +85,37 @@ impl PipeServer {
             )
         };
         assert_ne!(pipe, INVALID_HANDLE_VALUE, "the case's pipe is made");
+        let pipe = Owned(pipe);
         // SAFETY: a manual-reset event with no name and no security.
         let event = unsafe { CreateEventW(null(), 1, 0, null()) };
         assert!(!event.is_null(), "the case's event is made");
+        let event = Owned(event);
         // SAFETY: the structure is plain data, and zero is its valid initial state.
         let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
-        overlapped.hEvent = event;
+        overlapped.hEvent = event.0;
+        // From here every handle has its owner, and the structure belongs to the server that
+        // closes the pipe before it frees it, whichever assertion fails.
+        let mut server = PipeServer {
+            pipe,
+            event,
+            overlapped,
+        };
         // SAFETY: the pipe is open for overlapped use, and the structure lives as long as the
         // pipe does.
-        let connected = unsafe { ConnectNamedPipe(pipe, &raw mut *overlapped) };
+        let connected = unsafe { ConnectNamedPipe(server.pipe.0, &raw mut *server.overlapped) };
         // SAFETY: reads the calling thread's last error.
         let error = unsafe { GetLastError() };
         assert!(
             connected == 0 && (error == ERROR_IO_PENDING || error == ERROR_PIPE_CONNECTED),
             "the pipe waits for a client: error {error}"
         );
-        PipeServer {
-            pipe,
-            event,
-            _overlapped: overlapped,
-        }
+        server
     }
 
     /// Whether a client has opened the pipe, after giving a late one two seconds to arrive.
     fn saw_a_connection(&self) -> bool {
         // SAFETY: the event is open.
-        unsafe { WaitForSingleObject(self.event, 2000) == WAIT_OBJECT_0 }
-    }
-}
-
-impl Drop for PipeServer {
-    fn drop(&mut self) {
-        // SAFETY: both handles are open and closed once.
-        unsafe {
-            CloseHandle(self.pipe);
-            CloseHandle(self.event);
-        }
+        unsafe { WaitForSingleObject(self.event.0, 2000) == WAIT_OBJECT_0 }
     }
 }
 
