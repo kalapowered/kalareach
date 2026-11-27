@@ -224,14 +224,16 @@ function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
   return page.evaluate(
     (bound) =>
       new Promise<number>((resolve, reject) => {
+        const end = performance.now() + bound
         let last = window.scrollY
         let since = performance.now()
         let frames = 0
         let over = false
-        const deadline = setTimeout(() => {
+        const fail = (): void => {
           over = true
           reject(new Error(`the page was still scrolling after ${bound} ms: its last read was ${last}`))
-        }, bound)
+        }
+        const deadline = setTimeout(fail, bound)
         const tick = (): void => {
           if (over) return
           const now = window.scrollY
@@ -244,7 +246,10 @@ function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
           }
           if (frames >= 3 && performance.now() - since >= 100) {
             clearTimeout(deadline)
-            resolve(now)
+            // A frame that comes after the deadline is late whatever it finds: the timer's own task may
+            // not have run yet, so the clock is read here too.
+            if (performance.now() >= end) fail()
+            else resolve(now)
             return
           }
           requestAnimationFrame(tick)
@@ -1103,6 +1108,24 @@ test.describe('the drawer on a page that scrolls', () => {
 })
 
 test.describe('what moves', () => {
+  test('the used mark of the drawer goes with the narrow form: absent when wide, "false" when narrowed again', async ({ page }) => {
+    await openWindow(page, 600)
+    const sidebar = page.locator('aside.sidebar')
+    await expect(sidebar, 'a drawer nobody has opened is not used').toHaveAttribute('data-used', 'false')
+    await menuOf(page).click()
+    await expect(drawerOf(page)).toBeVisible()
+    await expect(sidebar, 'a drawer a person has opened is used').toHaveAttribute('data-used', 'true')
+    await page.setViewportSize({ width: 800, height: HEIGHT })
+    await expect(menuOf(page)).toHaveCount(0)
+    expect(await sidebar.getAttribute('data-used'), 'the wide form has no mark').toBeNull()
+    await page.setViewportSize({ width: 600, height: HEIGHT })
+    await expect(menuOf(page)).toBeVisible()
+    await expect(sidebar, 'narrowed again, the drawer is not yet used').toHaveAttribute('data-used', 'false')
+    await menuOf(page).click()
+    await expect(drawerOf(page)).toBeVisible()
+    await expect(sidebar, 'opened again by a person, it is used').toHaveAttribute('data-used', 'true')
+  })
+
   test('a pointer opens the drawer by travel from the edge it rests against, and a keyboard does not', async ({ page }) => {
     await openWindow(page, 600)
     const rest = await sidebarLeft(page)
@@ -1334,6 +1357,51 @@ test.describe('under a right-to-left root', () => {
     expect(Math.abs(now.y - was.y)).toBeLessThanOrEqual(1)
     expect(Math.abs(now.height - was.height)).toBeLessThanOrEqual(1)
     expect(now.width).toBeGreaterThanOrEqual(was.width - 1)
+  })
+})
+
+/**
+ * The scroll wait of these cases fails when the page cannot show it is at rest in time. It is read on
+ * a blank page: the frames it counts are stubbed, and so is the page's clock.
+ */
+test.describe('the cases\' own wait for the page to stop scrolling', () => {
+  test('a page that draws no frame fails at the deadline, and says so', async ({ page }) => {
+    await page.goto('about:blank')
+    await page.evaluate(() => {
+      window.requestAnimationFrame = () => 0
+    })
+    const started = Date.now()
+    await expect(settledScroll(page, 300)).rejects.toThrow(/still scrolling after 300 ms/)
+    expect(Date.now() - started, 'it did not wait for a frame that never comes').toBeLessThan(2500)
+  })
+
+  test('a quiet that is reached after the deadline is not a success', async ({ page }) => {
+    await page.goto('about:blank')
+    // The page's clock jumps past the deadline as the second frame is drawn: the three frames and the
+    // 100 ms of quiet that follow are all there, and all late.
+    await page.evaluate(() => {
+      const now = performance.now.bind(performance)
+      let skew = 0
+      performance.now = () => now() + skew
+      const frame = window.requestAnimationFrame.bind(window)
+      let drawn = 0
+      window.requestAnimationFrame = (callback) =>
+        frame((time) => {
+          drawn += 1
+          if (drawn === 2) skew = 60_000
+          callback(time)
+        })
+    })
+    await expect(settledScroll(page, 3000)).rejects.toThrow(/still scrolling after 3000 ms/)
+  })
+
+  test('a page at rest settles at its position', async ({ page }) => {
+    await page.goto('about:blank')
+    await page.setContent('<div style="height: 3000px"></div>')
+    await page.evaluate(() => {
+      window.scrollTo(0, 240)
+    })
+    expect(await settledScroll(page)).toBe(240)
   })
 })
 
