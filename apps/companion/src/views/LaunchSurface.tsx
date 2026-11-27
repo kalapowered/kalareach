@@ -176,7 +176,9 @@ export function LaunchSurface({
                     }}
                   >
                     <span>{offer.label}</span>
-                    <span className="launch-program">{offer.program}</span>
+                    <span className="launch-program">
+                      <TechnicalWord text={offer.program} />
+                    </span>
                   </Button>
                 ))}
               </div>
@@ -302,7 +304,9 @@ export function LaunchSurface({
                     }}
                   >
                     <span>{offer.label}</span>
-                    <span className="launch-program">{offer.program}</span>
+                    <span className="launch-program">
+                      <TechnicalWord text={offer.program} />
+                    </span>
                   </CommitButton>
                 ))}
               </div>
