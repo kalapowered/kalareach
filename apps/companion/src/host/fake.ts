@@ -869,6 +869,8 @@ export interface FakeHostControls {
   setFileNominated(nominated: boolean): void
   /** Makes this build's identity an unstable one, or a stable one again. */
   setIdentityStable(stable: boolean): void
+  /** Names this build's application and the path it runs from, as a host with longer names would. */
+  setIdentityNames(names: { readonly application_id?: string; readonly executable?: string }): void
   /**
    * Moves the host to another desktop: the platform setup reads, the desktop's own context and the
    * records for what it can do. macOS is where the host starts.
@@ -1510,6 +1512,7 @@ export function fakeHost(
   let chosenFile: string | null = null
   let dialogAnswer: string | null = 'notes.txt'
   let identityStable = true
+  let identityNames: { readonly application_id?: string; readonly executable?: string } = {}
   let standingOn: FakeDesktop = 'macos'
   const granted = new Set<string>([
     'desktop.application_launch',
@@ -2293,7 +2296,8 @@ export function fakeHost(
       }),
     onAuthorisedFileChanged: () => registering.then(() => () => undefined),
 
-    setupIdentity: () => Promise.resolve(setupIdentity(identityStable, connected, standingOn)),
+    setupIdentity: () =>
+      Promise.resolve({ ...setupIdentity(identityStable, connected, standingOn), ...identityNames }),
 
     openSettingsPane: (pane) => {
       const found = SETTINGS_PANES.find((each) => each.id === pane)
@@ -4373,6 +4377,9 @@ export function fakeHost(
     },
     setIdentityStable(stable) {
       identityStable = stable
+    },
+    setIdentityNames(names) {
+      identityNames = names
     },
     setDesktop(desktop) {
       standingOn = desktop
