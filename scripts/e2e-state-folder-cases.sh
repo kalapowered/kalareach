@@ -10,7 +10,9 @@
 # both scripts stop soon after the check, at the missing /bin/launchctl or at their platform test,
 # before they start anything. Run it in a container with a private /tmp, or with TMPDIR naming a
 # private folder (one that only the caller can write): every folder it makes lies in a scratch
-# folder that it makes there with mode 700.
+# folder that it makes there with mode 700. This plain form is for the cases as they are: a changed
+# or mutated copy of the library or of the scripts runs only in the container form (the whole root
+# read-only, a private temporary directory, a private process namespace).
 #
 # Every run is given a temporary directory of its own (TMPDIR), made below the scratch folder, so
 # that a folder inside it, a folder outside it and the directory itself can all be named. A refused
@@ -1035,6 +1037,16 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
     ok "$script starts its daemon inside the state folder, named ., and runs every kr command there, its cleanup included"
   fi
 done
+
+echo "== the library's header and the workflow's comment say what the check does not stop"
+cases=$((cases + 1))
+if ! grep -Fq "OWN account that moves a folder" "$root/scripts/lib/e2e-state-folder.sh"; then
+  fail "the library's header does not say that a process of the caller's own account that moves the chain is not stopped"
+elif ! grep -Fq "caller's own account that moves the chain after the check" "$root/.github/workflows/core-ci.yml"; then
+  fail "the workflow's comment does not say that a process of the caller's own account that moves the chain is not stopped"
+else
+  ok "the header and the workflow's comment name the limit"
+fi
 
 echo "e2e-state-folder-cases: $cases cases, scratch folders under $scratch"
 exit "$failed"

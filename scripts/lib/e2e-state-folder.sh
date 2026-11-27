@@ -51,8 +51,9 @@
 # that has changed). The check leaves the physical name of the state folder in E2E_STATE_FOLDER,
 # and the inode that was listed in E2E_STATE_FOLDER_ID. Every later use of the state folder in a
 # script runs through `e2e_state_folder_enter`, in a subshell: it changes into that physical name
-# once and looks again at what it is in (the name, the owner, the mode, the inode, the marker). A
-# script takes the folder's name from the working directory it is in, never from KR_E2E_STATE.
+# once and looks again at what it is in (the name, the inode, the marker). A script runs a `kr`
+# command or the daemon from inside the folder with the folder named `.`, and takes the folder's name
+# from the working directory it is in, never from KR_E2E_STATE.
 #
 # A refusal names a folder of the chain that its group or others can write with that folder's mode,
 # or a folder with an access list entry, so that a person knows what to change. Where a folder on the
@@ -60,7 +61,19 @@
 # listing, or a name that ends in a line feed and was cut there), the refusal adds fixed words after
 # the rule's sentence. A refusal has no effect. The check makes the one folder and the one file it
 # names, and when it cannot finish it removes the marker and the folder that it made, and nothing
-# else.
+# else; where it cannot remove one of them, the refusal says what is left.
+#
+# What the check does not stop. The started program inherits its working directory, and the product
+# turns that into a name and opens each file by that name, so the check holds only for as long as
+# the folders of the chain are not moved: a process of the caller's OWN account that moves a folder
+# of the chain after the walk is not stopped, and such a process can unload service jobs and end
+# processes directly, so no check of a name could keep it from them. Holding the root by a handle
+# is a change of the product and is not made here. The walk starts at the temporary directory: the
+# folders above it belong to the operating system and are not walked (a walk from the top of the
+# file system would refuse every run in a container, where the system's folders show as another
+# account's, and no supported host lets another account write them). Another account is stopped
+# only where it cannot write a folder of the chain, by its mode, its owner and, on macOS, its access
+# list; on Linux the group bits of the mode mask a list.
 
 # e2e_state_folder_list <entry>: reads <entry> (a name in the working directory, `.`, or a path) with
 # ONE listing that does not follow a link, and leaves what it shows in e2e_state_folder_ino (the
