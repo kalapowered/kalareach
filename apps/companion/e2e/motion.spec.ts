@@ -654,8 +654,9 @@ test.describe('motion', () => {
   // colour over the control's surface: the pixel sampled inside the control moves toward the label's
   // colour from the same pixel with the pointer resting on the control, and, with the pointer slid
   // off while the press is held (as on a touch screen, where nothing hovers), from the pixel at
-  // rest; the label keeps its contrast against both. A switch's thumb stands in its new place at once. Without
-  // reduced motion the same press scales a button and tints nothing, so the case cannot pass on a
+  // rest; the label keeps its contrast against both. A switch's track takes the same tint while it is
+  // held, in both of its states and not when it cannot be changed, and its thumb stands in its new place
+  // at once. Without reduced motion the same press scales a button and tints nothing, so the case cannot pass on a
   // page where nothing ever scales.
   test('a held press moves no control with reduced motion and tints it, and scales a button without it', async ({
     page
@@ -668,8 +669,8 @@ test.describe('motion', () => {
       await page.evaluate(startTransformRecord)
 
       // `floor` is the contrast the label needs against the pressed surface: 4.5 for text, 3 for a
-      // glyph that has no text.
-      const answers = async (kind: string, control: Locator, floor: number): Promise<void> => {
+      // glyph that has no text, and none for a control that has no label, such as a switch.
+      const answers = async (kind: string, control: Locator, floor: number | null): Promise<void> => {
         const where = `${kind}, ${colorScheme} theme`
         await control.scrollIntoViewIfNeeded()
         const box = await control.boundingBox()
@@ -691,10 +692,12 @@ test.describe('motion', () => {
             tintedToward(hovered, surface, label),
             `${where}: pressed ${show(surface)} against hover ${show(hovered)}`
           ).toBe(true)
-          expect(
-            contrast(label, surface),
-            `${where}: the label ${show(label)} against the pressed surface ${show(surface)}`
-          ).toBeGreaterThanOrEqual(floor)
+          if (floor !== null) {
+            expect(
+              contrast(label, surface),
+              `${where}: the label ${show(label)} against the pressed surface ${show(surface)}`
+            ).toBeGreaterThanOrEqual(floor)
+          }
 
           // With the pointer slid off and the press still held, as on a touch screen where nothing
           // hovers, it is a tint over the surface at rest.
@@ -706,10 +709,12 @@ test.describe('motion', () => {
             tintedToward(rest, alone, label),
             `${where}: pressed ${show(alone)} against rest ${show(rest)}`
           ).toBe(true)
-          expect(
-            contrast(label, alone),
-            `${where}: the label ${show(label)} against the pressed surface ${show(alone)}, no hover`
-          ).toBeGreaterThanOrEqual(floor)
+          if (floor !== null) {
+            expect(
+              contrast(label, alone),
+              `${where}: the label ${show(label)} against the pressed surface ${show(alone)}, no hover`
+            ).toBeGreaterThanOrEqual(floor)
+          }
         })
       }
 
@@ -731,6 +736,7 @@ test.describe('motion', () => {
       await page.getByRole('button', { name: 'Sharing' }).click()
       const toggle = page.getByRole('switch', { name: 'Let a viewer answer questions' })
       const thumb = toggle.locator('.switch-thumb')
+      await answers('switch', toggle, null)
       const before = await shown(thumb)
       await toggle.click()
       await twoFrames(page)
@@ -743,6 +749,25 @@ test.describe('motion', () => {
       expect(after.transform, 'the thumb has moved').not.toBe(before.transform)
       expect(after.moving, 'animations of the thumb').toEqual([])
       expect(after.runs, 'transitions of the thumb that started').toBe(0)
+
+      // The track takes the tint in its other state too, and a switch that cannot be changed now takes
+      // none: a press that does nothing must not look like one that does.
+      await answers('switch, changed', toggle, null)
+      await toggle.evaluate((node) => {
+        node.setAttribute('aria-disabled', 'true')
+      })
+      const box = await toggle.boundingBox()
+      if (!box) throw new Error('the switch has no box to press')
+      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+      await twoFrames(page)
+      const resting = await surfaceOf(page, probe, toggle)
+      await held(page, toggle, async () => {
+        const pressed = await surfaceOf(page, probe, toggle)
+        expect(
+          pressed.map((value, channel) => Math.abs(value - (resting[channel] ?? 0))).every((delta) => delta <= 1),
+          `a switch that cannot be changed, ${colorScheme} theme: pressed ${show(pressed)} against resting ${show(resting)}`
+        ).toBe(true)
+      })
     }
 
     // Without reduced motion the press is the scale and nothing else: no tint.
