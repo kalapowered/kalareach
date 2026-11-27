@@ -97,10 +97,13 @@ interface HeldAtChange {
  * that has the focus when the window changes form is kept in `held`, with the form that the change
  * leads to: the change is told before the page is drawn again, while the controls the new form takes
  * away are still there. An engine that draws the new form first has taken the focus off a control
- * that the form hides, and `held` is that one. The record belongs to the change that made it: one
- * made for another form, or left by a change that did not change the page's form, is dropped at
- * the next change, and a focus that has come to rest on a control since is where the person is, not
- * the record.
+ * that the form hides, and `held` is that one. The record holds a form, not the identity of a
+ * change: a later change to that form keeps it while the focus is on the body or on nothing,
+ * whichever change made it, and a focus that rests on a control replaces it, for that is where the
+ * person is. Two schedules have no case: a record that is never told of, which stays until a change
+ * to its form finds the focus on the body, and the record then moves the focus; and a render that
+ * comes before the telling, where the layout effect that reads the record does not ask where the
+ * focus is.
  */
 function useNarrow(held: { current: HeldAtChange | null }): boolean {
   const subscribe = useCallback(
@@ -110,6 +113,8 @@ function useNarrow(held: { current: HeldAtChange | null }): boolean {
       // An engine may draw the new form before it tells of the change, and by then it has taken the
       // focus off a control that the new form hides and given it to no other: that control is the
       // one that held it. A focus that went to another control was moved, not lost, and is not kept.
+      // A focus that left for no control does not say why: a press on a part that takes no focus, or a
+      // window that lost the focus, leaves it the same way, and is kept the same way.
       const blurred = (event: FocusEvent): void => {
         if (query.matches !== form && event.relatedTarget === null && event.target instanceof Element) {
           held.current = { control: event.target, narrow: query.matches }

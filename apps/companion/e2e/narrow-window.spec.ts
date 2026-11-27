@@ -706,7 +706,9 @@ test.describe('the words in the top bar', () => {
    * The shell's smallest window is 480 points high. At the largest text size the box cannot hold two
    * whole lines there: it is held to a fifth of the window, 96 points, about 1.7 lines of 56, and the
    * fade starts after about 1.2. What holds at that height is that the bar keeps to its share, the
-   * first line is whole and clear of the fade, and the whole reason is reached by the keys.
+   * first line is whole and clear of the fade, and the whole reason is reached by the keys. The
+   * cases test the upper bound only: a ceiling under a fifth of the window, 18 % of it for one, passes
+   * every assertion below.
    */
   for (const width of [480, 720] as const) {
     test(`${width} points wide and 480 high at the largest size: the words keep to a fifth of the window, the first line is clear, and the keys reach the end`, async ({
@@ -1209,10 +1211,14 @@ test.describe('the focus when the window narrows, whichever of the drawing and t
 })
 
 /**
- * What had the focus as the window changed form is kept for that change, and for no other. A person
- * who put the focus on the page after the new form was drawn, and before the page was told, keeps
- * it there; and a record that a change made without changing the page's form is not used by the
- * next change, which finds the focus where the person has put it.
+ * What had the focus as the window changed form is kept for the form that the change leads to, not
+ * for the change: the record holds a form. The two cases show a person who put the focus on the page
+ * after the new form was drawn, and before the page was told, keeping it there; and a record that a
+ * change made without changing the page's form, which the next change does not use because the focus
+ * is on the page's `main` by then: that case is held by the test of where the focus is alone. No
+ * case kills the form test of the layout effect that reads the record, the test of the focus that
+ * left for no control, or the form test of the keeping. Two schedules have no case: a record that is
+ * never told of, and a render that comes before the telling.
  */
 test.describe('the focus that the person moved while the window changed form stays where it is', () => {
   for (const [width, ratio] of [

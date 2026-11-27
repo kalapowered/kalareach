@@ -1606,8 +1606,12 @@
   .topbar .connection[data-more='true'] {
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
-    /* Only the half line at the lower edge fades: where the box holds 2.5 lines the two whole lines
-       above it stay as they are, and in a shorter box what is above the half line is clear. */
+    /* Where `lh` is known only the half line at the lower edge fades: where the box holds 2.5 lines
+       the two whole lines above it stay as they are, and in a shorter box what is above the half line
+       is clear. Where it is not known the pair above stands, and that fades a whole line, 1.5em: at
+       the largest text size in the smallest window, 480 points high, the box is 58 points, about one
+       line, and the fade starts 1.5 points below its top, so the first line lies under it; the first
+       line is clear of that fade only from a window about 935 points high. */
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
   }

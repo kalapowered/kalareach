@@ -920,7 +920,9 @@ export function useModalSurface(
     // there lands behind it. The focus that lands in a part that the surface excludes goes to the
     // surface's first control. A message's own controls are in none of those parts and stay reachable.
     // A focus that the page puts into one of those parts on purpose while the surface is open goes
-    // back too, so code that does so closes the surface first, as a message's action does.
+    // back too, so code that does so closes the surface first and puts the focus after the close has
+    // taken effect, as a message's action does. A handler that closes the surface and then calls
+    // `focus()` in the same turn still meets the listener: the close is committed later.
     const onFocus = (event: FocusEvent): void => {
       const target = event.target
       if (target instanceof Node && excluded.some((part) => part.contains(target))) focusable()[0]?.focus()
