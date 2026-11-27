@@ -367,18 +367,22 @@ impl MatchRule {
     }
 }
 
-/// How far the version a host established for a program fits the ranges a package declares.
+/// How far the version a host established for a program fits the ranges one rule is held to: the
+/// rule's own range and the further ranges the host passes with it, such as the range a
+/// connector's protocol is qualified for.
 ///
 /// The variants are in rank order: a package that covers the version ranks above one that says
-/// nothing about it, and that above one that refuses it.
+/// nothing about it, and that above one that refuses it. A package ranks by its best rule, so a
+/// package one of whose rules admits the version covers it even where another rule of the same
+/// package refuses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Coverage {
-    /// The version is known and some range the package declares refuses it.
+    /// The version is known and a range the rule is held to refuses it.
     Excludes,
-    /// The package declares no range, or the host established no version: nothing is established
-    /// for or against the package.
+    /// The rule is held to no range, or the host established no version: nothing is established
+    /// for or against the rule's package.
     Neutral,
-    /// The version is known and every range the package declares admits it.
+    /// The version is known and every range the rule is held to admits it.
     Covers,
 }
 
@@ -399,7 +403,7 @@ pub struct Candidate {
     /// Whether the rule recognised the program by an installation location it names, as well as
     /// by the executable's name.
     pub located: bool,
-    /// How far the program's version fits the ranges this rule and its package declare.
+    /// How far the program's version fits the ranges this rule is held to.
     pub coverage: Coverage,
 }
 
@@ -433,7 +437,10 @@ pub enum Resolution {
 /// does: a package's claim about the version of a program is its own, and the host cannot check
 /// it, so a package of another publisher that claims a version does not take a program from
 /// another this way. A package ranks by its best rule, and a package that is alone is chosen
-/// whatever its coverage. Then an exact rule beats an inferred one. Of the rules left, one
+/// whatever its coverage. A rule whose range refuses the version gives its package neither its
+/// installation location nor its exact confidence where another candidate ranks above it: each
+/// rule is one claim, and only the highest tier goes on to the steps below. Then an exact rule
+/// beats an inferred one. Of the rules left, one
 /// that matched an installation location its package names beats one that matched the executable's
 /// name alone, when one publisher published every package left, through one repository: the
 /// location says which product is installed there, and the name is shared by products that are
