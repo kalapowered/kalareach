@@ -81,6 +81,7 @@ import { sayingAddresses, ServiceAddress } from './ServiceAddress'
 import { SettingsChoiceForm } from './SettingsChoice'
 import { SettingsDevices } from './SettingsDevices'
 import { Button, Card, Switch } from './ui'
+import { Wording } from './Wording'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
 type Place = 'service' | 'settings' | 'devices' | 'recovery' | 'restore'
@@ -747,7 +748,7 @@ export function SyncPanel({
                     data-testid="recovery-host"
                     data-state={hostCover.state}
                   >
-                    {describeHostCover(hostCover)}
+                    <Wording of={describeHostCover(hostCover)} />
                   </p>
                 ) : null}
                 {confirmingReplace ? (

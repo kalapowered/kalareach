@@ -17,6 +17,7 @@ import type {
   SettingsLine,
   SettingsRestored
 } from '../host/port'
+import { technical, type Wording } from './wording'
 
 /** What recovery is for, and what the kit is. */
 export const RECOVERY_HELP =
@@ -121,38 +122,39 @@ export function offersReplacement(view: HostCoverView | null): boolean {
   )
 }
 
-function describeLeft(why: HostLeft): string {
+function describeLeft(why: HostLeft): Wording {
   switch (why.reason) {
     case 'no_service':
-      return 'The host on this computer uses no storage service, so it has no backups to cover. Nothing was changed.'
+      return ['The host on this computer uses no storage service, so it has no backups to cover. Nothing was changed.']
     case 'other_service':
-      return (
-        `The host stores its backups at ${why.host}, which is not the service this recovery is ` +
-        'kept at. Nothing was changed.'
-      )
+      return [
+        'The host stores its backups at ',
+        technical(why.host),
+        ', which is not the service this recovery is kept at. Nothing was changed.'
+      ]
     case 'sign_in':
-      return (
+      return [
         'The host is not signed in in a way that lets it keep backups. Sign the host in, then ' +
-        'cover its backups. Nothing was changed.'
-      )
+          'cover its backups. Nothing was changed.'
+      ]
     case 'setup_under_way':
-      return (
+      return [
         'A setup of the host\'s backups has not ended. Wait for it, then cover them. Nothing ' +
-        'was changed.'
-      )
+          'was changed.'
+      ]
     case 'other_kit':
-      return (
+      return [
         `The host's backups are set up under another kit (${why.host_fingerprint}), so this ` +
-        'recovery does not open them. Keep the kit printed when they were set up: it still opens ' +
-        'them. Nothing was changed.'
-      )
+          'recovery does not open them. Keep the kit printed when they were set up: it still opens ' +
+          'them. Nothing was changed.'
+      ]
     case 'unusable':
-      return (
+      return [
         'The host\'s backups are set up under this recovery, but the host cannot make backups ' +
-        'now. Nothing was changed.'
-      )
+          'now. Nothing was changed.'
+      ]
     case 'declined':
-      return `${DECLINED_BECAUSE[why.cause.kind] ?? DECLINED_BY_DEFAULT} The host's backups were not changed.`
+      return [`${DECLINED_BECAUSE[why.cause.kind] ?? DECLINED_BY_DEFAULT} The host's backups were not changed.`]
   }
 }
 
@@ -175,20 +177,20 @@ const DECLINED_BECAUSE: Readonly<Record<string, string>> = {
 
 const DECLINED_BY_DEFAULT = 'The host did not set its backups up under this recovery.'
 
-/** The sentence that says where covering the host's backups ended. */
-export function describeHostCover(view: HostCoverView): string {
+/** The sentence that says where covering the host's backups ended; a service's host name in it is a technical word. */
+export function describeHostCover(view: HostCoverView): Wording {
   if (view.state === 'left') return describeLeft(view.why)
   if (view.already) {
-    return `The host's backups are set up under this recovery (kit ${view.kit_fingerprint}).`
+    return [`The host's backups are set up under this recovery (kit ${view.kit_fingerprint}).`]
   }
   const replaced =
     view.replaced === null
       ? ''
       : ` What it backed up under the kit ${view.replaced} stays readable with that kit, and the host no longer adds to it.`
-  return (
+  return [
     `The host's backups are set up under this recovery (kit ${view.kit_fingerprint}): this ` +
-    `recovery's kit opens what the host backs up from now on.${replaced}`
-  )
+      `recovery's kit opens what the host backs up from now on.${replaced}`
+  ]
 }
 
 /** The name an offline copy is offered under in the save dialog. */

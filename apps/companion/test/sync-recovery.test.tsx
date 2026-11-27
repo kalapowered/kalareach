@@ -19,6 +19,7 @@ import type { RecoveryView } from '../src/host/port'
 import { MobileApp } from '../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from './purchase-words'
 import { readAloud, shown } from './live-regions'
+import { technicalWordText } from './technical-word-text'
 
 const SIGNED_IN = {
   state: 'signed_in',
@@ -406,6 +407,24 @@ describe('recovery', () => {
     expect(said).toHaveAttribute('data-state', 'left')
     expect(said).toHaveTextContent('no allowance for backup storage')
     expect(said).toHaveTextContent('backups were not changed')
+  })
+
+  it('says which service a host stores its backups at, and draws the host name as a technical word', async () => {
+    const { person, controls, sheet } = await openSheet()
+    act(() => {
+      controls.recovery.set({ state: 'on', kept_at: 'reach.kala.to' })
+      controls.account.set(SIGNED_IN)
+    })
+    const recovery = await within(sheet).findByTestId('recovery')
+    controls.recovery.coverHostAnswers({
+      state: 'left',
+      why: { reason: 'other_service', host: 'sync.example.org' }
+    })
+    await person.click(await within(recovery).findByTestId('recovery-cover-host'))
+    const said = await within(recovery).findByTestId('recovery-host')
+    expect(said).toHaveAttribute('data-state', 'left')
+    expect(said).toHaveTextContent('Nothing was changed')
+    expect(within(said).getByText(technicalWordText('sync.example.org'))).toBeInTheDocument()
   })
 
   it('draws the kit as a QR code and makes offline copies of the bundle and an archive, each where the dialog put it', async () => {
