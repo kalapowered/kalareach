@@ -711,3 +711,427 @@ async fn wait_until_ended(
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use kr_protocol::identity::ProcessStartSource;
+    use tokio::time::Instant;
+
+    use super::*;
+
+    fn process(pid: u64) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(pid, ProcessStartSource::WindowsProcessCreationTime, 1)
+    }
+
+    /// What the ending noted about the processes, as a session's record would.
+    #[derive(Default)]
+    struct Notes {
+        forced: Mutex<Vec<ProcessStartIdentity>>,
+        unsignalled: Mutex<Vec<(ProcessStartIdentity, String)>>,
+    }
+
+    impl Owned for Notes {
+        fn below(&self, _server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+            Vec::new()
+        }
+
+        fn left(&self, _process: &ProcessStartIdentity) -> bool {
+            false
+        }
+
+        fn forced(&self, process: &ProcessStartIdentity) {
+            self.forced.lock().expect("the list").push(process.clone());
+        }
+
+        fn unsignalled(&self, process: &ProcessStartIdentity, why: &str) {
+            self.unsignalled
+                .lock()
+                .expect("the list")
+                .push((process.clone(), why.to_owned()));
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Call {
+        RootRunning,
+        CloseInput,
+        Members,
+        Terminate,
+    }
+
+    /// A tree whose readings a case writes down. Nothing in it is a process: a terminate here is a
+    /// note, so no case of the ladder's order signals anything.
+    struct Fake {
+        begun: Instant,
+        calls: Mutex<Vec<(Call, Duration)>>,
+        /// What the tree holds before it is terminated, by how long after the ending began.
+        before: Box<dyn Fn(Duration) -> Result<Vec<Member>, String> + Send + Sync>,
+        /// What it holds after, one reading each; the last is read again and again.
+        after: Mutex<VecDeque<Result<Vec<Member>, String>>>,
+        /// When the root ends of itself, or never.
+        root_ends_at: Option<Duration>,
+        /// Whether the terminate ends the root.
+        terminate_ends_root: bool,
+        terminate_answer: Result<(), String>,
+        terminated: Mutex<bool>,
+    }
+
+    impl Fake {
+        fn new(
+            begun: Instant,
+            before: impl Fn(Duration) -> Result<Vec<Member>, String> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                begun,
+                calls: Mutex::new(Vec::new()),
+                before: Box::new(before),
+                after: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+                root_ends_at: None,
+                terminate_ends_root: true,
+                terminate_answer: Ok(()),
+                terminated: Mutex::new(false),
+            }
+        }
+
+        fn after(self, readings: Vec<Result<Vec<Member>, String>>) -> Self {
+            *self.after.lock().expect("the readings") = readings.into();
+            self
+        }
+
+        fn note(&self, call: Call) {
+            self.calls
+                .lock()
+                .expect("the calls")
+                .push((call, self.begun.elapsed()));
+        }
+
+        fn calls(&self) -> Vec<(Call, Duration)> {
+            self.calls.lock().expect("the calls").clone()
+        }
+
+        fn when(&self, wanted: Call) -> Vec<Duration> {
+            self.calls()
+                .into_iter()
+                .filter(|(call, _)| *call == wanted)
+                .map(|(_, at)| at)
+                .collect()
+        }
+
+        fn terminated(&self) -> bool {
+            *self.terminated.lock().expect("the flag")
+        }
+    }
+
+    impl Tree for Fake {
+        async fn root_running(&self) -> bool {
+            self.note(Call::RootRunning);
+            if self.terminated() && self.terminate_ends_root {
+                return false;
+            }
+            self.root_ends_at
+                .is_none_or(|ends| self.begun.elapsed() < ends)
+        }
+
+        fn close_input(&self) {
+            self.note(Call::CloseInput);
+        }
+
+        async fn members(&self) -> Result<Vec<Member>, String> {
+            self.note(Call::Members);
+            if !self.terminated() {
+                return (self.before)(self.begun.elapsed());
+            }
+            let mut after = self.after.lock().expect("the readings");
+            if after.len() > 1 {
+                after.pop_front().expect("a reading")
+            } else {
+                after.front().cloned().expect("a reading")
+            }
+        }
+
+        async fn terminate(&self) -> Result<(), String> {
+            self.note(Call::Terminate);
+            *self.terminated.lock().expect("the flag") = true;
+            self.terminate_answer.clone()
+        }
+    }
+
+    fn held(pids: &[u64]) -> Vec<Member> {
+        pids.iter().map(|pid| Member::Held(process(*pid))).collect()
+    }
+
+    const ROOT: u64 = 10;
+    const COMMAND: u64 = 11;
+
+    /// A tree that holds the server and its command until it is terminated.
+    fn stubborn(begun: Instant) -> Fake {
+        Fake::new(begun, |_| Ok(held(&[ROOT, COMMAND])))
+    }
+
+    async fn ending(tree: &Fake, notes: &Notes, begun: Instant) -> Retirement {
+        end_tree(tree, notes, begun).await
+    }
+
+    /// The Unix reading is by parentage: what it found running is the answer, and it never says it
+    /// could not tell.
+    #[test]
+    fn kr_req_07_60_a_reading_by_parentage_is_empty_or_nonempty_and_never_unknown() {
+        assert_eq!(Emptiness::of_survivors(&[]), Emptiness::Empty);
+        assert_eq!(Emptiness::of_survivors(&[process(1)]), Emptiness::Nonempty);
+        assert_eq!(
+            Emptiness::of_survivors(&[process(1), process(2)]),
+            Emptiness::Nonempty
+        );
+    }
+
+    /// A server that is gone before the ending begins and holds nothing is `Already`: its input is
+    /// not closed and nothing is ended.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_server_gone_before_the_ending_began_is_already_and_nothing_is_ended() {
+        let begun = Instant::now();
+        let mut tree = Fake::new(begun, |_| Ok(Vec::new()));
+        tree.root_ends_at = Some(Duration::ZERO);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.ended, Ended::Already);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert!(retirement.forced.is_empty() && retirement.survivors.is_empty());
+        assert!(tree.when(Call::CloseInput).is_empty());
+        assert!(tree.when(Call::Terminate).is_empty());
+    }
+
+    /// The order of the ending: the server's state is read, its input closed, the tree read and waited
+    /// for until the window is over, and only then terminated and read again.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_53_a_tree_that_will_not_empty_is_terminated_when_the_window_is_over() {
+        let begun = Instant::now();
+        let tree = stubborn(begun);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        let calls = tree.calls();
+        let place = |wanted: Call| {
+            calls
+                .iter()
+                .position(|(call, _)| *call == wanted)
+                .expect("the call was made")
+        };
+        assert_eq!(calls[0].0, Call::RootRunning);
+        assert!(place(Call::RootRunning) < place(Call::CloseInput));
+        assert!(place(Call::CloseInput) < place(Call::Members));
+        assert!(place(Call::Members) < place(Call::Terminate));
+        // Nothing is forced before the window is over, and what is read after is read after.
+        let terminated = tree.when(Call::Terminate);
+        assert_eq!(terminated.len(), 1);
+        assert!(terminated[0] >= GRACE_WINDOW, "{:?}", terminated[0]);
+        assert!(
+            terminated[0] < GRACE_WINDOW + Duration::from_millis(100),
+            "{:?}",
+            terminated[0]
+        );
+        let read = tree.when(Call::Members);
+        assert!(read.iter().filter(|at| **at < terminated[0]).count() > 1);
+        assert!(read.iter().any(|at| *at >= terminated[0]));
+
+        assert_eq!(retirement.ended, Ended::Force);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert_eq!(retirement.forced, vec![process(ROOT), process(COMMAND)]);
+        assert_eq!(*notes.forced.lock().expect("the list"), retirement.forced);
+        assert!(retirement.survivors.is_empty());
+    }
+
+    /// A tree that empties of itself inside the window is not terminated, and the ending does not
+    /// wait for the window.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_53_a_tree_that_empties_inside_the_window_is_never_terminated() {
+        let begun = Instant::now();
+        let mut tree = Fake::new(begun, |at| {
+            if at < Duration::from_secs(1) {
+                Ok(held(&[ROOT, COMMAND]))
+            } else {
+                Ok(Vec::new())
+            }
+        });
+        tree.root_ends_at = Some(Duration::from_secs(1));
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.ended, Ended::Input);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert!(retirement.forced.is_empty());
+        assert!(tree.when(Call::Terminate).is_empty());
+        assert!(begun.elapsed() < GRACE_WINDOW, "{:?}", begun.elapsed());
+    }
+
+    /// A command left behind by a server that ended is waited for until the window is over, then
+    /// ended with the terminate, and only it is noted as forced.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_53_a_command_left_by_a_server_that_ended_is_forced_when_the_window_is_over()
+    {
+        let begun = Instant::now();
+        let mut tree = Fake::new(begun, |at| {
+            if at < Duration::from_millis(100) {
+                Ok(held(&[ROOT, COMMAND]))
+            } else {
+                Ok(held(&[COMMAND]))
+            }
+        });
+        tree.root_ends_at = Some(Duration::from_millis(100));
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert!(tree.when(Call::Terminate)[0] >= GRACE_WINDOW);
+        assert_eq!(retirement.ended, Ended::Input);
+        assert_eq!(retirement.forced, vec![process(COMMAND)]);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+    }
+
+    /// A process that is in the tree after the terminate and the wait is named, and the hold stays.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_survivor_after_the_terminate_is_nonempty_and_named() {
+        let begun = Instant::now();
+        let tree = stubborn(begun).after(vec![Ok(held(&[COMMAND, 12]))]);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+        assert_eq!(retirement.survivors, vec![process(COMMAND), process(12)]);
+        // The reading went on for as long as a forced process is given to be gone, and no longer.
+        let ended_at = begun.elapsed();
+        assert!(ended_at >= GRACE_WINDOW + FORCE_WAIT, "{ended_at:?}");
+        assert!(
+            ended_at < GRACE_WINDOW + FORCE_WAIT + Duration::from_millis(100),
+            "{ended_at:?}"
+        );
+    }
+
+    /// A tree that cannot be read is not said to be empty.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_failed_enumeration_is_unknown() {
+        let begun = Instant::now();
+        let tree = stubborn(begun).after(vec![Err("the job would not say".to_owned())]);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Unknown);
+        assert!(retirement.survivors.is_empty());
+    }
+
+    /// An enumeration that failed becomes empty only by a later one that succeeds and is empty.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_an_unknown_becomes_empty_only_by_a_later_empty_reading() {
+        let begun = Instant::now();
+        let tree = stubborn(begun).after(vec![
+            Err("the job would not say".to_owned()),
+            Err("the job would not say".to_owned()),
+            Ok(Vec::new()),
+        ]);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert!(
+            begun.elapsed() < GRACE_WINDOW + FORCE_WAIT,
+            "the reading stopped at the empty one: {:?}",
+            begun.elapsed()
+        );
+    }
+
+    /// A member that cannot be asked about leaves it unknown; one that is held beside it is
+    /// running, so it is not.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_member_that_cannot_be_read_is_unknown_unless_one_beside_it_is_held() {
+        let begun = Instant::now();
+        let unreadable = Member::Unreadable("pid 12 could not be opened".to_owned());
+        let alone = stubborn(begun).after(vec![Ok(vec![unreadable.clone()])]);
+        let retirement = ending(&alone, &Notes::default(), begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Unknown);
+
+        let begun = Instant::now();
+        let beside = stubborn(begun).after(vec![Ok(vec![unreadable, Member::Held(process(13))])]);
+        let retirement = ending(&beside, &Notes::default(), begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+        assert_eq!(retirement.survivors, vec![process(13)]);
+    }
+
+    /// A reading that fails while the window runs does not end the wait early and is not a
+    /// reason to terminate before the window is over.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_53_a_failed_reading_inside_the_window_does_not_end_the_wait() {
+        let begun = Instant::now();
+        let tree = Fake::new(begun, |_| Err("the job would not say".to_owned()));
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert!(tree.when(Call::Terminate)[0] >= GRACE_WINDOW);
+        // Nothing was read, so nothing is named as forced.
+        assert!(retirement.forced.is_empty());
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+    }
+
+    /// A terminate that is refused forces nothing, says why for each process it did not end, and
+    /// leaves the tree as it was.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_refused_terminate_forces_nothing_and_is_noted_for_each_member() {
+        let begun = Instant::now();
+        let mut tree = stubborn(begun).after(vec![Ok(held(&[ROOT, COMMAND]))]);
+        tree.terminate_answer = Err("access was denied".to_owned());
+        tree.terminate_ends_root = false;
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert!(retirement.forced.is_empty());
+        assert!(notes.forced.lock().expect("the list").is_empty());
+        let unsignalled = notes.unsignalled.lock().expect("the list").clone();
+        assert_eq!(
+            unsignalled,
+            vec![
+                (process(ROOT), "access was denied".to_owned()),
+                (process(COMMAND), "access was denied".to_owned()),
+            ]
+        );
+        assert_eq!(retirement.ended, Ended::Alive);
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+    }
+
+    /// A server that is still running when the wait for it is over is alive, and is among the
+    /// survivors.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_server_that_outlives_the_terminate_is_alive_and_a_survivor() {
+        let begun = Instant::now();
+        let mut tree = stubborn(begun).after(vec![Ok(held(&[ROOT]))]);
+        tree.terminate_ends_root = false;
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.ended, Ended::Alive);
+        assert_eq!(retirement.survivors, vec![process(ROOT)]);
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+    }
+
+    /// The server's input is one pipe for every holder: a write that waits on a server that reads
+    /// nothing fails when another holder closes it.
+    #[tokio::test]
+    async fn kr_req_07_60_a_write_that_waits_on_the_input_ends_when_another_holder_closes_it() {
+        use tokio::io::AsyncWriteExt as _;
+
+        // A pipe that holds eight bytes and has no reader.
+        let (written, _unread) = tokio::io::duplex(8);
+        let input = Input::new(Some(written));
+        let mut writer = input.clone();
+        let mut closer = input;
+        let waiting = tokio::spawn(async move { writer.write_all(&[b'x'; 1 << 16]).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "the write waits on a full pipe");
+        closer.shutdown().await.expect("the input closes");
+        let ended = tokio::time::timeout(Duration::from_secs(30), waiting)
+            .await
+            .expect("the waiting write was woken")
+            .expect("the task ends");
+        assert!(ended.is_err(), "the write failed as the input was closed");
+    }
+}
