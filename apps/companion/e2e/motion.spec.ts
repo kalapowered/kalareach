@@ -27,7 +27,7 @@
 
 import { readFileSync, readdirSync } from 'node:fs'
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { DESKTOP_BUNDLE } from './served'
 
@@ -335,6 +335,84 @@ async function stopSurfaceRecord(): Promise<string[]> {
   return motion
 }
 
+/** What one control does at one moment of a press, as the engine computes it. */
+interface Shown {
+  readonly transform: string
+  /** The scale along x that the transform carries; 1 for none. */
+  readonly scale: number
+  /** Every running animation or transition of the element that changes its transform. */
+  readonly moving: string[]
+  /** How many transitions of the transform started on the element since the record began. */
+  readonly runs: number
+}
+
+/** Runs in the page. Records every transition of a transform that starts, by the element it starts on. */
+function startTransformRecord(): void {
+  const runs: EventTarget[] = []
+  document.addEventListener(
+    'transitionrun',
+    (event) => {
+      if (event.propertyName === 'transform' && event.target) runs.push(event.target)
+    },
+    true
+  )
+  ;(window as unknown as { krTransformRuns: EventTarget[] }).krTransformRuns = runs
+}
+
+/** What the control does now. */
+function shown(control: Locator): Promise<Shown> {
+  return control.evaluate((node) => {
+    const style = getComputedStyle(node)
+    const moving = node.getAnimations().flatMap((animation) => {
+      const effect = animation.effect
+      const names =
+        effect instanceof KeyframeEffect ? effect.getKeyframes().flatMap((frame) => Object.keys(frame)) : []
+      const property = 'transitionProperty' in animation ? String(animation.transitionProperty) : ''
+      return property === 'transform' || names.includes('transform') ? [animation.constructor.name] : []
+    })
+    const record = (window as unknown as { krTransformRuns?: EventTarget[] }).krTransformRuns ?? []
+    return {
+      transform: style.transform,
+      scale: style.transform === 'none' ? 1 : new DOMMatrix(style.transform).a,
+      moving,
+      runs: record.filter((target) => target === node).length
+    }
+  })
+}
+
+/** Waits two frames in the page, so that what the last input changed has been drawn and reported. */
+function twoFrames(page: Page): Promise<void> {
+  return page.evaluate(
+    () =>
+      new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            resolve()
+          })
+        })
+      })
+  )
+}
+
+/**
+ * A real press that is held: the pointer goes to the middle of the control and down, and stays down
+ * while `during` reads the page. It is released away from the control, so that no click follows.
+ */
+async function held(page: Page, control: Locator, during: () => Promise<void>): Promise<void> {
+  await control.scrollIntoViewIfNeeded()
+  const box = await control.boundingBox()
+  if (!box) throw new Error('the control has no box to press')
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await page.mouse.down()
+  try {
+    await twoFrames(page)
+    await during()
+  } finally {
+    await page.mouse.move(1, 1)
+    await page.mouse.up()
+  }
+}
+
 test.describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the application's own stylesheets declare lasts 0
   // or 120 to 200 ms, as the engine reads it, including a declaration nested inside another rule; a
@@ -501,5 +579,63 @@ test.describe('motion', () => {
         `${reducedMotion}: the record sees a transition on the surface: ${seen.join('; ')}`
       ).toBeGreaterThan(0)
     }
+  })
+
+  // KR-REQ-13.20: with reduced motion a press keeps its feedback and loses its movement. A button,
+  // an icon button, a navigation item and a session row are each held down by a real pointer press:
+  // the engine computes no transform for the control, and no transition or animation of a transform
+  // runs on it. A switch's thumb stands in its new place at once. Without reduced motion the same
+  // press scales a button, so the case cannot pass on a page where nothing ever scales.
+  test('a held press moves no control with reduced motion, and scales a button without it', async ({
+    page
+  }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    await page.goto('/harness.html')
+    await page.evaluate(startTransformRecord)
+
+    const keepsStill = async (kind: string, control: Locator): Promise<void> => {
+      await held(page, control, async () => {
+        const pressed = await shown(control)
+        expect(pressed.transform, `${kind}: the transform of the pressed control`).toBe('none')
+        expect(pressed.moving, `${kind}: animations of a transform while it is pressed`).toEqual([])
+        expect(pressed.runs, `${kind}: transitions of a transform that started on it`).toBe(0)
+      })
+    }
+
+    const sessions = page.getByRole('button', { name: 'Sessions', exact: true })
+    await keepsStill('navigation item', sessions)
+    await sessions.click()
+    await keepsStill('primary button', page.getByRole('button', { name: 'New session', exact: true }))
+    const row = page.getByTestId('session-row-1')
+    await keepsStill('session row', row)
+    await row.click()
+    await keepsStill('button', page.getByTestId('open-settings'))
+    await keepsStill('danger button', page.getByTestId('close-session'))
+    await page.getByTestId('open-settings').click()
+    await keepsStill('icon button', page.getByRole('button', { name: 'Close settings', exact: true }))
+
+    await page.getByRole('button', { name: 'Sharing' }).click()
+    const toggle = page.getByRole('switch', { name: 'Let a viewer answer questions' })
+    const thumb = toggle.locator('.switch-thumb')
+    const before = await shown(thumb)
+    await toggle.click()
+    await twoFrames(page)
+    const after = await shown(thumb)
+    const end =
+      (await toggle.getAttribute('aria-checked')) === 'true' ? 'matrix(1, 0, 0, 1, 14, 0)' : 'matrix(1, 0, 0, 1, 0, 0)'
+    expect(after.transform, 'the thumb two frames after the switch is pressed').toBe(end)
+    expect(after.transform, 'the thumb has moved').not.toBe(before.transform)
+    expect(after.moving, 'animations of the thumb').toEqual([])
+    expect(after.runs, 'transitions of the thumb that started').toBe(0)
+
+    await page.emulateMedia({ reducedMotion: 'no-preference' })
+    await page.goto('/harness.html')
+    await page.getByRole('button', { name: 'Sessions', exact: true }).click()
+    const create = page.getByRole('button', { name: 'New session', exact: true })
+    await held(page, create, async () => {
+      await expect
+        .poll(async () => (await shown(create)).scale, { message: 'the scale of a pressed button without reduced motion' })
+        .toBeCloseTo(0.97, 2)
+    })
   })
 })

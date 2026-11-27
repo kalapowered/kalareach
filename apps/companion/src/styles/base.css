@@ -249,6 +249,9 @@ html[data-input='keyboard'] *::after {
 /*
  * Reduced motion keeps the feedback and removes the travel: a surface fades instead of arriving,
  * and a press stops scaling. It is not "no feedback".
+ *
+ * The declarations for the pressed controls are important: the component and view styles load after
+ * this file and state the press with rules of equal weight, which would win over these.
  */
 @media (prefers-reduced-motion: reduce) {
   *,
@@ -263,13 +266,13 @@ html[data-input='keyboard'] *::after {
   .nav-item,
   .session-row,
   .switch-thumb {
-    transition: none;
+    transition: none !important;
   }
 
   .btn:active,
   .icon-btn:active,
   .nav-item:active,
   .session-row:active {
-    transform: none;
+    transform: none !important;
   }
 }
