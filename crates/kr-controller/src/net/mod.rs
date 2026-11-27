@@ -4876,9 +4876,9 @@ pub(crate) mod tests {
     }
 
     /// KR-REQ-10.44, KR-REQ-24.15: through the daemon, a bound that ran out while the daemon was
-    /// down is refused after a restart, with the request's reading of the wall clock at the
-    /// synchronisation itself. The restart takes the time spent from the record and from UTC; that
-    /// the record alone is enough is shown with clocks driven by hand in
+    /// down is refused after a restart, with the request's wall clock read at the synchronisation
+    /// itself. The restart takes the time spent from the record and from UTC. The recorded anchor
+    /// and the boot clock's advance suffice without the wall clock (stored elapsed term zero), see
     /// `a_restart_in_the_same_boot_adds_the_time_since_the_record`.
     ///
     /// It shows the revalidation after a restart: a bound that ran out while the daemon was down
