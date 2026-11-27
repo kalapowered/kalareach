@@ -935,21 +935,29 @@ test.describe('a passing message', () => {
   /**
    * Waits until nothing the toast holds is still moving: its own arrival, and anything a press set going
    * on one of its controls (a control eases into its pressed size and back, `transform` over the press
-   * time). A box read while that runs is a part of a pixel off the control's size, and the case measures
-   * to the pixel, so it reads at rest, not within a tolerance. A page with no motion has nothing running
-   * and this ends at once. Motion that does not end fails here, in these words, and does not pass.
+   * time). A box read while that runs is off the control's size, by up to 3 % (1.44 px at 48), and the
+   * case measures to the pixel, so it reads at rest, not within a tolerance. A page with no motion has
+   * nothing running and this ends at once. Motion that does not end fails here, in these words, and does
+   * not pass. The count holds every animation of the toast and what it holds, so one that never ends, one
+   * that is paused and one that keeps its end by fill also fail it on the bound; the toast has none.
    */
   const atRest = (page: Page) =>
     expect
       .poll(
         () =>
           page.locator('.toast').evaluate((toast) => {
-            // Reading the layout makes the page resolve a style change it has not resolved yet (a press
-            // just let go), so the transition that change starts is running before the count, not after.
+            // `getAnimations()` applies pending style changes before it answers, as the Web Animations
+            // specification has it; this layout read is a second safeguard.
             toast.getBoundingClientRect()
             return toast.getAnimations({ subtree: true }).length
           }),
-        { message: 'the toast and its controls come to rest: some motion of them is still running', timeout: 10_000 }
+        {
+          message: 'the toast and its controls come to rest: some motion of them is still running',
+          // The toast arrives in 200 ms: a short step ends the wait soon after it has, where the default
+          // steps (100, 250, 500, 1000 ms) end it at the next step, which can be 250 ms on.
+          intervals: [50],
+          timeout: 10_000
+        }
       )
       .toBe(0)
 
@@ -998,8 +1006,8 @@ test.describe('a passing message', () => {
 
       // The words reach their last line by scrolling the box, and the control stays where it is. The trial
       // click above is a real press and release at the control, which the page's handlers are not told of;
-      // the control still takes its pressed size, and eases back when a frame was drawn between the two, so
-      // the box is read once that has ended.
+      // the control takes its pressed state, and its size changes only when a frame is drawn between the
+      // two, after which it eases back, so the box is read once that has ended.
       await atRest(page)
       const before = await toast.getByRole('button', { name: 'Dismiss' }).boundingBox()
       await toast.locator('.toast-text').evaluate((element) => {
