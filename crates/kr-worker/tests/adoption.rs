@@ -2763,11 +2763,36 @@ fn kr_req_12_07_the_macos_argument_record_is_read_by_position() {
     );
 }
 
+/// The most that the operands of a `yes` program may total in [`start_yes`], each counted with the
+/// zero byte that ends it.
+///
+/// Given more than half of the C library's buffer size (512 bytes with musl, 4096 with glibc), GNU
+/// `yes` writes its output over its own operand strings: the zero byte after each becomes a space
+/// and the last one a line feed. The program has then rewritten its argument area, and the kernel
+/// gives an area whose last byte is not zero as the one string at its start, at most a page of it.
+/// A reading of such a program is not a reading of the area it was started with, and which one the
+/// reader gets depends on how soon after the start it reads.
+const YES_OPERANDS_LEFT_ALONE: usize = 512;
+
 /// Starts `/usr/bin/yes` with exactly `arguments` as its vector, its output held by a pipe nobody
-/// reads, so that it runs until it is ended whatever it is given.
+/// reads, so that it runs until it is ended whatever it is given. A long area is made by the first
+/// argument, which `yes` leaves alone; the operands that follow stay within
+/// [`YES_OPERANDS_LEFT_ALONE`].
+///
+/// # Panics
+///
+/// Panics when the operands are longer than that, or the program does not start.
 fn start_yes(arguments: &[&[u8]]) -> Child {
     use std::os::unix::ffi::OsStrExt as _;
 
+    let operands: usize = arguments[1..]
+        .iter()
+        .map(|argument| argument.len() + 1)
+        .sum();
+    assert!(
+        operands <= YES_OPERANDS_LEFT_ALONE,
+        "operands of {operands} bytes may be rewritten in place by the program that holds them"
+    );
     let mut command = Command::new("/usr/bin/yes");
     command.arg0(std::ffi::OsStr::from_bytes(arguments[0]));
     for argument in &arguments[1..] {
@@ -3138,12 +3163,13 @@ fn kr_req_12_07_a_reading_cut_inside_a_string_is_refused() {
 }
 
 /// KR-REQ-12.07: the reader gives every argument of a process whose argument area is larger than a
-/// page and than the first buffer it reads into, with the second argument as the exact bytes.
+/// page and than the first buffer it reads into, with the second argument as the exact bytes. The
+/// first argument fills the first buffer, so the arguments after it are read by the second call.
 #[test]
 fn kr_req_12_07_the_reader_gives_every_argument_of_a_process_with_a_large_area() {
     use std::ffi::OsString;
 
-    let lengths = [100_000_usize, 100_000, 100_000];
+    let lengths = [100_000_usize, 200, 100];
     let arguments: Vec<Vec<u8>> = lengths
         .iter()
         .enumerate()
@@ -3159,8 +3185,9 @@ fn kr_req_12_07_the_reader_gives_every_argument_of_a_process_with_a_large_area()
         .collect();
     let area: usize = arguments.iter().map(|argument| argument.len() + 1).sum();
     assert!(
-        area > FIRST_READING,
-        "the area is larger than the first buffer, which is larger than a page: {area}"
+        area > FIRST_READING && arguments[0].len() > FIRST_READING,
+        "the area is larger than the first buffer, which is larger than a page, and the first \
+         argument fills the buffer: {area}"
     );
     let refs: Vec<&[u8]> = arguments.iter().map(Vec::as_slice).collect();
     let mut child = start_yes(&refs);
