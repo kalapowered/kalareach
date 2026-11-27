@@ -694,8 +694,9 @@ the answer for at most two seconds: a token that differs from the stored one is 
 Firebase does not answer in time, or the build has no Firebase configuration, the stored token
 stands. The receivers answer a registration challenge through one function of the Rust library
 (`native/platform/src/push.rs`), reached by JNI on Android and by C symbols on iOS. A debug build
-reads the registration token and the gateway's origin from `kr-probe/push-request.json` in the data
-directory, because a device run has no provider; a release build reads neither.
+reads the gateway's origin and, when the request holds one, the registration token from
+`kr-probe/push-request.json` in the data directory, because a device run may have no provider; a
+request with no token leaves the platform's own in use. A release build reads neither.
 
 ## An owner's confirmations
 

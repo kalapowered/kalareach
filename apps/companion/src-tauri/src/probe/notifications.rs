@@ -4,10 +4,11 @@
 //! A script puts a request in the application's data directory (`kr-probe/push-request.json`),
 //! starts the application, and reads the result the application writes beside it
 //! (`kr-probe/push-result-<run>.txt`, one `check=<name> ok=<0 or 1> detail=<text>` line per check
-//! and `done=1` last). The request names the gateway as this phone reaches it and the registration
-//! token a provider would have given it: a device run has no provider, and a debug build takes both
-//! from the request in place of the managed service's origin and the platform's token. A release
-//! build has no request to read.
+//! and `done=1` last). The request names the gateway as this phone reaches it, and may name the
+//! registration token a provider would have given it. A debug build takes the origin from the
+//! request in place of the managed service's, and the token in place of the platform's; a request
+//! with no token leaves the platform's, which is how a run through a real provider reaches this
+//! phone. A release build has no request to read.
 //!
 //! What a request may ask for, in the order the application does it:
 //!
@@ -24,9 +25,9 @@
 //! * `route`: wait for a tap on a notification to open the application on a screen.
 //!
 //! The host, the gateway and what each of them saw are the script's and the host's suite to read:
-//! these lines say what the phone did. The request holds an invitation's secret and a token for a
-//! recording server, both thrown away with the run. Each request is run once: a result file that
-//! exists says its run was.
+//! these lines say what the phone did. The request holds an invitation's secret and, when it has
+//! one, a token for a recording server, both thrown away with the run. Each request is run once: a
+//! result file that exists says its run was.
 
 use std::time::{Duration, Instant};
 
@@ -55,9 +56,11 @@ pub struct Request {
     /// The gateway, as this phone reaches it.
     #[allow(dead_code)]
     pub origin: String,
-    /// The registration token a provider would have given this installation.
+    /// The registration token a provider would have given this installation, when the run has one
+    /// to give; with none, the platform's own is used.
+    #[serde(default)]
     #[allow(dead_code)]
-    pub token: String,
+    pub token: Option<String>,
     /// A direct invitation to pair with first, when the phone is not paired yet.
     #[serde(default)]
     pub invitation: Option<String>,
@@ -78,15 +81,19 @@ pub struct Request {
     pub route: bool,
 }
 
+/// Reads a request from the text a script left, when it is one this phone runs: it names its run
+/// the way a result file can carry, and holds no key a request does not define.
+fn parse(text: &str) -> Option<Request> {
+    let request = serde_json::from_str::<Request>(text).ok()?;
+    super::is_a_run_name(&request.run).then_some(request)
+}
+
 /// Reads the request a script left, when there is one that has not been run.
 #[must_use]
 pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
     let directory = app.path().app_data_dir().ok()?.join("kr-probe");
     let text = std::fs::read_to_string(directory.join("push-request.json")).ok()?;
-    let request = serde_json::from_str::<Request>(&text).ok()?;
-    if !super::is_a_run_name(&request.run) {
-        return None;
-    }
+    let request = parse(&text)?;
     // A request is run once: the result file is the record that it was, and a relaunch for another
     // purpose runs nothing again. The request itself stays, because the debug build reads the token
     // and the origin from it for as long as the device run lasts.
@@ -354,5 +361,41 @@ async fn route<R: Runtime>(app: &AppHandle<R>, checks: &mut Checks<'_>) {
             return;
         }
         tokio::time::sleep(LOOK).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request that names no registration token is read, so that the application asks the
+    /// platform for its own; a request that names one carries it, and a key the request does not
+    /// define, or a run name that a result file cannot carry, is still refused.
+    #[test]
+    fn a_request_may_leave_the_registration_token_to_the_platform() {
+        let without = parse(
+            r#"{"run":"live","origin":"http://127.0.0.1:8787","invitation":"an-invitation","enable":true}"#,
+        );
+        assert!(without.is_some(), "a request with no token is read");
+        let without = without.expect("a request that was read");
+        assert_eq!(without.token, None);
+        assert_eq!(without.invitation.as_deref(), Some("an-invitation"));
+        assert!(without.enable);
+
+        let with = parse(r#"{"run":"live","origin":"http://127.0.0.1:8787","token":"a-token"}"#);
+        assert!(with.is_some(), "a request with a token is read");
+        assert_eq!(
+            with.and_then(|request| request.token).as_deref(),
+            Some("a-token")
+        );
+
+        assert!(
+            parse(r#"{"run":"live","origin":"http://127.0.0.1:8787","tokn":"a-token"}"#).is_none(),
+            "a key the request does not define is refused"
+        );
+        assert!(
+            parse(r#"{"run":"../live","origin":"http://127.0.0.1:8787"}"#).is_none(),
+            "a run name that a result file cannot carry is refused"
+        );
     }
 }

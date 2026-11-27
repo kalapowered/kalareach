@@ -71,7 +71,7 @@ impl Check {
 mod answer;
 pub mod delegating;
 pub mod harness;
-#[cfg(mobile)]
+#[cfg(any(mobile, test))]
 pub mod notifications;
 
 pub use answer::answer_for;
