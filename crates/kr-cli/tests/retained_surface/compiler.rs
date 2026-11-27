@@ -737,10 +737,13 @@ struct Built {
     files: BTreeSet<(String, String)>,
 }
 
-/// The reports are made by `rustc` for the crates of this workspace only: a use in a dependency from
-/// the registry is no sighting of ours.
-fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<Built, String> {
-    let mut errors = tempfile::tempfile().map_err(|error| error.to_string())?;
+/// The `cargo check` of one configuration, before its streams are attached.
+pub fn check_command(
+    root: &Path,
+    target_dir: &Path,
+    config: Config,
+    meta: &Meta,
+) -> Result<Command, String> {
     let mut command = cargo_command();
     command.args([
         "check",
@@ -758,12 +761,41 @@ fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<
     }
     if let Some(target) = config.target {
         command.args(["--target", target]);
+        without_library(&mut command, target_dir)?;
     }
     command
         .arg("--message-format=json")
         .current_dir(root)
         .env("CARGO_TARGET_DIR", target_dir)
-        .env("RUSTFLAGS", "--force-warn deprecated")
+        .env("RUSTFLAGS", "--force-warn deprecated");
+    Ok(command)
+}
+
+/// A check for another target links nothing, so the build script of `libsodium-sys-stable` has no
+/// library to supply for it. Given a library folder, that script returns before it compiles or
+/// fetches anything; without one it falls back, for a Windows target, to a prebuilt archive that the
+/// crate does not ship and downloads it, so the check would need the network of the machine that runs
+/// it. The folder is the target folder, which is made first so that it exists. The two variables that
+/// send the script another way are removed: a directory of archives, and pkg-config, which the script
+/// refuses beside a library folder.
+fn without_library(command: &mut Command, target_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target_dir)
+        .and_then(|()| std::fs::canonicalize(target_dir))
+        .map(|folder| {
+            command
+                .env("SODIUM_LIB_DIR", folder)
+                .env_remove("SODIUM_USE_PKG_CONFIG")
+                .env_remove("SODIUM_DIST_DIR");
+        })
+        .map_err(|error| format!("{}: {error}", target_dir.display()))
+}
+
+/// The reports are made by `rustc` for the crates of this workspace only: a use in a dependency from
+/// the registry is no sighting of ours.
+fn build(root: &Path, target_dir: &Path, config: Config, meta: &Meta) -> Result<Built, String> {
+    let mut errors = tempfile::tempfile().map_err(|error| error.to_string())?;
+    let mut command = check_command(root, target_dir, config, meta)?;
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(
