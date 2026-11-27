@@ -31,6 +31,7 @@
 import { useEffect, type ReactNode } from 'react'
 
 import type { FakeHostControls } from './host/fake'
+import { wordsOf } from './markdown/link-words'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 /** The build session, whose conversation the short conversation's one message replaces. */
@@ -147,10 +148,8 @@ export function TapRecord({ controls }: { readonly controls: FakeHostControls })
     const show = (): void => {
       const rectangles = Array.from(document.querySelectorAll<HTMLElement>('.m-node .md-link'), (link) => {
         const box = link.getBoundingClientRect()
-        const range = document.createRange()
-        range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-        const words = Array.from(range.getClientRects())
-          .filter((rect) => rect.width > 0 && rect.height > 0)
+        // The words are read by the function that the press reads them with.
+        const words = wordsOf(link)
           .map((rect) => [rect.left, rect.top, rect.right, rect.bottom].map(round).join(' '))
           .join(' ')
         const line = parseFloat(getComputedStyle(link).lineHeight)

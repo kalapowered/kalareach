@@ -11,7 +11,7 @@ import { platform } from 'node:os'
 
 import { expect, test, type CDPSession, type Page } from '@playwright/test'
 
-import { CLICK_AWAY } from '../src/markdown/link-target'
+import { CLICK_AWAY, targetOf } from '../src/markdown/link-target'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -3036,3 +3036,365 @@ test.describe('a link in a box inside a message that clips it', () => {
   }
 })
 
+
+/**
+ * The words of a link are the lines of the text in its label and the box of each replaced element in it (an imported
+ * image), and no box of an element that holds text. A label whose text is drawn in an inline box (the word-break
+ * component's box, which the cases here put around the text) has the lines of its text as words and not the box's
+ * whole border area, which holds the blank room at the ends of the lines.
+ */
+const WORDS_PLAIN = 'https://example.org/words-plain'
+const WORDS_BOXED = 'https://example.org/words-boxed'
+const WORDS_CODE = 'https://example.org/words-code'
+const WORDS_IMAGE = 'https://example.org/words-image'
+const WORDS_SMALL = 'https://example.org/words-small'
+const WORDS_SMALL_CODE = 'https://example.org/words-small-code'
+const WORDS_NEAR = 'https://example.org/words-near'
+/** A label that is its own address: one long word to the engine, which the box breaks anywhere. */
+const BOXED_TEXT = 'https://example.org/reviews/2026-11-27/the-address-that-is-its-own-label-and-wraps-over-the-lines-of-a-narrow-pane-at-any-text-size-that-the-phone-offers'
+const WORDS_MESSAGES = {
+  plain: `[a plain label of a few words](${WORDS_PLAIN}) and plain words after it.`,
+  boxed: `[${BOXED_TEXT}](${WORDS_BOXED})`,
+  code: `[run \`npm test\` now](${WORDS_CODE}) and plain words after it.`,
+  image: `[an image label](${WORDS_IMAGE}) and plain words after it.`,
+  small: `Short: [i](${WORDS_SMALL}) and plain words after it.`,
+  smallCode: `Short: [\`i\`](${WORDS_SMALL_CODE}) and plain words after it.`,
+  near: `[docs near](${WORDS_NEAR}) and more words follow the link on this line, which ends the paragraph.`
+} as const
+/** The smallest text size of the phone's system setting, as a multiple of the default (iOS: 14 points for 17). */
+const SMALLEST_TEXT = 14 / 17
+/** An image of one transparent pixel, drawn at the size the case gives it. */
+const PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+
+type Rectangle = readonly [left: number, top: number, right: number, bottom: number]
+
+/**
+ * What the engine gives for a link's label, one node at a time and with no help of the page's own reader: the lines of
+ * each text node and the border box of each image, in the order of the label's nodes. The link is scrolled to the
+ * middle of the pane first, so the numbers are where the page shows them.
+ */
+async function textLinesOf(page: Page, href: string): Promise<Rectangle[]> {
+  return page.evaluate((target) => {
+    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+    if (!link) throw new Error(`the page shows no link ${target}`)
+    link.scrollIntoView({ block: 'center' })
+    const label = link.querySelector('.md-link-label') ?? link
+    const found: [number, number, number, number][] = []
+    const range = document.createRange()
+    const walk = (node: Node): void => {
+      for (const child of Array.from(node.childNodes)) {
+        if (child instanceof Text) {
+          range.selectNodeContents(child)
+          for (const rect of Array.from(range.getClientRects())) if (rect.width > 0 && rect.height > 0) found.push([rect.left, rect.top, rect.right, rect.bottom])
+        } else if (child instanceof HTMLImageElement) {
+          const rect = child.getBoundingClientRect()
+          if (rect.width > 0 && rect.height > 0) found.push([rect.left, rect.top, rect.right, rect.bottom])
+        } else if (child instanceof Element) {
+          walk(child)
+        }
+      }
+    }
+    walk(label)
+    return found
+  }, href)
+}
+
+/** What a range over the whole label gives, as the page's reader gave it before: every rectangle with a size. */
+async function rangeOverLabel(page: Page, href: string): Promise<Rectangle[]> {
+  return page.evaluate((target) => {
+    const link = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"]`)
+    if (!link) throw new Error(`the page shows no link ${target}`)
+    link.scrollIntoView({ block: 'center' })
+    const range = document.createRange()
+    range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
+    return Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect): [number, number, number, number] => [rect.left, rect.top, rect.right, rect.bottom])
+  }, href)
+}
+
+/**
+ * Puts the label's text in the word-break component's box (an inline box, `inline-block` with `max-width: 100%` and
+ * `overflow-wrap: anywhere`) as the component draws it. With `ragged`, the label's text is replaced by six words of
+ * `m` joined by hyphens, each a little over half as wide as the box: two never share a line, so the box has six lines
+ * with blank room on both sides of each (the measure's shape: short lines in a box as wide as the pane gives it).
+ * The box takes no hit: the stylesheet gives the label `pointer-events: auto`, which a box inside it inherits, and the
+ * browser's own click on such a box is a click on the link's element, which opens the link wherever in the box it
+ * lands. A tap in the blank room is then the press's to decide, by the rectangles of the words.
+ */
+async function putInBox(page: Page, href: string, ragged: boolean): Promise<void> {
+  await page.evaluate(
+    ({ target, short }) => {
+      const label = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"] .md-link-label`)
+      if (!label) throw new Error(`the page shows no label for ${target}`)
+      const box = document.createElement('span')
+      box.className = 'stand-in-box'
+      box.style.cssText = 'display: inline-block; max-width: 100%; overflow-wrap: anywhere; pointer-events: none'
+      box.append(...Array.from(label.childNodes))
+      label.append(box)
+      if (!short) return
+      const text = box.firstChild
+      if (!(text instanceof Text)) throw new Error('the label holds no text')
+      // The box is as wide as the pane gives it when the text is long and breaks often.
+      text.data = 'm-'.repeat(200)
+      const wide = box.getBoundingClientRect().width
+      const probe = document.createElement('span')
+      probe.style.cssText = 'position: absolute; visibility: hidden; white-space: nowrap'
+      label.append(probe)
+      let count = 1
+      for (; count < 200; count += 1) {
+        probe.textContent = `${'m'.repeat(count)}-`
+        if (probe.getBoundingClientRect().width >= wide * 0.55) break
+      }
+      probe.remove()
+      text.data = Array.from({ length: 6 }, () => 'm'.repeat(count)).join('-')
+    },
+    { target: href, short: ragged }
+  )
+  await settle(page)
+}
+
+/** Puts an image after the label's text, as an imported image is drawn in a label (`img.md-image`). */
+async function putImage(page: Page, href: string, alt: string, only: boolean): Promise<void> {
+  await page.evaluate(
+    ({ target, text, drawn }) => {
+      const label = document.querySelector<HTMLElement>(`.m-node .md-link[title="${target}"] .md-link-label`)
+      if (!label) throw new Error(`the page shows no label for ${target}`)
+      const image = document.createElement('img')
+      image.className = 'md-image'
+      image.src = drawn.source
+      image.alt = text
+      image.width = 96
+      image.height = 64
+      if (drawn.only) label.replaceChildren(image)
+      else label.append(image)
+    },
+    { target: href, text: alt, drawn: { source: PIXEL, only } }
+  )
+  await settle(page)
+}
+
+/** The rectangles that the harness's tap record lists for a link's words, as the record is started by the strip, and what the page's reader gave. */
+async function recordedWords(page: Page, href: string): Promise<Rectangle[]> {
+  if ((await page.locator('#kr-taps-links').count()) === 0) {
+    await page.locator('#kr-strip-toggle').click()
+    await page.locator('#kr-strip-taps').click()
+    await settle(page)
+  }
+  const text = (await page.locator('#kr-taps-links').textContent()) ?? ''
+  const name = href.slice(href.lastIndexOf('/') + 1)
+  const entry = text.split(' ; ').find((part) => part.startsWith(`L ${name} `))
+  if (entry === undefined) throw new Error(`the record lists no link ${name}: ${text.slice(0, 200)}`)
+  const numbers = /words ([-\d. ]*) line /.exec(entry)?.[1]?.trim().split(/\s+/).filter((each) => each !== '').map(Number) ?? []
+  const listed: Rectangle[] = []
+  for (let at = 0; at + 3 < numbers.length; at += 4) listed.push([numbers[at] ?? 0, numbers[at + 1] ?? 0, numbers[at + 2] ?? 0, numbers[at + 3] ?? 0])
+  return listed
+}
+
+/** Each rectangle against the first one's corner, so that a record read at one scroll compares with a reading at another. */
+const relative = (rects: readonly Rectangle[]): number[][] => {
+  const [first] = rects
+  const [left, top] = first ?? [0, 0]
+  return rects.map((rect) => [rect[0] - left, rect[1] - top, rect[2] - left, rect[3] - top].map((value) => Math.round(value * 10) / 10))
+}
+
+/** The same rectangles to a tenth of a point, which is how the record rounds them. */
+function expectSameRects(listed: readonly Rectangle[], wanted: readonly Rectangle[], what: string): void {
+  const got = relative(listed)
+  const want = relative(wanted)
+  expect(got.length, `${what}: how many rectangles (listed ${JSON.stringify(got)}, wanted ${JSON.stringify(want)})`).toBe(want.length)
+  got.forEach((rect, index) => {
+    rect.forEach((value, side) => {
+      expect(Math.abs(value - (want[index]?.[side] ?? Infinity)), `${what}: side ${String(side)} of rectangle ${String(index)}`).toBeLessThanOrEqual(0.2)
+    })
+  })
+}
+
+/** Whether a point lies at least `margin` outside the target (`targetOf`: the region the press gives a rectangle of words) of a line. */
+function outsideTarget(x: number, y: number, line: Rectangle, size: number, margin: number): boolean {
+  const target = targetOf({ left: line[0], top: line[1], right: line[2], bottom: line[3] }, { least: size, beside: size / 2 })
+  return x < target.left - margin || x > target.right + margin || y < target.top - margin || y > target.bottom + margin
+}
+
+/**
+ * The points inside the stand-in box that lie outside the target of every line of the label's text by at least 3 points, as many as
+ * `most`, spread along the box: the blank room at the ends of the lines, which no line's target reaches. The label's own inline box
+ * spans the stand-in box's whole width on the last row (the box sits on one line of the label, at its baseline) and takes hits there,
+ * and the engines send a tap near a link's element to it: the points keep the least size and a margin of 8 points from it.
+ */
+async function blankPoints(page: Page, href: string, size: number, most: number): Promise<{ x: number; y: number }[]> {
+  const lines = await textLinesOf(page, href)
+  const { box, label } = await page.evaluate((target) => {
+    const link = document.querySelector(`.m-node .md-link[title="${target}"]`)
+    const rect = link?.querySelector('.stand-in-box')?.getBoundingClientRect()
+    const own = Array.from(link?.querySelector('.md-link-label')?.getClientRects() ?? [], (each): [number, number, number, number] => [each.left, each.top, each.right, each.bottom])
+    return { box: rect ? ([rect.left, rect.top, rect.right, rect.bottom] as const) : null, label: own }
+  }, href)
+  if (box === null) throw new Error('the label has no stand-in box')
+  const found: { x: number; y: number }[] = []
+  for (let y = box[1] + 2; y < box[3] - 1; y += 3) {
+    for (let x = box[0] + 2; x < box[2] - 1; x += 3) {
+      if (lines.every((line) => outsideTarget(x, y, line, size, 3)) && label.every((own) => Math.max(own[0] - x, 0, x - own[2], own[1] - y, y - own[3]) >= size + 8)) found.push({ x, y })
+    }
+  }
+  const every = Math.max(1, Math.floor(found.length / most))
+  return found.filter((_, index) => index % every === 0).slice(0, most)
+}
+
+test.describe('the words of a link', () => {
+  test.use({ hasTouch: true })
+  test.describe.configure({ timeout: 300_000 })
+
+  for (const surface of SURFACES) {
+    test(`of a label in an inline box are the lines of its text, in the press and in the harness's record, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { width: 320, only: [PLAIN, PLAIN, WORDS_MESSAGES.boxed, PLAIN, PLAIN] })
+      await putInBox(page, WORDS_BOXED, true)
+      // What the engine gives for the whole label: the lines of the text and one more rectangle over the box's whole border area.
+      const whole = await rangeOverLabel(page, WORDS_BOXED)
+      const lines = await textLinesOf(page, WORDS_BOXED)
+      expect(lines.length, 'lines of the label’s text').toBeGreaterThanOrEqual(3)
+      expect(whole.length, 'rectangles that a range over the whole label gives').toBe(lines.length + 1)
+      const height = Math.max(...lines.map((line) => line[3] - line[1]))
+      expect(Math.max(...whole.map((rect) => rect[3] - rect[1])), 'the tallest rectangle of the range over the whole label, over one line').toBeGreaterThan(height * 2)
+      test.info().annotations.push({ type: 'measure', description: `${whole.map((rect) => `${String(Math.round(rect[2] - rect[0]))}x${String(Math.round(rect[3] - rect[1]))}`).join(' ')} (the last of the range is the box)` })
+      // The page's reader, as the harness's record lists it, gives the lines and not that box.
+      expectSameRects(await recordedWords(page, WORDS_BOXED), await textLinesOf(page, WORDS_BOXED), 'the rectangles of the words the record lists')
+    })
+
+    test(`a tap on the blank room at the end of a line of a label in an inline box opens nothing, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { width: 320, only: [PLAIN, PLAIN, WORDS_MESSAGES.boxed, PLAIN, PLAIN] })
+      await putInBox(page, WORDS_BOXED, true)
+      const points = await blankPoints(page, WORDS_BOXED, FINGER[surface], 6)
+      expect(points.length, 'points of the box that lie outside the target of every line of its text').toBeGreaterThan(0)
+      for (const point of points) {
+        const there = await page.evaluate(({ x, y }) => {
+          const element = document.elementFromPoint(x, y)
+          return `${element?.tagName ?? '-'}.${element?.className ?? ''}, ${element?.closest('.md-link') ? 'in the link' : 'outside every link'}`
+        }, point)
+        const made = await tapAndRead(page, point.x, point.y)
+        expect(made.opened, `links opened by a tap on the blank room of the box at ${String(Math.round(point.x))}, ${String(Math.round(point.y))} (the element there: ${there})`).toEqual([])
+        expect(made.litAtClick, `the look at the click on the blank room of the box at ${String(Math.round(point.x))}, ${String(Math.round(point.y))}`).toEqual([null])
+      }
+    })
+
+    test(`a tap on the words of each line of a label in an inline box opens its link, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { width: 320, only: [PLAIN, PLAIN, WORDS_MESSAGES.boxed, PLAIN, PLAIN] })
+      await putInBox(page, WORDS_BOXED, true)
+      const count = (await textLinesOf(page, WORDS_BOXED)).length
+      expect(count, 'lines of the label’s text').toBeGreaterThanOrEqual(3)
+      for (let index = 0; index < count; index += 1) {
+        const line = (await textLinesOf(page, WORDS_BOXED))[index]
+        if (line === undefined) throw new Error(`the label has no line ${String(index)}`)
+        const made = await tapAndRead(page, (line[0] + line[2]) / 2, (line[1] + line[3]) / 2)
+        expect(made.opened, `links opened by a tap on the words of line ${String(index + 1)} of ${String(count)}`).toEqual([WORDS_BOXED])
+      }
+    })
+
+    test(`a tap on the plain text near a link follows the rule of the reach, on ${surface}`, async ({ page }) => {
+      await pressPage(page, surface, { only: [PLAIN, PLAIN, WORDS_MESSAGES.near, PLAIN, PLAIN] })
+      const [line] = await textLinesOf(page, WORDS_NEAR)
+      if (line === undefined) throw new Error('the link has no words')
+      const y = (line[1] + line[3]) / 2
+      const inside = await pointOnTextAfter(page, WORDS_NEAR)
+      const within = await tapAndRead(page, inside.x, inside.y)
+      expect(within.opened, 'links opened by a tap on plain text inside the reach').toEqual([WORDS_NEAR])
+      const beyond = await tapAndRead(page, line[2] + FINGER[surface] + 12, y)
+      expect(beyond.opened, 'links opened by a tap on plain text past the reach').toEqual([])
+    })
+  }
+
+  for (const [drawn, style] of [
+    ['as the phone draws it', '.m-node code { padding: 0; }'],
+    ['with the padding that the desktop’s messages give it', '.m-node code { padding: 2px 5px; }']
+  ] as const) {
+    test(`of a label that holds inline code ${drawn} are the lines of its text, and the code’s box is no part of them`, async ({ page }) => {
+      await pressPage(page, 'ios', { style, only: [PLAIN, PLAIN, WORDS_MESSAGES.code, PLAIN, PLAIN] })
+      const lines = await textLinesOf(page, WORDS_CODE)
+      expect(lines.length, 'text nodes of the label with their lines').toBe(3)
+      const whole = await rangeOverLabel(page, WORDS_CODE)
+      const code = await page.evaluate(() => {
+        const box = document.querySelector('.m-node .md-link[title="https://example.org/words-code"] code')?.getBoundingClientRect()
+        const text = document.createRange()
+        const node = document.querySelector('.m-node .md-link[title="https://example.org/words-code"] code')?.firstChild
+        if (!box || !node) return null
+        text.selectNodeContents(node)
+        const rect = text.getBoundingClientRect()
+        return { left: rect.left - box.left, right: box.right - rect.right, top: rect.top - box.top, bottom: box.bottom - rect.bottom }
+      })
+      if (code === null) throw new Error('the label has no inline code')
+      test.info().annotations.push({
+        type: 'code padding',
+        description: `${String(whole.length)} rectangles in the range over the label, ${String(lines.length)} lines of text; the code's box lies ${JSON.stringify(code)} points beyond its text (left, right, top, bottom)`
+      })
+      expectSameRects(await recordedWords(page, WORDS_CODE), await textLinesOf(page, WORDS_CODE), 'the rectangles of the words the record lists')
+    })
+  }
+
+  test('of a label that holds an imported image are its text and the image’s box', async ({ page }) => {
+    await pressPage(page, 'ios', { only: [PLAIN, PLAIN, WORDS_MESSAGES.image, PLAIN, PLAIN] })
+    await putImage(page, WORDS_IMAGE, 'a picture', false)
+    const lines = await textLinesOf(page, WORDS_IMAGE)
+    const image = await page.evaluate(() => {
+      const rect = document.querySelector('.m-node .md-link[title="https://example.org/words-image"] img')?.getBoundingClientRect()
+      return rect ? ([rect.left, rect.top, rect.right, rect.bottom] as const) : null
+    })
+    expect(image, 'the image’s border box').not.toBeNull()
+    expect(lines[lines.length - 1], 'the last of the label’s words').toEqual(image)
+    expectSameRects(await recordedWords(page, WORDS_IMAGE), await textLinesOf(page, WORDS_IMAGE), 'the rectangles of the words the record lists')
+    const middle = lines[lines.length - 1]
+    if (middle === undefined) throw new Error('the label has no image')
+    const made = await tapAndRead(page, (middle[0] + middle[2]) / 2, (middle[1] + middle[3]) / 2)
+    expect(made.opened, 'links opened by a tap on the image').toEqual([WORDS_IMAGE])
+  })
+
+  // The least size of the area that opens a link: one short word at the smallest text size, in plain text and inside inline code.
+  for (const surface of SURFACES) {
+    for (const [kind, href, message, style] of [
+      ['one short word', WORDS_SMALL, WORDS_MESSAGES.small, '.m-node code { padding: 0; }'],
+      ['one short word in inline code', WORDS_SMALL_CODE, WORDS_MESSAGES.smallCode, '.m-node code { padding: 0; }'],
+      // The padding that the desktop's messages give inline code (`.message-content code`), which the phone's messages do not take.
+      ['one short word in padded inline code', WORDS_SMALL_CODE, WORDS_MESSAGES.smallCode, '.m-node code { padding: 2px 5px; }']
+    ] as const) {
+      test(`${kind} at the smallest text size has an area of the least size, on ${surface}`, async ({ page }) => {
+        await pressPage(page, surface, { scale: SMALLEST_TEXT, style, only: [PLAIN, PLAIN, message, PLAIN, PLAIN] })
+        const [line] = await textLinesOf(page, href)
+        if (line === undefined) throw new Error('the link has no words')
+        const [whole] = (await rangeOverLabel(page, href)).sort((a, b) => (b[2] - b[0]) * (b[3] - b[1]) - (a[2] - a[0]) * (a[3] - a[1]))
+        if (whole === undefined) throw new Error('the label has no rectangle')
+        test.info().annotations.push({
+          type: 'range over the label',
+          description: `${kind} ${surface}: largest rectangle ${String(Math.round((whole[2] - whole[0]) * 10) / 10)} x ${String(Math.round((whole[3] - whole[1]) * 10) / 10)}, text line ${String(Math.round((line[2] - line[0]) * 10) / 10)} x ${String(Math.round((line[3] - line[1]) * 10) / 10)}`
+        })
+        const words: Words = { x: (line[0] + line[2]) / 2, y: (line[1] + line[3]) / 2, left: line[0], top: line[1], right: line[2], bottom: line[3] }
+        const size = FINGER[surface]
+        const area = await areaOf(page, href, words, size)
+        test.info().annotations.push({
+          type: 'least target',
+          description: `${kind} ${surface}: ${extentsOf(area)} (least ${String(size)}), words ${String(Math.round((line[2] - line[0]) * 10) / 10)} x ${String(Math.round((line[3] - line[1]) * 10) / 10)}, ${String(area.taps)} taps`
+        })
+        expect.soft(Math.min(area.width, area.height), 'the area’s least side, measured by taps that open').toBeGreaterThanOrEqual(size)
+        expectArea(area)
+      })
+    }
+  }
+
+  // Nothing a screen reader hears changes with how the label is drawn: the role and the name of the link, and a key that opens it.
+  for (const [kind, href, message, name] of [
+    ['plain words', WORDS_PLAIN, WORDS_MESSAGES.plain, 'a plain label of a few words'],
+    ['an inline box', WORDS_BOXED, WORDS_MESSAGES.boxed, BOXED_TEXT],
+    ['inline code', WORDS_CODE, WORDS_MESSAGES.code, 'run npm test now'],
+    ['an image', WORDS_IMAGE, WORDS_MESSAGES.image, 'a picture of the build']
+  ] as const) {
+    test(`a link whose label is ${kind} is one button with the same name, and a key opens it`, async ({ page }) => {
+      await pressPage(page, 'ios', { width: 320, only: [PLAIN, PLAIN, message, PLAIN, PLAIN] })
+      if (href === WORDS_BOXED) await putInBox(page, href, false)
+      if (href === WORDS_IMAGE) await putImage(page, href, name, true)
+      const link = page.getByRole('button', { name, exact: true })
+      await expect(link, `buttons named ${name}`).toHaveCount(1)
+      await expect(link).toHaveAttribute('title', href)
+      await link.focus()
+      await page.keyboard.press('Enter')
+      expect(await openedLinks(page), 'links opened by the Enter key on the focused link').toEqual([href])
+    })
+  }
+})

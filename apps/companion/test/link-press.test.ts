@@ -90,11 +90,14 @@ beforeEach(() => {
   )
   // jsdom has no hit test: the element at a point is the one whose made box holds it.
   Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: hitAt })
-  // jsdom has no layout: the words of a link are the box that the made page gives its label.
+  // jsdom has no layout: the words of a link are read one text node at a time, and the made page gives the text of a
+  // label the box of the label, so a range over the label's text node is the label's box.
   Object.defineProperty(Range.prototype, 'getClientRects', {
     configurable: true,
     value(this: Range) {
-      const label = this.commonAncestorContainer as Element
+      const node = this.commonAncestorContainer
+      const label = node instanceof Element ? node : node.parentElement
+      if (label === null) return []
       reads.push(label)
       return [rectOf(boxes.get(label))]
     }
@@ -152,6 +155,7 @@ function conversation(count: number, each: number): { pane: HTMLElement; message
       link.title = `https://example.org/${String(m)}-${String(l)}`
       const label = document.createElement('span')
       label.className = 'md-link-label'
+      label.append(document.createTextNode('link'))
       link.append(label)
       const box = { left: 10 + l * 18, top: m * 100 + 20, right: 26 + l * 18, bottom: m * 100 + 37 }
       boxes.set(link, box)
@@ -363,6 +367,7 @@ function between(...wordsOf: Box[]): { pane: HTMLElement; text: HTMLElement; lin
     link.title = `https://example.org/${String(index)}`
     const label = document.createElement('span')
     label.className = 'md-link-label'
+    label.append(document.createTextNode('link'))
     link.append(label)
     boxes.set(link, box)
     boxes.set(label, box)

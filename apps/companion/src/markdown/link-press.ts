@@ -95,6 +95,7 @@
 import { useEffect, type RefObject } from 'react'
 
 import { LOOK_HOLD, SLOP, contestRadius, decide, keepsPress, linkAt, lookAt, opensByRule, type Layout, type Named, type PaneLink, type Press, type Rect } from './link-target'
+import { wordsOf } from './link-words'
 
 /** The message controls that are not links. */
 export const OTHER_CONTROLS = 'button:not(.md-link), a[href], input, select, textarea, summary'
@@ -471,7 +472,10 @@ const OPEN: Rect = { left: -Infinity, top: -Infinity, right: Infinity, bottom: I
  * link) this reads no box at all. Otherwise it reads the pane's box, the box of each message that holds
  * a link, and the box of each link of the messages that are near the point; of those links only the ones
  * within the radius have their words read, and their clipping ancestors, each ancestor once for all of
- * them. The reads grow with the number of messages that hold links and with the links of the messages
+ * them. A link's words are one range for each text node of its label and one box for each replaced element
+ * in it (`wordsOf`): a label of plain words is one range, as before, and a label with emphasis, inline code
+ * or an image is a few, while the box of an element that holds text is not read. The reads grow with the
+ * number of messages that hold links and with the links of the messages
  * near the point, so a message of some thousand links reads every one of its link boxes at each press
  * and each click. Besides those boxes, each press and each click finds the message of every link of
  * the pane with `closest`: a walk of the tree, not a layout read. While a press that lit a link lives, each
@@ -629,13 +633,4 @@ function clientBoxOf(element: Element): Rect {
   const left = box.left + element.clientLeft
   const top = box.top + element.clientTop
   return { left, top, right: left + element.clientWidth, bottom: top + element.clientHeight }
-}
-
-/** The rectangles of a link's words, one for each line its label covers. */
-function wordsOf(link: HTMLElement): Rect[] {
-  const range = document.createRange()
-  range.selectNodeContents(link.querySelector('.md-link-label') ?? link)
-  return Array.from(range.getClientRects())
-    .filter((rect) => rect.width > 0 && rect.height > 0)
-    .map((rect) => ({ left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom }))
 }
