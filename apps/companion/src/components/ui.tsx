@@ -919,6 +919,8 @@ export function useModalSurface(
     // message's action and ended elsewhere leaves the focus outside the surface, and a Shift+Tab from
     // there lands behind it. The focus that lands in a part that the surface excludes goes to the
     // surface's first control. A message's own controls are in none of those parts and stay reachable.
+    // A focus that the page puts into one of those parts on purpose while the surface is open goes
+    // back too, so code that does so closes the surface first, as a message's action does.
     const onFocus = (event: FocusEvent): void => {
       const target = event.target
       if (target instanceof Node && excluded.some((part) => part.contains(target))) focusable()[0]?.focus()

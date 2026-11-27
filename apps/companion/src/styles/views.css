@@ -1586,10 +1586,15 @@
     align-self: center;
     /* The bar stays in place, so what it holds is bounded: at the largest text size a long reason
        would otherwise fill the window and stay over the page. The words scroll inside their box.
-       The box is sized from the words' own line: two whole lines to read and the half of a third,
-       which the fade below cuts and so says that more follows; never under 12 % of the window, so a
-       reason that fits at the ordinary size shows whole, and never over 20 %. Where `lh` is not
-       known the first declaration stands. */
+       The box is sized from the words' own line, 2.5 lines; never under 12 % of the window, so a
+       reason that fits at the ordinary size shows whole, and never over 20 %. Where the window is
+       tall enough for the 2.5 lines inside that 20 %, two whole lines show and the half of a third,
+       which the fade below cuts and so says that more follows. In a shorter window the 20 % wins
+       and fewer lines show: at the largest text size (a line of about 56 points) the first line is
+       whole and clear of the fade from a window about 420 points high, two whole lines show from
+       about 560, and two lines clear of the fade from about 700; the smallest window, 480 points
+       high, shows 96 points, 1.7 lines, and the fade starts after 1.2. The rest is reached by scroll.
+       Where `lh` is not known the first declaration stands. */
     max-block-size: 12vh;
     max-block-size: clamp(12vh, 2.5lh, 20vh);
     overflow: hidden auto;
@@ -1601,7 +1606,8 @@
   .topbar .connection[data-more='true'] {
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
-    /* Only the half line that peeks fades: the two whole lines above it stay as they are. */
+    /* Only the half line at the lower edge fades: where the box holds 2.5 lines the two whole lines
+       above it stay as they are, and in a shorter box what is above the half line is clear. */
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
   }

@@ -87,10 +87,10 @@ async function withTextScale(page: Page, ratio: number): Promise<void> {
   }, ratio)
 }
 
-/** Opens the harness signed in, in a window of `width` points, with the text at `ratio`. */
-async function openWindow(page: Page, width: number, ratio = 1): Promise<void> {
+/** Opens the harness signed in, in a window of `width` by `height` points, with the text at `ratio`. */
+async function openWindow(page: Page, width: number, ratio = 1, height = HEIGHT): Promise<void> {
   await withTextScale(page, ratio)
-  await page.setViewportSize({ width, height: HEIGHT })
+  await page.setViewportSize({ width, height })
   await page.goto('/harness.html')
   await page.waitForSelector('.app-shell')
   await page.evaluate((view) => {
@@ -219,6 +219,9 @@ async function expectTravel(page: Page, seconds: number, what: string, property 
  * for 100 ms of the page's own clock. WebKit scrolls smoothly, so a read straight after a wheel can
  * fall in the middle of the scroll. The wait has a deadline of its own, a timer that does not depend
  * on a frame being drawn, and a page still moving at the deadline fails with the last value it read.
+ * The timer and the frames run on the page's own thread: a page whose thread is blocked blocks the
+ * deadline too, and the test's own time limit is the last bound. Three still frames and 100 ms are
+ * evidence of rest, not proof: a pause in a scroll that is longer passes.
  */
 function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
   return page.evaluate(
@@ -680,7 +683,7 @@ test.describe('the words in the top bar', () => {
     expect(state.line, 'a plain line at the lower edge').not.toBe('none')
   })
 
-  test('the window of the words is two whole lines and the half of a third, and the fade leaves the two lines alone', async ({
+  test('the window of the words is two whole lines and the half of a third in a window 800 points high, and the fade leaves the two lines alone', async ({
     page
   }) => {
     await openWindow(page, 480, LARGEST)
@@ -698,6 +701,63 @@ test.describe('the words in the top bar', () => {
     expect(read.box, 'a third line is cut, and says that more follows').toBeLessThan(3 * read.line)
     expect(read.box - read.fade, 'the fade starts after the second line: the two are not faded').toBeGreaterThanOrEqual(2 * read.line - 1)
   })
+
+  /**
+   * The shell's smallest window is 480 points high. At the largest text size the box cannot hold two
+   * whole lines there: it is held to a fifth of the window, 96 points, about 1.7 lines of 56, and the
+   * fade starts after about 1.2. What holds at that height is that the bar keeps to its share, the
+   * first line is whole and clear of the fade, and the whole reason is reached by the keys.
+   */
+  for (const width of [480, 720] as const) {
+    test(`${width} points wide and 480 high at the largest size: the words keep to a fifth of the window, the first line is clear, and the keys reach the end`, async ({
+      page
+    }) => {
+      await openWindow(page, width, LARGEST, 480)
+      await page.evaluate((reason) => {
+        window.krTestHost?.setConnected(false, reason)
+      }, LONG_REASON)
+      await expect(wordsOf(page)).toHaveAttribute('data-more', 'true')
+      const read = await page.evaluate(() => {
+        const element = document.querySelector('.topbar .connection') as HTMLElement
+        const style = getComputedStyle(element)
+        const fade = /calc\(100% - ([\d.]+)px\)/.exec(style.maskImage || style.webkitMaskImage || '')
+        return {
+          box: element.clientHeight,
+          more: element.scrollHeight - element.clientHeight,
+          line: parseFloat(style.lineHeight),
+          fade: fade ? parseFloat(fade[1] ?? 'NaN') : Number.NaN,
+          bar: (document.querySelector('.topbar') as HTMLElement).getBoundingClientRect().height,
+          window: window.innerHeight
+        }
+      })
+      expect(read.window, 'the window is the smallest one').toBe(480)
+      expect(read.box, 'the words keep to a fifth of the window').toBeLessThanOrEqual(0.2 * read.window + 1)
+      expect(read.bar, `the bar keeps to ${BAR_SHARE * 100} % of the window`).toBeLessThanOrEqual(BAR_SHARE * read.window)
+      expect(read.box, 'the first line is whole').toBeGreaterThanOrEqual(read.line - 1)
+      expect(read.box - read.fade, 'the first line is clear of the fade').toBeGreaterThanOrEqual(read.line - 1)
+      expect(read.more, 'more of the reason lies below what is shown').toBeGreaterThan(0)
+
+      const words = wordsOf(page)
+      await menuOf(page).focus()
+      await page.keyboard.press(tabKeys().forward)
+      await expect(words, 'the Tab after the control reaches the words').toBeFocused()
+      await expect
+        .poll(async () => {
+          await page.keyboard.press('ArrowDown')
+          return (await shown(page)).scrolled
+        }, 'an arrow key scrolls the words')
+        .toBeGreaterThan(0)
+      await expect
+        .poll(async () => {
+          await page.keyboard.press('End')
+          return (await shown(page)).more
+        }, 'at the end nothing follows')
+        .toBe('false')
+      const end = await shown(page)
+      expect(end.mask, 'at the end there is no fade').toBe('none')
+      expect(end.scrolled + read.box, 'the whole reason has been scrolled through').toBeGreaterThanOrEqual(read.box + read.more - 1)
+    })
+  }
 
   test('a short reason at the largest size fits its window: no stop, no role and no fade', async ({ page }) => {
     await openWindow(page, 480, LARGEST)
@@ -948,6 +1008,178 @@ test.describe('the focus when the window narrows over the standing sidebar', () 
   }
 })
 
+/** The query that decides the narrow form, as the application writes it. */
+const NARROW_QUERY = '(max-width: 720px)'
+
+interface NarrowControl {
+  hold(): void
+  release(): void
+  force(value: boolean | null): void
+  tell(): void
+}
+
+/**
+ * Puts the narrow query in the test's hand. An engine decides by itself whether the window's new
+ * form is drawn before the page is told of the change or after, and a test cannot ask for either.
+ * Here the telling is held back while the engine draws (`hold`, then `release`), or the page is told
+ * while the window still has its old form (`force` sets what the query answers, `tell` sends the
+ * change to those that listen). While a form is forced, the engine's own telling is dropped; `force`
+ * with null gives the query back its own answer. While the telling is held, the page that is drawn
+ * again for another reason still reads the old form, so that nothing but the telling changes it: only
+ * the query that listens for the change answers with the new one.
+ */
+async function controlNarrowQuery(page: Page): Promise<void> {
+  await page.addInitScript((text) => {
+    const state = {
+      forced: null as boolean | null,
+      pinned: null as boolean | null,
+      holding: false,
+      queue: [] as (() => void)[],
+      told: new Set<() => void>(),
+      listening: new WeakSet<object>()
+    }
+    const real = window.matchMedia.bind(window)
+    window.matchMedia = (query: string): MediaQueryList => {
+      const list = real(query)
+      if (query !== text) return list
+      Object.defineProperty(list, 'matches', {
+        get: () =>
+          state.forced ?? (state.pinned !== null && !state.listening.has(list) ? state.pinned : Reflect.get(MediaQueryList.prototype, 'matches', list))
+      })
+      const gates = new Map<unknown, { gate: () => void; deliver: () => void }>()
+      const add = list.addEventListener.bind(list)
+      const remove = list.removeEventListener.bind(list)
+      Object.defineProperty(list, 'addEventListener', {
+        value: (type: string, listener: unknown, options?: unknown): void => {
+          if (type !== 'change' || typeof listener !== 'function') {
+            add(type, listener as EventListener, options as AddEventListenerOptions)
+            return
+          }
+          const deliver = (): void => {
+            ;(listener as (event: Event) => void).call(list, new Event('change'))
+          }
+          const gate = (): void => {
+            if (state.forced !== null) return
+            if (state.holding) state.queue.push(deliver)
+            else deliver()
+          }
+          gates.set(listener, { gate, deliver })
+          state.listening.add(list)
+          state.told.add(deliver)
+          add('change', gate)
+        }
+      })
+      Object.defineProperty(list, 'removeEventListener', {
+        value: (type: string, listener: unknown, options?: unknown): void => {
+          const found = gates.get(listener)
+          if (type !== 'change' || found === undefined) {
+            remove(type, listener as EventListener, options as EventListenerOptions)
+            return
+          }
+          gates.delete(listener)
+          state.told.delete(found.deliver)
+          remove('change', found.gate)
+        }
+      })
+      return list
+    }
+    const control: NarrowControl = {
+      hold: () => {
+        state.holding = true
+        state.pinned = Reflect.get(MediaQueryList.prototype, 'matches', real(text))
+      },
+      release: () => {
+        state.holding = false
+        state.pinned = null
+        for (const deliver of state.queue.splice(0)) deliver()
+      },
+      force: (value) => {
+        state.forced = value
+      },
+      tell: () => {
+        for (const deliver of state.told) deliver()
+      }
+    }
+    ;(window as unknown as { krNarrow: NarrowControl }).krNarrow = control
+  }, NARROW_QUERY)
+}
+
+/** Holds back or lets through what the narrow query tells the page, or tells it now. */
+function narrowQuery(page: Page, action: 'hold' | 'release' | 'tell'): Promise<void> {
+  return page.evaluate((what) => {
+    ;(window as unknown as { krNarrow: NarrowControl }).krNarrow[what]()
+  }, action)
+}
+
+/** Sets what the narrow query answers, or, with null, gives it back its own answer. */
+function forceNarrow(page: Page, value: boolean | null): Promise<void> {
+  return page.evaluate((wanted) => {
+    ;(window as unknown as { krNarrow: NarrowControl }).krNarrow.force(wanted)
+  }, value)
+}
+
+/** The window has been drawn in its narrow form: the sidebar is the closed drawer, out of sight. */
+async function expectNarrowFormDrawn(page: Page): Promise<void> {
+  await expect
+    .poll(() => page.evaluate(() => getComputedStyle(document.querySelector('aside.sidebar') as Element).visibility), 'the window is drawn narrow')
+    .toBe('hidden')
+}
+
+/**
+ * The two orders in which an engine can draw a window's new form and tell the page of the change,
+ * each made by the test. Drawn first: the sidebar is out of sight and the page has not been told
+ * (there is no "Menu" yet); an engine of this order has already taken the focus off the control
+ * that the new form hides. Told first: the page has its narrow form and the window has not.
+ */
+test.describe('the focus when the window narrows, whichever of the drawing and the telling comes first', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    for (const [what, control] of [
+      ['the item of the destination that is shown', '.sidebar [aria-current="page"]'],
+      ['the Account item', '.sidebar .nav-item-account']
+    ] as const) {
+      test(`${width} points: the window is drawn narrow before the page is told, and ${what} had the focus: "Menu" has it`, async ({
+        page
+      }) => {
+        await controlNarrowQuery(page)
+        await openWindow(page, 800, ratio)
+        await page.locator(control).focus()
+        await expect(page.locator(control)).toBeFocused()
+        await narrowQuery(page, 'hold')
+        await page.setViewportSize({ width, height: HEIGHT })
+        await expectNarrowFormDrawn(page)
+        await expect(menuOf(page), 'the page has not been told: there is no "Menu"').toHaveCount(0)
+        await narrowQuery(page, 'release')
+        await expect(menuOf(page), 'the focus is on "Menu"').toBeFocused()
+        await expectDrawnInWindow(menuOf(page), 'the focus on "Menu"')
+        await expect(menuOf(page), 'the drawer did not open').toHaveAttribute('aria-expanded', 'false')
+        await expectDrawerClosed(page)
+      })
+
+      test(`${width} points: the page is told before the window is drawn narrow, and ${what} had the focus: "Menu" has it`, async ({
+        page
+      }) => {
+        await controlNarrowQuery(page)
+        await openWindow(page, 800, ratio)
+        await page.locator(control).focus()
+        await expect(page.locator(control)).toBeFocused()
+        await forceNarrow(page, true)
+        await narrowQuery(page, 'tell')
+        await expect(menuOf(page), 'the page has its narrow form and the focus is on "Menu"').toBeFocused()
+        expect(await page.evaluate(() => window.innerWidth), 'the window has not changed').toBe(800)
+        await page.setViewportSize({ width, height: HEIGHT })
+        await forceNarrow(page, null)
+        await expect(menuOf(page), 'the focus stays on "Menu" as the window is drawn narrow').toBeFocused()
+        await expectDrawnInWindow(menuOf(page), 'the focus on "Menu"')
+        await expect(menuOf(page), 'the drawer did not open').toHaveAttribute('aria-expanded', 'false')
+        await expectDrawerClosed(page)
+      })
+    }
+  }
+})
+
 /** What a host asks the owner to confirm, for the message that says so. */
 const REQUEST = {
   ceremony: 'touch_id' as const,
@@ -992,6 +1224,38 @@ test.describe('a message that asks for confirmation while the drawer is open', (
       await expect(page.locator('.sidebar [aria-current="page"]'), 'the view is the one that holds the request').toHaveText(/^Attention/)
       await expect(page.getByTestId('confirmation-row'), 'the request holds the focus').toBeFocused()
       expect(await page.evaluate(() => (document.querySelector('.workspace') as HTMLElement).inert), 'the page is not inert').toBe(false)
+    })
+  }
+})
+
+/**
+ * The same action where the web view has no `inert`: the focus listener of the open drawer is in
+ * place, and the page behind is not inert. The drawer is gone and the listener with it before the
+ * request's row takes the focus, so the row keeps it.
+ */
+test.describe('a message that asks for confirmation while the drawer is open, on a web view without the inert attribute', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    test(`${width} points, with no inert: its action closes the drawer and puts the focus on the request`, async ({ page }) => {
+      await withoutInert(page)
+      await openWindow(page, width, ratio)
+      await menuOf(page).click()
+      await itemOf(page, 'Hosts').click()
+      await expect(page.locator('.sidebar [aria-current="page"]')).toHaveText(/^Hosts/)
+      await menuOf(page).click()
+      await expect(drawerOf(page)).toBeVisible()
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, REQUEST)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('needs your confirmation')
+      await toast.getByRole('button', { name: 'Review' }).click()
+      await expect(drawerOf(page), 'the drawer is closed').toBeHidden()
+      await expectDrawerClosed(page)
+      await expect(page.locator('.sidebar [aria-current="page"]'), 'the view is the one that holds the request').toHaveText(/^Attention/)
+      await expect(page.getByTestId('confirmation-row'), 'the request holds the focus').toBeFocused()
     })
   }
 })
@@ -1255,9 +1519,10 @@ for (const [reduced, how] of [
 }
 
 /**
- * The drawer's exit lasts 160 ms, 120 ms with reduced motion. A read made straight after a close is
- * inside it, whatever the machine's speed, once the exit is made to last for seconds: the cases that
- * follow read the drawer in that time and wait for no hidden state. Where the web view has `inert`
+ * The drawer's exit lasts 160 ms, 120 ms with reduced motion. The cases that follow make it last
+ * 3 s, read the drawer straight after the press and wait for no hidden state. A read made within
+ * those 3 s is inside the exit; a stall of the machine of more than that, between the press and the
+ * read, would let the exit end first, and these cases are not proof against it. Where the web view has `inert`
  * the drawer still goes out by its transition and is out of reach at once; where it has none it has
  * no exit, and is hidden at once.
  */
