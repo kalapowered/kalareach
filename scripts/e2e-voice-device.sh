@@ -475,7 +475,7 @@ for base, folders, names in os.walk(top):
 # The reader on the pictures kept for it in the companion's voice tests (reader-fixtures), each a
 # picture of the product's own page with the text it shows beside it, one line of the text per line
 # of the file: lines of one card's text cut tight to one line each, as the picture of one element is
-# (these are the pictures a wrongly built reader gives no text for, the long ones above all); the
+# (on the Mac where the fault was measured, a bad build gave no text for these, the long ones above all); the
 # whole page of the provider choice; and a picture without any text, whose file is empty, which must
 # read as empty so that the reader can still refuse. Every picture is read whatever the others give,
 # so the log shows each. The check is that each listed line is read, every word whole; the lists are
