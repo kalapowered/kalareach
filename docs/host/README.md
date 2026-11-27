@@ -6925,13 +6925,14 @@ here where it does not. Its timers wait for the first page each session answers 
 
 The environment has a source of its own beside the sessions': the workflow journal (see *The
 automation service*). When one of a workflow revision's own limits is breached, a derived trigger is
-refused by the revision's own definition at admission, or a causal chain runs out of budget, the journal commits one attention record with the pause, and when a paused
-revision is enabled again it commits one that ends the pause's item. The daemon reads these records
-as the journal's registered attention consumer, at its start and every two seconds after. It
-registers again before every pass, which also tells it how far the journal records it as having
-read. The journal depends on the registration: it removes a record of an attention type only once
-every consumer registered for that type has passed it, and never removes a type nobody has
-registered for. The store removes nothing from the journal.
+refused by the revision's own definition at admission, or a causal chain runs out of budget, the
+journal commits one attention record with the pause, and when a paused revision is enabled again it
+commits one that ends the pause's item. The daemon reads these records as the journal's registered
+attention consumer, at its start and every two seconds after. It registers again before every pass,
+which also tells it how far the journal records it as having read. The journal depends on the
+registration: it removes a record of an attention type only once every consumer registered for that
+type has passed it, and never removes a type nobody has registered for. The store removes nothing
+from the journal.
 
 A pass reads the records past the store's own cursor, commits what they raise or end, and only then
 tells the journal how far the store has read; the journal keeps the furthest position it is told. A

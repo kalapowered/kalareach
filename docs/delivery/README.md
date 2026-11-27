@@ -862,15 +862,15 @@ moves, the lines the message will carry: one sentence per rule ("A question is w
 ...", "An approval is waiting in session ...", "A command failed in session ...") that names the
 session by its identifier and dated by when the condition was first seen. A notice about an
 automation pause adds the host's own summary of it, which names the workflow or the
-causal chain by identifier and the limit or the refusal as the workflow journal records it (a limit on a node's
-wait names the node by the identifier its author gave it); no other rule carries a summary out.
-Nothing a session said is in the lines, and a worker's words cannot be: the attention store keeps
-none. The lines are checked when the message is composed, against the grant of the rule that sends
-it, as far as each is about a session: a line naming a session the grant does not reach, or dated
-before the history the grant reaches (for a grant with no history bound, before the grant began,
-whether or not it includes the live screen), is left out and counted in the message, and a notice
-about a session the grant does not reach produces no message for that destination at all. A line
-that names no session is the host's own words about the host or an automation, and the grant's
+causal chain by identifier and the limit or the refusal as the workflow journal records it (a limit
+on a node's wait names the node by the identifier its author gave it); no other rule carries a
+summary out. Nothing a session said is in the lines, and a worker's words cannot be: the attention
+store keeps none. The lines are checked when the message is composed, against the grant of the rule
+that sends it, as far as each is about a session: a line naming a session the grant does not reach,
+or dated before the history the grant reaches (for a grant with no history bound, before the grant
+began, whether or not it includes the live screen), is left out and counted in the message, and a
+notice about a session the grant does not reach produces no message for that destination at all. A
+line that names no session is the host's own words about the host or an automation, and the grant's
 right to be told of that is all it needs. A recovery that produces from the same event again
 composes from the same input lines and applies the destination's current grant to them again.
 
