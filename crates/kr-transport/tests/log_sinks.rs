@@ -86,6 +86,19 @@ fn approved() -> Vec<(&'static str, String, usize)> {
             .to_owned(),
             1,
         ),
+        // The test helper that keeps the last lines a test process logged, to name the layer of a
+        // failed connect of a paired device: the capture stands only in a test-support file, keeps
+        // its lines in memory under a fixed bound, prints them only in the panic of that failed
+        // connect, and is the process's default only when the process has none.
+        (
+            "kr-controller/tests/net_support/connect_report.rs",
+            concat!(
+                "tracing::subscriber::set_",
+                "global_default(Capture).is_ok(),"
+            )
+            .to_owned(),
+            1,
+        ),
         (
             "apps/companion/src-tauri/tests/navigation.rs",
             concat!(
