@@ -4062,6 +4062,61 @@ async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off
     }
 }
 
+/// KR-REQ-19.08: the record of a slow wait is optional and its failure line is read in logs that
+/// other people read, so it names the record's file and the kind of the failure, never the folder:
+/// not where a write failed, not where the evidence variable points, not what the reader said of a
+/// refused value.
+#[test]
+fn kr_req_19_08_a_record_that_cannot_be_kept_names_its_file_and_not_its_folder() {
+    const MARKER: &str = "a-folder-a-person-named";
+    let root = tempfile::tempdir().expect("a directory");
+
+    // The record's place holds a folder, so the file cannot be opened.
+    let blocked = root.path().join(MARKER);
+    std::fs::create_dir_all(blocked.join(support::WAIT_RECORD)).expect("a folder in its place");
+    let opening = support::write_wait(&blocked, "a wait").expect_err("the file is not opened");
+
+    // The folder's own place holds a file, so the folder cannot be made.
+    let file = root.path().join(format!("{MARKER}-file"));
+    std::fs::write(&file, "a file").expect("a file");
+    let making =
+        support::write_wait(&file.join("evidence"), "a wait").expect_err("the folder is not made");
+
+    // A value the reader refuses names itself in the reader's own words; the record's line does not.
+    let refusal = kr_test_artifacts::confine(std::path::Path::new(MARKER))
+        .expect_err("a relative value is refused");
+    assert!(
+        refusal.to_string().contains(MARKER),
+        "the refusal names the value it was given, so this case can tell: {refusal}"
+    );
+    let refused = support::wait_folder(Some(Err(refusal))).expect_err("no folder");
+    let unset = support::wait_folder(None).expect_err("no folder");
+
+    for words in [&opening, &making, &refused, &unset] {
+        assert!(
+            words.contains(support::WAIT_RECORD),
+            "the line names the record's file: {words}"
+        );
+        assert!(
+            !words.contains(MARKER),
+            "the line names no folder of the person's: {words}"
+        );
+    }
+    assert!(
+        opening.contains("IsADirectory") && making.contains("NotADirectory"),
+        "the line names the kind of the failure: {opening} / {making}"
+    );
+
+    // A folder that can be written keeps the line.
+    let kept = root.path().join("kept");
+    support::write_wait(&kept, "one wait").expect("the line is kept");
+    support::write_wait(&kept, "another wait").expect("the next line is kept");
+    assert_eq!(
+        std::fs::read_to_string(kept.join(support::WAIT_RECORD)).expect("the record"),
+        "one wait\nanother wait\n"
+    );
+}
+
 /// KR-REQ-19.08: what a person reads while the main connection is not made is what the last try
 /// came to. After the host refused a connection at its admission they are the host's; after a try
 /// that did not reach the host they say so, and a connection that opens clears them.

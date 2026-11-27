@@ -82,6 +82,21 @@ pub fn directory() -> PathBuf {
     directory_from(std::env::var_os(VARIABLE).as_deref())
 }
 
+/// The directory `KR_TEST_ARTIFACTS_DIR` names, for a caller that keeps an optional record and must
+/// not fail, or print a folder, on the record's account. It does not panic, it makes no directory
+/// of the run's own and it says nothing on standard error: `None` where the variable is not set,
+/// and the refusal where its value is outside the roots. The refusal's words name the value as it
+/// was given, as [`directory`]'s panic does; a caller that reports a refusal in a log other people
+/// read says only that the value was refused.
+#[must_use]
+pub fn named_directory() -> Option<Result<PathBuf, Refused>> {
+    named_from(std::env::var_os(VARIABLE).as_deref())
+}
+
+fn named_from(value: Option<&OsStr>) -> Option<Result<PathBuf, Refused>> {
+    value.map(|value| confine(Path::new(value)))
+}
+
 fn directory_from(value: Option<&OsStr>) -> PathBuf {
     match value {
         Some(value) => confine(Path::new(value)).unwrap_or_else(|refused| panic!("{refused}")),
@@ -421,6 +436,28 @@ mod tests {
 
     fn real(path: &Path) -> PathBuf {
         real_path(path).expect("resolves")
+    }
+
+    #[test]
+    fn a_named_directory_is_none_unset_and_an_error_not_a_panic_when_refused() {
+        assert_eq!(named_from(None), None, "no variable names nothing");
+
+        let root = temporary();
+        let inside = root.path().join("evidence");
+        let named = named_from(Some(inside.as_os_str()))
+            .expect("a value names a directory")
+            .expect("a value inside the roots is taken");
+        assert_eq!(named, real(root.path()).join("evidence"));
+        assert!(!inside.exists(), "reading the name makes nothing");
+
+        let elsewhere = Path::new(if cfg!(windows) { r"C:\Windows" } else { "/etc" });
+        let refused = named_from(Some(elsewhere.as_os_str()))
+            .expect("a value names a directory")
+            .expect_err("a value outside the roots is refused, not a panic");
+        assert!(
+            refused.to_string().contains(VARIABLE),
+            "the refusal names the variable: {refused}"
+        );
     }
 
     #[test]

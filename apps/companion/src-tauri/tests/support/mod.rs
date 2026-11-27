@@ -53,31 +53,58 @@ pub const fn through_rounds(rounds: u32) -> Duration {
         .saturating_add(WATCHDOG)
 }
 
+/// The file the record of the slow phone-session waits is kept in, in the run's evidence folder.
+pub const WAIT_RECORD: &str = "companion-phone-session-waits.txt";
+
 /// Appends `line` to the record of the phone-session waits that took longer than the ordinary
-/// watchdog, in the run's evidence folder (the one the hosted jobs keep), and prints it. A line that
-/// cannot be kept is printed with why and fails nothing: the wait it records came or failed on its
-/// own account.
+/// watchdog, in the run's evidence folder (the one the hosted jobs keep), and prints it. The record
+/// is optional: where the variable that names the folder is not set, or its value is refused, or the
+/// file cannot be written, one line says so with the file's name and a fixed category, never the
+/// folder, which a log that other people read must not name; and nothing fails, since the wait the
+/// line records came or failed on its own account.
 pub fn keep_wait(line: &str) {
+    eprintln!("{line}");
+    let kept = wait_folder(kr_test_artifacts::named_directory())
+        .and_then(|folder| write_wait(&folder, line));
+    if let Err(why) = kept {
+        eprintln!("{why}");
+    }
+}
+
+/// The folder the record goes in, or the words that say it has none: the variable is not set, or
+/// its value is refused. The refusal's own words are not passed on: they name the value it was
+/// given.
+pub fn wait_folder(
+    named: Option<Result<std::path::PathBuf, kr_test_artifacts::Refused>>,
+) -> Result<std::path::PathBuf, String> {
+    match named {
+        Some(Ok(folder)) => Ok(folder),
+        Some(Err(_refused)) => Err(wait_not_kept(
+            "the evidence folder the run names is refused",
+        )),
+        None => Err(wait_not_kept("the evidence folder is not set")),
+    }
+}
+
+/// Appends `line` to the record in `folder`. Why it could not is one line that names the record's
+/// file and the kind of the failure and never `folder`.
+pub fn write_wait(folder: &std::path::Path, line: &str) -> Result<(), String> {
     use std::io::Write as _;
 
-    eprintln!("{line}");
-    let path = kr_test_artifacts::directory().join("companion-phone-session-waits.txt");
-    let write = || -> std::io::Result<()> {
-        if let Some(folder) = path.parent() {
-            std::fs::create_dir_all(folder)?;
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
-        writeln!(file, "{line}")
-    };
-    if let Err(error) = write() {
-        eprintln!(
-            "this wait's record could not be kept at {}: {error}",
-            path.display()
-        );
-    }
+    let failed =
+        |step: &str, error: &std::io::Error| wait_not_kept(&format!("{step} ({:?})", error.kind()));
+    std::fs::create_dir_all(folder)
+        .map_err(|error| failed("the folder could not be made", &error))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(folder.join(WAIT_RECORD))
+        .map_err(|error| failed("the file could not be opened", &error))?;
+    writeln!(file, "{line}").map_err(|error| failed("the line could not be written", &error))
+}
+
+fn wait_not_kept(why: &str) -> String {
+    format!("this wait's record could not be kept in {WAIT_RECORD}: {why}")
 }
 
 pub fn loopback() -> SocketAddr {
