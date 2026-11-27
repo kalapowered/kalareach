@@ -738,9 +738,19 @@ pub struct ConnectionState {
     /// replaced by one it admits. A request refused on the withdrawn connection was answered with a
     /// failure just before the replacement, so the page says so whenever this grows.
     pub replaced: u64,
-    /// While no connection is held and a try to reach a host has run longer than it takes to
-    /// answer, which kind of host that try is for, and null otherwise. The reason is not changed
-    /// while this shows: it keeps the words of the last try that failed.
+    /// While no connection is held and a try to reach the host in use has run past `SLOW_TRY`
+    /// without ending, which kind of host that try is for; null otherwise.
+    ///
+    /// Null proves nothing: a try can be running with no mark. A mark is taken only when the
+    /// standing words are those of a host that was not reached (a try that failed, or a connection
+    /// that ended with nothing refused: an unreached attempt), so a choice's first try and a try
+    /// that follows other words (the host's own answer, or words this application wrote) never
+    /// show one, and a try shorter than `SLOW_TRY` shows none. The mark comes off in the commit
+    /// that writes the try's result or finds nothing to reach, when the task that runs the try
+    /// unwinds from a panic, and in any other write of the reason; between the end of the try and
+    /// that commit it still shows. The reason is not changed while the mark shows. A try for the
+    /// host on this machine has no bound of its own, so the mark stays for as long as that host
+    /// holds its socket open and sends nothing.
     pub still_reaching: Option<Reaching>,
 }
 
