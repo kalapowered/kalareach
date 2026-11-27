@@ -227,7 +227,8 @@ pub enum JournalEventKind {
         /// Which limit was breached, or the refusal, in its own words.
         reason: String,
     },
-    /// The pause a limit or a refusal caused was cleared, which ends that item's condition.
+    /// A paused revision was enabled again, whatever caused the pause, a request for it included.
+    /// It ends the condition of the item that a limit or a refusal raised, when one did.
     WorkflowResumed {
         /// The workflow.
         workflow_id: WorkflowId,
@@ -603,7 +604,9 @@ pub struct AttentionOutboxRecord {
     pub sequence: u64,
     /// What the record is about.
     pub subject: AttentionSubject,
-    /// Which limit was reached.
+    /// Why the record was written, in the journal's words: the ceiling that was reached, the limit
+    /// that was breached or the refusal of the definition, or, for a record that ends a pause,
+    /// that the revision was enabled again.
     pub reason: String,
     /// When the record was committed.
     pub created_at_ms: u64,

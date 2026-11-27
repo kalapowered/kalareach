@@ -127,7 +127,7 @@ wire_enum! {
     WorkflowAlertKind {
         CausalLimit => "causal_limit", "A causal chain ran out of budget and was paused.";
         WorkflowPaused => "workflow_paused", "A workflow revision was paused by one of its own limits or by a refusal of its definition at admission.";
-        WorkflowResumed => "workflow_resumed", "The pause a limit or a refusal caused was cleared by enabling the revision.";
+        WorkflowResumed => "workflow_resumed", "A paused workflow revision was enabled again, which cleared the pause, whatever caused it: a request, one of its own limits or a refusal of its definition.";
     }
 }
 
@@ -494,9 +494,11 @@ pub struct WorkflowRunSummary {
 
 /// One attention record the automation journal holds and no attention state has acknowledged.
 ///
-/// It is the record an exhausted chain or a breached workflow limit owes, and the one that ends a
-/// pause. It stays in the journal, and in `workflow.read`, until the environment's attention state
-/// has taken it.
+/// An exhausted causal chain owes one. A workflow revision owes one when one of its own limits
+/// pauses it, or when a trigger that a node produced finds its stored definition refused at
+/// admission, and one that ends the pause when it is enabled again, whatever caused the pause, a
+/// request for it included. A record stays in the journal, and in `workflow.read`, until the
+/// environment's attention state has taken it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowAlert {
@@ -510,7 +512,9 @@ pub struct WorkflowAlert {
     pub revision: Nullable<U64>,
     /// The chain, for an alert about a causal budget.
     pub causal_root_id: Nullable<CausalRootId>,
-    /// Which limit was reached, or what ended the condition.
+    /// Why, as the journal wrote it: for a chain, the ceiling that was reached; for a paused
+    /// revision, the limit that was breached or the refusal of its definition, in its own words;
+    /// for the record that ends a pause, that the revision was enabled again.
     pub reason: String,
     /// When the record was committed.
     pub raised_at_ms: TimestampMs,

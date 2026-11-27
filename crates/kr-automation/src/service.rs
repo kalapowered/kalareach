@@ -444,9 +444,9 @@ impl AutomationService {
 
     /// Enables an installed workflow revision (`workflow.enable`).
     ///
-    /// Enabling clears a pause, whether the pause came from `workflow.pause` or from a breached
-    /// per-workflow limit, so the same authorised method that starts a revision is the one that
-    /// restarts it. The change and the record of the action commit together, so a replayed
+    /// Enabling clears a pause, whether the pause came from `workflow.pause`, from a breached
+    /// per-workflow limit or from a refusal of the stored definition at admission, so the same
+    /// authorised method that starts a revision is the one that restarts it. The change and the record of the action commit together, so a replayed
     /// enable is answered from its record and cannot undo a pause decided after it.
     ///
     /// # Errors

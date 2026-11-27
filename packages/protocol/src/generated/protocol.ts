@@ -33554,9 +33554,11 @@ export interface ProtocolVersion8 {
 /**
  * One attention record the automation journal holds and no attention state has acknowledged.
  *
- * It is the record an exhausted chain or a breached workflow limit owes, and the one that ends a
- * pause. It stays in the journal, and in `workflow.read`, until the environment's attention state
- * has taken it.
+ * An exhausted causal chain owes one. A workflow revision owes one when one of its own limits
+ * pauses it, or when a trigger that a node produced finds its stored definition refused at
+ * admission, and one that ends the pause when it is enabled again, whatever caused the pause, a
+ * request for it included. A record stays in the journal, and in `workflow.read`, until the
+ * environment's attention state has taken it.
  */
 export interface WorkflowAlert {
   /**
@@ -33572,7 +33574,9 @@ export interface WorkflowAlert {
    */
   raised_at_ms: string
   /**
-   * Which limit was reached, or what ended the condition.
+   * Why, as the journal wrote it: for a chain, the ceiling that was reached; for a paused
+   * revision, the limit that was breached or the refusal of its definition, in its own words;
+   * for the record that ends a pause, that the revision was enabled again.
    */
   reason: string
   /**

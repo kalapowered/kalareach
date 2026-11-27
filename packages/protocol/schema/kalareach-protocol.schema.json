@@ -43754,7 +43754,7 @@
     },
     "WorkflowAlert": {
       "additionalProperties": false,
-      "description": "One attention record the automation journal holds and no attention state has acknowledged.\n\nIt is the record an exhausted chain or a breached workflow limit owes, and the one that ends a\npause. It stays in the journal, and in `workflow.read`, until the environment's attention state\nhas taken it.",
+      "description": "One attention record the automation journal holds and no attention state has acknowledged.\n\nAn exhausted causal chain owes one. A workflow revision owes one when one of its own limits\npauses it, or when a trigger that a node produced finds its stored definition refused at\nadmission, and one that ends the pause when it is enabled again, whatever caused the pause, a\nrequest for it included. A record stays in the journal, and in `workflow.read`, until the\nenvironment's attention state has taken it.",
       "properties": {
         "causal_root_id": {
           "anyOf": [
@@ -43776,7 +43776,7 @@
           "description": "When the record was committed."
         },
         "reason": {
-          "description": "Which limit was reached, or what ended the condition.",
+          "description": "Why, as the journal wrote it: for a chain, the ceiling that was reached; for a paused\nrevision, the limit that was breached or the refusal of its definition, in its own words;\nfor the record that ends a pause, that the revision was enabled again.",
           "type": "string"
         },
         "revision": {
@@ -43832,7 +43832,7 @@
         },
         {
           "const": "workflow_resumed",
-          "description": "The pause a limit or a refusal caused was cleared by enabling the revision.",
+          "description": "A paused workflow revision was enabled again, which cleared the pause, whatever caused it: a request, one of its own limits or a refusal of its definition.",
           "type": "string"
         }
       ]

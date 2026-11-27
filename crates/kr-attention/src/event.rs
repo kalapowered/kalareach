@@ -343,7 +343,8 @@ pub enum EventKind {
     AutomationPaused {
         /// What was paused.
         subject: AttentionAutomationSubject,
-        /// Which limit was reached, as the workflow journal names it.
+        /// Why it was paused, as the workflow journal wrote it: the ceiling or limit that was
+        /// reached, or the refusal of the definition, in its own words.
         reason: String,
         /// The grant the workflow revision or the chain acts under, when the journal can name one.
         ///
