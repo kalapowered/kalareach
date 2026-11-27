@@ -4127,11 +4127,13 @@ async fn kr_req_19_08_the_connection_waits_give_up_at_their_own_bound() {
 }
 
 /// KR-REQ-19.08: the keeper waits between two tries for no longer than the client library's
-/// back-off says for that try, and its tries go on. The waits that pass reconnect rounds hold only
-/// that a connection came back in time, so a keeper that slept longer than its back-off says would
-/// pass them; this case reads the keeper's own sleeps. The keeper runs on a paused clock against
-/// attempts that fail at once, so each gap between two tries is the sleep the keeper chose, to the
-/// instant, and no draw of the back-off changes what is held: only the ceiling of each try is.
+/// back-off says for that try and for no less than its floor, and its tries go on. The waits that
+/// pass reconnect rounds hold only that a connection came back in time, so a keeper that slept
+/// longer than its back-off says would pass them; this case reads the keeper's own sleeps. The
+/// keeper runs on a paused clock against attempts that fail at once, so each gap between two tries
+/// is the sleep the keeper chose, to the instant. What is held is the ceiling of each try and the
+/// floor of every wait, a keeper that never sleeps being a retry loop that spins; nothing is held
+/// about the draw between them.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off_says() {
     use companion_tauri::connection::{Attempt, keep};
@@ -4192,13 +4194,21 @@ async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off
         .map(|pair| pair[1].duration_since(pair[0]))
         .collect();
     // Each gap first: a keeper that sleeps too long is told by the gap that was too long, and not
-    // by the count of tries that it had no time left to make.
+    // by the count of tries that it had no time left to make. Every draw of the back-off is at
+    // least its minimum, so a gap below it is a keeper that did not sleep as long as it was told.
     for (number, (gap, ceiling)) in gaps.iter().zip(&ceilings).enumerate() {
         assert!(
             gap <= ceiling,
             "the keeper waited {gap:?} before try {} and the back-off's ceiling for it is \
              {ceiling:?}; the gaps were {gaps:?}",
             number + 2
+        );
+        assert!(
+            *gap >= kr_transport::reconnect::BACKOFF_MIN,
+            "the keeper waited {gap:?} before try {} and the back-off's floor is {:?}; the gaps \
+             were {gaps:?}",
+            number + 2,
+            kr_transport::reconnect::BACKOFF_MIN
         );
     }
     // Then the tries go on: one after each failed one, until the keeper is told that there is
