@@ -484,6 +484,309 @@ pub struct ClosureRecord {
     pub closed_at_ms: TimestampMs,
 }
 
+/// What follows a clause kept from a message, or a description of what failed, to say why the rest
+/// is not here.
+///
+/// It is also the detail a paired device is given for a resource that a closure's entry names the
+/// host in, which is why it lives beside the closure's constructor: a record is charged for the
+/// words the device will receive.
+pub const WHY_NOT_SHOWN: &str = "the detail names the host and is not sent to a paired device";
+
+/// The most bytes one free text member of a closure record keeps: an entry's `kind`, `detail` and
+/// `name`, and the root's signal.
+pub const CLOSURE_TEXT_BYTES: usize = 1_024;
+
+/// The bytes of entries a closure record holds when a worker or the host builds it: three
+/// quarters of the largest frame a paired device is sent.
+pub const CLOSURE_BUDGET_BYTES: usize = 196_608;
+
+/// The most members one list of a closure record holds, the entry for what was left out included.
+/// The codec refuses a list that is longer.
+const CLOSURE_LIST_MEMBERS: usize = kr_cbor::Limits::DEFAULT.max_collection_len;
+
+/// The kind of the entry that counts what a closure record does not list.
+pub const NOT_LISTED_KIND: &str = "not_listed";
+
+/// Why a closure record leaves entries out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OmissionReason {
+    /// The record holds a limited number of bytes of entries, so the worker or the host that wrote
+    /// it listed the first ones.
+    Budget,
+    /// The connection a device reads the record on cannot carry it in one frame, so the host
+    /// counts the entries instead of listing any.
+    Connection,
+}
+
+impl OmissionReason {
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Budget => "a closure record has a size limit",
+            Self::Connection => "this connection cannot carry the whole record in one frame",
+        }
+    }
+}
+
+/// The words of the entry's detail before each number and before the reason. They do not change
+/// with a count ("1 of the ended processes" reads right for every number), so the one reader of the
+/// entry reads every count.
+const BEFORE_ENDED: &str = "not listed here: ";
+const BEFORE_OTHER: &str = " of the ended processes and ";
+const BEFORE_REASON: &str = " of the other entries, because ";
+
+/// The entry a closure record carries in place of the entries it does not list.
+///
+/// It is a [`SurvivingResource`] of kind `not_listed` whose detail is two counts and a reason in
+/// fixed words, so no member is added to any type and a reader that does not know the entry takes it
+/// as an ordinary one. Only this type writes it and only this type reads it: a reader gets the counts
+/// as numbers and never parses text itself, and a `not_listed` entry that does not read back as one
+/// of these is an ordinary entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClosureOmission {
+    /// The processes the closure terminated and the record does not list.
+    pub ended: u64,
+    /// The entries of `surviving` the record does not list.
+    pub other: u64,
+    /// Why they are not listed.
+    pub reason: OmissionReason,
+}
+
+impl ClosureOmission {
+    /// Returns the entry that says this.
+    #[must_use]
+    pub fn entry(&self) -> SurvivingResource {
+        SurvivingResource {
+            kind: NOT_LISTED_KIND.to_owned(),
+            detail: format!(
+                "{BEFORE_ENDED}{}{BEFORE_OTHER}{}{BEFORE_REASON}{}",
+                self.ended,
+                self.other,
+                self.reason.words()
+            ),
+        }
+    }
+
+    /// Reads an entry back, or `None` when it is not exactly what [`ClosureOmission::entry`] writes.
+    #[must_use]
+    pub fn read(entry: &SurvivingResource) -> Option<Self> {
+        if entry.kind != NOT_LISTED_KIND {
+            return None;
+        }
+        let rest = entry.detail.strip_prefix(BEFORE_ENDED)?;
+        let (ended, rest) = rest.split_once(BEFORE_OTHER)?;
+        let (other, why) = rest.split_once(BEFORE_REASON)?;
+        let reason = [OmissionReason::Budget, OmissionReason::Connection]
+            .into_iter()
+            .find(|reason| reason.words() == why)?;
+        Some(Self {
+            ended: count_written(ended)?,
+            other: count_written(other)?,
+            reason,
+        })
+    }
+}
+
+/// A count as [`ClosureOmission::entry`] writes it: decimal digits with no sign and no leading zero.
+fn count_written(text: &str) -> Option<u64> {
+    let count: u64 = text.parse().ok()?;
+    (count.to_string() == text).then_some(count)
+}
+
+fn count_of(entries: usize) -> u64 {
+    u64::try_from(entries).unwrap_or(u64::MAX)
+}
+
+/// The bytes `value` takes in its canonical encoding, headers included.
+fn encoded_size<T: Serialize>(value: &T) -> usize {
+    kr_cbor::to_canonical_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// `text` held to [`CLOSURE_TEXT_BYTES`]: cut on a character boundary, with `...` where it ends.
+fn held_to_the_text_bytes(text: &mut String) {
+    if text.len() <= CLOSURE_TEXT_BYTES {
+        return;
+    }
+    let mut end = CLOSURE_TEXT_BYTES - "...".len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str("...");
+}
+
+/// An entry of `surviving` as a paired device is given it when its detail names the host.
+fn as_a_device_is_given(entry: &SurvivingResource) -> SurvivingResource {
+    SurvivingResource {
+        kind: entry.kind.clone(),
+        detail: format!("{}: {WHY_NOT_SHOWN}", entry.kind),
+    }
+}
+
+/// What an entry of `surviving` costs a record: the larger of its own encoding and its encoding in
+/// the form a device is given.
+fn charged(entry: &SurvivingResource) -> usize {
+    encoded_size(entry).max(encoded_size(&as_a_device_is_given(entry)))
+}
+
+/// The longest prefix of `entries` that fits in `left` bytes and `members` entries, which takes
+/// the first `always` entries whatever they cost. Returns it with the number of entries left out.
+fn prefix_within<T>(
+    mut entries: Vec<T>,
+    charge: impl Fn(&T) -> usize,
+    left: &mut usize,
+    members: usize,
+    always: usize,
+) -> (Vec<T>, usize) {
+    let mut kept = 0;
+    let mut spent = 0_usize;
+    for entry in &entries {
+        if kept == members {
+            break;
+        }
+        let total = spent.saturating_add(charge(entry));
+        if kept >= always && total > *left {
+            break;
+        }
+        spent = total;
+        kept += 1;
+    }
+    *left = left.saturating_sub(spent);
+    let omitted = entries.len() - kept;
+    entries.truncate(kept);
+    (entries, omitted)
+}
+
+impl ClosureRecord {
+    /// Returns this record with its two lists held to `budget` bytes, the one place that decides
+    /// what a closure record lists.
+    ///
+    /// Every free text member is cut to [`CLOSURE_TEXT_BYTES`] first. A `surviving` entry is then
+    /// charged at the larger of its own encoding and its encoding in the form a paired device is
+    /// given, since a device is shown the second whatever the host wrote; a `terminated` entry is
+    /// charged at its own. `surviving` is listed first, in the order it was given, then `terminated`,
+    /// each as a prefix, and neither takes more than the codec's limit of members, the entry below
+    /// included. The first entry of `surviving` is always listed, so a record that left a survivor
+    /// out names one. When anything is left out, one entry of kind `not_listed` is added last to
+    /// `surviving`; it is not charged.
+    ///
+    /// `ownership_coverage` and every other member are unchanged: they are the worker's account of
+    /// the whole lists, which this does not shorten in what it says.
+    #[must_use]
+    pub fn bounded(mut self, budget: usize) -> Self {
+        if let Some(signal) = self.root_signal.0.as_mut() {
+            held_to_the_text_bytes(signal);
+        }
+        for process in &mut self.terminated {
+            if let Some(name) = process.name.0.as_mut() {
+                held_to_the_text_bytes(name);
+            }
+        }
+        for resource in &mut self.surviving {
+            held_to_the_text_bytes(&mut resource.kind);
+            held_to_the_text_bytes(&mut resource.detail);
+        }
+        let mut left = budget;
+        let (mut surviving, mut other) =
+            prefix_within(self.surviving, charged, &mut left, CLOSURE_LIST_MEMBERS, 1);
+        let (terminated, ended) = prefix_within(
+            self.terminated,
+            encoded_size,
+            &mut left,
+            CLOSURE_LIST_MEMBERS,
+            0,
+        );
+        if ended + other > 0 {
+            if surviving.len() == CLOSURE_LIST_MEMBERS {
+                surviving.pop();
+                other += 1;
+            }
+            surviving.push(
+                ClosureOmission {
+                    ended: count_of(ended),
+                    other: count_of(other),
+                    reason: OmissionReason::Budget,
+                }
+                .entry(),
+            );
+        }
+        Self {
+            terminated,
+            surviving,
+            ..self
+        }
+    }
+
+    /// Returns the entry that counts what this record does not list, when it carries one: the last
+    /// entry of `surviving`, when it reads as [`ClosureOmission::entry`] writes it.
+    #[must_use]
+    pub fn omitted(&self) -> Option<ClosureOmission> {
+        self.surviving.last().and_then(ClosureOmission::read)
+    }
+
+    /// Returns the resources the record lists as having survived: `surviving` without the entry
+    /// that counts what is not listed.
+    #[must_use]
+    pub fn survivors(&self) -> &[SurvivingResource] {
+        match self.surviving.split_last() {
+            Some((last, listed)) if ClosureOmission::read(last).is_some() => listed,
+            _ => &self.surviving,
+        }
+    }
+
+    /// Whether the session left anything running or unaccounted for, listed or not. Ended
+    /// processes that the record does not list are not something it left.
+    #[must_use]
+    pub fn left_something(&self) -> bool {
+        !self.survivors().is_empty() || self.omitted().is_some_and(|omitted| omitted.other > 0)
+    }
+
+    /// Returns this record as a paired device is given it when its frame does not fit: both lists
+    /// replaced by one entry that counts everything in them, and the root's signal cut.
+    ///
+    /// Counts the entry already there adds to its own. Nothing else is copied from the lists.
+    #[must_use]
+    pub fn reduced_for_a_device(&self) -> Self {
+        let earlier = self.omitted();
+        let mut root_signal = self.root_signal.clone();
+        if let Some(signal) = root_signal.0.as_mut() {
+            held_to_the_text_bytes(signal);
+        }
+        Self {
+            session_id: self.session_id,
+            session_epoch: self.session_epoch,
+            reason: self.reason,
+            root_exit_code: self.root_exit_code,
+            root_signal,
+            terminated: Vec::new(),
+            surviving: vec![
+                ClosureOmission {
+                    ended: count_of(self.terminated.len())
+                        .saturating_add(earlier.map_or(0, |omitted| omitted.ended)),
+                    other: count_of(self.survivors().len())
+                        .saturating_add(earlier.map_or(0, |omitted| omitted.other)),
+                    reason: OmissionReason::Connection,
+                }
+                .entry(),
+            ],
+            ownership_coverage: self.ownership_coverage,
+            durability: self.durability,
+            closed_at_ms: self.closed_at_ms,
+        }
+    }
+
+    /// The bytes by which this record's entries grow in the form a paired device is given, headers
+    /// included: for each entry, the encoding it has there less its own, where that is more.
+    #[must_use]
+    pub fn device_extra(&self) -> usize {
+        self.surviving
+            .iter()
+            .map(|entry| {
+                encoded_size(&as_a_device_is_given(entry)).saturating_sub(encoded_size(entry))
+            })
+            .fold(0, usize::saturating_add)
+    }
+}
+
 /// The event an attach stream ends with when its session closes.
 ///
 /// Its payload is the session's [`ClosureRecord`]. It follows every byte of output the attachment

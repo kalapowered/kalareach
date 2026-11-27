@@ -58,6 +58,7 @@ use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Re
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::session::WHY_NOT_SHOWN;
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 
 use crate::catalogue::admissions::UNRECORDABLE_CLAUSE;
@@ -65,10 +66,6 @@ use crate::supervision::windows::{
     A_TASK_NAMED, COULD_NOT_LIST, DID_NOT_REGISTER, DID_NOT_REMOVE, DID_NOT_RUN, IS_REGISTERED,
     NOT_THE_ONE_REGISTERED, READS_BACK_DIFFERENTLY,
 };
-
-/// What follows a clause kept from a message, or a description of what failed, to say why the rest
-/// is not here.
-const WHY_NOT_SHOWN: &str = "the detail names the host and is not sent to a paired device";
 
 /// As [`WHY_NOT_SHOWN`], for a refusal withheld whatever it says, because the host cannot tell the
 /// agent's words from its own.
@@ -1463,7 +1460,8 @@ mod tests {
     use kr_protocol::ids::{DiagnosticId, EventType, RequestId, SessionId, StreamId};
     use kr_protocol::scalars::U64;
     use kr_protocol::session::{
-        ClosureReason, ClosureRecord, Durability, OwnershipCoverage, SurvivingResource,
+        CLOSURE_BUDGET_BYTES, ClosureOmission, ClosureReason, ClosureRecord, Durability,
+        OmissionReason, OwnershipCoverage, SurvivingResource, TerminatedProcess,
     };
 
     /// Everything a path, an account or a command can look like in the text of a failure.
@@ -1917,6 +1915,123 @@ mod tests {
             outcome: Outcome::Ok(ParamsValue::from_typed(&record).expect("encodes")),
         });
         assert!(matches!(frame_for_a_device(&frame), Cow::Owned(_)));
+    }
+
+    /// A closure record as a device is given it, decoded again.
+    fn shown_to_a_device(record: &ClosureRecord) -> ClosureRecord {
+        let frame = closed(record);
+        match frame_for_a_device(&frame) {
+            Cow::Owned(ControlFrame::Notification(shown)) => {
+                shown.payload.to_typed().expect("decodes")
+            }
+            Cow::Borrowed(ControlFrame::Notification(shown)) => {
+                shown.payload.to_typed().expect("decodes")
+            }
+            _ => panic!("a notification is shown as a notification"),
+        }
+    }
+
+    fn encoded(record: &ClosureRecord) -> usize {
+        kr_cbor::to_canonical_vec(record).expect("encodes").len()
+    }
+
+    /// KR-REQ-09.22: a record is charged for what the door shows, so the widest record a worker
+    /// builds, 4,096 entries of one byte that names the host, is at most the budget and the
+    /// entry's allowance and the fixed members when shown, where the whole list was about 377,000
+    /// bytes.
+    #[test]
+    fn a_bounded_closure_is_shown_within_the_budget_it_was_charged() {
+        let whole = closure_leaving(&vec![("process", "/"); 4_096]);
+        let before = encoded(&shown_to_a_device(&whole));
+        let bounded = whole.clone().bounded(CLOSURE_BUDGET_BYTES);
+        let shown = shown_to_a_device(&bounded);
+        let after = encoded(&shown);
+        println!(
+            "4,096 one-byte details that name the host: as built {} bytes, as shown {before} bytes; \
+             bounded: as built {} bytes, as shown {after} bytes, {} listed, {:?}",
+            encoded(&whole),
+            encoded(&bounded),
+            bounded.survivors().len(),
+            bounded.omitted()
+        );
+        assert!(
+            before > 350_000,
+            "the whole record is {before} bytes as shown"
+        );
+        assert!(
+            after <= CLOSURE_BUDGET_BYTES + 512 + 1_536,
+            "the bounded record is {after} bytes as shown"
+        );
+        assert_eq!(
+            shown.surviving.last(),
+            bounded.surviving.last(),
+            "the door leaves the entry that counts what is not listed as it is"
+        );
+    }
+
+    /// KR-REQ-09.22: the record's allowance is what the door adds, for a kind and a detail of every
+    /// length a worker writes: the encoded size of the record as shown less its own, where that is
+    /// more (an entry whose detail is longer than the device is given grows by nothing).
+    #[test]
+    fn the_device_extra_of_a_record_is_what_the_door_adds_to_it() {
+        for kind_len in [0, 1, 7, 13, 14, 16, 17, 23, 24, 100, 255, 256, 1_024] {
+            for detail_len in [1, 2, 23, 24, 70, 255, 256, 1_024] {
+                let kind = "k".repeat(kind_len);
+                let detail = format!("/{}", "d".repeat(detail_len - 1));
+                let record = closure_leaving(&[(kind.as_str(), detail.as_str())]);
+                let shown = shown_to_a_device(&record);
+                assert_eq!(
+                    shown.surviving[0].detail,
+                    format!("{kind}: {WHY_NOT_SHOWN}"),
+                    "kind of {kind_len} bytes, detail of {detail_len}"
+                );
+                assert_eq!(
+                    encoded(&shown).saturating_sub(encoded(&record)),
+                    record.device_extra(),
+                    "kind of {kind_len} bytes, detail of {detail_len}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-09.22: the entry that counts what a record does not list names nothing of the host,
+    /// so the door leaves it as it is, for every count and both reasons; and the `terminated` list
+    /// is not rewritten, so it is not charged for a rewrite.
+    #[test]
+    fn the_door_leaves_the_omission_entry_and_the_terminated_list_as_they_are() {
+        for (ended, other) in [(0, 1), (1, 1), (2, 0), (4_096, 4_096), (u64::MAX, u64::MAX)] {
+            for reason in [OmissionReason::Budget, OmissionReason::Connection] {
+                let mut record = closure_leaving(&[]);
+                record.surviving.push(
+                    ClosureOmission {
+                        ended,
+                        other,
+                        reason,
+                    }
+                    .entry(),
+                );
+                assert!(
+                    matches!(
+                        frame_for_a_device(&closed(&record)),
+                        Cow::Borrowed(ControlFrame::Notification(_))
+                    ),
+                    "{:?}",
+                    record.surviving
+                );
+            }
+        }
+        let mut record = closure_leaving(&[]);
+        record.terminated = vec![TerminatedProcess {
+            identity: kr_protocol::identity::ProcessStartIdentity::new(
+                4,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                9,
+            ),
+            name: Nullable::some("/usr/local/bin/a-helper-of-the-session".to_owned()),
+            forced: false,
+        }];
+        assert_eq!(shown_to_a_device(&record), record);
+        assert_eq!(record.device_extra(), 0);
     }
 
     #[test]
