@@ -24,6 +24,7 @@ import {
 } from 'react'
 
 import { sayingAddresses, ServiceAddress, spokenAddress } from '../components/ServiceAddress'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Button, Card, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
@@ -507,7 +508,7 @@ export function PairingFlow({
                     setDraftOrigin(event.target.value)
                   }}
                 />
-                <p className="form-hint">An https address, like https://reach.kala.to.</p>
+                <p className="form-hint">An https address, like <TechnicalWord text="https://reach.kala.to" />.</p>
                 <div className="row">
                   <Button type="submit" tone="primary" data-testid="save-service">
                     Use this service
