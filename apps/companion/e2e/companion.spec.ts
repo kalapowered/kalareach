@@ -3332,8 +3332,11 @@ test.describe('the wheel of a raw view in control mode', () => {
   })
 
   // KR-REQ-13.18: over a program that does not read the wheel, a wheel turned in control mode sends the
-  // program nothing, and the view neither moves its window nor changes the text size with it. It shows
-  // the view in a scripted host, not what a real program does when it reports no mouse.
+  // program nothing, and the view neither takes the event nor moves its window with it: it leaves the
+  // event to the page. The wheel turns towards the history the window could move into, so a view that
+  // handed it to the pan would move. It shows the view in a scripted host, not what a real program does
+  // when it reports no mouse. The text size is read too, but a wheel without Control has no way to
+  // change it, so that read cannot fail here.
   test('a wheel over a program that does not read it sends nothing and moves nothing', async ({ page }) => {
     await openSession(page)
     await page.evaluate(() => {
@@ -3350,14 +3353,17 @@ test.describe('the wheel of a raw view in control mode', () => {
     const size = await lineHeight(page)
     const moved = await moves(page)
 
+    // Three rows of wheel away from the person, towards the history above the live screen.
     await page.mouse.move(cell.x + 4.5 * cell.width, cell.y + 2.5 * cell.height)
-    await page.mouse.wheel(0, 3 * cell.height)
+    await page.mouse.wheel(0, -3 * cell.height)
     // The page has the event once the view has had it: nothing is waited for by time.
     await expect.poll(async () => (await wheelsSeen(page)).length).toBe(1)
     expect(await turned(page)).toBe(0)
     expect((await programInputs(page)).filter((input) => input.kind === 'wheel')).toEqual([])
     await expect(surface).toHaveAttribute('data-wheel-to-application', '0')
     expect(await moves(page)).toBe(moved)
+    // The view left the event to the page.
+    expect(await wheelsSeen(page)).toEqual([{ held: false, cancelled: false }])
     expect(await lineHeight(page)).toBe(size)
     await expect(page.getByTestId('terminal-position')).toHaveText('')
   })
