@@ -317,6 +317,10 @@ SWIFT
     }
     ocr="$artefacts/read-text"
     : >"$artefacts/reader-check.log"
+    check_the_reader_fixtures || {
+        say "the pictures kept for the text reader are not all there, or one cannot be read; see $artefacts/reader-check.log"
+        return 1
+    }
     # The reader is first held to pictures it must read as drawn. This is a check of the instrument,
     # not a retry of any assertion or wait: a wrong reading of a known picture says that the system
     # built the reader's recognition programs wrongly, so the folder they were built into, which this
@@ -373,6 +377,58 @@ check_the_readers() {
         reader_verdict refused '"Start voice session" absent from a picture of "Start Voice Sessions"' image_lacks "$lacks" "Start voice session"
 }
 
+# The pictures the reader is held to, by name: each is a .png beside a .txt of the text it shows.
+reader_fixtures=(
+    line-agent-not-running line-charged line-discarded line-own-channel line-provider-and-service
+    line-selected-context line-statement-from-model line-tokens line-unlocked-screen
+    no-text one-line whole-page
+)
+
+# Whether all of those pictures are there before the reader reads any: each has a picture that is not
+# empty and a text file that can be read, the text has a line of words, except that of no-text, which
+# has none because its picture shows none, and no other file stands beside them. Without this the
+# check passes with whatever is left: a deleted pair is a picture less, and a missing text file is
+# no words wanted, which a reader that gives nothing then meets. Each fault is written to the log.
+check_the_reader_fixtures() {
+    local dir="$here/apps/companion/test/voice/reader-fixtures" name known file listed ok=0
+    local log_file="$artefacts/reader-check.log"
+    if [ ! -d "$dir" ]; then
+        printf 'the folder of known pictures is not there: %s\n' "$dir" >>"$log_file"
+        return 1
+    fi
+    for name in "${reader_fixtures[@]}"; do
+        if [ ! -f "$dir/$name.png" ] || [ ! -r "$dir/$name.png" ] || [ ! -s "$dir/$name.png" ]; then
+            printf '%s.png is missing, empty or cannot be read\n' "$name" >>"$log_file"
+            ok=1
+        fi
+        if [ ! -f "$dir/$name.txt" ] || [ ! -r "$dir/$name.txt" ]; then
+            printf '%s.txt is missing or cannot be read\n' "$name" >>"$log_file"
+            ok=1
+        elif [ "$name" = no-text ]; then
+            if [ -n "$(tr -d '[:space:]' <"$dir/$name.txt")" ]; then
+                printf 'no-text.txt has words, and its picture shows none\n' >>"$log_file"
+                ok=1
+            fi
+        elif [ -z "$(tr -d '[:space:]' <"$dir/$name.txt")" ]; then
+            printf '%s.txt has no words, so nothing would be required of the reader\n' "$name" >>"$log_file"
+            ok=1
+        fi
+    done
+    for file in "$dir"/*; do
+        [ -e "$file" ] || continue
+        name="${file##*/}"
+        listed=0
+        for known in "${reader_fixtures[@]}"; do
+            if [ "$name" = "$known.png" ] || [ "$name" = "$known.txt" ]; then listed=1; fi
+        done
+        if [ "$listed" -eq 0 ]; then
+            printf '%s is not one of the known pictures or their texts\n' "$name" >>"$log_file"
+            ok=1
+        fi
+    done
+    return "$ok"
+}
+
 # The reader on the pictures kept for it in the companion's voice tests (reader-fixtures), each a
 # picture of the product's own page with the text it shows beside it, one line of the text per line
 # of the file: lines of one card's text cut tight to one line each, as the picture of one element is
@@ -383,9 +439,8 @@ check_the_readers() {
 check_the_reader_on_known_pictures() {
     local dir="$here/apps/companion/test/voice/reader-fixtures" picture name rows row ok=0
     printf 'known pictures, read with the programs kept in %s\n' "${reader_home:?}" >>"$artefacts/reader-check.log"
-    for picture in "$dir"/*.png; do
-        name="${picture##*/}"
-        name="${name%.png}"
+    for name in "${reader_fixtures[@]}"; do
+        picture="$dir/$name.png"
         rows=()
         while IFS= read -r row; do
             [ -z "$row" ] || rows+=("$row")
