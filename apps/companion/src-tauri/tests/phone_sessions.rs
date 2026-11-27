@@ -56,27 +56,52 @@ async fn phone_under(adopted: &Adopted, grant: kr_protocol::pairing::ProposedGra
     phone
 }
 
+/// What the waits for the main connection read of a phone: the state of its main connection, and
+/// when the tries to the host were asked for. A case on a paused clock reads a scripted phone, so
+/// the waits' own bounds are held with no stall to wait for.
+trait ConnectionRead {
+    /// The page's answer to `connection_state`.
+    fn connection_state(&self) -> Value;
+
+    /// When the tries to the host were asked for, against `since`.
+    fn tries_since(&self, since: Instant) -> String;
+
+    /// Whether a wait that took longer than the ordinary watchdog is kept in the evidence folder.
+    fn keeps_slow_waits(&self) -> bool {
+        true
+    }
+}
+
+impl ConnectionRead for Companion {
+    fn connection_state(&self) -> Value {
+        self.call("connection_state", json!({}))
+            .expect("the connection's state")
+    }
+
+    fn tries_since(&self, since: Instant) -> String {
+        Self::tries_since(self, since)
+    }
+}
+
 /// Waits until the phone's main connection is up for the first time: the first try comes with no
 /// delay before it, so the wait is the ordinary watchdog and has no reconnect round in it.
-async fn connected(companion: &Companion) {
+async fn connected(companion: &impl ConnectionRead) {
     connected_within(companion, WATCHDOG).await;
 }
 
 /// Waits until the phone's main connection is up again after tries that did not make it. It waits
 /// through two reconnect rounds: a try that stalls at its bounds and fails, and the next one, which
 /// makes the connection.
-async fn reconnected(companion: &Companion) {
+async fn reconnected(companion: &impl ConnectionRead) {
     connected_within(companion, through_rounds(2)).await;
 }
 
 /// Waits until the phone's main connection is up, for at most `wait`.
-async fn connected_within(companion: &Companion, wait: Duration) {
+async fn connected_within(companion: &impl ConnectionRead, wait: Duration) {
     let began = Instant::now();
     let outcome = tokio::time::timeout(wait, async {
         loop {
-            let state = companion
-                .call("connection_state", json!({}))
-                .expect("the connection's state");
+            let state = companion.connection_state();
             if state["connected"] == true {
                 return;
             }
@@ -3115,21 +3140,36 @@ fn told_of(companion: &Companion, opening: &str) -> Vec<Value> {
 /// The caller gives the wait: a case that waits for the keeper's tries after a try that did not make
 /// the connection gives one that passes a reconnect round for each, and a case that waits for an
 /// opening's watch gives the ordinary watchdog.
+/// A wait that took longer than the ordinary watchdog, whether it came or ran out, writes one line
+/// to the run's evidence folder, as the waits for the main connection do.
 async fn asked_since(control: &LinkControl, before: usize, count: usize, wait: Duration) {
     let began = Instant::now();
-    tokio::time::timeout(wait, async {
+    let outcome = tokio::time::timeout(wait, async {
         while control.asked() - before < count {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "the host was asked {} times of {count} within {wait:?}; {}",
+    .await;
+    let took = began.elapsed();
+    let stood = |how: &str| {
+        format!(
+            "the host was asked {} times of {count}: {how} after {took:.1?} of {wait:?}; {}",
             control.asked() - before,
             control.tries_since(began)
         )
-    });
+    };
+    match outcome {
+        Ok(()) => {
+            if took > WATCHDOG {
+                support::keep_wait(&stood("it came"));
+            }
+        }
+        Err(_) => {
+            let words = stood("it ran out");
+            support::keep_wait(&words);
+            panic!("{words}");
+        }
+    }
 }
 
 /// KR-REQ-19.08: a refusal of the connection at its admission that repeats does not end a session's
@@ -3831,10 +3871,8 @@ async fn kr_req_19_08_a_view_whose_connection_the_host_refuses_at_admission_is_l
 }
 
 /// What the connection's state says: whether the main connection is up, and why not.
-fn connection_reason(companion: &Companion) -> (bool, Option<String>) {
-    let state = companion
-        .call("connection_state", json!({}))
-        .expect("the connection's state");
+fn connection_reason(companion: &impl ConnectionRead) -> (bool, Option<String>) {
+    let state = companion.connection_state();
     (
         state["connected"] == true,
         state["reason"].as_str().map(str::to_owned),
@@ -3847,7 +3885,7 @@ fn connection_reason(companion: &Companion) -> (bool, Option<String>) {
 /// A wait that ran out fails with the same words.
 fn wait_ended<T>(
     what: &str,
-    companion: &Companion,
+    companion: &impl ConnectionRead,
     began: Instant,
     wait: Duration,
     outcome: Result<T, tokio::time::error::Elapsed>,
@@ -3864,14 +3902,16 @@ fn wait_ended<T>(
     };
     match outcome {
         Ok(value) => {
-            if took > WATCHDOG {
+            if took > WATCHDOG && companion.keeps_slow_waits() {
                 support::keep_wait(&stood("came"));
             }
             value
         }
         Err(_) => {
             let words = stood("ran out");
-            support::keep_wait(&words);
+            if companion.keeps_slow_waits() {
+                support::keep_wait(&words);
+            }
             panic!("{words}")
         }
     }
@@ -3879,7 +3919,10 @@ fn wait_ended<T>(
 
 /// Waits until the main connection is down with a reason that `holds`. It waits through two
 /// reconnect rounds: a try that stalls at its bounds, and the next one, which tells the reason.
-async fn connection_down_where(companion: &Companion, holds: impl Fn(&str) -> bool) -> String {
+async fn connection_down_where(
+    companion: &impl ConnectionRead,
+    holds: impl Fn(&str) -> bool,
+) -> String {
     let wait = through_rounds(2);
     let began = Instant::now();
     let outcome = tokio::time::timeout(wait, async {
@@ -3976,6 +4019,113 @@ fn kr_req_19_08_a_wait_through_reconnect_rounds_outlasts_them() {
     );
 }
 
+/// A phone whose main connection a case scripts against the clock: it is up from `up_after` and
+/// tells the reason it is down from `reason_after`, both counted from when the phone was made.
+struct Scripted {
+    made: tokio::time::Instant,
+    up_after: Option<Duration>,
+    reason_after: Option<Duration>,
+}
+
+impl Scripted {
+    fn never() -> Self {
+        Self {
+            made: tokio::time::Instant::now(),
+            up_after: None,
+            reason_after: None,
+        }
+    }
+}
+
+impl ConnectionRead for Scripted {
+    fn connection_state(&self) -> Value {
+        let age = self.made.elapsed();
+        let up = self.up_after.is_some_and(|after| age >= after);
+        let reason = self
+            .reason_after
+            .filter(|after| age >= *after)
+            .map(|_| "the host does not answer");
+        json!({ "connected": up, "reason": reason })
+    }
+
+    fn tries_since(&self, _since: Instant) -> String {
+        "no try was asked for".to_owned()
+    }
+
+    fn keeps_slow_waits(&self) -> bool {
+        false
+    }
+}
+
+/// How long a wait ran, on the clock the case paused, and whether it came or ran out.
+async fn timed<T>(
+    wait: impl std::future::Future<Output = T>,
+) -> (Duration, std::thread::Result<T>) {
+    use futures_util::FutureExt as _;
+
+    let began = tokio::time::Instant::now();
+    let ended = std::panic::AssertUnwindSafe(wait).catch_unwind().await;
+    (began.elapsed(), ended)
+}
+
+/// KR-REQ-19.08: the helpers that wait for the main connection give up at their own bound and not
+/// before or after it. The plain case above holds the arithmetic of a round; this one holds the
+/// bound each helper takes from it, by the helpers themselves, on a paused clock against a
+/// scripted phone, so that no stall has to be waited for. A wait that ended early would fail a
+/// reconnect that the product makes in time, and one that ended late would pass a reconnect that
+/// the product makes too late.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn kr_req_19_08_the_connection_waits_give_up_at_their_own_bound() {
+    const POLL: Duration = Duration::from_millis(100);
+    let two_rounds = RECONNECT_ROUND * 2;
+
+    // The first connection has no round before it: it gives up at the ordinary watchdog.
+    let (took, ended) = timed(connected(&Scripted::never())).await;
+    assert!(
+        (WATCHDOG..=WATCHDOG + POLL).contains(&took),
+        "the first connection is waited for {took:?}, not the watchdog of {WATCHDOG:?}"
+    );
+    assert!(ended.is_err(), "a connection that never comes is not made");
+
+    // A connection that comes back after tries that did not make it has two rounds before it.
+    let (took, ended) = timed(reconnected(&Scripted::never())).await;
+    assert!(
+        (through_rounds(2)..=through_rounds(2) + POLL).contains(&took),
+        "a reconnect is waited for {took:?}, not the {:?} of two rounds",
+        through_rounds(2)
+    );
+    assert!(ended.is_err(), "a connection that never comes is not made");
+    let late = Scripted {
+        up_after: Some(two_rounds),
+        ..Scripted::never()
+    };
+    let (took, ended) = timed(reconnected(&late)).await;
+    assert!(
+        took >= two_rounds,
+        "a connection that comes after two rounds ({two_rounds:?}) was given up on at {took:?}"
+    );
+    assert!(ended.is_ok(), "the connection that came was seen");
+
+    // The reason a try came to is told after a delay and a try, as the connection's state says it.
+    let (took, ended) = timed(connection_down_where(&Scripted::never(), |_| true)).await;
+    assert!(
+        (through_rounds(2)..=through_rounds(2) + POLL).contains(&took),
+        "a reason is waited for {took:?}, not the {:?} of two rounds",
+        through_rounds(2)
+    );
+    assert!(ended.is_err(), "a reason that is never told is not read");
+    let told = Scripted {
+        reason_after: Some(two_rounds),
+        ..Scripted::never()
+    };
+    let (took, ended) = timed(connection_down_where(&told, |_| true)).await;
+    assert!(
+        took >= two_rounds,
+        "a reason that is told after two rounds ({two_rounds:?}) was given up on at {took:?}"
+    );
+    assert!(ended.is_ok(), "the reason that was told was read");
+}
+
 /// KR-REQ-19.08: the keeper waits between two tries for no longer than the client library's
 /// back-off says for that try, and its tries go on. The waits that pass reconnect rounds hold only
 /// that a connection came back in time, so a keeper that slept longer than its back-off says would
@@ -4041,17 +4191,8 @@ async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off
         .windows(2)
         .map(|pair| pair[1].duration_since(pair[0]))
         .collect();
-    assert!(
-        ended.is_ok(),
-        "the keeper made {} tries in {all_of_them:?} of the ladder's ceilings and then went on \
-         waiting; the gaps between its tries were {gaps:?}",
-        times.len()
-    );
-    assert_eq!(
-        times.len(),
-        FAILED_TRIES + 1,
-        "the keeper made a try after each failed one until it was told there was nothing to keep"
-    );
+    // Each gap first: a keeper that sleeps too long is told by the gap that was too long, and not
+    // by the count of tries that it had no time left to make.
     for (number, (gap, ceiling)) in gaps.iter().zip(&ceilings).enumerate() {
         assert!(
             gap <= ceiling,
@@ -4060,6 +4201,15 @@ async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off
             number + 2
         );
     }
+    // Then the tries go on: one after each failed one, until the keeper is told that there is
+    // nothing to keep, all inside the ceilings' sum.
+    assert_eq!(
+        times.len(),
+        FAILED_TRIES + 1,
+        "the keeper made a try after each failed one within {all_of_them:?} of the ladder's \
+         ceilings; it ended: {}; the gaps were {gaps:?}",
+        ended.is_ok()
+    );
 }
 
 /// KR-REQ-19.08: the record of a slow wait is optional and its failure line is read in logs that
