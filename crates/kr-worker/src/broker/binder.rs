@@ -227,7 +227,10 @@ pub struct TiedPackage {
     /// The ranges it holds a version to, as written: those of the rule that recognised the program
     /// and of its connector's pin.
     pub ranges: Vec<String>,
-    /// The version its own signed records name for the program's bytes, where they name it.
+    /// The version its own signed records name for the program's bytes, where they name one that
+    /// the decision can compare. It is `None` for one of three reasons: no digest reached the
+    /// decision, no record of the package names the digest, or a record names it at text that is
+    /// no package version.
     pub version: Option<String>,
     /// How far that version fits those ranges.
     pub coverage: Coverage,

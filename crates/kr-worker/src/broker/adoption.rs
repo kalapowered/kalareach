@@ -136,8 +136,8 @@ fn tie_refusal(tie: &Tie) -> String {
             format!("each declare no range for version {version}"),
         ),
         (_, None) => (
-            "has no signed record of this build".to_owned(),
-            "each have no signed record of this build".to_owned(),
+            "has no version that this decision can compare".to_owned(),
+            "each have no version that this decision can compare".to_owned(),
         ),
     };
     let clauses: Vec<(String, String)> = tie.packages.iter().map(makes).collect();
