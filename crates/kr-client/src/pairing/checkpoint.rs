@@ -2284,6 +2284,11 @@ mod tests {
         ] {
             rig.write_file(vec![base.clone(), other.clone()], Vec::new());
             assert_eq!(
+                cause(&rig.checkpoints.held_checkpoints()),
+                None,
+                "two entries that differ only in the {name} read"
+            );
+            assert_eq!(
                 held(&rig),
                 vec![base.clone(), other],
                 "two entries that differ only in the {name} read"
