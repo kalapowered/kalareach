@@ -16,6 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 
 import type { Question } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Banner, Button, CommitButton } from '../components/ui'
 import { AGENT_READ_CADENCE_MS } from '../app/agent'
 import { readOnCadence } from '../app/cadence'
@@ -88,7 +89,10 @@ function Asker({
   return (
     <>
       <p className="small muted" data-testid={`${id}-asker`}>
-        Asked by <strong>{asker.executable ?? 'a program the host could not name'}</strong>{' '}
+        Asked by{' '}
+        <strong>
+          {asker.executable === null ? 'a program the host could not name' : <TechnicalWord text={asker.executable} />}
+        </strong>{' '}
         ({asker.process})
         {asker.label !== null ? (
           <>
@@ -99,7 +103,7 @@ function Asker({
       </p>
       {asker.path !== null ? (
         <p className="small faint question-path" data-testid={`${id}-asker-path`}>
-          {asker.path}
+          <TechnicalWord text={asker.path} />
         </p>
       ) : null}
     </>
@@ -544,7 +548,7 @@ function KeptRow({
   readonly kept: KeptAnswer
   readonly settled: SettledAnswer | null
   /** The session it was given in, as a person names it, or null when it cannot be named now. */
-  readonly where: string | null
+  readonly where: ReactNode
   readonly busy: boolean
   readonly onSend: () => void
   readonly onDismiss: () => void
@@ -617,7 +621,7 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
   const [unreadable, setUnreadable] = useState(0)
   const [failure, setFailure] = useState<string | null>(null)
   const [settled, setSettled] = useState<ReadonlyMap<string, SettledAnswer>>(new Map())
-  const [named, setNamed] = useState<ReadonlyMap<string, string>>(new Map())
+  const [named, setNamed] = useState<ReadonlyMap<string, ReactNode>>(new Map())
   const [busy, setBusy] = useState<string | null>(null)
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
@@ -690,7 +694,9 @@ export function KeptAnswers({ sessionId }: { readonly sessionId?: string }): Rea
           new Map(
             result.sessions.map((each) => [
               each.session_id,
-              `Session ${each.display_number} · ${each.cwd}`
+              <>
+                Session {each.display_number} · <TechnicalWord text={each.cwd} />
+              </>
             ])
           )
         )
