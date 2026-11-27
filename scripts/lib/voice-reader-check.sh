@@ -82,13 +82,21 @@ chmod +x "$root/bin/rm"
 # The reader. It prints the text kept beside the picture it is given. Every read is recorded with the
 # home it was started with. FAKE_READER=fails makes each read fail (exit 2). FAKE_BAD_FIRST=N makes
 # the first N folders (by KR_READER_HOME, in the order they are first used) read wrong, leaving out
-# the first line of every text, as a wrong build of the system's programs leaves rows out.
+# the first line of every text, as a wrong build of the system's programs leaves rows out. Like the
+# system, it writes a file of compiled programs into the home folder it was started with
+# (CFFIXED_USER_HOME) the first time it runs there, unless FAKE_COMPILES=0.
 cat >"$root/reader-standin.sh" <<'STANDIN'
 #!/bin/bash
 image=$1
 name=${image##*/}
 home=${KR_READER_HOME-unset}
 printf '%s home=%s cffixed=%s\n' "$name" "$home" "${CFFIXED_USER_HOME-unset}" >>"$FAKE_DIR/reads.log"
+if [ -n "${CFFIXED_USER_HOME-}" ] && [ "${FAKE_COMPILES:-1}" = 1 ]; then
+    programs="$CFFIXED_USER_HOME/Library/Caches/read-text-bin/com.apple.e5rt.e5bundlecache"
+    if [ ! -d "$programs" ]; then
+        mkdir -p "$programs" && printf 'programs for %s\n' "$CFFIXED_USER_HOME" >"$programs/program"
+    fi
+fi
 [ "${FAKE_READER:-good}" != fails ] || exit 2
 if ! grep -qxF -- "$home" "$FAKE_DIR/homes.log" 2>/dev/null; then
     printf '%s\n' "$home" >>"$FAKE_DIR/homes.log"
@@ -135,7 +143,7 @@ run_script() {
     local name=$1
     shift
     c="$root/$name"
-    env PATH="$root/bin:$PATH" KR_TEST_ARTIFACTS_DIR="$c/art" KR_MOBILE_SCREENSHOT_DIR="$c/shots" \
+    env -u CFFIXED_USER_HOME PATH="$root/bin:$PATH" KR_TEST_ARTIFACTS_DIR="$c/art" KR_MOBILE_SCREENSHOT_DIR="$c/shots" \
         FAKE_DIR="$c/fake" FAKE_ROOT="$root" READER_STANDIN="$root/reader-standin.sh" "$@" \
         bash "$c/tree/scripts/e2e-voice-device.sh" reader >"$c/out.log" 2>&1
     printf '%s\n' "$?" >"$c/rc"
@@ -233,6 +241,59 @@ run_script reader-recovers FAKE_BAD_FIRST=2
 expect "two mismatches and a pass: three checks" test "$(checks reader-recovers)" = 3
 expect "two mismatches and a pass: three folders are removed in all" test "$(removals reader-recovers)" = 3
 expect "two mismatches and a pass: the run goes on" says "$(out reader-recovers)" "the text reader read the known pictures as drawn"
+
+# ---- The folder of the system's compiled programs -----------------------------------------------
+
+# Every launch of the reader by the script carries the folder made for it in the environment the
+# reader starts with, and the compiler carries none: the setting is the reader's alone.
+make_tree launch-environment
+run_script launch-environment
+reads_file="$(fake launch-environment reads.log)"
+expect "launch: the reader was read twelve times" test "$(reads launch-environment)" = 12
+expect "launch: each read starts with CFFIXED_USER_HOME set to its folder" awk '
+    { home = $2; sub("home=", "", home); started = $3; sub("cffixed=", "", started); if (home != started) bad = 1 }
+    END { exit bad }' "$reads_file"
+expect "launch: the compiler starts without CFFIXED_USER_HOME" test "$(sort -u "$(fake launch-environment swiftc.log)")" = "CFFIXED_USER_HOME=unset"
+
+# The TypeScript reads screenshots with the program it is given, started the way readImage starts it:
+# the reader it is given is the wrapper, which gives the home to the reader, and fails without a folder.
+wrapper="$root/launch-environment/art/voice-device/read-text"
+picture="$root/launch-environment/tree/apps/companion/test/voice/reader-fixtures/one-line.png"
+typescript_start() {
+    node --input-type=module -e '
+      import { execFileSync } from "node:child_process"
+      execFileSync(process.argv[1], [process.argv[2]], { encoding: "utf8", timeout: 30_000 })
+    ' "$wrapper" "$picture"
+}
+KR_READER_HOME="$root/launch-environment/typescript-home" FAKE_DIR="$root/launch-environment/fake" typescript_start >/dev/null 2>&1
+expect "TypeScript launch: the reader starts with CFFIXED_USER_HOME set to the folder" \
+    grep -qF -- "home=$root/launch-environment/typescript-home cffixed=$root/launch-environment/typescript-home" "$reads_file"
+no_folder_no_reading() { ! FAKE_DIR="$root/launch-environment/fake" typescript_start >/dev/null 2>&1; }
+expect "TypeScript launch: no folder, no reading" no_folder_no_reading
+
+# The wrapper is the only name the reader goes by: the compiler writes the reader elsewhere, the
+# script passes the wrapper to the TypeScript, and the TypeScript holds no other name.
+expect "one name: the compiler writes the reader to read-text-bin" grep -qx -- "$root/launch-environment/art/voice-device/read-text-bin" "$(fake launch-environment swiftc-out.log)"
+expect "one name: the script gives the TypeScript the wrapper" grep -qF -- '"http://localhost:$port" "$ocr" "$shots"' "$here/scripts/e2e-voice-device.sh"
+expect "one name: the TypeScript names no compiled reader" never_says "$here/apps/companion/test/voice/assert-voice-surface.ts" "read-text-bin"
+
+# The files the system compiled are written to the log for each build, each build in a folder of its
+# own, with a SHA-1 for each file.
+make_tree programs-recorded
+run_script programs-recorded FAKE_BAD_FIRST=2
+expect "programs: a line for each of three builds" test "$(grep -c '^programs under ' "$(check_log programs-recorded)")" = 3
+expect "programs: each build's folder is its own" test "$(grep '^programs under ' "$(check_log programs-recorded)" | sort -u | wc -l | tr -d ' ')" = 3
+expect "programs: each build wrote one file" test "$(grep -c ': 1 file(s)$' "$(check_log programs-recorded)")" = 3
+expect "programs: each file has a SHA-1" test "$(grep -cE '^    [0-9a-f]{40} Library/Caches/read-text-bin/' "$(check_log programs-recorded)")" = 3
+
+# A reader that wrote no program under its folder cannot be helped by a new folder: the run stops after
+# the first mismatch and says so.
+make_tree programs-missing
+run_script programs-missing FAKE_BAD_FIRST=9 FAKE_COMPILES=0
+expect "no programs: one check" test "$(checks programs-missing)" = 1
+expect "no programs: the folder is removed once" test "$(removals programs-missing)" = 1
+expect "no programs: the run says a new folder cannot build them again" says "$(out programs-missing)" "a new folder cannot build them again"
+expect "no programs: the run fails with exit 2" rc_is programs-missing 2
 
 if [ "$failures" -ne 0 ]; then
     printf '%s case assertion(s) failed\n' "$failures"

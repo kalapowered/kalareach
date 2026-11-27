@@ -83,11 +83,13 @@ proved() { proved_lines+=("$*"); }
 unproved() { unproved_lines+=("$*"); }
 fail() { failures=$((failures + 1)); say "FAILED: $*"; }
 
-# The text reader's own folder of the programs the system compiles for it, for this run. The system
-# builds them at the reader's first run and keeps them under the home folder, named for the reader;
-# a bad build is kept, and every later run of the reader reads wrong from it (see the reader's
-# source). So the reader is told, by KR_READER_HOME, to keep them in a folder made here, which this
-# run can check and, if it reads wrong, throw away.
+# The text reader's own folder, for this run, of the programs the system compiles for it. The system
+# builds them at the reader's first run and keeps them in a folder named for the reader under the
+# home folder. On one Mac (macOS 27.2.1, Apple M4 Pro, 27 November 2026) some builds came out wrong,
+# and every later run of the reader read wrong from a wrong build: no text for a picture of one long
+# line, rows left out of a page. The cause was not found. So the reader's home is a folder made here,
+# KR_READER_HOME, which the reader's launch sets (see ocr_ready), and which this run can check and, if
+# the reader reads wrong from it, throw away.
 reader_home=""
 
 make_reader_home() {
@@ -252,17 +254,6 @@ import Vision
 
 // Prints the text the system recognises in one image: a line of the image per line, from the top
 // down and, along a line, from the left.
-
-// The system compiles the programs it recognises text with when a reader first runs, and keeps them
-// in a folder named for the reader under the home folder. Some builds come out wrong, and then every
-// later run of the reader reads wrong from them: no text for a picture of one line, rows left out of
-// a page, whatever the margin and the recognition options. The script gives the reader a folder of
-// its own for the run, so that a wrong build can be thrown away. Without KR_READER_HOME the reader
-// keeps the system's default folder.
-if let home = ProcessInfo.processInfo.environment["KR_READER_HOME"], !home.isEmpty {
-    setenv("CFFIXED_USER_HOME", home, 1)
-}
-
 guard CommandLine.arguments.count == 2,
       let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
       let picture = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { exit(2) }
@@ -311,10 +302,20 @@ for row in rows {
     print(row.sorted { $0.box.minX < $1.box.minX }.map(\.text).joined(separator: " "))
 }
 SWIFT
-    swiftc -O -o "$artefacts/read-text" "$source" >"$artefacts/read-text-build.log" 2>&1 || {
+    swiftc -O -o "$artefacts/read-text-bin" "$source" >"$artefacts/read-text-build.log" 2>&1 || {
         say "the text reader did not build; see $artefacts/read-text-build.log"
         return 1
     }
+    # The only name the reader is held by, here and in the TypeScript that reads screenshots with it.
+    # It starts the compiled reader with the folder for the system's compiled programs set in the
+    # reader's launch environment, before its process starts and for no other program, and it refuses
+    # to start the reader without a folder, so that no reading goes into the system's default one.
+    cat >"$artefacts/read-text" <<'WRAPPER'
+#!/bin/sh
+: "${KR_READER_HOME:?the text reader has no folder for its recognition programs}"
+exec env CFFIXED_USER_HOME="$KR_READER_HOME" "${0%/*}/read-text-bin" "$@"
+WRAPPER
+    chmod +x "$artefacts/read-text"
     ocr="$artefacts/read-text"
     : >"$artefacts/reader-check.log"
     check_the_reader_fixtures || {
@@ -333,6 +334,7 @@ SWIFT
         make_reader_home || { say "no folder could be made for the text reader's recognition programs"; return 1; }
         check_the_reader_on_known_pictures
         verdict=$?
+        record_reader_programs
         [ "$verdict" -ne 0 ] || break
         discard_reader_home || {
             say "the folder of the text reader's recognition programs could not be thrown away; see $artefacts/reader-check.log"
@@ -340,6 +342,10 @@ SWIFT
         }
         if [ "$verdict" -ne 1 ]; then
             say "the text reader failed on a known picture, which no new build of its recognition programs changes; see $artefacts/reader-check.log"
+            return 1
+        fi
+        if [ "$reader_programs" -eq 0 ]; then
+            say "the text reader's text did not match a known picture, and the system wrote no program under the folder made for the reader, so a new folder cannot build them again; see $artefacts/reader-check.log"
             return 1
         fi
         if [ "$build" -eq 4 ]; then
@@ -435,6 +441,33 @@ check_the_reader_fixtures() {
         fi
     done
     return "$ok"
+}
+
+# Writes to the log the files the system compiled for the reader into the folder made for this build,
+# one line each with its SHA-1, and sets reader_programs to how many there are: none says that the
+# reader's home did not take effect, and a new folder cannot then build them again.
+reader_programs=0
+record_reader_programs() {
+    local listing
+    listing="$(python3 -I -c '
+import hashlib, os, sys
+top = sys.argv[1]
+for base, folders, names in os.walk(top):
+    folders.sort()
+    for name in sorted(names):
+        path = os.path.join(base, name)
+        if os.path.islink(path):
+            continue
+        with open(path, "rb") as handle:
+            print(hashlib.sha1(handle.read()).hexdigest(), os.path.relpath(path, top))
+' "${reader_home:?}")" || listing=""
+    if [ -z "$listing" ]; then
+        reader_programs=0
+    else
+        reader_programs="$(printf '%s\n' "$listing" | wc -l | tr -d ' ')"
+    fi
+    printf 'programs under %s: %s file(s)\n' "$reader_home" "$reader_programs" >>"$artefacts/reader-check.log"
+    [ -z "$listing" ] || printf '%s\n' "$listing" | awk '{ print "    " $0 }' >>"$artefacts/reader-check.log"
 }
 
 # The reader on the pictures kept for it in the companion's voice tests (reader-fixtures), each a
