@@ -1180,6 +1180,59 @@ test.describe('the focus when the window narrows, whichever of the drawing and t
   }
 })
 
+/**
+ * What had the focus as the window changed form is kept for that change, and for no other. A person
+ * who put the focus on the page after the new form was drawn, and before the page was told, keeps
+ * it there; and a record that a change made without changing the page's form is not used by the
+ * next change, which finds the focus where the person has put it.
+ */
+test.describe('the focus that the person moved while the window changed form stays where it is', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    test(`${width} points: the person put the focus on the page after the window was drawn narrow and before the page was told`, async ({
+      page
+    }) => {
+      await controlNarrowQuery(page)
+      await openWindow(page, 800, ratio)
+      await page.locator('.sidebar [aria-current="page"]').focus()
+      await narrowQuery(page, 'hold')
+      await page.setViewportSize({ width, height: HEIGHT })
+      await expectNarrowFormDrawn(page)
+      await page.locator('main').focus()
+      await expect(page.locator('main')).toBeFocused()
+      await narrowQuery(page, 'release')
+      await expect(menuOf(page), 'the page is told and has its narrow form').toBeVisible()
+      await expect(page.locator('main'), 'the focus stays where the person put it').toBeFocused()
+    })
+
+    test(`${width} points: a change that left the page's form as it was leaves nothing for the next one to use`, async ({ page }) => {
+      await controlNarrowQuery(page)
+      await openWindow(page, 800, ratio)
+      await page.locator('.sidebar [aria-current="page"]').focus()
+      await narrowQuery(page, 'hold')
+      await page.setViewportSize({ width, height: HEIGHT })
+      await expectNarrowFormDrawn(page)
+      // Whichever engine drew the form, the focus is off the control that the form hides.
+      await page.evaluate(() => {
+        ;(document.activeElement as HTMLElement | null)?.blur()
+      })
+      await page.setViewportSize({ width: 800, height: HEIGHT })
+      await expect
+        .poll(() => page.evaluate(() => getComputedStyle(document.querySelector('aside.sidebar') as Element).visibility))
+        .toBe('visible')
+      await narrowQuery(page, 'release')
+      await expect(menuOf(page), 'the page was told of both changes and was never narrow').toHaveCount(0)
+      await page.locator('main').focus()
+      await expect(page.locator('main')).toBeFocused()
+      await page.setViewportSize({ width, height: HEIGHT })
+      await expect(menuOf(page), 'the window narrows again and the page has its narrow form').toBeVisible()
+      await expect(page.locator('main'), 'the focus stays where the person put it').toBeFocused()
+    })
+  }
+})
+
 /** What a host asks the owner to confirm, for the message that says so. */
 const REQUEST = {
   ceremony: 'touch_id' as const,

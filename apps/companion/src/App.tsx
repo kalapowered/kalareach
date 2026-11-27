@@ -86,25 +86,41 @@ function useClipped(ref: RefObject<HTMLElement | null>, text: string | null): { 
   return state
 }
 
+/** The element that had the focus as the window changed form, and the form that the change led to. */
+interface HeldAtChange {
+  readonly control: Element | null
+  readonly narrow: boolean
+}
+
 /**
  * Whether the window is narrow now, and again each time it becomes or stops being so. The element
- * that has the focus when the window changes form is kept in `held`: the change is told before the
- * page is drawn again, while the controls the new form takes away are still there. An engine that
- * draws the new form first has taken the focus off a control that the form hides, and `held` is that one.
+ * that has the focus when the window changes form is kept in `held`, with the form that the change
+ * leads to: the change is told before the page is drawn again, while the controls the new form takes
+ * away are still there. An engine that draws the new form first has taken the focus off a control
+ * that the form hides, and `held` is that one. The record belongs to the change that made it: one
+ * made for another form, or left by a change that did not change the page's form, is dropped at
+ * the next change, and a focus that has come to rest on a control since is where the person is, not
+ * the record.
  */
-function useNarrow(held: { current: Element | null }): boolean {
+function useNarrow(held: { current: HeldAtChange | null }): boolean {
   const subscribe = useCallback(
     (notify: () => void): (() => void) => {
       const query = window.matchMedia(NARROW)
       let form = query.matches
       // An engine may draw the new form before it tells of the change, and by then it has taken the
-      // focus off a control that the new form hides: that control is the one that held it.
+      // focus off a control that the new form hides and given it to no other: that control is the
+      // one that held it. A focus that went to another control was moved, not lost, and is not kept.
       const blurred = (event: FocusEvent): void => {
-        if (query.matches !== form && event.target instanceof Element) held.current = event.target
+        if (query.matches !== form && event.relatedTarget === null && event.target instanceof Element) {
+          held.current = { control: event.target, narrow: query.matches }
+        }
       }
       const changed = (): void => {
         form = query.matches
-        held.current ??= document.activeElement
+        const active = document.activeElement
+        const lost = active === null || active === document.body
+        const kept = held.current
+        held.current = kept !== null && kept.narrow === form && lost ? kept : { control: active, narrow: form }
         notify()
       }
       document.addEventListener('focusout', blurred, true)
@@ -225,7 +241,7 @@ export function App(): ReactNode {
   // closed: back to the control that opened it, or onto the page that was chosen.
   const words = useRef<HTMLSpanElement | null>(null)
   const { clipped, more } = useClipped(words, connection === null ? null : connection.connected ? 'connected' : (connection.reason ?? ''))
-  const heldAtChange = useRef<Element | null>(null)
+  const heldAtChange = useRef<HeldAtChange | null>(null)
   const narrow = useNarrow(heldAtChange)
   const [wasNarrow, setWasNarrow] = useState(narrow)
   const [navigationOpen, setNavigationOpen] = useState(false)
@@ -276,8 +292,9 @@ export function App(): ReactNode {
   // "Menu" and "Close menu" go, and when one of them had the focus it goes to the item of the
   // destination that is shown, where the sidebar now stands.
   useLayoutEffect(() => {
-    const held = heldAtChange.current
+    const record = heldAtChange.current
     heldAtChange.current = null
+    const held = record !== null && record.narrow === narrow ? record.control : null
     if (!(held instanceof HTMLElement)) return
     if (narrow) {
       if (sidebar.current?.contains(held) === true) menu.current?.focus()
