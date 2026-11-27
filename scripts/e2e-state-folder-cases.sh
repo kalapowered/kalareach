@@ -22,8 +22,9 @@
 # targets, and the checksum of every file, the folder's own mode and owner included. An accepted run
 # must go on to its script's own next stop on Linux, which shows that the check passed and did not
 # end the script, and must leave the folder made, marked with the owner word, with mode 700, and
-# marked the same on a second run. Each failed case prints a line that starts with `FAILED:`; the
-# script ends with status 1 when any case failed. It removes nothing: its folders stay under the
+# marked the same on a second run. Each failed case prints a line that starts with `FAILED:` and a line
+# after it that starts with `  at:` and names where the check failed; the script ends with status 1
+# when any case failed. It removes nothing: its folders stay under the
 # directory it names at the end.
 # The library cases below set variables inside subshells on purpose, so that none of them stays.
 # shellcheck disable=SC2030,SC2031
@@ -79,8 +80,15 @@ failed=0
 cases=0
 n=0
 caller="$(id -u)"
+# A failed check prints its sentence, then one `  at:` line with the file and line of the failing call
+# and of each call above it, up to the line of the case that made it.
 fail() {
+  local depth at=""
+  for ((depth = 1; depth < ${#FUNCNAME[@]}; depth++)); do
+    at="$at ${BASH_SOURCE[depth]##*/}:${BASH_LINENO[depth - 1]}"
+  done
   echo "FAILED: $*"
+  echo "  at:$at"
   failed=1
 }
 ok() {
