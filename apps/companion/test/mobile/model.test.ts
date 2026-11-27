@@ -60,6 +60,7 @@ import {
   writeRecord
 } from '../../src/mobile/model/store'
 import { describeAccount, usageFraction } from '../../src/model/account'
+import { wordingText } from '../../src/model/wording'
 import { detectSurface, minimumTarget, showsBackControl, TOUCH_TARGET } from '../../src/mobile/platform'
 
 const NOW = 1_763_000_000_000
@@ -721,8 +722,11 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
 
 describe('the commercial surface on a mobile build (KR-REQ-17.32)', () => {
   it('says plainly that no account is needed for local work', () => {
-    const text = describeAccount({ state: 'signed_out', outcome: null })
+    const text = wordingText(describeAccount({ state: 'signed_out', outcome: null }))
     expect(text).toContain('work exactly as they do with one')
+    expect(wordingText(describeAccount({ state: 'signed_in', email: 'sam@example.com' } as never))).toBe(
+      'Signed in as sam@example.com.'
+    )
   })
 
   it('reads a usage line as a fraction of what is included', () => {

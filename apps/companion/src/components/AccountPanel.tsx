@@ -41,6 +41,7 @@ import { DeleteAccount, useDeletion } from './DeleteAccount'
 import { Notices } from './Notices'
 import { SyncPanel } from './SyncPanel'
 import { Button, Card } from './ui'
+import { Wording } from './Wording'
 
 /** The account, read from the backend and kept current. */
 export interface AccountHandle {
@@ -210,7 +211,9 @@ export function AccountPanel({
               ref={statusRef}
               aria-busy={view.state === 'finishing'}
             >
-              <p className="account-lead">{describeAccount(view)}</p>
+              <p className="account-lead">
+                <Wording of={describeAccount(view)} />
+              </p>
               {view.state === 'unavailable' ? (
                 <p className="account-note">{describeUnavailable(view.reason)}</p>
               ) : null}

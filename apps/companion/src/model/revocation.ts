@@ -18,6 +18,7 @@ import type {
   RevocationStanding,
   RevocationView
 } from '../host/port'
+import { technical, type Wording } from './wording'
 
 /** How the person confirms, for the ceremony this computer offers. Null where it offers none. */
 function by(ceremony: CeremonyKind): string | null {
@@ -184,9 +185,9 @@ export function anyWaiting(view: RevocationView): boolean {
 }
 
 /** How a host is reached, said under its name. */
-export function describeRoute(host: RevocationHost, origin: string | null): string {
+export function describeRoute(host: RevocationHost, origin: string | null): Wording {
   if (host.route === 'direct') {
-    return 'The host on this computer. Revocations go to it directly.'
+    return ['The host on this computer. Revocations go to it directly.']
   }
   const every = host.feed?.poll_interval_seconds
   const reads =
@@ -196,8 +197,8 @@ export function describeRoute(host: RevocationHost, origin: string | null): stri
         ? ` The host reads its feed every ${every} seconds while it is online.`
         : ' The host reads its feed while it is online.'
   return origin === null
-    ? `Reached through its feed.${reads}`
-    : `Reached through its feed at ${origin}.${reads}`
+    ? [`Reached through its feed.${reads}`]
+    : ['Reached through its feed at ', technical(origin), `.${reads}`]
 }
 
 /** What is known of whether the host answered, in a line. Null when it listed its devices. */

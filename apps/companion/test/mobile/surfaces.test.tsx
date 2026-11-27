@@ -26,6 +26,7 @@ import { MobileApp, type MobileBuild } from '../../src/mobile/MobileApp'
 import { AttachmentPicker } from '../../src/mobile/components/picker'
 import { Inbox } from '../../src/mobile/views/Inbox'
 import { PURCHASE_WORDS } from '../purchase-words'
+import { sentenceText } from '../technical-word-text'
 import { TOUCH_TARGET, type MobilePlatform } from '../../src/mobile/platform'
 
 const MAIN_SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -735,7 +736,7 @@ describe('the commercial surface (KR-REQ-17.32)', () => {
     })
     await person.click(await screen.findByRole('button', { name: /^Account/ }))
     const account = await screen.findByTestId('mobile-account')
-    expect(await within(account).findByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(await within(account).findByText(sentenceText('Signed in as sam@example.com.'))).toBeInTheDocument()
     expect(await within(account).findByText('1.4 of 5 GB')).toBeInTheDocument()
 
     const text = (account.textContent ?? '').toLowerCase()

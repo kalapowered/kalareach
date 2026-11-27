@@ -56,7 +56,9 @@ import {
   type OwnedOrganisation,
   type Stage
 } from '../model/deletion'
+import { TechnicalWord } from './TechnicalWord'
 import { Button, Card } from './ui'
+import { Wording } from './Wording'
 
 /** Where the step stands. */
 export type DeletionStep =
@@ -583,7 +585,7 @@ export function DeleteAccount({
     </Button>
   )
 
-  let lead: string
+  let lead: ReactNode
   let body: ReactNode = null
   let actions: ReactNode = null
   switch (step.name) {
@@ -613,7 +615,7 @@ export function DeleteAccount({
       break
     case 'read':
     case 'sending':
-      lead = `This deletes the account ${preview?.address ?? ''}. It cannot be undone.`
+      lead = <>This deletes the account {preview === null ? '' : <TechnicalWord text={preview.address} />}. It cannot be undone.</>
       body = preview === null ? null : <Reading preview={preview} surface={surface} />
       actions = (
         <>
@@ -633,7 +635,7 @@ export function DeleteAccount({
       break
     case 'code':
     case 'confirming':
-      lead = preview === null ? '' : describeCodeSent(preview, codeSure)
+      lead = preview === null ? '' : <Wording of={describeCodeSent(preview, codeSure)} />
       body = (
         <div className="deletion-field">
           <label className="deletion-label" htmlFor={fieldId}>

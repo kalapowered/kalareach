@@ -16,6 +16,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import { technicalWordText } from './technical-word-text'
 import { receivedFailure } from '../src/host/tauri'
 import type {
   RevocationDevice,
@@ -453,7 +454,9 @@ describe('revoking a device', () => {
   it('says where requests are published', async () => {
     screenOf(view([host()]))
     await rowOf('the-phone')
-    expect(screen.getByText(/Reached through its feed at reach\.kala\.to/)).toBeVisible()
+    const origin = screen.getByText(technicalWordText('reach.kala.to'))
+    expect(origin.parentElement).toHaveTextContent(/Reached through its feed at reach\.kala\.to\./)
+    expect(origin).toBeVisible()
   })
 
   it('says of a host whose reading of its feed is not current that it is not, and says it of no other', async () => {

@@ -14,6 +14,7 @@
  */
 
 import { ACCOUNT_HOST } from './account'
+import { technical, type Wording } from './wording'
 
 /** Something the person should know before they confirm. */
 export type DeletionWarning =
@@ -280,12 +281,12 @@ export function describeRefusal(reason: CodeRefusal, attemptsLeft: number): stri
 }
 
 /** The line that says the code was sent, or may have been. */
-export function describeCodeSent(preview: DeletionPreview, sure: boolean): string {
+export function describeCodeSent(preview: DeletionPreview, sure: boolean): Wording {
   const digits = String(CODE_DIGITS)
   const minutes = String(preview.code_lifetime_minutes)
   return sure
-    ? `We sent an ${digits}-digit code to ${preview.address}. It works for ${minutes} minutes.`
-    : `An ${digits}-digit code may have been sent to ${preview.address}. It works for ${minutes} minutes.`
+    ? [`We sent an ${digits}-digit code to `, technical(preview.address), `. It works for ${minutes} minutes.`]
+    : [`An ${digits}-digit code may have been sent to `, technical(preview.address), `. It works for ${minutes} minutes.`]
 }
 
 /** The line that says the account owns more organisations than one request can accept. */

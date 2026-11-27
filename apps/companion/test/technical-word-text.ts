@@ -6,3 +6,15 @@
 export function technicalWordText(text: string): (content: string, element: Element | null) => boolean {
   return (_content, element) => element?.classList.contains('technical-word') === true && element.textContent === text
 }
+
+/**
+ * A text matcher for a sentence that holds a technical word. The word is a box of its own, so no one
+ * element holds the sentence as its own text; the innermost element whose text content is the whole
+ * sentence is the one that says it.
+ */
+export function sentenceText(text: string): (content: string, element: Element | null) => boolean {
+  return (_content, element) =>
+    element !== null &&
+    element.textContent === text &&
+    !Array.from(element.children).some((child) => child.textContent === text)
+}

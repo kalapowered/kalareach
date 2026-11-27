@@ -25,6 +25,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObjec
 
 import { useApp } from '../app/state'
 import { Badge, Banner, Button, Card } from '../components/ui'
+import { Wording } from '../components/Wording'
 import { failureMessage, watch, type RevocationDevice, type RevocationHost, type RevocationView, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import { minimumTarget } from '../mobile/platform'
@@ -303,7 +304,9 @@ function HostCard({
       <div className="card-header">
         <div className="spacer card-title">
           <h2>{host.name}</h2>
-          <p className="muted small">{describeRoute(host, view.feed_origin)}</p>
+          <p className="muted small">
+            <Wording of={describeRoute(host, view.feed_origin)} />
+          </p>
         </div>
         <Badge tone={host.contact === 'answered' ? 'success' : 'neutral'}>
           {host.contact === 'answered'

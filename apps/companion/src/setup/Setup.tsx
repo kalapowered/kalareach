@@ -42,6 +42,7 @@ import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach
 
 import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, Sheet, Switch } from '../components/ui'
+import { Wording } from '../components/Wording'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type SetupIdentity, type SetupPlatform } from '../host/port'
 import {
@@ -744,11 +745,15 @@ function useRoomUnderBar(bar: RefObject<HTMLElement | null>, shown: boolean): vo
  * operating system will recognise again tomorrow. An ad-hoc signature is real, and it is different
  * every build, so a grant given against it is given to a build that will not exist.
  */
-function signatureLine(signature: SetupIdentity['signature']): string {
+function signatureLine(signature: SetupIdentity['signature']): ReactNode {
   if (!signature.read) return signature.refusal ?? 'not read'
   if (!signature.valid) return 'a signature the operating system would not verify'
   if (signature.ad_hoc || !signature.authority) {
-    return `an ad-hoc signature${signature.identifier ? ` on ${signature.identifier}` : ''}`
+    return (
+      <>
+        an ad-hoc signature{signature.identifier ? <> on <TechnicalWord text={signature.identifier} /></> : ''}
+      </>
+    )
   }
   return signature.team ? `${signature.authority} (${signature.team})` : signature.authority
 }
@@ -1592,7 +1597,7 @@ function DescriptionsCard({ descriptions }: { readonly descriptions: Description
         {setup && setup.offered ? (
           <>
             <p className="faint small" data-testid="setup-model-size">
-              {costSentence(setup)}
+              <Wording of={costSentence(setup)} />
             </p>
             <p className="faint small">
               Nothing is fetched until you ask

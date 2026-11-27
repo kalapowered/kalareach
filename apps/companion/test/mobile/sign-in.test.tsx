@@ -16,6 +16,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
 import { MobileApp } from '../../src/mobile/MobileApp'
 import { PURCHASE_WORDS } from '../purchase-words'
+import { sentenceText } from '../technical-word-text'
 
 function start() {
   const { port, controls } = fakeHost()
@@ -64,7 +65,7 @@ describe('signing in hands the ceremony to the system browser (KR-REQ-17.19)', (
         outcome: null
       })
     })
-    expect(await within(account).findByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(await within(account).findByText(sentenceText('Signed in as sam@example.com.'))).toBeInTheDocument()
     expect(await within(account).findByText('1.2 of 10 GB')).toBeInTheDocument()
     expect(within(account).getByRole('meter', { name: 'Relay this month: 1.2 of 10 GB' })).toBeInTheDocument()
     expect(within(account).getByRole('status')).toHaveFocus()

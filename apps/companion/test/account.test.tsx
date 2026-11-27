@@ -17,6 +17,7 @@ import type { HostPort } from '../src/host/port'
 import type { AccountView } from '../src/model/account'
 import { NOTICES_TITLE } from '../src/model/notices'
 import { PURCHASE_WORDS } from './purchase-words'
+import { sentenceText } from './technical-word-text'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -71,7 +72,7 @@ describe('the desktop Account sheet', () => {
         outcome: null
       })
     })
-    expect(await screen.findByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(await screen.findByText(sentenceText('Signed in as sam@example.com.'))).toBeInTheDocument()
     expect(item).toHaveTextContent('sam@example.com')
   })
 
@@ -106,7 +107,7 @@ describe('the desktop Account sheet', () => {
     act(() => {
       controls.account.set(signedIn('second@example.com', 'bbbb'))
     })
-    await within(sheet).findByText('Signed in as second@example.com.')
+    await within(sheet).findByText(sentenceText('Signed in as second@example.com.'))
     // Another sign-in of the same address, written by another window into the shared store, is
     // another grant.
     act(() => {
@@ -164,7 +165,7 @@ describe('the desktop Account sheet', () => {
     expect(
       await within(sheet).findByText('KalaReach could not remove the sign-in from this device.')
     ).toBeInTheDocument()
-    expect(within(sheet).getByText('Signed in as sam@example.com.')).toBeInTheDocument()
+    expect(within(sheet).getByText(sentenceText('Signed in as sam@example.com.'))).toBeInTheDocument()
     expect(within(sheet).getByRole('button', { name: 'Sign out' })).toBeInTheDocument()
   })
 

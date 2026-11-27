@@ -16,6 +16,7 @@ import type { DescriptionPause, DescriptionSetup } from '@kalareach/protocol'
 import { readOnCadence } from '../app/cadence'
 import { failureMessage, type HostPort } from '../host/port'
 import { readableBytes } from './host'
+import { technical, type Wording } from '../model/wording'
 
 /** How often a fetch that is running is asked about, in milliseconds. */
 export const PROGRESS_EVERY_MS = 1000
@@ -81,12 +82,11 @@ export function fetchedFraction(setup: DescriptionSetup): number | null {
   return Math.min(1, Math.max(0, fetched / total))
 }
 
-/** The size and the sources, in one sentence, before anything is fetched. */
-export function costSentence(setup: DescriptionSetup): string {
+/** The size and the sources, in one sentence, before anything is fetched; each source is a technical word. */
+export function costSentence(setup: DescriptionSetup): Wording {
   const size = `${readableBytes(Number(setup.asset_bytes))} to download`
-  const from =
-    setup.sources.length > 0 ? `, from ${setup.sources.join(' and ')}` : ''
-  return `${size}${from}.`
+  const sources = setup.sources.flatMap((source, at): Wording => (at === 0 ? [technical(source)] : [' and ', technical(source)]))
+  return sources.length > 0 ? [`${size}, from `, ...sources, '.'] : [`${size}.`]
 }
 
 /** What the card holds: the host's last answer, and what is being done about it. */

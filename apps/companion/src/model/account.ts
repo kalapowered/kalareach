@@ -9,6 +9,8 @@
  * checkout, no payment form and no call to action that sends a person somewhere to buy.
  */
 
+import { technical, type Wording } from './wording'
+
 /** How this build reached the device. */
 export type Channel = 'app_store' | 'play' | 'independent'
 
@@ -101,23 +103,23 @@ export const ACCOUNT_HOST = 'reach.kala.to'
 /** What the Sign in button leads to, said beside it. */
 export const SIGN_IN_HELP = `Opens ${ACCOUNT_HOST}, where you use a passkey or an email code.`
 
-/** The sentence a person reads first, for where the device stands. */
-export function describeAccount(view: AccountView): string {
+/** The sentence a person reads first, for where the device stands; the account's address is a technical word. */
+export function describeAccount(view: AccountView): Wording {
   switch (view.state) {
     case 'signed_out':
     case 'unavailable':
     case 'unreadable':
-      return 'No account on this device. Your hosts, sessions and agents work exactly as they do with one.'
+      return ['No account on this device. Your hosts, sessions and agents work exactly as they do with one.']
     case 'browser_open':
-      return `Continue on ${ACCOUNT_HOST}. This screen updates when you finish there.`
+      return [`Continue on ${ACCOUNT_HOST}. This screen updates when you finish there.`]
     case 'finishing':
-      return 'Signing in…'
+      return ['Signing in…']
     case 'signed_in':
       return view.email === null
-        ? "Signed in. The account's address has not been read yet."
-        : `Signed in as ${view.email}.`
+        ? ["Signed in. The account's address has not been read yet."]
+        : ['Signed in as ', technical(view.email), '.']
     case 'ended':
-      return 'Your sign-in on this device has ended. Your hosts, sessions and agents keep working.'
+      return ['Your sign-in on this device has ended. Your hosts, sessions and agents keep working.']
   }
 }
 
