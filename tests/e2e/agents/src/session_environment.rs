@@ -48,10 +48,16 @@ const NAME_CHARACTERS: usize = 60;
 
 /// The variable the shell integration exports for the line that is running and removes when the
 /// next prompt shows: the capability the worker gives each accepted line, which `kr detach` reads.
-/// A line the worker answers late runs without it, so the shell holds it at some typed lines of
-/// the check and not at others. The list of exported names that the check counts and digests
-/// leaves this one name out, so that the parts of one reading are one list whether the answer to
-/// a line came in time or not; every other name is counted and compared as before.
+/// A line runs without it when the worker answers late, and also when the worker answers in time
+/// with no capability for the line (`shells/zsh/src/kr_bridge.c`, `kr_bridge_line_token`), so the
+/// shell holds it at some typed lines of the check and not at others. The list of exported names
+/// that the check counts and digests leaves this one name out, so that the parts of one reading
+/// are one list whatever the answer to a line was; every other name is counted and compared as
+/// before.
+///
+/// Leaving it out costs the forbidden-name check nothing: that check judges a name only by the
+/// cleared patterns, and no pattern names a name that begins with [`keys::PRODUCT`], which this
+/// one does (a case holds the two together).
 pub const LINE_CAPABILITY: &str = "KR_DETACH_TOKEN";
 
 /// How a failure begins when the shell's environment is not as the harness gave it.
@@ -101,14 +107,14 @@ fn short_hex_of(bytes: &[u8]) -> String {
 }
 
 /// What the parts of the answer about the exported names say of the whole list: how many names the
-/// shell exports and the digest of the whole sorted list, one name to a line. Every part must say
-/// the same, and the names read must give the digest, so that the parts are read as one list and
-/// not as pieces of lists that changed in between.
+/// shell exports besides [`LINE_CAPABILITY`] and the digest of the whole sorted list of them, one
+/// name to a line. Every part must say the same, and the names read must give the digest, so that
+/// the parts are read as one list and not as pieces of lists that changed in between.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
-    /// How many names the shell exports.
+    /// How many names the shell exports, [`LINE_CAPABILITY`] not counted.
     pub total: usize,
-    /// The digest of the sorted names.
+    /// The digest of the sorted names, [`LINE_CAPABILITY`] not among them.
     pub digest: String,
 }
 
@@ -376,7 +382,8 @@ impl Expected {
     }
 
     /// The line a pass prints, so that a log shows the check ran and what it compared: the names
-    /// compared, `ok`, how many names the shell exports, and the exported names that were not
+    /// compared, `ok`, how many exported names were read ([`LINE_CAPABILITY`] is not among them,
+    /// so a pass no longer shows whether the reads had it), and the exported names that were not
     /// compared, which only the entry's cleared patterns judge. Never a value and never a digest.
     #[must_use]
     pub fn passed_line(&self, exported: &[String]) -> String {
@@ -529,8 +536,8 @@ impl Expected {
 }
 
 /// What the screen's rows say of the names the shell exports: the names this part lists, and how
-/// many names the shell exports in all. `read` are the names the earlier parts listed, and `said`
-/// is the total those parts gave, where there were any.
+/// many names the shell exports in all, [`LINE_CAPABILITY`] not counted. `read` are the names the
+/// earlier parts listed, and `said` is the total those parts gave, where there were any.
 ///
 /// A part is whole only when it lists exactly the names it was asked for: the ones from position
 /// `read.len() + 1` on, at most [`PART_NAMES`] and no fewer than the total leaves, each with the
@@ -590,7 +597,8 @@ pub fn read_exported(
     };
     if let Some(said) = said.filter(|said| said.total != total) {
         return Err(format!(
-            "{NOT_READ_WHOLE} the shell said it exports {} names and then {total}",
+            "{NOT_READ_WHOLE} the shell said it exports {} names and then {total}, not counting \
+             the capability of its line",
             said.total
         ));
     }
@@ -1260,6 +1268,18 @@ mod tests {
                 "{other}: {failure}"
             );
         }
+    }
+
+    /// The capability's name begins as the product's own names do, and no cleared pattern names
+    /// one of those ([`keys::names`]): so the forbidden-name check judged nothing about it before
+    /// it was left out of the list, and loses nothing now.
+    #[test]
+    fn the_line_capability_is_a_name_of_the_products_own_that_no_pattern_clears() {
+        assert!(
+            LINE_CAPABILITY.starts_with(keys::PRODUCT),
+            "{LINE_CAPABILITY} does not begin with {}, so a pattern could clear it",
+            keys::PRODUCT
+        );
     }
 
     #[test]
