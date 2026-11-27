@@ -1558,7 +1558,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
 /// debug build on an Android emulator with Google Play services and no account. This case reports
 /// only what the host held: the count of destinations at one sample after the owner's
 /// confirmation; the one destination record that ended the wait for it, with the time the wait
-/// first saw it and the time the record says it was configured, its authorisation and its state;
+/// first saw it and the record's configuration timestamp, its authorisation and its state;
 /// and, when the script says the phone's negative step ended, the count of destinations and the
 /// record's authorisation again. The rest is shown by the run's other records, which whoever runs
 /// the case reads beside this report: the phone's records show that the receiver answered the
@@ -1566,7 +1566,9 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
 /// token and then issued the sender authorisation. The host's samples alone do not show that the
 /// host held no destination before that authorisation: the sample after the confirmation does not
 /// pause the phone, and the first-seen time is when the wait saw the record, not when it was
-/// written (the configured time is).
+/// written. The configuration timestamp is not the write time either: the host samples it (the
+/// later of its clock and its own UTC floor) before it awaits the gateway's confirmation, puts it
+/// in the record, and writes the destination after the confirmation.
 ///
 /// It does not show a physical phone, its radio, its battery policy or a maker's limits on
 /// background work; a delivery to an application that is stopped or whose screen is off; an Apple
