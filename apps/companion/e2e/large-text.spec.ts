@@ -8,7 +8,7 @@
  * size, and read the drawn text itself: the lines each word is laid on, not a picture.
  */
 
-import { expect, test, type Page } from '@playwright/test'
+import { expect, test, type BrowserContext, type Page } from '@playwright/test'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
@@ -35,7 +35,12 @@ const DESKTOP: Form = { name: 'desktop 721 wide', phone: false, width: 721, heig
 const NARROW_WINDOW: Form = { name: 'window 320 wide', phone: false, width: 320, height: 900 }
 const WIDE_WINDOW: Form = { name: 'window 721 wide', phone: false, width: 721, height: 900 }
 
-/** Sets the text size as the platform does, before the page loads: on the root's own size, or through the phone's ratio. */
+/**
+ * Sets the text size as the platform does, before the page loads: on the root's own size, or through
+ * the phone's ratio. A script that is added to a page runs on every later load of it, and the order
+ * of two such scripts is not defined, so a page is given one size and never another: each size is
+ * read on a page of its own.
+ */
 async function withTextSize(page: Page, form: Form, size: number): Promise<void> {
   if (form.phone) {
     await page.addInitScript((value) => {
@@ -58,6 +63,16 @@ async function withTextSize(page: Page, form: Form, size: number): Promise<void>
       })
     }, size)
   }
+}
+
+/**
+ * Fails unless the root's computed text size is the size that the page was asked for: the browser's
+ * own 16 points at the ordinary size, and 53 over 17 times that at the largest. Every measure starts
+ * here, so a page at another size cannot pass for the one it was meant to read.
+ */
+async function expectTextSize(page: Page, size: number): Promise<void> {
+  const drawn = await page.evaluate(() => Number.parseFloat(getComputedStyle(document.documentElement).fontSize))
+  expect(drawn, `the root's text size at ${size === 1 ? 'the ordinary size' : 'the largest size'}`).toBeCloseTo(16 * size, 1)
 }
 
 /** Waits for the step's fade to end, so a measure reads what a person settles on. */
@@ -182,9 +197,10 @@ interface Reading {
  * line. A word's lines are read from its own text range, so a word that a line break has cut in two
  * is found whatever is drawn, and one that is moved whole to the next line is not. A box's holder is
  * the first box above it that is not a list, a list item or an inline box: the card a list is in, the
- * row a button is in.
+ * row a button is in. The page must be at the text size `size`.
  */
-function reading(page: Page, root: string): Promise<Reading> {
+async function reading(page: Page, root: string, size: number): Promise<Reading> {
+  await expectTextSize(page, size)
   return page.evaluate((selector) => {
     const base = document.querySelector(selector)
     if (base === null) throw new Error(`no ${selector} on the page`)
@@ -320,15 +336,30 @@ const PLACES: readonly Place[] = [
   }
 ]
 
+/** What a place reads at the ordinary size, on a page of its own that is closed after the reading. */
+async function readAtTheOrdinarySize(
+  context: BrowserContext,
+  open: Place['open'],
+  form: Form,
+  root: string
+): Promise<Reading> {
+  const page = await context.newPage()
+  try {
+    await open(page, form, 1)
+    return await reading(page, root, 1)
+  } finally {
+    await page.close()
+  }
+}
+
 test.describe('A word is kept whole where its holder has room for it', () => {
   for (const place of PLACES) {
     for (const form of place.forms) {
-      test(`${place.name}, ${form.name}`, async ({ page }) => {
-        await place.open(page, form, 1)
-        const ordinary = await reading(page, place.root(form))
+      test(`${place.name}, ${form.name}`, async ({ context, page }) => {
+        const ordinary = await readAtTheOrdinarySize(context, place.open, form, place.root(form))
         expect(ordinary.cut.map((one) => one.word), 'words cut at the ordinary size').toEqual([])
         await place.open(page, form, LARGEST)
-        const largest = await reading(page, place.root(form))
+        const largest = await reading(page, place.root(form), LARGEST)
         test.info().annotations.push(
           { type: 'cut', description: `${largest.cut.length} words are cut at the largest size` },
           { type: 'cannot fit', description: cannotFit(ordinary, largest).join('; ') || 'none' }
@@ -338,14 +369,20 @@ test.describe('A word is kept whole where its holder has room for it', () => {
     }
   }
 
-  test('the measure finds the words that an indentation which grows with the text cuts', async ({ page }) => {
-    await atTheDeletion(page, PHONE, 1)
+  test('the measure finds the words that an indentation which grows with the text cuts', async ({ context, page }) => {
     const root = '[data-testid="delete-account"]'
-    const ordinary = await reading(page, root)
+    const ordinary = await readAtTheOrdinarySize(context, atTheDeletion, PHONE, root)
     await atTheDeletion(page, PHONE, LARGEST)
     // The control: the list's indentation grows with the text, as it did, so words that fit are cut.
     await page.addStyleTag({ content: '.deletion-list { padding-inline-start: 4rem !important }' })
-    expect(cutAtTheBound(ordinary, await reading(page, root)).length).toBeGreaterThan(0)
+    expect(cutAtTheBound(ordinary, await reading(page, root, LARGEST)).length).toBeGreaterThan(0)
+  })
+
+  test('the measure refuses a page that is not at the size it was asked for', async ({ page }) => {
+    await atTheDeletion(page, PHONE, LARGEST)
+    await expect(expectTextSize(page, 1)).rejects.toThrow(/ordinary size/)
+    await expect(reading(page, '[data-testid="delete-account"]', 1)).rejects.toThrow(/ordinary size/)
+    await expectTextSize(page, LARGEST)
   })
 })
 
@@ -354,7 +391,8 @@ test.describe('A word is kept whole where its holder has room for it', () => {
  * status text and the one below, with the distance the footer itself keeps between its parts. A row
  * is the boxes that share a stretch of the page from top to bottom.
  */
-async function footerRows(page: Page): Promise<{ readonly own: number; readonly gaps: readonly number[] }> {
+async function footerRows(page: Page, size: number): Promise<{ readonly own: number; readonly gaps: readonly number[] }> {
+  await expectTextSize(page, size)
   return page.evaluate(() => {
     const footer = document.querySelector('.terminal-footer')
     if (footer === null) throw new Error('no footer on the page')
@@ -381,7 +419,7 @@ test.describe('The rows of the terminal footer stand one distance apart', () => 
     for (const size of [1, LARGEST]) {
       test(`${form.name}, text ${size === 1 ? 'ordinary' : 'largest'}`, async ({ page }) => {
         await atTheFooter(page, form, size)
-        const { own, gaps } = await footerRows(page)
+        const { own, gaps } = await footerRows(page, size)
         expect(gaps.length, 'rows below the first').toBeGreaterThan(0)
         expect(
           gaps.map((gap) => Number(gap.toFixed(1))),
@@ -394,7 +432,7 @@ test.describe('The rows of the terminal footer stand one distance apart', () => 
   test('the measure finds rows that stand at another distance', async ({ page }) => {
     await atTheFooter(page, NARROW_WINDOW, LARGEST)
     await page.addStyleTag({ content: '.terminal-footer .row { row-gap: 3px !important }' })
-    const { own, gaps } = await footerRows(page)
+    const { own, gaps } = await footerRows(page, LARGEST)
     expect(gaps.some((gap) => Math.abs(gap - own) > 0.5)).toBe(true)
   })
 })
@@ -439,7 +477,13 @@ interface Standing {
  * product's other choices stand in would hold the same two buttons (a row that wraps, the first
  * choice first), put beside it in the same card.
  */
-async function pairBesideItsSiblings(page: Page, first: string, second: string): Promise<{ readonly drawn: Standing; readonly siblings: Standing }> {
+async function pairBesideItsSiblings(
+  page: Page,
+  first: string,
+  second: string,
+  size: number
+): Promise<{ readonly drawn: Standing; readonly siblings: Standing }> {
+  await expectTextSize(page, size)
   return page.evaluate(
     ([one, two]) => {
       const a = document.querySelector(`[data-testid="${one}"]`)
@@ -488,7 +532,7 @@ test.describe('A pair of buttons stands as the other choices of the product do',
       for (const size of [1, LARGEST]) {
         test(`${pair.name}, ${form.name}, text ${size === 1 ? 'ordinary' : 'largest'}`, async ({ page }) => {
           await pair.open(page, form, size)
-          const { drawn, siblings } = await pairBesideItsSiblings(page, pair.first, pair.second)
+          const { drawn, siblings } = await pairBesideItsSiblings(page, pair.first, pair.second, size)
           expect(drawn).toEqual(siblings)
         })
       }
