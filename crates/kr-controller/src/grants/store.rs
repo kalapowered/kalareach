@@ -7665,4 +7665,67 @@ mod a_boot_the_host_can_no_longer_tell_apart {
             "the failed transaction stored nothing"
         );
     }
+
+    /// Whether a decision at the reading `at`, in a boot whose start read zero, takes a start
+    /// point, and whether the text stamped at `stamped` in that boot is then served for it.
+    fn a_decision_at(at: u64, stamped: u64) -> (bool, Result<(), Withheld>) {
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store"));
+        let connection = Connection::open(&path).expect("the registry opens");
+        let clock = SetClock::at(0);
+        let boot = boot_in(&clock, 71);
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the start's transaction");
+        Boots::observe(&connection, boot.clock(), boot.epoch()).expect("the start reads zero");
+        connection.execute_batch("COMMIT").expect("committed");
+        clock.set(at);
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the decision's transaction");
+        StartPoint::take(NOW_MS, &connection, &boot, &[7; 16]).expect("the decision");
+        connection.execute_batch("COMMIT").expect("committed");
+        let point = connection
+            .query_row("SELECT boot_ms FROM grant_starts", [], |row| {
+                Ok(StartPoint {
+                    wall_ms: NOW_MS,
+                    boot_epoch: BootEpoch::new(71),
+                    boot_ms: row.get::<_, i64>(0)?.try_into().unwrap_or_default(),
+                })
+            })
+            .ok();
+        let stamp = Stamp {
+            boot_epoch: BootEpoch::new(71),
+            boot_ms: stamped,
+        };
+        (
+            point.is_some(),
+            admit(0, point.as_ref(), Some(&stamp), &Recorded(&connection)),
+        )
+    }
+
+    /// A decision that reads the counter at zero takes no start point, and the text stamped before
+    /// it is withheld. A daemon that records a grant is never in the first millisecond of its boot,
+    /// so a zero is a reading that failed, and a point at zero would serve every text the boot made,
+    /// the text made before the decision among it. A positive reading still gives its point.
+    #[test]
+    fn a_decision_whose_reading_is_zero_takes_no_start_point_and_a_positive_one_still_does() {
+        // The start of the boot read zero too, so the boot's high is zero when the decision reads.
+        assert_eq!(
+            a_decision_at(0, 5_000),
+            (false, Err(Withheld::NoStartPoint)),
+            "no point at zero: the text stamped at 5,000 is withheld"
+        );
+        assert_eq!(
+            a_decision_at(1_000, 5_000),
+            (true, Ok(())),
+            "a positive reading takes its point, and later text is served"
+        );
+        assert_eq!(
+            a_decision_at(1_000, 500),
+            (true, Err(Withheld::BeforeHistoryBound)),
+            "and earlier text is not"
+        );
+    }
 }

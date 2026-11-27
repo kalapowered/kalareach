@@ -276,6 +276,12 @@ impl StartPoint {
     /// host can no longer tell from another: the access is then left with none until the host next
     /// starts in a boot it can tell apart.
     ///
+    /// A reading of zero gives no point either. A daemon that records a grant is never in the first
+    /// millisecond of its boot, so a zero is a counter that failed to answer, and a point at zero
+    /// would be before every text the boot made: the text made before the decision would be
+    /// served. The sample is still recorded, and the access has no point: its text is withheld
+    /// until the host next starts in a boot whose counter answers.
+    ///
     /// Call it after the caller's refusal checks, as the last statement before the point's write,
     /// so that what can fail after it is the write and the commit. The caller writes the point with
     /// [`StartPoint::write`] and reports the returned [`Observed`] after its transaction commits.
@@ -289,11 +295,12 @@ impl StartPoint {
         boot: &BootClock,
     ) -> Result<(Observed, Option<Self>)> {
         let observed = Boots::observe(connection, boot.clock(), boot.epoch())?;
-        let point = matches!(observed.state, BootState::Known(_)).then_some(Self {
-            wall_ms: decision_wall_ms,
-            boot_epoch: boot.epoch(),
-            boot_ms: observed.reading,
-        });
+        let point = (matches!(observed.state, BootState::Known(_)) && observed.reading > 0)
+            .then_some(Self {
+                wall_ms: decision_wall_ms,
+                boot_epoch: boot.epoch(),
+                boot_ms: observed.reading,
+            });
         Ok((observed, point))
     }
 

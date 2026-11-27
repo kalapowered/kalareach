@@ -308,6 +308,14 @@ mod apple {
 
     /// Returns `CLOCK_MONOTONIC_RAW`, in milliseconds since this boot, truncated as
     /// [`super::from_timespec`] truncates.
+    ///
+    /// A call that fails leaves the reading at zero in a release build; a debug build stops. The
+    /// host's record of boots treats that zero as follows. In a boot whose recorded high is above
+    /// zero it is a reading below the high, and the boot is spoiled. A boot's first record keeps it
+    /// as a high of zero, which every later reading passes, so the next reading is not lost. A
+    /// decision never takes a start point at zero, so that access has no point and its text is
+    /// withheld until the host next starts in a boot whose counter answers, and a stamp that reads
+    /// zero is withheld, since no point is below it.
     pub fn raw_elapsed_ms() -> u64 {
         let mut time = libc::timespec {
             tv_sec: 0,
