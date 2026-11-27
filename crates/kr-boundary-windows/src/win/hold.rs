@@ -39,7 +39,9 @@ use crate::local_path;
 use crate::refusal::Refusal;
 use crate::slot::TreeIdentity;
 
-use super::admission::{attributes_refusal, cut_start, is_cloud_tag, reparse_refusal};
+use super::admission::{
+    attributes_refusal, chain_paths, cut_start, is_cloud_tag, reparse_refusal, spelled,
+};
 use super::client::ClientIdentity;
 use super::ffi::{self, Handle, wide_path};
 use super::listing::{self, Failure, RepositoryListing};
@@ -225,9 +227,23 @@ impl TreeHold {
         if !self.config_is_unchanged() {
             names.insert("config".to_owned());
         }
-        for folder in self.chain.iter().chain(std::iter::once(&self.git_dir)) {
+        // A folder that changed is named by its path as the person spells it, from the tree's own
+        // path, not by the device path that the held handle reports.
+        let paths = chain_paths(&self.path);
+        let git_path = format!(r"{}\.git", spelled(&self.path));
+        let folders = self.chain.iter().chain(std::iter::once(&self.git_dir));
+        for (index, folder) in folders.enumerate() {
             if !folder_is_unchanged(folder) {
-                names.insert(String::from_utf16_lossy(folder.path()));
+                let shown = if index < self.chain.len() {
+                    paths.get(index)
+                } else {
+                    Some(&git_path)
+                };
+                names.insert(
+                    shown
+                        .cloned()
+                        .unwrap_or_else(|| String::from_utf16_lossy(folder.path())),
+                );
             }
         }
         names.extend(listing::present_names(&self.git_dir));
@@ -245,6 +261,7 @@ impl TreeHold {
             Err(_) => {
                 names.insert("hooks".to_owned());
                 names.insert(r"info\attributes".to_owned());
+                names.insert(r"info\exclude".to_owned());
             }
         }
         if names.is_empty() {
@@ -387,7 +404,10 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
             FOLDER_CHANGED_WORDS,
         )
     })?;
-    let display = dos_path(tree.handle())?;
+    // The hold keeps the path with its long-path prefix, which later opens by name use; the
+    // refusals show it as the person spells it.
+    let dos = dos_path(tree.handle())?;
+    let display = spelled(&dos).to_owned();
     person_reads(client, tree.handle(), &display)?;
     let git_name: Vec<u16> = ".git".encode_utf16().collect();
     let git_dir = match tree.open_directory_named(&git_name, LIST) {
@@ -426,7 +446,7 @@ pub fn hold_tree(path: &str, client: &ClientIdentity) -> Result<TreeHold, Refusa
         listing,
         states,
         listed_files,
-        path: display,
+        path: dos,
     })
 }
 

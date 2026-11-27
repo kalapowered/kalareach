@@ -48,14 +48,14 @@ use kr_boundary_windows::win::admission::{
 };
 use kr_boundary_windows::win::ffi::{Handle, system_windows_directory};
 use kr_boundary_windows::win::hold::{
-    ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, MODULES_WORDS, RULE_ABSENT_NAME,
-    RULE_HOLD_FAILED, RULE_LISTING_BOUND, RULE_MODULES, TreeHold, hold_tree,
+    ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, MODULES_WORDS, PERSON_WORDS, RULE_ABSENT_NAME,
+    RULE_HOLD_FAILED, RULE_LISTING_BOUND, RULE_MODULES, RULE_PERSON, TreeHold, hold_tree,
 };
 use kr_boundary_windows::win::job::{Job, Limits};
 use kr_boundary_windows::win::launch::{
     ChildSpec, InvocationId, ResumePermit, Std, TokenSpec, VerifiedPath, launch, pipe,
 };
-use kr_boundary_windows::win::sd::{Principals, SdKind, descriptor};
+use kr_boundary_windows::win::sd::{Principals, SdKind, descriptor, descriptor_from_text};
 
 use common::people::{Boundary, Person, acting_as, prepare, runs_as_the_system};
 use common::project::{CONFIG, Project};
@@ -1184,4 +1184,64 @@ fn config_hold_a_hooks_folder_beyond_the_bounds_is_refused_at_the_hold() {
     held(&links, "a link name of 255 bytes");
     junction("k".repeat(244));
     refused(&links, "a link name of 256 bytes");
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_person_who_cannot_read_the_tree_is_refused_by_its_path_without_the_prefix() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhpr");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "no-read");
+    let alone = descriptor_from_text("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
+    acl::set_protected(&project.root, &alone).expect("the person's right on the tree is taken");
+    let refusal = hold_tree(project.root.to_str().unwrap(), &ordinary.as_client())
+        .expect_err("a person who cannot read the tree is refused");
+    assert_eq!(refusal.rule, RULE_PERSON, "{}", refusal.detail());
+    let detail = refusal.detail();
+    let path = detail
+        .strip_prefix(&format!("{PERSON_WORDS}: "))
+        .unwrap_or_else(|| panic!("the refusal gives its words and then the path: {detail}"));
+    assert!(
+        !path.starts_with(r"\\"),
+        "the path is spelled without the long-path prefix: {path}"
+    );
+    assert!(
+        path.ends_with(project.root.file_name().unwrap().to_str().unwrap()),
+        "the path is the tree's: {path}"
+    );
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_held_folder_that_changed_is_named_by_its_path_on_the_drive() {
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhfn");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "folder-name");
+    let hold =
+        hold_tree(project.root.to_str().unwrap(), &ordinary.as_client()).expect("the tree is held");
+    match set_cloud_tag(&project.git) {
+        Ok(()) => {
+            let seen = hold
+                .end_check()
+                .expect_err("a reparse point on a held folder");
+            let expected = format!(r"{}\.git", hold.path.trim_start_matches(r"\\?\"));
+            assert!(
+                seen.names.contains(&expected),
+                "the folder is named by its path on the drive, not by its device path: {seen:?}"
+            );
+        }
+        Err(failure) => {
+            println!("NOT SHOWN: the guest takes no tag on a folder that holds files: {failure}");
+        }
+    }
 }

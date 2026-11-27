@@ -1,14 +1,17 @@
-//! What a repository's Git directory holds that the broker cannot hold open: the names that must be
-//! absent, the hooks folder and the `info\attributes` file, each file with its digest.
+//! What a repository's Git directory holds beside `config`: the names that must be absent, the
+//! hooks folder, and the `info\attributes` and `info\exclude` files, each file with its digest.
 //!
 //! The holds of [`super::hold`] stop a rename, a replacement and a deletion of the held objects, and
-//! they do not stop the creation of a new name or a write to a file that is not held. A taken-over
-//! Git can leave a `commondir` file for the next operation, or a hook that the person's own Git
-//! runs later. The broker takes one listing when it holds the tree and compares it with a fresh one
-//! before the resume and at the end, by name, identity, size and digest. At the hold it also keeps
-//! each listed file open for reading and sharing it for reading only, so that no account can write
-//! to, rename or delete a hook or the attributes file while the tree is held, whatever view of it
-//! a process keeps: a kept view maps the file's data, and that mapping outlives the broker's check.
+//! they do not stop the creation of a new name. A taken-over Git can leave a `commondir` file for
+//! the next operation, or a hook that the person's own Git runs later. The broker takes one listing
+//! when it holds the tree. Before the process resumes it looks again for the names that must be
+//! absent and for nothing else; at the end it compares a fresh listing with the held one, by name,
+//! identity, size and digest. At the hold it also keeps each listed file open for reading and
+//! shares it for reading only, so that a write through a handle opened after the hold, a rename and
+//! a deletion of a hook or of either file are refused while the tree is held. A writable open that
+//! a process made before the hold makes the hold refuse. Sharing is a rule of handles, so a
+//! writable view that outlives its handle does not depend on it: when the hold stands over such a
+//! view, what the view writes is a change that the end check sees by digest.
 
 #![allow(unsafe_code)]
 

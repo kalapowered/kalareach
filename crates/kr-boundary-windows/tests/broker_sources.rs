@@ -70,7 +70,7 @@ const PLANTED: [(&str, &str); 7] = [
     ("a grafts file", r"info\grafts"),
     ("a hook", r"hooks\pre-commit"),
     ("an attributes file", r"info\attributes"),
-    ("a .git file", ".git"),
+    ("a shallow file", "shallow"),
     ("a worktrees folder", r"worktrees\"),
 ];
 

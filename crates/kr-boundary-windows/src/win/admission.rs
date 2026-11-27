@@ -99,7 +99,7 @@ pub const RULE_LABEL: &str = "admission-label";
 /// The end of the reply when a boundary account holds a right on an object; the path and the right
 /// come before it.
 // text: SIBLING_WORDS
-pub const SIBLING_WORDS: &str = "the group of another boundary account has this right";
+pub const SIBLING_WORDS: &str = "another boundary account has this right";
 
 /// The end of the reply when the person's own account lacks a right that the grant needs.
 // text: PERSON_LACKS_WORDS
@@ -370,12 +370,12 @@ fn object_refusal(rule: &'static str, path: &str, words: &str) -> Refusal {
 }
 
 /// The path of the tree as the person spelled it, without the platform's long-path prefix.
-fn spelled(path: &str) -> &str {
+pub(super) fn spelled(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
 /// The path of each directory of the chain, the volume's root first, from the tree's own path.
-fn chain_paths(tree_path: &str) -> Vec<String> {
+pub(super) fn chain_paths(tree_path: &str) -> Vec<String> {
     let parts: Vec<&str> = spelled(tree_path).split('\\').collect();
     (0..parts.len())
         .map(|index| {
