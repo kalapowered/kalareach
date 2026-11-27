@@ -310,6 +310,10 @@ struct SessionRecord {
 
 /// How a closed session ended. Which processes it stopped and what survived are counted and not
 /// named: their names are text, and a count is what a person reading the file needs.
+///
+/// A record that was held to a budget lists some of its entries and counts the rest. The listed
+/// counts are the entries the record lists, and the two not-listed counts are the entries it only
+/// counts, so the three together say how many the session had.
 #[derive(Serialize)]
 struct ClosureOut {
     reason: ClosureReason,
@@ -320,6 +324,8 @@ struct ClosureOut {
     durability: Durability,
     terminated_count: u64,
     surviving_count: u64,
+    not_listed_ended_processes: u64,
+    not_listed_other_entries: u64,
 }
 
 impl SessionRecord {
@@ -334,18 +340,23 @@ impl SessionRecord {
             shell: rules.field(&summary.shell_path),
             cwd: rules.field(&summary.cwd),
             environment_sources: summary.environment_sources,
-            closure: summary.closure.as_ref().map(|closure| ClosureOut {
-                reason: closure.reason,
-                root_exit_code: closure.root_exit_code.as_ref().map(|code| code.get()),
-                root_signal: closure
-                    .root_signal
-                    .as_ref()
-                    .map(|signal| rules.field(signal)),
-                closed_at_ms: closure.closed_at_ms.get(),
-                ownership_coverage: closure.ownership_coverage,
-                durability: closure.durability,
-                terminated_count: closure.terminated.len() as u64,
-                surviving_count: closure.surviving.len() as u64,
+            closure: summary.closure.as_ref().map(|closure| {
+                let omitted = closure.omitted();
+                ClosureOut {
+                    reason: closure.reason,
+                    root_exit_code: closure.root_exit_code.as_ref().map(|code| code.get()),
+                    root_signal: closure
+                        .root_signal
+                        .as_ref()
+                        .map(|signal| rules.field(signal)),
+                    closed_at_ms: closure.closed_at_ms.get(),
+                    ownership_coverage: closure.ownership_coverage,
+                    durability: closure.durability,
+                    terminated_count: closure.terminated.len() as u64,
+                    surviving_count: closure.survivors().len() as u64,
+                    not_listed_ended_processes: omitted.map_or(0, |omitted| omitted.ended),
+                    not_listed_other_entries: omitted.map_or(0, |omitted| omitted.other),
+                }
             }),
         }
     }

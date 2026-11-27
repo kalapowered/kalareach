@@ -357,6 +357,8 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
         [
             "closed_at_ms",
             "durability",
+            "not_listed_ended_processes",
+            "not_listed_other_entries",
             "ownership_coverage",
             "reason",
             "root_exit_code",
@@ -367,10 +369,74 @@ fn a_closed_session_is_recorded_by_its_closure_and_counts_and_names_nothing_else
     );
     assert_eq!(session["closure"]["terminated_count"], 1);
     assert_eq!(session["closure"]["surviving_count"], 2);
+    assert_eq!(session["closure"]["not_listed_ended_processes"], 0);
+    assert_eq!(session["closure"]["not_listed_other_entries"], 0);
     assert_eq!(session["closure"]["ownership_coverage"], "incomplete");
     assert_eq!(session["closure"]["durability"], "volatile");
     assert_eq!(session["closure"]["root_signal"], "SIGTERM");
     assert_eq!(session["closure"]["reason"], "root_signal");
+}
+
+/// KR-REQ-29.04: a closure that counts entries it does not list is recorded by what it lists and
+/// by two numbers for what it counts; the entry that carries the count is not one of the listed
+/// resources, and the record has no sentence of its own for it.
+#[test]
+fn a_closure_that_counts_what_it_does_not_list_is_recorded_by_two_numbers() {
+    use kr_protocol::session::{
+        ClosureOmission, ClosureRecord, OmissionReason, SurvivingResource, TerminatedProcess,
+    };
+
+    let mut closed = listed(5);
+    closed.state = SessionState::Closed;
+    closed.closure = Nullable::some(ClosureRecord {
+        session_id: session_id(5),
+        session_epoch: SessionEpoch::V1,
+        reason: ClosureReason::WorkerCrash,
+        root_exit_code: Nullable::null(),
+        root_signal: Nullable::null(),
+        terminated: vec![TerminatedProcess {
+            identity: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                9,
+            ),
+            name: Nullable::null(),
+            forced: false,
+        }],
+        surviving: vec![
+            SurvivingResource {
+                kind: "process".to_owned(),
+                detail: "process 7 is still running".to_owned(),
+            },
+            ClosureOmission {
+                ended: 4_000,
+                other: 1,
+                reason: OmissionReason::Budget,
+            }
+            .entry(),
+        ],
+        ownership_coverage: OwnershipCoverage::Incomplete,
+        durability: Durability::Durable,
+        closed_at_ms: TimestampMs::new(2_000),
+    });
+    let selection = select(&report(0, false, &[]), vec![closed], &report(0, false, &[]));
+    let text = compose(&Reading { listed: selection }, &[], &rules())
+        .expect("composes")
+        .text()
+        .to_owned();
+    assert!(
+        !text.contains("not listed here") && !text.contains("not_listed\""),
+        "the record carries the numbers and not the entry's sentence: {text}"
+    );
+    let record: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let closure = &record["sessions"][0]["closure"];
+    assert_eq!(
+        closure["surviving_count"], 1,
+        "the entry that counts is not a survivor"
+    );
+    assert_eq!(closure["terminated_count"], 1);
+    assert_eq!(closure["not_listed_ended_processes"], 4_000);
+    assert_eq!(closure["not_listed_other_entries"], 1);
 }
 
 /// What the host says, scripted per call: the last answer repeats, so a host can change once.

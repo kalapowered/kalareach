@@ -289,8 +289,36 @@ const SURVIVING_KINDS: [&str; 4] = [
 ///
 /// A process's name is the session's own, shown to the person who asked about the session; what a
 /// surviving resource's detail says is the host's sentence, said as its class and its length.
+///
+/// A record that was held to a budget lists some of its entries and counts the rest. `surviving`
+/// lists the resources the record names, and `not_listed` says how many entries the record only
+/// counts; it is there only for a record that counts any.
 #[must_use]
 pub fn closure(record: &ClosureRecord) -> Document {
+    let document = closure_listed(record);
+    match record.omitted() {
+        Some(omitted) => document.with(
+            "not_listed",
+            shown!(
+                "closure entries listed: {}; not listed: {} of the ended processes and {} of the \
+                 other entries",
+                (record.terminated.len() + record.survivors().len()) as u64,
+                crate::shown::carried(
+                    kr_protocol::hostinfo::export::ContentClass::Number,
+                    &omitted.ended.to_string()
+                ),
+                crate::shown::carried(
+                    kr_protocol::hostinfo::export::ContentClass::Number,
+                    &omitted.other.to_string()
+                ),
+            ),
+        ),
+        None => document,
+    }
+}
+
+/// The members of a closure's document that the record lists.
+fn closure_listed(record: &ClosureRecord) -> Document {
     Document::new()
         .with("session_id", output::said(&record.session_id))
         .with("session_epoch", output::said(&record.session_epoch))
@@ -323,7 +351,7 @@ pub fn closure(record: &ClosureRecord) -> Document {
         .with(
             "surviving",
             record
-                .surviving
+                .survivors()
                 .iter()
                 .map(|resource| {
                     Document::new()
@@ -1315,6 +1343,54 @@ mod tests {
             ],
             "every field is checked above"
         );
+    }
+
+    /// A closure that counts entries it does not list is exported by what it lists and by one line
+    /// that says how many it counts: the entry that carries the count is not rendered as a resource,
+    /// and a closure that counts nothing has no such line.
+    #[test]
+    fn a_closure_that_counts_what_it_does_not_list_is_exported_with_its_two_numbers() {
+        let closure_of = |surviving: Vec<kr_protocol::session::SurvivingResource>| ClosureRecord {
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [3; 16],
+            )),
+            session_epoch: kr_protocol::ids::SessionEpoch::V1,
+            reason: kr_protocol::session::ClosureReason::WorkerCrash,
+            root_exit_code: kr_protocol::scalars::Nullable::null(),
+            root_signal: kr_protocol::scalars::Nullable::null(),
+            terminated: Vec::new(),
+            surviving,
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_protocol::scalars::TimestampMs::new(9),
+        };
+        let listed = kr_protocol::session::SurvivingResource {
+            kind: "process".to_owned(),
+            detail: "process 42 is still running".to_owned(),
+        };
+        let counting = kr_protocol::session::ClosureOmission {
+            ended: 4_000,
+            other: 1,
+            reason: kr_protocol::session::OmissionReason::Budget,
+        };
+
+        let rendered = closure(&closure_of(vec![listed.clone(), counting.entry()])).json();
+        assert_eq!(
+            rendered["surviving"],
+            json!([{ "kind": "process", "detail": "[message withheld, 27 bytes]" }]),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered["not_listed"],
+            json!(
+                "closure entries listed: 1; not listed: 4000 of the ended processes and 1 of the \
+                 other entries"
+            ),
+            "{rendered}"
+        );
+
+        let whole = closure(&closure_of(vec![listed])).json();
+        assert!(whole.get("not_listed").is_none(), "{whole}");
     }
 
     #[test]
