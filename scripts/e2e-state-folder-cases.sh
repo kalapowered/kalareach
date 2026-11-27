@@ -941,6 +941,51 @@ stand_check "$t" "$t/rmf/new/state"
 said "a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/rmf/new/state" "$left_both")"
 unset -f stand_chmod stand_rm
 
+# The cleanup takes the names that it looks for from the shell's own read of the directory, never from
+# the text of a listing, which a variable of the environment can change: a quoting style (GNU `ls`) puts
+# quotes round every name, and forced colour (macOS `ls`; the stand-in `ls` here reads CLICOLOR_FORCE and
+# answers `--color=always`) puts colour codes round the name of a directory. A caller can also set
+# GLOBIGNORE to a pattern that matches every name, the option failglob, and no globbing at all (set -f),
+# which change the shell's own read. In each case the removals fail, so the marker (and the folder that the walk made) stand, and the
+# sentence says what was kept instead of saying that nothing was.
+mk "$t/qs/exist/state" "$t/qs/new" "$t/cl/new" "$t/hg/exist/state" "$t/hg/new" "$t/ng/exist/state" "$t/ng/new" "$t/fg/exist/state"
+stand_chmod() { return 1; }
+stand_rm() { return 1; }
+QUOTING_STYLE=c stand_check "$t" "$t/qs/exist/state"
+said "under a quoting style set in the environment, a failed removal of the marker is said" "$(write_sentence "$t/qs/exist/state" "$left_marker")"
+QUOTING_STYLE=c stand_check "$t" "$t/qs/new/state"
+said "under a quoting style set in the environment, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/qs/new/state" "$left_both")"
+stand_ls() {
+  if [ -n "${CLICOLOR_FORCE:-}" ] && [ "${1:-}" = -A ]; then
+    LS_COLORS='di=01;34' command ls --color=always "$@"
+  else
+    command ls "$@"
+  fi
+}
+CLICOLOR=1 CLICOLOR_FORCE=1 stand_check "$t" "$t/cl/new/state"
+unset -f stand_ls
+said "under forced colour set in the environment, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/cl/new/state" "$left_both")"
+unset -f stand_chmod
+stand_chmod() { GLOBIGNORE='*'; return 1; }
+stand_check "$t" "$t/hg/exist/state"
+said "under a pattern set by the caller that hides every name, a failed removal of the marker is said" "$(write_sentence "$t/hg/exist/state" "$left_marker")"
+stand_check "$t" "$t/hg/new/state"
+said "under a pattern set by the caller that hides every name, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/hg/new/state" "$left_both")"
+unset -f stand_chmod
+stand_chmod() { set -f; return 1; }
+stand_check "$t" "$t/ng/exist/state"
+said "under no globbing set by the caller, a failed removal of the marker is said" "$(write_sentence "$t/ng/exist/state" "$left_marker")"
+stand_check "$t" "$t/ng/new/state"
+said "under no globbing set by the caller, a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/ng/new/state" "$left_both")"
+unset -f stand_chmod stand_rm
+# The marker is gone and the folder is empty, so the directory reads as gone and nothing is kept, with the
+# option failglob set by the caller (an unmatched pattern is then an error).
+stand_chmod() { shopt -s failglob; return 1; }
+stand_rm() { command rm -f -- "$t/fg/exist/state/.kr-e2e-owner"; return 1; }
+stand_check "$t" "$t/fg/exist/state"
+unset -f stand_chmod stand_rm
+said "under failglob set by the caller, a marker whose removal reports a failure but that is gone" "$(write_sentence "$t/fg/exist/state")"
+
 # The folder that the walk made is moved aside and another closed folder of the caller's takes its name
 # before the walk enters it: the cleanup does not remove what it did not make, and says that what it made
 # is still there.

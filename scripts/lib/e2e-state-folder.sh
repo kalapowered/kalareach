@@ -246,18 +246,34 @@ e2e_state_folder_mark() {
 }
 
 # e2e_state_folder_gone <name>: tells whether <name>, a name in the working directory, is gone. It reads
-# the directory and looks for the name in what it holds: a test of the name itself gives the same
-# answer for a name that is not there and for one that cannot be looked at (a folder that cannot be
-# searched, an input or output error), so a failed test shows nothing. It returns 0 where the directory
-# was read and does not hold the name, 1 where it holds it, and 2 where it could not be read, which
-# shows neither. `LC_ALL=C` only fixes the bytes of the names; no message is read.
+# the directory and compares each name in it, whole and byte for byte, with <name>: a test of the name
+# itself gives the same answer for a name that is not there and for one that cannot be looked at (a
+# folder that cannot be searched, an input or output error), so a failed test shows nothing. The
+# listing command is run only for its exit status, which says whether the directory can be read; its
+# text is never read, since a variable of the environment (a quoting style, forced colour) can change
+# how it prints a name. The names come from the shell's own read of the directory, in a subshell that
+# sets every option that could change that read: patterns are expanded (not left as they are), no
+# pattern hides a name, an unmatched pattern is neither an error nor itself, names that start with a
+# dot count, and the bytes of a name are compared as they are. It returns 0 where the directory was read and does not hold the name, 1 where
+# it holds it, and 2 where it could not be read, which shows neither.
 e2e_state_folder_gone() {
-  local names
-  names="$(LC_ALL=C ls -A -- . 2> /dev/null && printf x)" || return 2
-  case $'\n'"$names" in
-    *$'\n'"$1"$'\n'*) return 1 ;;
+  local found=0
+  ls -A -- . > /dev/null 2>&1 || return 2
+  (
+    unset GLOBIGNORE
+    LC_ALL=C
+    set +f
+    shopt -u failglob
+    shopt -s nullglob dotglob
+    for entry in ./*; do
+      [ "${entry#./}" = "$1" ] && exit 1
+    done
+    exit 0
+  ) || found=$?
+  case "$found" in
+    0 | 1) return "$found" ;;
   esac
-  return 0
+  return 2
 }
 
 # e2e_state_folder_fail <status>: ends the walk. It first removes what the walk made and nothing
