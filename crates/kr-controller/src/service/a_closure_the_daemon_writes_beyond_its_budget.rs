@@ -136,8 +136,13 @@ async fn the_daemons_own_record_lists_the_unaccounted_worker_first_and_is_held_t
         OwnershipCoverage::Incomplete,
         "a death nobody confirmed claims nothing, whatever the cut"
     );
-    let written = kr_cbor::to_canonical_vec_within(&record, &kr_cbor::Limits::DEFAULT)
-        .expect("the codec writes the record");
+    let written = kr_cbor::to_canonical_vec_within(&record, &kr_cbor::Limits::DEFAULT);
+    assert!(
+        written.is_ok(),
+        "the codec writes the record: {:?}",
+        written.as_ref().err()
+    );
+    let written = written.unwrap_or_default();
     assert!(
         written.len() + record.device_extra() <= CLOSURE_BUDGET_BYTES + 2_048,
         "the record as a device is shown it fits the budget and the room the entry takes: {} bytes",

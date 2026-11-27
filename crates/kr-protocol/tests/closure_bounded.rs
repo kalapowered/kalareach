@@ -285,6 +285,25 @@ fn a_cut_that_leaves_out_survivors_left_something() {
         vec![survivor("process", "process 4 is still running")],
     );
     assert!(whole.bounded(CLOSURE_BUDGET_BYTES).left_something());
+
+    // A record that counts survivors and lists none (the form a device is given) left something;
+    // one that counts only ended processes did not.
+    let counting = |ended, other| {
+        record(
+            Vec::new(),
+            vec![
+                ClosureOmission {
+                    ended,
+                    other,
+                    reason: OmissionReason::Connection,
+                }
+                .entry(),
+            ],
+        )
+    };
+    assert!(counting(0, 3).survivors().is_empty());
+    assert!(counting(0, 3).left_something());
+    assert!(!counting(7, 0).left_something());
 }
 
 /// KR-REQ-09.22: the cut does not touch what the worker said about the whole: coverage, the
