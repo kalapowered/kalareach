@@ -1294,7 +1294,7 @@ fn bypass_for(
 mod tests {
     use std::time::Duration;
 
-    use kr_plugin_sdk::matching::Coverage;
+    use kr_plugin_sdk::matching::{Candidate, Coverage, MatchConfidence, from_one_publisher};
     use kr_protocol::ids::PluginId;
 
     use super::{ADOPTED_REFUSAL, IDLE_LOOK, Pace, Tie, WATCH_INTERVAL, tie_refusal};
@@ -1524,5 +1524,72 @@ mod tests {
             ),
             "packages of one publisher whose clauses differ get one clause each"
         );
+    }
+
+    /// KR-REQ-12.19: the refusal a view shows for a tie is the host's own words, and
+    /// `tests/fixtures/tie-refusals.json` holds them. Each tie there, built the way the binder builds
+    /// one, is worded as the file says, and the file's `one_publisher` is what the host's publisher
+    /// test answers for those identifiers. The page's cases take the same texts as the refusal a
+    /// host reports, so a change of the host's words turns this case red until the file says them.
+    #[test]
+    fn each_tie_is_worded_as_the_fixture_says() {
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/fixtures/tie-refusals.json"))
+                .expect("the fixture parses");
+        let ties = document["ties"].as_object().expect("a map of ties");
+        assert!(!ties.is_empty(), "the fixture holds ties");
+        for (name, held) in ties {
+            let packages: Vec<TiedPackage> = held["packages"]
+                .as_array()
+                .expect("a list of packages")
+                .iter()
+                .map(|package| TiedPackage {
+                    plugin_id: PluginId::new(package["plugin_id"].as_str().expect("an identifier"))
+                        .expect("a plugin identifier"),
+                    protocol: package["protocol"].as_str().map(str::to_owned),
+                    ranges: package["ranges"]
+                        .as_array()
+                        .expect("a list of ranges")
+                        .iter()
+                        .map(|range| range.as_str().expect("a range").to_owned())
+                        .collect(),
+                    version: package["version"].as_str().map(str::to_owned),
+                    coverage: match package["coverage"].as_str() {
+                        Some("covers") => Coverage::Covers,
+                        Some("excludes") => Coverage::Excludes,
+                        Some("neutral") => Coverage::Neutral,
+                        other => panic!("`{name}` names a coverage the host has not: {other:?}"),
+                    },
+                })
+                .collect();
+            let candidates: Vec<Candidate> = packages
+                .iter()
+                .map(|package| Candidate {
+                    plugin_id: package.plugin_id.clone(),
+                    authority: String::new(),
+                    rule_id: "executable".to_owned(),
+                    confidence: MatchConfidence::Exact,
+                    distribution_matched: false,
+                    located: false,
+                    coverage: package.coverage,
+                })
+                .collect();
+            let one_publisher = held["one_publisher"]
+                .as_bool()
+                .expect("whether one publisher published them");
+            assert_eq!(
+                from_one_publisher(&candidates),
+                one_publisher,
+                "`{name}`: the publisher test the host runs on these identifiers"
+            );
+            assert_eq!(
+                tie_refusal(&Tie {
+                    packages,
+                    one_publisher
+                }),
+                held["refusal"].as_str().expect("a refusal"),
+                "`{name}`: the words the host writes for this tie"
+            );
+        }
     }
 }

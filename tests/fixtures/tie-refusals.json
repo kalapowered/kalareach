@@ -1,0 +1,52 @@
+{
+  "about": "Refusals the host writes for a program that several packages recognise equally well, each held to the tie it comes from. The host's own case (the worker's `each_tie_is_worded_as_the_fixture_says`) builds each tie and holds the refusal the host writes for it to the text here, and holds `one_publisher` to the host's publisher test; the page's cases take these texts as the refusal a host reports. A change of the host's words turns the host's case red until this file says the new words.",
+  "ties": {
+    "two_publishers": {
+      "one_publisher": false,
+      "packages": [
+        {
+          "plugin_id": "acme/codex",
+          "protocol": null,
+          "ranges": [">=1.0.0, <2.0.0"],
+          "version": "1.4.0",
+          "coverage": "covers"
+        },
+        {
+          "plugin_id": "openai/codex",
+          "protocol": null,
+          "ranges": [">=1.0.0, <2.0.0"],
+          "version": "1.4.0",
+          "coverage": "covers"
+        }
+      ],
+      "refusal": "it was not launched through the integration, and acme/codex (>=1.0.0, <2.0.0) covers version 1.4.0 and openai/codex (>=1.0.0, <2.0.0) covers version 1.4.0, and they come from different publishers or repositories, so neither is preferred, so no package was chosen for it and none of its bridges is admitted"
+    },
+    "three_publishers": {
+      "one_publisher": false,
+      "packages": [
+        {
+          "plugin_id": "acme/codex",
+          "protocol": null,
+          "ranges": [">=1.0.0, <2.0.0"],
+          "version": "1.4.0",
+          "coverage": "covers"
+        },
+        {
+          "plugin_id": "openai/codex",
+          "protocol": null,
+          "ranges": [">=1.0.0, <2.0.0"],
+          "version": "1.4.0",
+          "coverage": "covers"
+        },
+        {
+          "plugin_id": "other/codex",
+          "protocol": null,
+          "ranges": [">=1.0.0, <2.0.0"],
+          "version": "1.4.0",
+          "coverage": "covers"
+        }
+      ],
+      "refusal": "it was not launched through the integration, and acme/codex (>=1.0.0, <2.0.0) covers version 1.4.0, openai/codex (>=1.0.0, <2.0.0) covers version 1.4.0 and other/codex (>=1.0.0, <2.0.0) covers version 1.4.0, and they come from different publishers or repositories, so none is preferred, so no package was chosen for it and none of its bridges is admitted"
+    }
+  }
+}
