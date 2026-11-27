@@ -1213,6 +1213,11 @@ expect "the lookup reads 2 with an interpreter that ends with 1 (errexit on)" 2 
 # What the interpreter prints is not part of the walk's answer, which is read from standard output.
 gone_path="$g/pyout" gone_status "$g/dir" absent
 expect "the lookup says nothing of what the interpreter prints on either stream" "0|" "$gs|$gone_text"
+# The flag -I: the interpreter ignores the PYTHON variables. PYTHONHOME names an empty folder here, where the
+# interpreter finds no library; without the flag it does not start and a name that is not there reads 2.
+mk "$g/home"
+gone_setup='export PYTHONHOME="$g/home"' gone_status "$g/dir" absent
+expect "the lookup of a name that is not there reads 0 with PYTHONHOME naming an empty folder" 0 "$gs"
 
 # Where the interpreter is unavailable the cleanup's sentence says that the marker, and the folder that the walk
 # made, may still be there: the state could not be shown, which is not the same as clean.
