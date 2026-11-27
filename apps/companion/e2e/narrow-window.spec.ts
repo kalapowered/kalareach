@@ -212,30 +212,63 @@ async function expectTravel(page: Page, seconds: number, what: string, property 
 }
 
 /**
- * The page's scroll position once it has stopped: two reads in a row, a frame apart, agree. WebKit
- * scrolls smoothly, so a read straight after a wheel can fall in the middle of the scroll. The wait
- * is bounded, and a page still moving at the bound fails with the last two values it read.
+ * The page's scroll position once it has stopped: it has not changed for three frames in a row and
+ * for 100 ms of the page's own clock. WebKit scrolls smoothly, so a read straight after a wheel can
+ * fall in the middle of the scroll. The wait has a deadline of its own, a timer that does not depend
+ * on a frame being drawn, and a page still moving at the deadline fails with the last value it read.
  */
 function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
-  return page.evaluate(async (bound) => {
-    const frame = (): Promise<void> =>
-      new Promise((resolve) => {
-        requestAnimationFrame(() => {
-          resolve()
-        })
-      })
-    const started = performance.now()
-    let before = window.scrollY
-    for (;;) {
-      await frame()
-      const now = window.scrollY
-      if (now === before) return now
-      if (performance.now() - started > bound) {
-        throw new Error(`the page was still scrolling after ${bound} ms: it read ${before}, then ${now}`)
-      }
-      before = now
-    }
-  }, boundMilliseconds)
+  return page.evaluate(
+    (bound) =>
+      new Promise<number>((resolve, reject) => {
+        let last = window.scrollY
+        let since = performance.now()
+        let frames = 0
+        let over = false
+        const deadline = setTimeout(() => {
+          over = true
+          reject(new Error(`the page was still scrolling after ${bound} ms: its last read was ${last}`))
+        }, bound)
+        const tick = (): void => {
+          if (over) return
+          const now = window.scrollY
+          if (now !== last) {
+            last = now
+            since = performance.now()
+            frames = 0
+          } else {
+            frames += 1
+          }
+          if (frames >= 3 && performance.now() - since >= 100) {
+            clearTimeout(deadline)
+            resolve(now)
+            return
+          }
+          requestAnimationFrame(tick)
+        }
+        requestAnimationFrame(tick)
+      }),
+    boundMilliseconds
+  )
+}
+
+/** Starts counting the wheel events that reach the page, after the hold has had its say. */
+async function watchWheels(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const holder = window as unknown as { __wheels?: number }
+    holder.__wheels = 0
+    window.addEventListener(
+      'wheel',
+      () => {
+        holder.__wheels = (holder.__wheels ?? 0) + 1
+      },
+      { passive: true }
+    )
+  })
+}
+
+function wheelsDelivered(page: Page): Promise<number> {
+  return page.evaluate(() => (window as unknown as { __wheels?: number }).__wheels ?? 0)
 }
 
 /** Whether the focus is inside the drawer. */
@@ -743,10 +776,14 @@ test.describe('the window as it is at 721 points and wider', () => {
     await expect(current, 'the focus stays on the item it was on').toBeFocused()
     await page.getByRole('button', { name: /^Hosts/ }).click()
     await expect(page.locator('.sidebar [aria-current="page"]')).toHaveText(/^Hosts/)
-    // Narrowed again, the drawer is closed and ready.
+    // Narrowed again, the drawer is closed and ready, and nothing travelled to put it there.
+    await watchTravel(page)
     await page.setViewportSize({ width: 600, height: HEIGHT })
     await expect(menuOf(page)).toHaveAttribute('aria-expanded', 'false')
     await expect(drawerOf(page)).toBeHidden()
+    await expect.poll(() => sidebarLeft(page)).toBeLessThanOrEqual(-238)
+    expect(await travelOf(page), 'a window that changes form again moves the sidebar to its closed place without a transition').toEqual([])
+    expect(await travelOf(page, 'opacity'), 'and fades nothing').toEqual([])
   })
 })
 
@@ -875,6 +912,7 @@ test.describe('the drawer on a page that scrolls', () => {
       expect(open.width, 'the page behind is as wide as it was').toBe(before.width)
 
       // A wheel over the scrim, and over the drawer, in both directions and past the drawer's own end.
+      await watchWheels(page)
       for (const [x, delta] of [
         [width - 8, 400],
         [width - 8, -400],
@@ -883,9 +921,11 @@ test.describe('the drawer on a page that scrolls', () => {
         [20, -2000]
       ] as const) {
         await page.mouse.move(x, HEIGHT / 2)
+        const before = await wheelsDelivered(page)
         await page.mouse.wheel(0, delta)
-        await page.waitForTimeout(120)
-        expect(await page.evaluate(() => window.scrollY), `the page after a wheel of ${delta} at ${x}`).toBe(scrolled)
+        // The wheel reached the page, and the page has stopped: what it reads then is what the hold left.
+        await expect.poll(() => wheelsDelivered(page), `the wheel of ${delta} at ${x} reached the page`).toBeGreaterThan(before)
+        expect(await settledScroll(page), `the page after a wheel of ${delta} at ${x}`).toBe(scrolled)
       }
       expect(await rectangleOf(main)).toEqual(open)
 
