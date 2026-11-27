@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use kr_ipc::identity::{ProcessState, current_process_start_identity, process_state};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::scalars::Digest256;
-use kr_worker::broker::server::{Ended, MAX_ERROR_BYTES, Owned, Server, ServerSpec};
+use kr_worker::broker::server::{Emptiness, Ended, MAX_ERROR_BYTES, Owned, Server, ServerSpec};
 use kr_worker::ownership::{OwnedProcesses, OwnershipBoundary};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -330,6 +330,7 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
     assert_eq!(retirement.ended, Ended::Input);
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(retirement.survivors.is_empty());
+    assert_eq!(retirement.emptiness, Emptiness::Empty);
     assert!(gone(server.identity()) && gone(&command));
 }
 
@@ -377,6 +378,7 @@ async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_b
         retirement.forced
     );
     assert!(retirement.survivors.is_empty());
+    assert_eq!(retirement.emptiness, Emptiness::Empty);
     assert!(gone(server.identity()) && gone(&command));
     assert_eq!(*record.forced.lock().expect("the list"), retirement.forced);
     // KR-REQ-07.53: both were there until the five seconds were over, and no longer.
