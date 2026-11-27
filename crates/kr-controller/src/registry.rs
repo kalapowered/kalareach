@@ -627,7 +627,8 @@ impl Registry {
     /// are left, `None`, for [`Registry::open_to_read`] to refuse in its own words. A registry
     /// that lost an evidence table
     /// is refused here, by the table's name, because opening it would make that table again,
-    /// empty. The file is opened for writing without being created, and the name is checked to
+    /// empty. A registry at version 17 or 20, which no release wrote, is refused here by its
+    /// version, in the look, before the file is opened for writing. The file is opened for writing without being created, and the name is checked to
     /// still name the file that was looked at and to record the same version on that connection, so
     /// a file replaced by another regular file between the look and the open is refused, and never
     /// made new. A file replaced by another kind of file in that window is the owner's race, as it
@@ -938,12 +939,15 @@ impl Registry {
             read_stall: crate::attention::Pause::default(),
         };
         // The version is read, and a version this build does not open is refused, before the first
-        // statement that can write. Setting the journal mode rewrites the file's header when the
-        // file is not in write-ahead mode, so a refused registry would not be left as it was by a
-        // refusal that came after it. What the connection did before this, its first read, writes
-        // nothing: a rollback journal that a stop left is rolled back by the database itself at
-        // that read, in every opener, and a write-ahead file's log and index, which that read
-        // makes where there are none, are removed again when the connection closes.
+        // statement of ours that can write. Setting the journal mode rewrites the file's header when
+        // the file is not in write-ahead mode, so a refused registry would not be left as it was by
+        // a refusal that came after it. What the connection did before this, its first read,
+        // writes nothing of ours. SQLite's own recovery can write at that read: it rolls back a
+        // rollback journal that a stop left (an opener that cannot write does not), and in
+        // write-ahead mode it makes the log and the index where there are none. When the last
+        // connection closes, an empty log and the index are removed, and a log that holds data is
+        // checkpointed into the file: the file's bytes can change after a refusal, and its
+        // version, its schema and its rows do not.
         let recorded = registry.recorded_version()?;
         if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
             return Err(refused_version(version));
@@ -985,9 +989,10 @@ impl Registry {
     /// Brings the file's own tables to this build's schema, from the version `recorded` that the
     /// caller read and found this build opens: `None` for a file that records none.
     ///
-    /// Nothing is written before this: the caller has read the version and refused the ones this
-    /// build does not open, ahead of the journal mode and every other statement that can write, so
-    /// not even a table an ordinary writer makes is made in a file that is refused.
+    /// This makes no table in a file that is refused: the caller has read the version and refused
+    /// the ones this build does not open, ahead of the journal mode and every other statement of
+    /// ours that can write. For a file this build opens, the journal mode was set just before this
+    /// call.
     fn migrate(&self, recorded: Option<i64>) -> Result<()> {
         self.connection
             .execute_batch(
@@ -1277,7 +1282,8 @@ impl Registry {
                 self.migrate_19_to_21()?;
             }
             Some(19) => self.migrate_19_to_21()?,
-            // A version that is refused was refused above, before anything was written.
+            // The caller refuses these versions first, before a statement of ours writes; this arm
+            // returns the same refusal.
             Some(version) => return Err(refused_version(version)),
         }
         self.connection

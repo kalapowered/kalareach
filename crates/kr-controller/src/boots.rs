@@ -279,8 +279,10 @@ impl StartPoint {
     /// A reading of zero gives no point either. A daemon that records a grant is never in the first
     /// millisecond of its boot, so a zero is a counter that failed to answer, and a point at zero
     /// would be before every text the boot made: the text made before the decision would be
-    /// served. The sample is still recorded, and the access has no point: its text is withheld
-    /// until the host next starts in a boot whose counter answers.
+    /// served. The sample is still recorded, and the access has no point. The cost: the text made
+    /// for that access between this decision and the host's next start in a boot whose counter
+    /// answers is never served, because the point that start gives lies after it. Nothing is
+    /// logged: the boot is not spoiled, so [`Observed::report`] has nothing to say.
     ///
     /// Call it after the caller's refusal checks, as the last statement before the point's write,
     /// so that what can fail after it is the write and the commit. The caller writes the point with
