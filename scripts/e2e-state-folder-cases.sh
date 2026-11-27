@@ -600,6 +600,8 @@ rc="$(
 . "$root/scripts/lib/e2e-state-folder.sh"
   export TMPDIR="$t"
   export KR_E2E_STATE=""
+  # The case starts with no KR_STATE_DIR, whatever the environment that runs it holds.
+  unset KR_STATE_DIR
   e2e_state_folder_check
   run="$(mktemp -d "${E2E_STATE_TMP%/}/krrun.XXXXXX")"
   e2e_state_folder_take "the run's state folder $run/s" "$run/s" "${run##*/}"
