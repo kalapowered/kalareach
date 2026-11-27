@@ -22,10 +22,16 @@ mod common;
 
 use std::fs::{self, File, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
+use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
+use std::ptr::null;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+    UnmapViewOfFile,
+};
 
 use kr_boundary_windows::env::{Kind, QualifiedGit, RootPaths, TreePaths, build_env};
 use sha2::{Digest, Sha256};
@@ -43,7 +49,7 @@ use kr_boundary_windows::win::admission::{
 use kr_boundary_windows::win::ffi::{Handle, system_windows_directory};
 use kr_boundary_windows::win::hold::{
     ABSENT_NAME_WORDS, Changed, LISTING_BOUND_WORDS, MODULES_WORDS, RULE_ABSENT_NAME,
-    RULE_LISTING_BOUND, RULE_MODULES, TreeHold, hold_tree,
+    RULE_HOLD_FAILED, RULE_LISTING_BOUND, RULE_MODULES, TreeHold, hold_tree,
 };
 use kr_boundary_windows::win::job::{Job, Limits};
 use kr_boundary_windows::win::launch::{
@@ -739,6 +745,105 @@ fn config_hold_a_listed_hook_is_held_for_reading_only_and_a_new_name_is_seen_at_
     );
     fs::remove_dir(project.git.join(r"hooks\newdir")).unwrap();
     assert_eq!(hold.end_check(), Ok(()), "the folder removed");
+}
+
+/// A writable open of a file and a writable view of its data, as a process keeps them from before
+/// the hold. The view is unmapped when the writer is dropped, and the section after it.
+struct Writer {
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    _section: Handle,
+    file: Option<File>,
+}
+
+impl Writer {
+    fn open(path: &Path) -> Writer {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("the file opens for writing");
+        // SAFETY: the file's handle is open for reading and writing; the section has no name and
+        // no security descriptor of its own.
+        let raw = unsafe {
+            CreateFileMappingW(file.as_raw_handle(), null(), PAGE_READWRITE, 0, 0, null())
+        };
+        let section = Handle::new(raw, "a section of the file").expect("the section is made");
+        // SAFETY: the section is open for writing, and a length of 0 maps the whole file.
+        let view = unsafe { MapViewOfFile(section.raw(), FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!view.Value.is_null(), "the view is mapped");
+        Writer {
+            view,
+            _section: section,
+            file: Some(file),
+        }
+    }
+
+    /// The writer's handle closes; the view of the data stays.
+    fn close_the_file(&mut self) {
+        self.file = None;
+    }
+
+    fn write_first_byte(&self, byte: u8) {
+        // SAFETY: the view maps at least one byte of the file for writing and lives as long as the
+        // writer.
+        unsafe { self.view.Value.cast::<u8>().write_volatile(byte) };
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // SAFETY: the view was mapped once and is unmapped once.
+        unsafe { UnmapViewOfFile(self.view) };
+    }
+}
+
+#[test]
+#[ignore = "needs an elevated SYSTEM session in a disposable Windows guest (see the file's header)"]
+fn config_hold_a_hook_that_a_process_has_open_for_writing_refuses_the_hold_and_a_kept_view_is_seen()
+{
+    if !runs_as_the_system() {
+        eprintln!("skipped: the case needs the system's token");
+        return;
+    }
+    prepare();
+    let ordinary = Person::new("krhwv");
+    let scratch = Scratch::new();
+    let project = Project::make(&scratch, "writable-view");
+    let hook = project.git.join(r"hooks\pre-commit");
+    plant(&hook, b"echo one\n");
+    let root = project.root.to_str().unwrap();
+
+    // A process has the hook open for writing and a writable view of it from before the hold: the
+    // hold's open shares the file for reading only, and meets the writer.
+    let mut writer = Writer::open(&hook);
+    let refusal = hold_tree(root, &ordinary.as_client())
+        .expect_err("a hook that a process has open for writing is not held");
+    assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
+
+    // The writer's handle closes and its view stays. Sharing is a rule of handles, so the hold may
+    // stand over the view; then a write through the view is a change that the end check sees.
+    writer.close_the_file();
+    match hold_tree(root, &ordinary.as_client()) {
+        Err(refusal) => {
+            assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
+            println!("the hold refuses a hook whose writable view outlives its handle");
+        }
+        Ok(hold) => {
+            assert_eq!(hold.end_check(), Ok(()), "nothing is written yet");
+            writer.write_first_byte(b'E');
+            assert_eq!(
+                hold.end_check(),
+                Err(changed(&[r"hooks\pre-commit"])),
+                "a write through a view made before the hold is seen at the end"
+            );
+            println!("the hold stands over a hook whose writable view outlives its handle");
+        }
+    }
+
+    // With no writer left, the hook is held.
+    drop(writer);
+    hold_tree(root, &ordinary.as_client())
+        .expect("a hook that nobody has open for writing is held");
 }
 
 /// Sets a reparse point with a cloud tag on a file or a folder through a handle that asks only for
