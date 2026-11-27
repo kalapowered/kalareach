@@ -1530,14 +1530,30 @@ fn kr_req_12_19_coverage_beats_location() {
                 .package(store, &program),
             Claim::new("two")
                 .range(">=1.0.0")
-                .named("3.0.0")
+                .named("3.1.0")
                 .package(store, &program),
         ]
     });
     assert_eq!(
         selected(&decision(&setup)).as_deref(),
         Some("kalareach/two"),
-        "the package that covers 3.0.0 beats the located one that refuses it"
+        "the package that covers the version beats the located one that refuses it"
+    );
+    // The adoption's first look, by the path alone, finds the located package; the decision made
+    // with the digest after the reading is the one that binds and that names the version.
+    let told = found(&setup);
+    assert_eq!(
+        told.plugin_id.as_ref().map(ToString::to_string).as_deref(),
+        Some("kalareach/two"),
+        "the adopted program is bound by the second decision"
+    );
+    let profile = setup
+        .broker
+        .profile_of(told.application_instance_id)
+        .expect("its profile");
+    assert_eq!(
+        profile.binary.version, "3.1.0",
+        "the profile carries the version the second decision's package names"
     );
     for package in &mut setup.packages {
         package.qualified = Vec::new();
