@@ -820,8 +820,9 @@ fn config_hold_a_hook_that_a_process_has_open_for_writing_refuses_the_hold_and_a
         .expect_err("a hook that a process has open for writing is not held");
     assert_eq!(refusal.rule, RULE_HOLD_FAILED, "{}", refusal.detail());
 
-    // The writer's handle closes and its view stays. Sharing is a rule of handles, so the hold may
-    // stand over the view; then a write through the view is a change that the end check sees.
+    // The writer's handle closes and its section and view stay. A guest refuses the hold in this
+    // state too; a platform that let the hold stand would show a write through the view as a change
+    // at the end, which the second arm asserts.
     writer.close_the_file();
     match hold_tree(root, &ordinary.as_client()) {
         Err(refusal) => {

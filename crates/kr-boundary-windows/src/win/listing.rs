@@ -9,9 +9,9 @@
 //! identity, size and digest. At the hold it also keeps each listed file open for reading and
 //! shares it for reading only, so that a write through a handle opened after the hold, a rename and
 //! a deletion of a hook or of either file are refused while the tree is held. A writable open that
-//! a process made before the hold makes the hold refuse. Sharing is a rule of handles, so a
-//! writable view that outlives its handle does not depend on it: when the hold stands over such a
-//! view, what the view writes is a change that the end check sees by digest.
+//! a process made before the hold makes the hold refuse, and so does a writable section that the
+//! process keeps with its view after it closed the file's handle (read on a guest). A write that
+//! gets past all of this is a change that the end check sees by digest.
 
 #![allow(unsafe_code)]
 
