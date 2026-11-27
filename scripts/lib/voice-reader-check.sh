@@ -199,6 +199,41 @@ run_script fixture-complete
 expect "the whole set: twelve reads" test "$(reads fixture-complete)" = 12
 expect "the whole set: the script says they read as drawn" says "$(out fixture-complete)" "the text reader read the known pictures as drawn"
 
+# ---- A text that does not match, and a reading that fails ----------------------------------------
+
+checks() { grep -c '^known pictures, read with' "$(check_log "$1")"; }
+removals() { [ -f "$(fake "$1" rm.log)" ] && wc -l <"$(fake "$1" rm.log)" | tr -d ' '; }
+
+# A reader that fails is not a reader that read wrong text: the run stops after the first check, with
+# its own words, and builds nothing again.
+make_tree reader-fails
+run_script reader-fails FAKE_READER=fails
+expect "a failing reader: one check, of twelve reads" test "$(checks reader-fails)" = 1 -a "$(reads reader-fails)" = 12
+expect "a failing reader: its folder is removed once" test "$(removals reader-fails)" = 1
+expect "a failing reader: the log shows the failed readings" says "$(check_log reader-fails)" "a failed reading (exit 2)"
+expect "a failing reader: the run says it failed" says "$(out reader-fails)" "the text reader failed on a known picture"
+expect "a failing reader: the run claims no four checks" never_says "$(out reader-fails)" "four"
+expect "a failing reader: the run fails with exit 2" rc_is reader-fails 2
+
+# Four mismatches, each with a folder of its own: four checks, no cause claimed.
+make_tree reader-mismatches
+run_script reader-mismatches FAKE_BAD_FIRST=9
+expect "four mismatches: four checks" test "$(checks reader-mismatches)" = 4
+expect "four mismatches: four folders are removed" test "$(removals reader-mismatches)" = 4
+expect "four mismatches: the run says four checks did not match" says "$(out reader-mismatches)" "did not match a known picture in four checks"
+expect "four mismatches: the run clears the page of nothing" never_says "$(out reader-mismatches)" "the page is not at fault"
+expect "four mismatches: the run names no builder of the wrong text" never_says "$(out reader-mismatches)" "gave wrong text"
+expect "four mismatches: the log shows the text the reader gave" says "$(check_log reader-mismatches)" "what the reader gave for whole-page"
+expect "four mismatches: the run fails with exit 2" rc_is reader-mismatches 2
+
+# Two mismatches and then a good folder: the third check passes. The two rejected folders are removed
+# at once and the good one when the run ends.
+make_tree reader-recovers
+run_script reader-recovers FAKE_BAD_FIRST=2
+expect "two mismatches and a pass: three checks" test "$(checks reader-recovers)" = 3
+expect "two mismatches and a pass: three folders are removed in all" test "$(removals reader-recovers)" = 3
+expect "two mismatches and a pass: the run goes on" says "$(out reader-recovers)" "the text reader read the known pictures as drawn"
+
 if [ "$failures" -ne 0 ]; then
     printf '%s case assertion(s) failed\n' "$failures"
     exit 1

@@ -322,23 +322,31 @@ SWIFT
         return 1
     }
     # The reader is first held to pictures it must read as drawn. This is a check of the instrument,
-    # not a retry of any assertion or wait: a wrong reading of a known picture says that the system
-    # built the reader's recognition programs wrongly, so the folder they were built into, which this
-    # run made, is thrown away and they are built again, at most three more times, before the run
-    # gives up. No claim about the page is read, or taken again, in the meantime.
-    local build
+    # not a retry of any assertion or wait. Text that does not match a known picture can come from the
+    # recognition programs the system built for the reader, which is the one cause tried here: the
+    # folder they were built into, which this run made, is thrown away and they are built again, at
+    # most three more times. Only a mismatch is tried again. A reading that failed, or could not be
+    # made, stops the run at once with its own words, since a new build would not change it. No claim
+    # about the page is read, or taken again, in the meantime.
+    local build verdict
     for build in 1 2 3 4; do
         make_reader_home || { say "no folder could be made for the text reader's recognition programs"; return 1; }
-        check_the_reader_on_known_pictures && break
+        check_the_reader_on_known_pictures
+        verdict=$?
+        [ "$verdict" -ne 0 ] || break
         discard_reader_home || {
             say "the folder of the text reader's recognition programs could not be thrown away; see $artefacts/reader-check.log"
             return 1
         }
-        if [ "$build" -eq 4 ]; then
-            say "this system's text recognition gave wrong text for a known picture in four builds of its programs; the page is not at fault; see $artefacts/reader-check.log"
+        if [ "$verdict" -ne 1 ]; then
+            say "the text reader failed on a known picture, which no new build of its recognition programs changes; see $artefacts/reader-check.log"
             return 1
         fi
-        say "the text reader read a known picture wrong; building its recognition programs again"
+        if [ "$build" -eq 4 ]; then
+            say "the text reader's text did not match a known picture in four checks, each with a new folder for its recognition programs; the cause is not decided here (the system's recognition, a picture, or its expected text, a stale file among them); see $artefacts/reader-check.log"
+            return 1
+        fi
+        say "the text reader's text did not match a known picture; building its recognition programs again"
     done
     say "the text reader read the known pictures as drawn, and read none in a picture without text"
     check_the_readers || {
@@ -435,9 +443,11 @@ check_the_reader_fixtures() {
 # (these are the pictures a wrongly built reader gives no text for, the long ones above all); the
 # whole page of the provider choice; and a picture without any text, whose file is empty, which must
 # read as empty so that the reader can still refuse. Every picture is read whatever the others give,
-# so the log shows each.
+# so the log shows each. Answers 0 when every picture read as drawn, 1 when the text of one did not
+# match (the log then shows the text the reader gave), and 2 when a reading failed or could not be
+# made, which says nothing about the text and is never taken for a mismatch.
 check_the_reader_on_known_pictures() {
-    local dir="$here/apps/companion/test/voice/reader-fixtures" picture name rows row ok=0
+    local dir="$here/apps/companion/test/voice/reader-fixtures" picture name rows row verdict mismatch=0 error=0
     printf 'known pictures, read with the programs kept in %s\n' "${reader_home:?}" >>"$artefacts/reader-check.log"
     for name in "${reader_fixtures[@]}"; do
         picture="$dir/$name.png"
@@ -446,12 +456,23 @@ check_the_reader_on_known_pictures() {
             [ -z "$row" ] || rows+=("$row")
         done <"$dir/$name.txt"
         if [ "${#rows[@]}" -eq 0 ]; then
-            reader_verdict passed "$name: no text in a picture without any" image_reads_nothing "$picture" || ok=1
+            reader_verdict passed "$name: no text in a picture without any" image_reads_nothing "$picture"
         else
-            reader_verdict passed "$name: every line of its text" image_shows "$picture" "${rows[@]}" || ok=1
+            reader_verdict passed "$name: every line of its text" image_shows "$picture" "${rows[@]}"
         fi
+        verdict=$?
+        case "$verdict" in
+            0) ;;
+            1)
+                mismatch=1
+                printf 'what the reader gave for %s, read again:\n' "$name" >>"$artefacts/reader-check.log"
+                "$ocr" "$picture" 2>/dev/null | awk '{ print "    " $0 }' >>"$artefacts/reader-check.log"
+                ;;
+            *) error=1 ;;
+        esac
     done
-    return "$ok"
+    [ "$error" -eq 0 ] || return 2
+    return "$mismatch"
 }
 
 # Whether the reader finds nothing at all in an image: 0 when it gives no character but spacing, 1
@@ -462,9 +483,9 @@ image_reads_nothing() {
     [ -z "${text//[[:space:]]/}" ]
 }
 
-# Runs one picture check, writes what it did beside what it had to do, and answers whether they
-# agree. A reader or conversion that failed is neither a pass nor a refusal, so it agrees with
-# nothing.
+# Runs one picture check, writes what it did beside what it had to do, and answers 0 when they agree
+# and 1 when they do not. A reader or conversion that failed is neither a pass nor a refusal, so it
+# agrees with nothing, and the answer is 2 so that it is never taken for a disagreement.
 reader_verdict() {
     local want=$1 what=$2 got rc
     shift 2
@@ -476,7 +497,11 @@ reader_verdict() {
         *) got="a failed reading (exit $rc)" ;;
     esac
     printf '%s: %s; it must be %s\n' "$what" "$got" "$want" >>"$artefacts/reader-check.log"
-    [ "$got" = "$want" ]
+    [ "$got" != "$want" ] || return 0
+    case "$rc" in
+        0 | 1) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 # The words of a text, in lower case, one space between them and one at each end. A word is a run
