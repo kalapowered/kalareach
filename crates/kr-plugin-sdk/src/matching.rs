@@ -311,8 +311,8 @@ impl MatchRule {
         authority: &str,
         path: &str,
         observed: Option<&DistributionMatch>,
-        _installed: Option<&PackageVersion>,
-        _ranges: &[&VersionRange],
+        installed: Option<&PackageVersion>,
+        ranges: &[&VersionRange],
     ) -> Option<Candidate> {
         let executable_matched = self.executable.matches_path(path);
         let distribution_matched = match (self.distribution.0.as_ref(), observed) {
@@ -339,8 +339,31 @@ impl MatchRule {
             confidence,
             distribution_matched,
             located: executable_matched && !self.executable.path_suffix.is_empty(),
-            coverage: Coverage::Neutral,
+            coverage: self.coverage(installed, ranges),
         })
+    }
+
+    /// How far `installed` fits the rule's own range and the further `ranges`: every range must
+    /// admit it. Nothing counts against a package for a version nobody established, or for a range
+    /// it never declared.
+    fn coverage(&self, installed: Option<&PackageVersion>, ranges: &[&VersionRange]) -> Coverage {
+        let Some(installed) = installed else {
+            return Coverage::Neutral;
+        };
+        let mut declared = self
+            .executable
+            .version_range
+            .0
+            .iter()
+            .chain(ranges.iter().copied())
+            .peekable();
+        if declared.peek().is_none() {
+            Coverage::Neutral
+        } else if declared.all(|range| range.admits(installed)) {
+            Coverage::Covers
+        } else {
+            Coverage::Excludes
+        }
     }
 }
 
@@ -389,9 +412,11 @@ pub enum Resolution {
     Selected(Candidate),
     /// Several packages recognised it, and the person decides.
     ///
-    /// A host does not pick one on the package's behalf. An exact rule beats every inferred one,
-    /// and among rules of one confidence a rule that names the installation location beats one
-    /// that names only the executable when one publisher in one repository published every
+    /// A host does not pick one on the package's behalf. Where one publisher in one repository
+    /// published every package, a package that covers the program's version beats one that says
+    /// nothing about it, and that beats one that refuses it. An exact rule beats every inferred
+    /// one, and among rules of one confidence a rule that names the installation location beats
+    /// one that names only the executable when one publisher in one repository published every
     /// package left, so this is reached where several packages are left that recognise the
     /// program equally well.
     Conflict(Vec<Candidate>),
@@ -401,7 +426,14 @@ pub enum Resolution {
 ///
 /// An explicit selection wins outright. That is the rule section 11 states, and it is why the
 /// selection is compared before confidence: a person who chose a package is not overruled by a
-/// rule that calls itself exact. Then an exact rule beats an inferred one. Of the rules left, one
+/// rule that calls itself exact. Then the packages that cover the program's version beat those
+/// that say nothing about it, and those beat the ones that refuse it, so that a rule that calls
+/// itself exact does not take a program whose version its package refuses. Coverage ranks only
+/// when one publisher published every package, through one repository, as the location below
+/// does: a package's claim about the version of a program is its own, and the host cannot check
+/// it, so a package of another publisher that claims a version does not take a program from
+/// another this way. A package ranks by its best rule, and a package that is alone is chosen
+/// whatever its coverage. Then an exact rule beats an inferred one. Of the rules left, one
 /// that matched an installation location its package names beats one that matched the executable's
 /// name alone, when one publisher published every package left, through one repository: the
 /// location says which product is installed there, and the name is shared by products that are
@@ -424,30 +456,27 @@ pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resol
     {
         return Resolution::Selected(chosen.clone());
     }
+    let candidates = if from_one_publisher(&candidates) {
+        let best = candidates.iter().map(|candidate| candidate.coverage).max();
+        candidates
+            .into_iter()
+            .filter(|candidate| Some(candidate.coverage) == best)
+            .collect()
+    } else {
+        candidates
+    };
     let exact: Vec<Candidate> = candidates
         .iter()
         .filter(|candidate| candidate.confidence == MatchConfidence::Exact)
         .cloned()
         .collect();
     let considered = if exact.is_empty() { candidates } else { exact };
-    // The publisher in its authority: the name of a publisher stands for one publisher only within
-    // the repository whose root vouches for it.
-    let publisher = |candidate: &Candidate| {
-        candidate
-            .plugin_id
-            .as_str()
-            .split_once('/')
-            .map(|(publisher, _)| (publisher.to_owned(), candidate.authority.clone()))
-    };
     let located: Vec<Candidate> = considered
         .iter()
         .filter(|candidate| candidate.located)
         .cloned()
         .collect();
-    let one_publisher = considered
-        .first()
-        .map(publisher)
-        .is_some_and(|first| first.is_some() && considered.iter().all(|c| publisher(c) == first));
+    let one_publisher = from_one_publisher(&considered);
     let considered = if located.is_empty() || !one_publisher {
         considered
     } else {
@@ -468,6 +497,24 @@ pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resol
         [one] => Resolution::Selected((*one).clone()),
         _ => Resolution::Conflict(considered),
     }
+}
+
+/// Whether one publisher published every package of `candidates`, through one repository. The name
+/// of a publisher stands for one publisher only within the repository whose root vouches for it.
+fn from_one_publisher(candidates: &[Candidate]) -> bool {
+    let publisher = |candidate: &Candidate| {
+        candidate
+            .plugin_id
+            .as_str()
+            .split_once('/')
+            .map(|(publisher, _)| (publisher.to_owned(), candidate.authority.clone()))
+    };
+    candidates.first().map(publisher).is_some_and(|first| {
+        first.is_some()
+            && candidates
+                .iter()
+                .all(|candidate| publisher(candidate) == first)
+    })
 }
 
 #[cfg(test)]
@@ -745,10 +792,12 @@ mod tests {
         }
     }
 
+    /// The package a resolution chose, or what it made of the candidates instead, so that a case
+    /// compares the one value in its own assertion.
     fn chosen(resolution: Resolution) -> String {
         match resolution {
             Resolution::Selected(chosen) => chosen.plugin_id.to_string(),
-            other => panic!("one package should be chosen: {other:?}"),
+            other => format!("no one package: {other:?}"),
         }
     }
 
