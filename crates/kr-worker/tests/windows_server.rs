@@ -678,7 +678,9 @@ async fn kr_req_07_60_a_start_dropped_during_the_create_leaves_no_process() {
         Sha256::digest(std::fs::read(&executable).expect("the copy is read")).into(),
     );
 
-    let (reached, wait_reached) = std::sync::mpsc::channel();
+    // Told from the blocking thread the start's create runs on, and awaited here: this test's
+    // runtime has one thread, so a wait that blocks it would stop the start it waits for.
+    let (reached, mut wait_reached) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let released = Mutex::new(released);
     seams::after_server_create(Some(Box::new(move |_name: &str| {
@@ -705,9 +707,13 @@ async fn kr_req_07_60_a_start_dropped_during_the_create_leaves_no_process() {
         .await
         .map(|_| ())
     });
-    wait_reached
-        .recv_timeout(LIVENESS)
-        .expect("the start reached the pipe's creation");
+    assert!(
+        matches!(
+            tokio::time::timeout(LIVENESS, wait_reached.recv()).await,
+            Ok(Some(()))
+        ),
+        "the start reached the pipe's creation"
+    );
     starting.abort();
     let _ = starting.await;
     release.send(()).expect("the start is released");
