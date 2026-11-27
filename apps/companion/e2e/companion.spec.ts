@@ -3183,7 +3183,7 @@ test.describe("moving a raw view's window", () => {
 test.describe('the wheel of a raw view in control mode', () => {
   /** How many moves the page has made with its view. */
   const moves = (page: Page): Promise<number> =>
-    page.evaluate(() => window.krTestHost?.terminalViews[0]?.moves.length ?? -1)
+    page.evaluate(() => window.krTestHost?.terminalViews.at(-1)?.moves.length ?? -1)
 
   /** The turns of every wheel the program has been given, in all. */
   async function turned(page: Page): Promise<number> {
@@ -3209,8 +3209,9 @@ test.describe('the wheel of a raw view in control mode', () => {
 
   /**
    * From here on, every wheel event the page sees once the view has handled it: whether a pointer
-   * button was down by the pointer events the page saw (an engine's own wheel event does not carry the
-   * buttons held), and whether the view cancelled the event.
+   * button was down by the pointer events the page saw (the test tool's wheel function takes the held
+   * buttons and does not send them, in either engine, so the wheel event it sends carries none; a
+   * mouse's own wheel event with a button down does), and whether the view cancelled the event.
    */
   async function recordWheels(page: Page): Promise<void> {
     await page.evaluate(() => {
@@ -3248,7 +3249,11 @@ test.describe('the wheel of a raw view in control mode', () => {
     // KR-REQ-13.18: a wheel turned with Control held, and one with Shift held, goes to the program at
     // the session's cell under the pointer with that modifier set and every turn counted; the text size
     // stays and the window does not move. It shows the view's own handling in a scripted host, not a
-    // mouse or a touchpad of a person's, and not what a program does with the modifier.
+    // mouse or a touchpad of a person's, and not what a program does with the modifier. The Shift wheel
+    // is a vertical delta with Shift set, as the test tool sends it; a wheel whose delta is sideways
+    // only is not covered (the view takes the program's turns from the vertical delta). The turns show
+    // that the pan did not take the wheel: the window holds the whole live screen and has no room to
+    // move down or sideways, so the move count cannot show it.
     test(`a wheel with ${modifier} held goes to the program with it, and the view neither zooms nor moves`, async ({
       page
     }) => {
