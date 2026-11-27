@@ -2916,15 +2916,13 @@ fn kr_req_12_07_the_linux_command_line_is_read_by_position() {
     assert_eq!(read.vector, strings(&["yes", "/opt/agent/cli.js", "x"]));
     assert_eq!(read.script_argument, script("/opt/agent/cli.js"));
 
-    let read = parse_cmdline(b"yes\0/opt/agent/cli.js\0x").expect("a reading with no last zero");
-    assert_eq!(
-        read.vector,
-        strings(&["yes", "/opt/agent/cli.js", "x"]),
-        "the strings are what lies between the zero bytes"
+    assert!(
+        parse_cmdline(b"yes\0/opt/agent/cli.js\0x").is_none(),
+        "a reading with a zero byte inside and none at its end is cut or rewritten, and is refused"
     );
-    assert_eq!(
-        read.script_argument, None,
-        "a reading that does not end where an area ends is a rewritten one and names no script"
+    assert!(
+        parse_cmdline(b"\0x").is_none(),
+        "and a zero byte at the start is one inside"
     );
 
     let read = parse_cmdline(b"retitled\0").expect("a title with its zero");
@@ -3059,12 +3057,11 @@ fn kr_req_12_07_a_reading_that_fills_its_buffer_is_made_again_whole_or_refused()
     }
 
     // A call that answers fewer bytes than the area holds is what the call gave: nothing is read
-    // from where it ended.
+    // from where it ended, and a cut inside a string is refused (its own case holds that rule).
     let (arguments, opens, calls) = read(&area(1000), Some(10));
-    assert_eq!(
-        arguments.expect("a short answer").vector,
-        ["yes", "/aaaaa"],
-        "the ten bytes it gave"
+    assert!(
+        arguments.is_none(),
+        "the ten bytes it gave end inside a string"
     );
     assert_eq!((opens, calls), (1, 1), "the area is not continued");
 
@@ -3083,6 +3080,61 @@ fn kr_req_12_07_a_reading_that_fills_its_buffer_is_made_again_whole_or_refused()
 
     // A file that cannot be opened or read answers nothing.
     assert!(arguments_from::<&[u8]>(|| None).is_none());
+}
+
+/// KR-REQ-12.07: a Linux reading that holds a zero byte inside and none at its end is cut or
+/// rewritten, and the look adopts nothing from it. Fed through the reader that answers fewer bytes
+/// than the area holds, as the kernel does where a page of the area could not be read. A reading cut
+/// directly after a zero byte cannot be told from a whole area and is read as one (the stated limit),
+/// and one cut before any zero byte is the one-string form a retitled process gives.
+#[test]
+fn kr_req_12_07_a_reading_cut_inside_a_string_is_refused() {
+    use std::cell::Cell;
+    use std::ffi::OsString;
+
+    // `yes`, `/opt/agent/cli.js` and `x`, each with its zero byte: 24 bytes.
+    let area = b"yes\0/opt/agent/cli.js\0x\0";
+    let read = |answer: Option<usize>| {
+        let (opens, calls) = (Cell::new(0), Cell::new(0));
+        let arguments = arguments_from(|| {
+            opens.set(opens.get() + 1);
+            Some(Answering {
+                area,
+                answer,
+                calls: &calls,
+            })
+        });
+        (arguments, opens.get(), calls.get())
+    };
+
+    for cut in [5, 10, 21, 23] {
+        let (arguments, opens, calls) = read(Some(cut));
+        assert!(
+            arguments.is_none(),
+            "a reading of {cut} bytes ends inside a string and is refused"
+        );
+        assert_eq!((opens, calls), (1, 1), "one reading, one call: {cut}");
+    }
+
+    let (arguments, opens, calls) = read(Some(22));
+    let arguments = arguments.expect("a cut directly after a zero byte reads as a whole area");
+    assert_eq!(arguments.vector, ["yes", "/opt/agent/cli.js"]);
+    assert_eq!(
+        arguments.script_argument,
+        Some(OsString::from("/opt/agent/cli.js"))
+    );
+    assert_eq!((opens, calls), (1, 1));
+
+    let (arguments, ..) = read(Some(3));
+    let arguments = arguments.expect("a cut before any zero byte is the one-string form");
+    assert_eq!(arguments.vector, ["yes"]);
+    assert_eq!(arguments.script_argument, None);
+
+    let (arguments, ..) = read(None);
+    assert_eq!(
+        arguments.expect("the whole area").vector,
+        ["yes", "/opt/agent/cli.js", "x"]
+    );
 }
 
 /// KR-REQ-12.07: the reader gives every argument of a process whose argument area is larger than a

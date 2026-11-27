@@ -973,15 +973,20 @@ pub fn arguments_from<R: std::io::Read>(mut open: impl FnMut() -> Option<R>) -> 
 /// Reads what one read call of `/proc/<pid>/cmdline` gave: one argument after each NUL-terminated
 /// one.
 ///
-/// Every position is exact, empty arguments included. A reading that does not end in a zero byte is
-/// one a process rewrote, as a process that sets its title does, and names no script. An empty
-/// reading, as a process that has ended or is still being started gives, and a reading of one
-/// empty argument are read as nothing.
+/// Every position is exact, empty arguments included. A reading that holds a zero byte and does not
+/// end in one was cut inside a string or rewritten by the process, and is read as nothing. A
+/// reading with no zero byte at all is the one string a process that sets its title leaves, and
+/// names no script. An empty reading, as a process that has ended or is still being started gives,
+/// and a reading of one empty argument are read as nothing.
 #[cfg(any(target_os = "linux", feature = "testing"))]
 #[must_use]
 pub fn parse_cmdline(bytes: &[u8]) -> Option<Arguments> {
-    let area = bytes.strip_suffix(&[0]);
-    let arguments: Vec<&[u8]> = area.unwrap_or(bytes).split(|byte| *byte == 0).collect();
+    let area = match bytes.strip_suffix(&[0]) {
+        Some(area) => area,
+        None if bytes.contains(&0) => return None,
+        None => bytes,
+    };
+    let arguments: Vec<&[u8]> = area.split(|byte| *byte == 0).collect();
     if arguments == [b"".as_slice()] {
         return None;
     }
@@ -990,9 +995,7 @@ pub fn parse_cmdline(bytes: &[u8]) -> Option<Arguments> {
             .iter()
             .map(|argument| String::from_utf8_lossy(argument).into_owned())
             .collect(),
-        script_argument: area
-            .and(arguments.get(1))
-            .and_then(|second| script_of(second)),
+        script_argument: arguments.get(1).and_then(|second| script_of(second)),
     })
 }
 
