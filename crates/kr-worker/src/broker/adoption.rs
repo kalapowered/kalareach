@@ -519,7 +519,7 @@ impl Adoptions {
         // and a profile records is the same path as text, as before.
         let image = crate::questions::binding::executable_path_of(pid)?;
         let executable = image.display().to_string();
-        let recognition = match self.broker.recognise(&executable) {
+        let recognition = match self.broker.recognise(&executable, None) {
             Recognition::Nothing => return None,
             found => found,
         };

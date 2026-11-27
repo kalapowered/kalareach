@@ -30,7 +30,9 @@ use kr_worker::broker::adoption::{
 };
 use kr_worker::broker::binder::Recognition;
 use kr_worker::broker::catalogue::{Admissions, testing};
-use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources, fixture};
+use kr_worker::broker::connectors::{
+    ConnectorSource, ConnectorSources, InstalledConnector, QualifiedExecutable, fixture,
+};
 use kr_worker::broker::process::{BrokerTransport, Credential, ManagedProcess, TransportHandle};
 use kr_worker::persistence::JournalHealth;
 
@@ -966,7 +968,10 @@ fn kr_req_12_24_a_package_of_another_publisher_does_not_take_a_program_by_naming
         ]
     });
     let path = setup.program.display().to_string();
-    let selected = |setup: &Setup| match setup.broker.recognise(&path) {
+    let selected = |setup: &Setup| match setup
+        .broker
+        .recognise(&path, Some(&digest_of(&setup.program)))
+    {
         Recognition::Package(found) => Some(found.plugin_id.to_string()),
         Recognition::Tied(_) => None,
         Recognition::Nothing => panic!("the packages recognise the program"),
@@ -1011,7 +1016,10 @@ fn kr_req_12_24_a_package_under_the_same_publisher_name_in_another_repository_do
         ]
     });
     let path = setup.program.display().to_string();
-    let selected = |setup: &Setup| match setup.broker.recognise(&path) {
+    let selected = |setup: &Setup| match setup
+        .broker
+        .recognise(&path, Some(&digest_of(&setup.program)))
+    {
         Recognition::Package(found) => Some(found.plugin_id.to_string()),
         Recognition::Tied(_) => None,
         Recognition::Nothing => panic!("the packages recognise the program"),
@@ -1034,6 +1042,828 @@ fn kr_req_12_24_a_package_under_the_same_publisher_name_in_another_repository_do
         selected(&setup),
         None,
         "equal claims from two roots bind neither"
+    );
+}
+
+/// The stand-in's build as a package's signed records name it: the stand-in's digest at `version`.
+fn build(program: &Path, version: &str) -> QualifiedExecutable {
+    QualifiedExecutable {
+        digest: digest_of(program),
+        version: version.to_owned(),
+    }
+}
+
+/// A package that recognises the stand-in by its name and says what it knows of the stand-in's
+/// version: the versions its rule covers, where it declares any, and the version its signed
+/// records name the stand-in's digest at, where they name it.
+struct Claim<'a> {
+    publisher: &'a str,
+    name: &'a str,
+    suffix: &'a [&'a str],
+    range: Option<&'a str>,
+    named: Option<&'a str>,
+}
+
+impl<'a> Claim<'a> {
+    /// A package of the publisher the shipped packages have that claims nothing about a version.
+    fn new(name: &'a str) -> Self {
+        Self {
+            publisher: "kalareach",
+            name,
+            suffix: &[],
+            range: None,
+            named: None,
+        }
+    }
+
+    /// The same, its rule declaring that it covers the versions `range` admits.
+    fn range(self, range: &'a str) -> Self {
+        Self {
+            range: Some(range),
+            ..self
+        }
+    }
+
+    /// The same, its signed records naming the stand-in's digest at `version`.
+    fn named(self, version: &'a str) -> Self {
+        Self {
+            named: Some(version),
+            ..self
+        }
+    }
+
+    /// The same, published by another publisher.
+    fn under(self, publisher: &'a str) -> Self {
+        Self { publisher, ..self }
+    }
+
+    /// The same, its rule naming the installation location `suffix`.
+    fn at(self, suffix: &'a [&'a str]) -> Self {
+        Self { suffix, ..self }
+    }
+
+    /// Writes the package in `store`; `program` is the stand-in its records name.
+    fn package(&self, store: &Path, program: &Path) -> ConnectorSource {
+        let mut package = fixture::declarative_package_with(store, self.name, |manifest| {
+            manifest["publisher_id"] = serde_json::json!(self.publisher);
+            let rule = &mut manifest["match_rules"][0];
+            rule["executable"]["file_stem"] = serde_json::json!(fixture::COMMAND);
+            rule["executable"]["path_suffix"] = serde_json::json!(self.suffix);
+            rule["executable"]["version_range"] = serde_json::json!(self.range);
+            rule["distribution"] = serde_json::Value::Null;
+            rule["confidence"] = serde_json::json!("inferred");
+        })
+        .expect("the package");
+        package.qualified = self
+            .named
+            .map(|version| build(program, version))
+            .into_iter()
+            .collect();
+        package
+    }
+}
+
+/// A package with a connector table that pins the protocol `protocol` to the range `range`
+/// (`=` and one version), recognising the stand-in by its name, whose signed records name the
+/// stand-in's digest at `named`.
+fn pinned(
+    store: &Path,
+    program: &Path,
+    name: &'static str,
+    protocol: &str,
+    range: &str,
+    named: &str,
+) -> ConnectorSource {
+    let shape = fixture::Shape {
+        plugin_name: name,
+        display_name: name,
+        executable: fixture::COMMAND,
+        integration: None,
+        ..fixture::Shape::codex_backend()
+    };
+    let mut table: serde_json::Value = serde_json::from_str(&fixture::gateway_connector_json_for(
+        &format!("kalareach/{name}"),
+        true,
+    ))
+    .expect("the table is JSON");
+    table["protocol"] = serde_json::json!({
+        "name": protocol,
+        "qualified_range": range,
+        "tested_version": range.trim_start_matches('='),
+    });
+    let mut package = fixture::package_with_connector(
+        store,
+        &program.with_file_name("kr-hook"),
+        &shape,
+        serde_json::to_string_pretty(&table).expect("a table encodes"),
+    )
+    .expect("the package");
+    package.qualified = vec![build(program, named)];
+    package
+}
+
+/// What the broker makes of the stand-in once its bytes are hashed.
+fn decision(setup: &Setup) -> Recognition {
+    setup.broker.recognise(
+        &setup.program.display().to_string(),
+        Some(&digest_of(&setup.program)),
+    )
+}
+
+/// The package a decision selects.
+fn selected(recognition: &Recognition) -> Option<String> {
+    match recognition {
+        Recognition::Package(found) => Some(found.plugin_id.to_string()),
+        _ => None,
+    }
+}
+
+/// The packages a decision ties, in the order it names them.
+fn tied(recognition: &Recognition) -> Option<Vec<String>> {
+    match recognition {
+        Recognition::Tied(plugins) => Some(plugins.iter().map(ToString::to_string).collect()),
+        _ => None,
+    }
+}
+
+/// The announcement of the stand-in found running, which ends with it.
+fn found(setup: &Setup) -> AgentInstanceSummary {
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let mut told = setup.adopt(&foreground);
+    started.end();
+    assert_eq!(told.len(), 1, "the stand-in is found running: {told:?}");
+    told.remove(0)
+}
+
+/// The sentence that says why a tie's bridges are refused, for packages of one publisher through
+/// one repository, `clauses` saying what each makes of the version.
+fn refusal(clauses: &str) -> String {
+    format!(
+        "it was not launched through the integration, and {clauses}, so no package was chosen for \
+         it and none of its bridges is admitted"
+    )
+}
+
+/// The same for packages that do not come from one publisher through one repository: `preferred`
+/// is "neither" for two packages and "none" for more.
+fn refusal_across(clauses: &str, preferred: &str) -> String {
+    refusal(&format!(
+        "{clauses}, and they come from different publishers or repositories, so {preferred} is \
+         preferred"
+    ))
+}
+
+/// Sets what every package of `setup` has signed records say of the stand-in: its digest at
+/// `version`.
+fn record_for_all(setup: &mut Setup, version: &str) {
+    let program = setup.program.clone();
+    for package in &mut setup.packages {
+        package.qualified = vec![build(&program, version)];
+    }
+}
+
+/// KR-REQ-12.19: of the packages of one publisher through one repository that recognise a program,
+/// the one whose rule covers the version the signed records name for the program's bytes is bound,
+/// and which one it is follows the records. Every stand-in has one digest, so the records change
+/// between two admissions; both packages name the digest, or the naming would decide.
+#[test]
+fn kr_req_12_19_selection_by_version() {
+    let mut setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "the package whose range admits 1.4.0 is the one chosen"
+    );
+
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    assert_eq!(
+        told[0]
+            .plugin_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("kalareach/one"),
+        "the adopted program is bound to the package that covers its version"
+    );
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(
+        profile.binary.version, "1.4.0",
+        "the profile carries the version the records name"
+    );
+    started.end();
+
+    record_for_all(&mut setup, "2.1.0");
+    setup.admit_only(2, &[0, 1]);
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/two"),
+        "the records now say 2.1.0, and the other package's range admits it"
+    );
+}
+
+/// KR-REQ-12.19: a package's protocol pin, its name and the range it is qualified for, read against
+/// the version the signed records name, ranks a package like a range of its rule does. Two packages
+/// whose rules declare no range differ only by their pins, and the program is bound to the one
+/// whose pin admits its version; a version that neither admits ties them, and the announcement
+/// names each protocol and range.
+#[test]
+fn kr_req_12_19_selection_by_the_protocol_pin() {
+    let mut setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            pinned(store, &program, "pin-a", "proto-a", "=1.4.0", "1.4.0"),
+            pinned(store, &program, "pin-b", "proto-b", "=2.1.0", "1.4.0"),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/pin-a"),
+        "the pin that admits 1.4.0"
+    );
+    record_for_all(&mut setup, "2.1.0");
+    setup.admit_only(2, &[0, 1]);
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/pin-b"),
+        "the pin that admits 2.1.0"
+    );
+    record_for_all(&mut setup, "3.0.0");
+    setup.admit_only(3, &[0, 1]);
+    assert_eq!(
+        tied(&decision(&setup)),
+        Some(vec![
+            "kalareach/pin-a".to_owned(),
+            "kalareach/pin-b".to_owned()
+        ]),
+        "neither pin admits 3.0.0"
+    );
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/pin-a (proto-a, =1.4.0) and kalareach/pin-b (proto-b, =2.1.0) each \
+                 refuse version 3.0.0"
+            )
+            .as_str()
+        )
+    );
+}
+
+/// KR-REQ-12.19: a version that every package's ranges refuse ties them, and the announcement says
+/// so, naming each package's ranges and the version. A package that is alone is bound whatever it
+/// says of the version, and its typed routes are refused for that version as before.
+#[test]
+fn kr_req_12_19_a_version_outside_every_range() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("3.0.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .named("3.0.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        tied(&decision(&setup)),
+        Some(vec!["kalareach/one".to_owned(), "kalareach/two".to_owned()]),
+        "neither range admits 3.0.0"
+    );
+    let told = found(&setup);
+    assert!(told.plugin_id.as_ref().is_none(), "bound to none: {told:?}");
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/one (>=1.0.0, <2.0.0) and kalareach/two (>=2.0.0, <3.0.0) each \
+                 refuse version 3.0.0"
+            )
+            .as_str()
+        )
+    );
+}
+
+/// KR-REQ-12.19: a package that is alone and refuses the version the records name stays bound, and
+/// its table is refused for that version, with the words it has always had.
+#[test]
+fn kr_req_12_19_a_lone_package_that_excludes_the_version_stays_bound() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![pinned(
+            store, &program, "pin-a", "proto-a", "=1.4.0", "3.0.0",
+        )]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/pin-a"),
+        "the only package recognising the program is chosen"
+    );
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    assert_eq!(
+        setup.bound_to(told[0].application_instance_id),
+        Some(setup.packages[0].package_digest),
+        "and bound to it"
+    );
+    started.end();
+    let connector =
+        InstalledConnector::read(setup.packages[0].clone()).expect("the connector reads");
+    let refused = connector
+        .native_tables(&digest_of(&setup.program))
+        .expect_err("a table qualified for 1.4.0 is refused for 3.0.0");
+    assert!(
+        refused
+            .detail
+            .contains("not qualified for version 3.0.0 of proto-a"),
+        "{}",
+        refused.detail
+    );
+}
+
+/// KR-REQ-12.19: packages of one publisher that all cover the version tie, and the announcement
+/// says that each covers it, for two packages and for three, naming the ranges.
+#[test]
+fn kr_req_12_19_two_packages_that_both_cover() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=1.2.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert!(told.plugin_id.as_ref().is_none(), "bound to none: {told:?}");
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/one (>=1.0.0, <2.0.0) and kalareach/two (>=1.2.0) each cover version \
+                 1.4.0"
+            )
+            .as_str()
+        )
+    );
+
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=1.2.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("three")
+                .range("=1.4.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/one (>=1.0.0, <2.0.0), kalareach/three (=1.4.0) and kalareach/two \
+                 (>=1.2.0) each cover version 1.4.0"
+            )
+            .as_str()
+        ),
+        "the packages come in the order of their names, whatever order the snapshot holds them in"
+    );
+}
+
+/// KR-REQ-12.19: a package whose range refuses the version the records name loses to one that
+/// declares nothing about the build.
+#[test]
+fn kr_req_12_19_an_excluded_package_loses_to_one_that_knows_nothing_of_the_build() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("3.0.0")
+                .package(store, &program),
+            Claim::new("two").package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/two"),
+        "the package that refuses 3.0.0 does not take the program"
+    );
+}
+
+/// KR-REQ-12.19: a package whose own signed records name the program's build, at a version its range
+/// admits, beats a package whose range admits the same version and whose records name nothing: a
+/// package knows a build only by its own records.
+#[test]
+fn kr_req_12_19_a_package_that_names_the_digest_beats_one_whose_range_admits_the_version() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=1.0.0, <2.0.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "the package that names the build covers it; the other knows nothing of it"
+    );
+}
+
+/// KR-REQ-12.19: a package that covers the version beats one that names an installation location
+/// and refuses it, and with no record of the version the location decides as before.
+#[test]
+fn kr_req_12_19_coverage_beats_location() {
+    let mut setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .at(&["bin"])
+                .range(">=1.0.0, <2.0.0")
+                .named("3.0.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=1.0.0")
+                .named("3.0.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/two"),
+        "the package that covers 3.0.0 beats the located one that refuses it"
+    );
+    for package in &mut setup.packages {
+        package.qualified = Vec::new();
+    }
+    setup.admit_only(2, &[0, 1]);
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "with no record of the version, the location decides"
+    );
+}
+
+/// KR-REQ-12.24, KR-REQ-12.19: a package of another publisher, or of the same name through another
+/// repository, whose signed records name the program's build at a version its range admits does
+/// not take the program by that claim: its records are its own, and the host cannot check them.
+/// The packages conflict as they would with no records.
+#[test]
+fn kr_req_12_24_a_package_with_builds_of_another_publisher_does_not_take_a_program() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one").package(store, &program),
+            Claim::new("two")
+                .under("example-vendor")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        tied(&decision(&setup)),
+        Some(vec![
+            "example-vendor/two".to_owned(),
+            "kalareach/one".to_owned()
+        ]),
+        "another publisher's claim on the version takes nothing"
+    );
+
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one").package(store, &program),
+            Claim::new("two")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/two"),
+        "through one repository the package that covers the version is chosen"
+    );
+    let shipped = testing::admitted(&setup.packages[0]);
+    let mut stranger = testing::admitted(&setup.packages[1]);
+    stranger.origin.enrolment_key = "another-root".to_owned();
+    let _ = testing::admit(
+        &setup.admissions,
+        &setup.sources,
+        &setup.broker,
+        vec![shipped, stranger],
+        2,
+    );
+    assert_eq!(
+        tied(&decision(&setup)),
+        Some(vec!["kalareach/one".to_owned(), "kalareach/two".to_owned()]),
+        "the same name through another repository takes nothing either"
+    );
+}
+
+/// KR-REQ-12.19: the rank and the announcement hold one answer to whether the packages come from one
+/// publisher through one repository. Packages that the rank does not rank are announced as coming
+/// from different publishers or repositories, with a clause for each package and never that each
+/// covers the version; packages it ranks are never announced so.
+#[test]
+fn kr_req_12_19_the_rank_and_the_sentence_agree_on_what_one_publisher_is() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .under("example-vendor")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal_across(
+                "example-vendor/two (>=1.0.0) covers version 1.4.0 and kalareach/one (>=1.0.0) \
+                 covers version 1.4.0",
+                "neither"
+            )
+            .as_str()
+        ),
+        "two packages that both cover, from two publishers"
+    );
+
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .under("example-vendor")
+                .package(store, &program),
+            Claim::new("three")
+                .under("other-vendor")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal_across(
+                "example-vendor/two has no signed record of this build, kalareach/one (>=1.0.0) \
+                 covers version 1.4.0 and other-vendor/three has no signed record of this build",
+                "none"
+            )
+            .as_str()
+        ),
+        "three packages from three publishers"
+    );
+
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two").package(store, &program),
+        ]
+    });
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "the same claims from one publisher are ranked, and no tie is announced"
+    );
+}
+
+/// KR-REQ-12.19: a snapshot whose signed records name the program's build, applied after a program
+/// was tied, binds it to the package that covers its version, and the session announces the
+/// instance as bound.
+#[test]
+fn kr_req_12_19_a_later_admission_that_names_the_build_resolves_a_tie_and_the_sweep_announces_it() {
+    let mut setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .package(store, &program),
+        ]
+    });
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let told = setup.adopt(&foreground);
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    let instance = told[0].application_instance_id;
+    assert!(
+        told[0].plugin_id.as_ref().is_none(),
+        "no record names the build, so the two packages are tied: {told:?}"
+    );
+    let notice = told[0].refusal.clone();
+
+    record_for_all(&mut setup, "1.4.0");
+    setup.admit_only(2, &[0, 1]);
+    assert_eq!(
+        setup.bound_to(instance),
+        Some(setup.packages[0].package_digest),
+        "the records name the build, and the package whose range admits it takes the instance"
+    );
+    let told = setup.adoptions.sweep();
+    assert_eq!(
+        told.len(),
+        1,
+        "the instance is announced as bound: {told:?}"
+    );
+    assert_eq!(
+        told[0]
+            .plugin_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("kalareach/one")
+    );
+    assert_eq!(
+        told[0].refusal.as_ref().map(String::as_str),
+        Some(ADOPTED_REFUSAL)
+    );
+    assert!(setup.adoptions.sweep().is_empty(), "and once");
+    assert_eq!(
+        notice.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/one (>=1.0.0, <2.0.0) and kalareach/two (>=2.0.0, <3.0.0) each have \
+                 no signed record of this build"
+            )
+            .as_str()
+        ),
+        "the first announcement said what each package knew of the build"
+    );
+    started.end();
+}
+
+/// KR-REQ-12.19: the adoption decides again, with the program's digest, after it has read the
+/// program, so a snapshot applied between the first look and the reading is the one that decides:
+/// it binds the package the new records favour, and a snapshot that admits no package leaves the
+/// program unadopted.
+#[test]
+fn kr_req_12_19_the_window_between_the_two_decisions() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let later: Vec<_> = setup
+        .packages
+        .iter()
+        .cloned()
+        .map(|mut package| {
+            package.qualified = vec![build(&setup.program, "2.1.0")];
+            testing::admitted(&package)
+        })
+        .collect();
+    let (arrived, release) = setup.adoptions.pause_before_reading();
+    let told = std::thread::scope(|scope| {
+        let looking = scope.spawn(|| setup.adoptions.look(&foreground));
+        arrived
+            .recv_timeout(LIVENESS)
+            .expect("the look reaches the stop before it reads the program");
+        let _ = testing::admit(&setup.admissions, &setup.sources, &setup.broker, later, 2);
+        release.send(()).expect("the look is let go");
+        looking.join().expect("the look ends")
+    });
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    assert_eq!(
+        told[0]
+            .plugin_id
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("kalareach/two"),
+        "the records of the snapshot applied meanwhile decide"
+    );
+    let profile = setup
+        .broker
+        .profile_of(told[0].application_instance_id)
+        .expect("its profile");
+    assert_eq!(profile.binary.version, "2.1.0");
+    started.end();
+
+    // A snapshot that admits no package in that window: the program is adopted by none.
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let started = setup.start();
+    let foreground = Setup::foreground(&started, Vec::new());
+    let (arrived, release) = setup.adoptions.pause_before_reading();
+    let told = std::thread::scope(|scope| {
+        let looking = scope.spawn(|| setup.adoptions.look(&foreground));
+        arrived
+            .recv_timeout(LIVENESS)
+            .expect("the look reaches the stop before it reads the program");
+        let _ = testing::admit(&setup.admissions, &setup.sources, &setup.broker, vec![], 2);
+        release.send(()).expect("the look is let go");
+        looking.join().expect("the look ends")
+    });
+    assert!(told.is_empty(), "the program is adopted by none: {told:?}");
+    assert_eq!(setup.adoptions.adopted(&started.process), None);
+    assert!(bindings_held(&setup).is_empty());
+    started.end();
+}
+
+/// KR-REQ-12.19: with no record of the program's version nothing changes: packages that recognise
+/// a program equally well stay tied, and one that is alone stays bound, whatever ranges they hold.
+#[test]
+fn kr_req_12_19_an_unknown_version_changes_nothing() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            Claim::new("one")
+                .range(">=1.0.0, <2.0.0")
+                .package(store, &program),
+            Claim::new("two")
+                .range(">=2.0.0, <3.0.0")
+                .package(store, &program),
+        ]
+    });
+    assert_eq!(
+        tied(&decision(&setup)),
+        Some(vec!["kalareach/one".to_owned(), "kalareach/two".to_owned()]),
+        "no record names the build, so no range ranks the packages"
+    );
+    setup.admit_only(2, &[0]);
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "a lone package is bound whether or not its range could admit the version"
     );
 }
 

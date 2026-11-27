@@ -34,7 +34,7 @@ use kr_worker::broker::Broker;
 use kr_worker::broker::adoption::{Adoptions, Foreground};
 use kr_worker::broker::binder::Recognition;
 use kr_worker::broker::catalogue::{Admissions, testing};
-use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources};
+use kr_worker::broker::connectors::{ConnectorSource, ConnectorSources, QualifiedExecutable};
 use kr_worker::persistence::JournalHealth;
 
 /// The variable that makes a placed copy of this binary the stand-in program: it sleeps for as
@@ -137,6 +137,7 @@ struct Setup {
     /// The connectors the worker installed from what it admitted: what a session's command
     /// integrations are looked up in.
     sources: ConnectorSources,
+    admissions: Admissions,
     packages: Vec<(String, ConnectorSource)>,
     // Declared last: the directory is removed after every field above has let go of its files.
     host: kr_ipc::testing::TempHost,
@@ -160,15 +161,42 @@ impl Setup {
             .map(|(_, source)| testing::admitted(source))
             .collect();
         let sources = ConnectorSources::new();
-        let _ = testing::admit(&Admissions::new(), &sources, &broker, admitted, 1);
+        let admissions = Admissions::new();
+        let _ = testing::admit(&admissions, &sources, &broker, admitted, 1);
         let adoptions = Adoptions::new(Arc::clone(&broker), host.environment_id());
         Self {
             host,
             broker,
             adoptions,
             sources,
+            admissions,
             packages,
         }
+    }
+
+    /// Hands over the next snapshot, at `round`, in which the signed records of the shipped packages
+    /// `named` name the program at `program` at `version`.
+    fn name_the_build(&mut self, round: u64, named: &[&str], program: &Path, version: &str) {
+        for (name, source) in &mut self.packages {
+            if named.contains(&name.as_str()) {
+                source.qualified = vec![QualifiedExecutable {
+                    digest: digest_of(program),
+                    version: version.to_owned(),
+                }];
+            }
+        }
+        let admitted: Vec<_> = self
+            .packages
+            .iter()
+            .map(|(_, source)| testing::admitted(source))
+            .collect();
+        let _ = testing::admit(
+            &self.admissions,
+            &self.sources,
+            &self.broker,
+            admitted,
+            round,
+        );
     }
 
     /// The digest of the shipped package named `name`.
@@ -466,7 +494,7 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
     // chosen for it. The terminal is all such a program has.
     let elsewhere = setup.host.root().join("bin/kimi").display().to_string();
     assert_eq!(
-        setup.broker.recognise(&elsewhere),
+        setup.broker.recognise(&elsewhere, None),
         Recognition::Tied(vec![plugin("kimi-cli"), plugin("kimi-code-cli")]),
         "a kimi outside the installation location is claimed equally by both profiles"
     );
@@ -480,7 +508,7 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
 /// that instance has: no binding, so no observation and no action is claimed for it.
 #[test]
 fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two_profiles() {
-    let setup = Setup::new();
+    let mut setup = Setup::new();
     let (line, resolution) = decided("opencode");
     let Resolution::Bypassed {
         arguments, reason, ..
@@ -492,7 +520,9 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
     for relative in ["bin/opencode", ".opencode/bin/opencode"] {
         let (typed, program) = setup.typed_at(relative, &arguments[1..]);
         assert_eq!(
-            setup.broker.recognise(&program.display().to_string()),
+            setup
+                .broker
+                .recognise(&program.display().to_string(), Some(&digest_of(&program))),
             Recognition::Tied(vec![plugin("opencode"), plugin("opencode-attach")]),
             "{relative}: both profiles claim it equally"
         );
@@ -544,6 +574,34 @@ fn an_opencode_program_is_found_as_a_native_terminal_bound_to_neither_of_its_two
             "{relative}: the vector as typed, with nothing added"
         );
     }
+
+    // Once the signed records name the build, the two profiles still claim it equally, and the
+    // announcement says what each makes of its version.
+    let (typed, program) = setup.typed_at("named/bin/opencode", &arguments[1..]);
+    setup.name_the_build(2, &["opencode", "opencode-attach"], &program, "1.18.31");
+    assert_eq!(
+        setup
+            .broker
+            .recognise(&program.display().to_string(), Some(&digest_of(&program))),
+        Recognition::Tied(vec![plugin("opencode"), plugin("opencode-attach")]),
+        "both profiles cover the version the records name, so neither is preferred"
+    );
+    let told = setup.adopt(&foreground(&typed, &program, reason));
+    assert_eq!(told.len(), 1, "the program is found running: {told:?}");
+    assert_eq!(
+        told[0].refusal.as_ref().map(String::as_str),
+        Some(
+            "it was not launched through the integration, and kalareach/opencode \
+             (opencode-server-v2-events, =1.18.31) and kalareach/opencode-attach \
+             (opencode-server-events, =1.18.31) each cover version 1.18.31, so no package was \
+             chosen for it and none of its bridges is admitted"
+        )
+    );
+}
+
+/// The digest of the file at `path`.
+fn digest_of(path: &Path) -> Digest256 {
+    Digest256::from_bytes(kr_cbor::sha256(&std::fs::read(path).expect("a file")))
 }
 
 /// The identifier of the shipped package named `name`.

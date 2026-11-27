@@ -75,7 +75,7 @@ impl Admitted {
     /// worker reads every rule as a guess, so a rule that names the installation location outranks
     /// one that names only the executable, among the packages of one publisher through one
     /// repository. Equal claims select nothing, and the packages that make them are named.
-    fn recognise(&self, path: &str) -> Recognised {
+    fn recognise(&self, path: &str, _digest: Option<&Digest256>) -> Recognised {
         let mut found: Vec<(Candidate, Digest256)> = Vec::new();
         for (digest, (package, read)) in &self.packages {
             let manifest = read.manifest();
@@ -347,12 +347,12 @@ impl Broker {
     /// whose rule names the installation location is selected, among the packages of one
     /// publisher through one repository, and packages that recognise it equally well select none.
     #[must_use]
-    pub fn recognise(&self, path: &str) -> Recognition {
+    pub fn recognise(&self, path: &str, digest: Option<&Digest256>) -> Recognition {
         let state = self.state();
         let Some(frame) = state.admitted.frame else {
             return Recognition::Nothing;
         };
-        match state.admitted.recognise(path) {
+        match state.admitted.recognise(path, digest) {
             Recognised::Nothing => Recognition::Nothing,
             Recognised::Tied(plugins) => Recognition::Tied(plugins),
             Recognised::One(digest) => {
@@ -972,7 +972,10 @@ impl BrokerState {
             })
             .collect();
         for (application_instance_id, executable) in unbound {
-            let Recognised::One(digest) = self.admitted.recognise(&executable.path) else {
+            let Recognised::One(digest) = self
+                .admitted
+                .recognise(&executable.path, Some(&executable.digest))
+            else {
                 continue;
             };
             let binding_id = BrokerBindingId::new(kr_ipc::new_uuid());

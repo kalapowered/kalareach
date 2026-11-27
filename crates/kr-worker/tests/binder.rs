@@ -578,7 +578,10 @@ fn kr_req_27_09_an_executable_no_signed_build_names_keeps_the_terminal_route_and
         .expect("the launched instance is registered");
     worker.register(3);
 
-    let Recognition::Package(matched) = worker.broker.recognise(&program().path) else {
+    let Recognition::Package(matched) = worker
+        .broker
+        .recognise(&program().path, Some(&program().digest))
+    else {
         panic!("the admitted package recognises the program");
     };
     let named = program().digest;
