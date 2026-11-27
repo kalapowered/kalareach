@@ -543,9 +543,9 @@ for (const kind of KINDS) {
       context,
       browserName
     }) => {
-      // Chromium lets a case read the clipboard; WebKit under the driver grants no read of it, so there the
-      // text of the range and of the selection, which is what the engine copies, are what is compared.
-      // The selection is set by the page's own range, not by a pointer gesture.
+      // In Chromium the case copies with the keyboard and reads the clipboard. In WebKit under the driver the
+      // clipboard cannot be read, so there it compares the text of the range and of the selection, and reads
+      // no copy. The selection is set by the page's own range, not by a pointer gesture.
       const clipboard = browserName === 'chromium'
       if (clipboard) await context.grantPermissions(['clipboard-read', 'clipboard-write'])
       const sample = kind.sample(kind.parts.join(''))
@@ -578,7 +578,7 @@ for (const kind of KINDS) {
       if (clipboard) {
         expect(whole.clipboard?.replace(/\s/gu, ''), 'something was copied').toBe(shown.replace(/\s/gu, ''))
         expect(whole.clipboard).toBe(wholeControl.clipboard)
-        expect(inside.clipboard).toBe(insideControl.clipboard)
+        expect(inside.clipboard, 'the copy of the range inside the word').toBe(inside.word.slice(1, -1))
       }
     })
 
