@@ -959,6 +959,34 @@ test.describe('the focus when the window widens over the drawer', () => {
 })
 
 /**
+ * The open drawer's focus listener goes with the drawer. A window widened past 720 points while the
+ * drawer is open, on a web view without `inert`, takes the drawer away and leaves the sidebar
+ * standing beside the page; a focus that the person then puts on the page stays where they put it,
+ * and is not sent to the sidebar's first control by a listener that outlived the drawer. Only a
+ * widening shows it: a drawer that closes while the window is narrow is hidden at once, and a hidden
+ * control takes no focus, so a listener left behind there has nothing to send the focus to.
+ */
+test.describe('the open drawer\'s focus listener when the window widens over it, on a web view without the inert attribute', () => {
+  test('600 points, with no inert: after the window widened over the open drawer, a focus put on the page stays where the person put it', async ({
+    page
+  }) => {
+    await withoutInert(page)
+    await openWindow(page, 600)
+    await menuOf(page).click()
+    await expect(drawerOf(page)).toBeVisible()
+    await page.setViewportSize({ width: 800, height: HEIGHT })
+    await expect(menuOf(page), 'the window is wide: there is no "Menu"').toHaveCount(0)
+    await expect(drawerOf(page), 'there is no open drawer').toHaveCount(0)
+    expect(
+      await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar') as Element).position),
+      'the sidebar stands beside the page'
+    ).toBe('sticky')
+    await page.locator('main').focus()
+    await expect(page.locator('main'), 'the focus stays where the person put it').toBeFocused()
+  })
+})
+
+/**
  * A window narrowed below 720 points puts the sidebar out of reach: it is the closed drawer, and
  * "Menu" is the control that stands for it. Whatever of the sidebar had the focus, and whatever was
  * to return the focus to it, goes to "Menu", which is drawn inside the window with nothing over it.
