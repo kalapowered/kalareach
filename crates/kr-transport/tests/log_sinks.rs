@@ -65,6 +65,18 @@ fn approved() -> Vec<(&'static str, String, usize)> {
             .to_owned(),
             1,
         ),
+        // The test helper that records the events of a checkpoint read's recovery: the capture
+        // stands only in the file's test module, belongs to the test's own thread, and its guard
+        // is dropped when the helper ends.
+        (
+            "kr-client/src/pairing/candidate.rs",
+            concat!(
+                "let guard = tracing::dispatcher::set_",
+                "default(&dispatch);"
+            )
+            .to_owned(),
+            1,
+        ),
         (
             "kr-controller/tests/proxy_login_logs.rs",
             concat!(
