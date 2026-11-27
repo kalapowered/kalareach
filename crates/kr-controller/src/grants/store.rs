@@ -7141,7 +7141,7 @@ mod the_boundary_of_a_reading {
         assert!(delayed.high >= 101, "{delayed:?}");
     }
 
-    /// So does the pass at a start.
+    /// The pass at a start reads the counter after it has taken the write lock, not before it.
     #[test]
     fn the_pass_at_a_start_reads_the_counter_after_it_holds_the_write_lock() {
         let temp = tempfile::tempdir().expect("a directory");
@@ -7211,7 +7211,7 @@ mod the_boundary_of_a_reading {
         assert!(delayed.high >= 101, "{delayed:?}");
     }
 
-    /// So does a redemption.
+    /// A redemption reads the counter after it has taken the write lock, not before it.
     #[test]
     fn the_redemption_of_a_share_reads_the_counter_after_it_holds_the_write_lock() {
         let temp = tempfile::tempdir().expect("a directory");
@@ -7258,7 +7258,7 @@ mod the_boundary_of_a_reading {
         assert!(delayed.high >= 101, "{delayed:?}");
     }
 
-    /// So does a transfer of control.
+    /// A transfer of control reads the counter after it has taken the write lock, not before it.
     #[test]
     fn a_transfer_reads_the_counter_after_it_holds_the_write_lock() {
         let temp = tempfile::tempdir().expect("a directory");

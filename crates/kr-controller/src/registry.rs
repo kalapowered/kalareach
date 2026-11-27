@@ -3356,11 +3356,6 @@ fn begin_write(connection: &mut Connection) -> Result<rusqlite::Transaction<'_>>
         .map_err(ControllerError::registry)
 }
 
-/// The table that records, for each boot, that its clock continuity was lost and when its owner
-/// established the clock again.
-///
-/// The registry creates it with its other tables, and so does the device directory, which ends a
-/// boot's lost continuity in the same transaction as the trust record it writes.
 /// Whether this build refuses a registry at `version`: 17 and 20, which no release wrote, and every
 /// version outside the range this build reads.
 const fn is_refused_version(version: i64) -> bool {
@@ -3383,6 +3378,11 @@ fn refused_version(version: i64) -> ControllerError {
     ControllerError::RegistryUnavailable { detail }
 }
 
+/// The table that records, for each boot, that its clock continuity was lost and when its owner
+/// established the clock again.
+///
+/// The registry creates it with its other tables, and so does the device directory, which ends a
+/// boot's lost continuity in the same transaction as the trust record it writes.
 pub(crate) const CLOCK_CONTINUITY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS clock_continuity (
          boot_epoch        BLOB PRIMARY KEY NOT NULL,
          lost_at_ms        INTEGER NOT NULL,
