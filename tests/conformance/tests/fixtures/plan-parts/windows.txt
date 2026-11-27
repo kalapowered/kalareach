@@ -54,11 +54,11 @@ the compile budget's reading of a thread's processor time :: cargo test --locked
 the plugin runtime's library :: cargo test --locked -p kr-plugin-runtime --lib -- --show-output
 the plugin runtime running real components :: cargo test --locked -p kr-plugin-runtime --test execution -- --show-output --skip kr_req_11_41_the_budget_counts_the_compiling_threads_own_processor_time
 the plugin runtime's service over a pipe :: cargo test --locked -p kr-plugin-runtime --test service -- --show-output
+the control daemon started through the environment's scheduled task :: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output
 part 2/2
 the control daemon, the worker, the forwarder and the plugin host the suites start, and the release tool whose header a case reads :: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
 the control daemon the suites start, built with the testing feature :: cargo build --locked -p kr-controller --features testing --bin kr-controller-held
 the description process the update suite assembles into releases :: cargo build --locked -p kr-describe-model --bin kr-describe-inference
-the control daemon started through the environment's scheduled task :: cargo test --locked -p kr-cli --test startup_windows -- --ignored --skip a_task_the_task_scheduler_does_not_start --show-output
 the attention store :: cargo test --locked -p kr-attention -- --show-output
 the client's stores and their directory flush :: cargo test --locked -p kr-client --lib -- --show-output
 the terminal input encoder :: cargo test --locked -p kr-keys -- --show-output
@@ -71,6 +71,9 @@ each store opens and reads what the previous holder committed while it still map
 a command node refused where no command can be run :: cargo test --locked -p kr-automation --test definitions a_command_node_is_refused_where_no_command_can_be_run -- --show-output
 a descendant keeps its causal root, depth and parent :: cargo test --locked -p kr-automation --test causal_budget a_descendant_takes_its_ancestry_from_the_node_that_produced_its_trigger -- --show-output
 a workflow does not retrigger on its own descendants by default :: cargo test --locked -p kr-automation --test causal_budget self_retrigger_is_refused_without_explicit_recurrence -- --show-output
+a review node is refused where no program can be started :: cargo test --locked -p kr-automation --test definitions -- --exact a_review_node_is_refused_when_offered_on_windows run_tests_stays_refused_on_windows_when_offered a_review_node_naming_a_shared_working_tree_is_refused_when_offered a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered --show-output
+a review node asks for the rights of a program start :: cargo test --locked -p kr-automation --test authority -- --exact a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each a_review_node_needs_a_grant_that_selects_every_session --show-output
+a review node is not charged to a chain where none is offered :: cargo test --locked -p kr-automation --test causal_budget a_review_node_charges_one_session_to_its_chain -- --show-output
 the contact skill's installer :: cargo test --locked -p kr-controller --lib agent_tools -- --show-output
 the contact skill installed and removed through the daemon :: cargo test --locked -p kr-controller --test agent_tools --test contact_skill -- --show-output
 the directory secret store and the libsodium boundary :: cargo test --locked -p kr-crypto -- --show-output

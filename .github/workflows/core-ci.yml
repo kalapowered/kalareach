@@ -1760,19 +1760,11 @@ jobs:
       # host asks of a review node before a dispatch are asked here as on every platform.
       - name: Test that a review node is refused where no program can be started
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: |
-          cargo test --locked -p kr-automation --test definitions \
-            a_review_node_is_refused_when_offered_on_windows \
-            run_tests_stays_refused_on_windows_when_offered \
-            a_review_node_naming_a_shared_working_tree_is_refused_when_offered \
-            a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered
+        run: cargo test --locked -p kr-automation --test definitions -- --exact a_review_node_is_refused_when_offered_on_windows run_tests_stays_refused_on_windows_when_offered a_review_node_naming_a_shared_working_tree_is_refused_when_offered a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered
 
       - name: Test that a review node asks for the rights of a program start
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: |
-          cargo test --locked -p kr-automation --test authority \
-            a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each \
-            a_review_node_needs_a_grant_that_selects_every_session
+        run: cargo test --locked -p kr-automation --test authority -- --exact a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each a_review_node_needs_a_grant_that_selects_every_session
 
       - name: Test that a review node is not charged to a chain where none is offered
         if: ${{ !cancelled() && matrix.part == 'second' }}

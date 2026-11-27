@@ -1269,6 +1269,68 @@ name = 'self_retrigger_is_refused_without_explicit_recurrence'
 reason = 'on Windows only the cases named `self_retrigger_is_refused_without_explicit_recurrence` of this target are qualified'
 
 [[step]]
+id = 'rust-a-review-node-is-refused-where-no-program-can-be'
+group = 'rust'
+what = 'a review node is refused where no program can be started'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'definitions',
+    '--',
+    '--exact',
+    'a_review_node_is_refused_when_offered_on_windows',
+    'run_tests_stays_refused_on_windows_when_offered',
+    'a_review_node_naming_a_shared_working_tree_is_refused_when_offered',
+    'a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered',
+]
+
+[[step]]
+id = 'rust-a-review-node-asks-for-the-rights-of-a-program-start'
+group = 'rust'
+what = 'a review node asks for the rights of a program start'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'authority',
+    '--',
+    '--exact',
+    'a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each',
+    'a_review_node_needs_a_grant_that_selects_every_session',
+]
+
+[[step]]
+id = 'rust-a-review-node-is-not-charged-to-a-chain-where-none-is'
+group = 'rust'
+what = 'a review node is not charged to a chain where none is offered'
+platforms = ['windows']
+reading = 'cargo'
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-automation',
+    '--test',
+    'causal_budget',
+    'a_review_node_charges_one_session_to_its_chain',
+]
+[step.filter]
+name = 'a_review_node_charges_one_session_to_its_chain'
+reason = 'on Windows only the cases named `a_review_node_charges_one_session_to_its_chain` of this target are qualified'
+
+[[step]]
 id = 'rust-the-contact-skill-s-installer'
 group = 'rust'
 what = '''the contact skill's installer'''
