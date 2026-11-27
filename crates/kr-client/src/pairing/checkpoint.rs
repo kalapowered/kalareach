@@ -19,6 +19,13 @@
 //! * Every operation takes an operating-system lock on `checkpoints.lock` for its own file work and
 //!   never holds it across a wait on the network. The work is synchronous: a caller on a runtime
 //!   runs it on a blocking task.
+//! * The lock stays required. Just before a settle replaces the file, it reads the file again and
+//!   refuses with [`Unsettled::Changed`] when it differs from the snapshot its result was derived
+//!   from, so that it does not drop what another writer committed meanwhile. It never retries: the
+//!   caller asks again. That makes the gap smaller; it does not close it. The replacement is not
+//!   conditional, so two writers that both check before either renames still lose a write. A file
+//!   system whose lock does not exclude leaves the same gap, and so does a writer that does not
+//!   take the lock: it can lower a checkpoint alone, and no check in a settle can stop it.
 //! * A file this release cannot read is a refusal, never an empty set.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -369,6 +376,11 @@ pub enum Unsettled {
     Unreadable(SnapshotCause),
     /// Something else holds the lock.
     Busy,
+    /// The file differed from the snapshot when it was read again just before the replacement:
+    /// another writer replaced it meanwhile. Nothing was written, and the file holds what that
+    /// writer wrote. The answer was derived from a file that no longer stands, so it is asked for
+    /// again.
+    Changed,
     /// The file could not be written. Either a second read showed the old file, or that read
     /// failed too; in the second case the replacement may have landed, since a failed read after a
     /// failed write cannot tell.
@@ -404,6 +416,11 @@ pub struct PairedCheckpoints {
     /// the flush of the directory after it fail, and a settle must tell that from a write that never
     /// began.
     write: Writer,
+    /// Runs in a settle just before the file is read again for the comparison with the snapshot,
+    /// so that a test can put another writer's commit between the two. Production has no such
+    /// step.
+    #[cfg(test)]
+    before_compare: fn(&Path),
 }
 
 /// A function that replaces a file whole.
@@ -434,6 +451,8 @@ impl PairedCheckpoints {
         Self {
             directory,
             write: kr_ipc::paths::write_owner_only_file,
+            #[cfg(test)]
+            before_compare: |_| {},
         }
     }
 
@@ -441,6 +460,14 @@ impl PairedCheckpoints {
     #[cfg(test)]
     fn with_writer(mut self, write: Writer) -> Self {
         self.write = write;
+        self
+    }
+
+    /// These checkpoints, running `before_compare` with the file's path in each settle that is
+    /// about to replace the file, before the file is read again.
+    #[cfg(test)]
+    fn with_before_compare(mut self, before_compare: fn(&Path)) -> Self {
+        self.before_compare = before_compare;
         self
     }
 
@@ -508,12 +535,18 @@ impl PairedCheckpoints {
     /// is dropped. When the write reports an error, the file is read again: if it holds what was
     /// meant, the replacement landed and the answer is settled with `confirmed` false.
     ///
+    /// Just before the replacement the file is read again. It is replaced only when it still equals
+    /// the snapshot that the result was derived from; the module's notes say what that does not
+    /// close.
+    ///
     /// # Errors
     ///
     /// Returns [`Unsettled::NotAnOwner`] at once, before the lock and with nothing taken, for a
     /// record that is no owner. Otherwise returns why nothing was settled, and with
     /// [`Unsettled::Superseded`] that the pairing is no longer the current owner pairing, after the
-    /// checkpoint it named was taken.
+    /// checkpoint it named was taken. [`Unsettled::Changed`] says that the file differed from the
+    /// snapshot just before the replacement, and an [`Unsettled::Unreadable`] from that second read
+    /// that it could not be read: neither writes anything.
     pub fn settle_checkpoint(
         &self,
         host: &PairedHost,
@@ -575,6 +608,15 @@ impl PairedCheckpoints {
                 return Err(Unsettled::Full);
             }
             let path = self.directory.join(CHECKPOINTS_FILE);
+            #[cfg(test)]
+            (self.before_compare)(&path);
+            // The last look before the replacement: the result was derived from the snapshot, so a
+            // file that is no longer the snapshot belongs to another writer, whose checkpoints
+            // this result would drop. A refusal, never a retry: the caller asks again. A read that
+            // fails is a refusal too, and nothing is written.
+            if self.read_file()? != file {
+                return Err(Unsettled::Changed);
+            }
             if (self.write)(&path, &bytes).is_err() {
                 match self.read_file() {
                     Ok(read) if read == next => confirmed = false,
@@ -2028,6 +2070,87 @@ mod tests {
             unconfirmed(Outcome::Raised)
         );
         assert_eq!(entries(&rig), vec![(1, 9)], "the new file stands");
+    }
+
+    thread_local! {
+        static ANOTHER_WRITER: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Another writer's commit between a settle's snapshot and its comparison: the file becomes
+    /// the bytes the test put in `ANOTHER_WRITER`.
+    fn another_writer_commits(path: &Path) {
+        ANOTHER_WRITER.with_borrow(|bytes| {
+            kr_ipc::paths::write_owner_only_file(path, bytes).expect("the other writer's file");
+        });
+    }
+
+    /// A settle replaces the file only while it still equals the snapshot its result was derived
+    /// from: the higher checkpoint that another writer committed after the snapshot, and the entry
+    /// it added, stand, and the answer is refused as one that did not settle.
+    #[test]
+    fn a_file_that_changed_after_the_snapshot_is_refused_and_left_as_it_is() {
+        let mut rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(&record, &given(1, 7), NOW)
+            .expect("settled");
+        let theirs = serde_json::to_vec(&CheckpointsFile {
+            version: FORMAT_VERSION,
+            checkpoints: vec![entry_of(&record, 1, 9), entry_of(&record, 2, 3)],
+            told: vec![told(&record, Intended::Checkpoint)],
+        })
+        .expect("bytes");
+        ANOTHER_WRITER.set(theirs.clone());
+        rig.checkpoints = rig
+            .checkpoints
+            .clone()
+            .with_before_compare(another_writer_commits);
+
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&record, &given(1, 8), NOW),
+            Err(Unsettled::Changed),
+            "an outcome other than Superseded, which the candidate reads as: the pairing stands"
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            theirs,
+            "the file is what the other writer wrote, byte for byte"
+        );
+        assert_eq!(
+            entries(&rig),
+            vec![(1, 9), (2, 3)],
+            "the higher checkpoint and the added entry are kept"
+        );
+    }
+
+    /// A second read that fails is a refusal too, and nothing is written over what it found.
+    #[test]
+    fn a_second_read_that_fails_is_a_refusal_and_writes_nothing() {
+        let mut rig = Rig::new();
+        let record = owner(1);
+        rig.hosts.record(record.clone()).expect("recorded");
+        rig.checkpoints
+            .settle_checkpoint(&record, &given(1, 7), NOW)
+            .expect("settled");
+        ANOTHER_WRITER.set(b"{".to_vec());
+        rig.checkpoints = rig
+            .checkpoints
+            .clone()
+            .with_before_compare(another_writer_commits);
+
+        assert_eq!(
+            rig.checkpoints
+                .settle_checkpoint(&record, &given(1, 8), NOW),
+            Err(Unsettled::Unreadable(SnapshotCause::Unreadable))
+        );
+        assert_eq!(
+            std::fs::read(rig.path(CHECKPOINTS_FILE)).expect("the file"),
+            b"{",
+            "the file the second read could not use is not replaced"
+        );
     }
 
     /// A write that lands and is not confirmed leaves the answer its own standing: a lower answer
