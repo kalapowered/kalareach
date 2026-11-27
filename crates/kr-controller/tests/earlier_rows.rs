@@ -1468,6 +1468,36 @@ fn what_a_reader_sees(path: &Path) -> (i64, Vec<(String, String, String)>, u64) 
     (version, schema, digest.finish())
 }
 
+/// KR-REQ-23.45: an update refuses a registry at 17 or 20 by its version, also in a folder that
+/// cannot take the log and the index a write-ahead file makes as it is opened for writing: the look
+/// that reads the version opens nothing for writing, so the refusal does not wait on that open.
+#[test]
+fn an_update_refuses_a_registry_at_17_or_20_by_its_version_in_a_folder_that_takes_no_new_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    for version in [17_i64, 20] {
+        let temp = tempfile::tempdir().expect("a directory on the internal disk");
+        let folder = temp.path().join("sealed");
+        std::fs::create_dir(&folder).expect("a folder");
+        let path = folder.join("registry.db");
+        registry_in_mode(&path, version, Journal::WriteAhead);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555))
+            .expect("the folder is sealed");
+        let sealed = std::fs::File::create(folder.join("probe")).is_err();
+        let outcome = kr_controller::registry::Registry::bring_forward(&path, environment);
+        // Unsealed before anything is asserted, so that the temporary folder can be removed.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755))
+            .expect("the folder is open again");
+        assert!(sealed, "the folder takes no new file");
+        let refusal = outcome.expect_err("refused").to_string();
+        assert!(
+            refusal.contains(&format!("schema version {version}")),
+            "refused by its version at {version}: {refusal}"
+        );
+    }
+}
+
 /// KR-REQ-23.45: a registry that a newer daemon left with a log that holds writes is refused, and
 /// the refusal adds nothing to what the database's own recovery does: the version, the schema's
 /// text and every table's rows, read through the log, are the same before and after. The log is the

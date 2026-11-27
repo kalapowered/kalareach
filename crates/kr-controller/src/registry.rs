@@ -697,6 +697,13 @@ impl Registry {
             return Ok(None);
         }
         Self::refuse_a_lost_table(&peek, from)?;
+        // A version inside the range this build brings forward that no release wrote is refused
+        // here, by the read that opened nothing for writing. The writable open below makes a
+        // write-ahead file's log and index, and in a folder that cannot take them it fails with an
+        // answer that does not name the version.
+        if is_refused_version(from) {
+            return Err(refused_version(from));
+        }
         drop(peek);
         // Without the flag that creates a file: a registry removed meanwhile is not made again.
         let connection = open_connection(
