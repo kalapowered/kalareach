@@ -16,9 +16,19 @@
 //! constant where the code has one ([`LINK_BYTES`], `kr_term::title::MAX_TITLE_BYTES`,
 //! `kr_term::title::MAX_DEPTH`, `kr_protocol::ids::MAX_OPAQUE_ID_LEN`, `MAX_UPSTREAM_REQUEST_ID_LEN`,
 //! `kr_protocol::error::MAX_ERROR_MESSAGE_LEN`, `kr_worker::service::MAX_OUTPUT_EVENT_BYTES`, the
-//! page's own [`PAGE_BYTES`] and [`PAGE_ITEMS`]), and each case says which. Every frame a case
-//! prints has passed the transport's own encoder at the compiled bound, with its collection, item,
-//! depth and string limits and not only its length.
+//! page's own [`PAGE_BYTES`] and [`PAGE_ITEMS`]), and each case says which.
+//!
+//! The projection frames are samples, not maxima. The page is one that reaches its byte bound, and
+//! the delta is the largest update that a search over linked cells finds; neither is shown to be
+//! the largest the engine can make (a combining mark after each cell's character adds bytes without
+//! adding a cell, for one). The header with every table at its bound
+//! is a hand-built upper bound that the engine cannot produce: its saved cursors, styles and
+//! keyboard values are at the largest value of their wire types, where the engine keeps smaller
+//! ones. It bounds the size of a header; it is not a state of the engine.
+//!
+//! Every frame a case prints, and every message of the input stream and bare answer before hello,
+//! has passed the transport's own encoder at the compiled bound, with its collection, item, depth
+//! and string limits and not only its length.
 
 use std::fmt::Write as _;
 use std::hint::black_box;
@@ -184,9 +194,10 @@ fn encoder_limits() -> Limits {
     Limits::DEFAULT.with_max_message_len(COMPILED - FRAME_LENGTH_PREFIX_LEN)
 }
 
-/// Whether the transport's encoder writes `frame` at the compiled bound.
-fn encoder_accepts(frame: &ControlFrame) -> bool {
-    to_canonical_vec_within(frame, &encoder_limits()).is_ok()
+/// Whether the transport's encoder writes `message`, a frame or a message of a stream of its own,
+/// at the compiled bound.
+fn encoder_accepts(message: &(impl Serialize + ?Sized)) -> bool {
+    to_canonical_vec_within(message, &encoder_limits()).is_ok()
 }
 
 /// The size of the payload `frame` carries as the codec encodes it: a notification's payload, a
@@ -222,7 +233,7 @@ fn line(name: &str, frame: &ControlFrame, charge: Option<usize>) -> String {
     )
 }
 
-/// What one frame of the widest kind a worker sends is, with the queue charge the worker gives it.
+/// What one frame of a kind a worker sends is, with the queue charge the worker gives it.
 struct Measured {
     /// The event type.
     name: &'static str,
@@ -774,7 +785,7 @@ fn packed_script(cols: u32, rows: u32) -> Vec<u8> {
     script
 }
 
-/// The widest delta the worker's own builder makes: the engine's delta of a screen that changed
+/// A delta the worker's own builder makes: the engine's delta of a screen that changed
 /// every table a header carries and `cells` linked cells since a snapshot, passed through `advance`.
 /// `None` when the change is too large for one update and the builder asks for a snapshot instead.
 fn product_delta(cells: u32) -> Option<Outgoing> {
@@ -823,10 +834,12 @@ fn product_delta(cells: u32) -> Option<Outgoing> {
     }
 }
 
-/// The widest delta the builder sends as an update: the most linked cells a change can carry before
-/// the builder asks for a snapshot. The cost of the message grows with the cells and stops at the
-/// row's cut, so the search takes the largest count that is still an update.
-fn widest_product_delta() -> Outgoing {
+/// A large delta the builder sends as an update: the most linked cells a change can carry before the
+/// builder asks for a snapshot. The cost of the message grows with the cells and stops at the row's
+/// cut, so the search takes the largest count that is still an update. It is a sample and not the
+/// largest delta: it stays under the page's byte bound, and a search over the cells alone does not
+/// try other ways to add bytes to it.
+fn delta_sample() -> Outgoing {
     let (mut low, mut high) = (1_u32, 2_048_u32);
     let mut widest = product_delta(low).expect("a delta of one cell and the tables is an update");
     while low < high {
@@ -859,13 +872,15 @@ fn projection_charge(event: &ProjectionEvent) -> usize {
     .len()
 }
 
-/// Every kind of notification a worker sends, at its widest, with what the worker's queue charges.
-fn widest_events() -> Vec<Measured> {
+/// Every kind of notification a worker sends, with what the worker's queue charges. The kinds that
+/// carry no projection are at the bounds of their types; the projection kinds (the header, the page
+/// and the delta) are samples from a driven engine.
+fn measured_events() -> Vec<Measured> {
     let events = installed(2_048, 24, &crowded_script(2_048, true));
     let header = header_of(&events);
-    // The pages of a screen of three rows of linked cells, the widest of which is the widest page: a
-    // run carries its own copy of its link, so a page of runs that each hold a link of the largest
-    // size reaches the byte bound of a page before the limit of its values. The first page of an
+    // The pages of a screen of three rows of linked cells, of which the sample is the largest: a run
+    // carries its own copy of its link, so a page of runs that each hold a link of the largest size
+    // reaches the byte bound of a page before the limit of its values. The first page of an
     // installation is the buffer that is not showing, and it is empty.
     let packed = installed_within(2_048, 3, &packed_script(2_048, 3), 4 * PAGE_BYTES);
     let page = widest(
@@ -877,9 +892,9 @@ fn widest_events() -> Vec<Measured> {
             })
             .collect(),
     );
-    // The widest delta is the one the worker's own builder makes, not one built by hand: a delta
-    // that carries more than a page of values is a snapshot's work and is never sent.
-    let delta_outgoing = widest_product_delta();
+    // The delta is one the worker's own builder makes, not one built by hand: a delta that carries
+    // more than a page of values is a snapshot's work and is never sent.
+    let delta_outgoing = delta_sample();
     let ProjectionEvent::Delta(delta) = &delta_outgoing.event else {
         unreachable!("the builder's update carries a delta");
     };
@@ -1145,7 +1160,7 @@ fn the_guards_cost_is_recorded() {
 /// between its frame and its bytes, which a cut by the receiver's bound has to leave room for.
 #[test]
 fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it() {
-    let events = widest_events();
+    let events = measured_events();
     let mut table = String::from("MEASURE | the relay's overhead\n");
     let mut overhead_max = i64::MIN;
     for name in [
@@ -1202,7 +1217,7 @@ fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it(
     let page_items = page.items;
     writeln!(
         table,
-        "MEASURE | the widest page: payload {} | values {page_items} of PAGE_ITEMS {PAGE_ITEMS} | PAGE_BYTES {PAGE_BYTES} | frame {page_frame} | the compiled frame without its prefix {}",
+        "MEASURE | a page sample at the byte bound: payload {} | values {page_items} of PAGE_ITEMS {PAGE_ITEMS} | PAGE_BYTES {PAGE_BYTES} | frame {page_frame} | the compiled frame without its prefix {}",
         page.payload,
         COMPILED - FRAME_LENGTH_PREFIX_LEN
     )
@@ -1224,7 +1239,7 @@ fn a_cut_output_and_projection_frame_grows_by_nothing_when_a_device_is_shown_it(
     );
     assert!(
         page_frame <= COMPILED - FRAME_LENGTH_PREFIX_LEN,
-        "the widest page is whole in the compiled frame, found {page_frame}"
+        "a page sample at the byte bound is whole in the compiled frame, found {page_frame}"
     );
 
     // The control: a closure that names the host in a survivor's detail is lengthened by the same
@@ -1354,17 +1369,19 @@ fn the_small_records_and_the_reserve_they_make() {
     );
 }
 
-/// The widest projection header and row, from a real screen driven to fill every table a header
-/// carries, and from the header with each table stuffed to its bound.
+/// The projection header and row sizes: the header of a real screen driven to fill every table a
+/// header carries, and a hand-built upper bound with each table stuffed to its bound.
 ///
-/// The stuffed header is built from the limits of the engine's tables: ten title pairs of
+/// The stuffed header is a hand-built upper bound that the engine cannot produce: its saved
+/// cursors, its styles and its keyboard values are at `u64::MAX` where the engine keeps smaller
+/// ones. It is built from the limits of the engine's tables: ten title pairs of
 /// `kr_term::title::MAX_TITLE_BYTES` and `MAX_DEPTH`, a tab stop in each of 2,048 columns, a
 /// palette override for each of 256 indices, three hyperlinks of the largest size the engine admits,
 /// [`LINK_BYTES`] less the semicolon that parts its parameters from its target (the open link and
 /// the link of each buffer's saved cursor), a saved cursor for each buffer, and a flag stack of
 /// [`KEYBOARD_STACK_DEPTH`] for each buffer's keyboard.
 #[test]
-fn the_widest_projection_header_and_row() {
+fn the_projection_header_and_row_sizes() {
     let cols = 2_048;
     let events = installed(cols, 24, &crowded_script(cols, true));
     let driven = header_of(&events);
@@ -1427,7 +1444,10 @@ fn the_widest_projection_header_and_row() {
     let mut table = String::from("MEASURE | the projection header\n");
     for (name, header) in [
         ("driven by a real screen", &driven),
-        ("every table at its bound", &stuffed),
+        (
+            "hand-built upper bound, every table at its bound, not an engine state",
+            &stuffed,
+        ),
         ("modes, keys and framing alone", &bare),
     ] {
         let frame = notice(PROJECTION_SNAPSHOT_EVENT, header);
@@ -1451,7 +1471,7 @@ fn the_widest_projection_header_and_row() {
     let stuffed_frame = frame_len(&shown(&notice(PROJECTION_SNAPSHOT_EVENT, &stuffed)));
     writeln!(
         table,
-        "MEASURE | the header with every table at its bound: frame {stuffed_frame} | against the floor {FLOOR}: {} | against the transport's floor {TRANSPORT_FLOOR}: {}",
+        "MEASURE | the hand-built upper-bound header (not an engine state): frame {stuffed_frame} | against the floor {FLOOR}: {} | against the transport's floor {TRANSPORT_FLOOR}: {}",
         signed_difference(stuffed_frame + FRAME_LENGTH_PREFIX_LEN, FLOOR),
         signed_difference(stuffed_frame + FRAME_LENGTH_PREFIX_LEN, TRANSPORT_FLOOR)
     )
@@ -1477,14 +1497,15 @@ fn the_widest_projection_header_and_row() {
     );
     assert!(
         stuffed_frame + FRAME_LENGTH_PREFIX_LEN <= FLOOR,
-        "the header with every table at its bound is whole at the floor of {FLOOR}, found {stuffed_frame}"
+        "the hand-built upper-bound header is whole at the floor of {FLOOR}, found {stuffed_frame}"
     );
     assert!(
         payload_len(&stuffed) >= payload_len(&driven),
         "the stuffed header is the wider one"
     );
 
-    // The widest row: two thousand and forty-eight cells, each its own run.
+    // A row of two thousand and forty-eight cells, each its own run: the costs of a run are those of
+    // styled ASCII cells, not of every rendition and text.
     let styled = styled_cells;
     let plain_runs = |cells: u32| -> Vec<u8> {
         let mut script = String::new();
@@ -1651,19 +1672,21 @@ fn the_widest_pairing_answer_and_the_widest_refusal() {
     }
     // Before a peer has said hello the door writes a bare `Response`, not a control frame around
     // one, which is a few bytes smaller; the widest answer then is an error answer.
-    let bare = |outcome: Outcome| {
-        encoded_len(
-            &to_canonical_value(&Response {
-                request_id: RequestId::new(u64::MAX),
-                outcome,
-            })
-            .expect("a response"),
-        )
+    let bare = |outcome: Outcome| Response {
+        request_id: RequestId::new(u64::MAX),
+        outcome,
     };
     let bare_challenge = bare(Outcome::Ok(
         ParamsValue::from_typed(&challenge).expect("encodes"),
     ));
     let bare_refusal = bare(Outcome::Error(widest_error.clone()));
+    assert!(
+        encoder_accepts(&bare_challenge) && encoder_accepts(&bare_refusal),
+        "the transport's encoder refuses a bare answer before hello at the compiled bound"
+    );
+    let bare_len =
+        |response: &Response| encoded_len(&to_canonical_value(response).expect("a response"));
+    let (bare_challenge, bare_refusal) = (bare_len(&bare_challenge), bare_len(&bare_refusal));
     writeln!(
         table,
         "MEASURE | before hello, a bare Response: a challenge {bare_challenge} | the widest error answer {bare_refusal}"
@@ -1709,6 +1732,11 @@ fn the_widest_pairing_answer_and_the_widest_refusal() {
             fenced_bytes: U64::new(u64::MAX),
         },
     ];
+    // An acknowledgement is not a control frame, but the same encoder limits hold it.
+    assert!(
+        encoder_accepts(&refused) && small.iter().all(encoder_accepts),
+        "the transport's encoder refuses an acknowledgement at the compiled bound"
+    );
     let refused_len = payload_len(&refused);
     let widest_small = small.iter().map(payload_len).max().expect("a variant");
     writeln!(
@@ -2084,11 +2112,12 @@ fn cut_page(
 }
 
 /// How many live instances an answer carries at the floor before the door's frame is over, with the
-/// page cut as the worker cuts it, and where the worker itself refuses the peer.
+/// page cut as the worker cuts it, and where the worker itself refuses the peer. Every count from
+/// none to the worker's refusal is tried.
 struct Fit {
-    /// The most instances for which a device receives the answer at every count tried up to it: the
-    /// count before the first at which the door's frame is over the bound. A page is cut to whole
-    /// resources, so a larger count can fit again by the room a cut leaves.
+    /// The count before the first at which the door's frame is over the bound: every count to it
+    /// fits, and it is not the greatest count that fits. A page is cut to whole resources, so a
+    /// larger count can fit again by the room a cut leaves.
     fit: usize,
     /// The most instances for which the worker still answers: one more and it refuses the peer
     /// because its frame cannot hold the answer and one resource.
@@ -2097,16 +2126,12 @@ struct Fit {
     carried: usize,
     /// The frame at `fit`, and at the first count over the bound (0 where there is none).
     frames: (usize, usize),
-    /// Of the counts sampled above `fit`, up to the worker's limit: how many are over the bound, and
-    /// how many were sampled.
-    over_above_the_fit: (usize, usize),
+    /// The counts above the first count over the bound, up to the worker's limit, at which the
+    /// door's frame fits again.
+    fits_again: Vec<usize>,
+    /// The frames whose sizes are printed: the one at `fit` and the one at the first count over.
+    printed: Vec<ControlFrame>,
 }
-
-/// Every count to this one is tried; above it, every `SCAN_STRIDE`th. The whole range costs minutes
-/// in a debug build, and the counts a device sees without a refusal that the door lengthens lie
-/// well below it.
-const SCAN_EXACT: usize = 64;
-const SCAN_STRIDE: usize = 32;
 
 /// The largest count in `0..=4_096` for which `holds` is true, taking it to be true up to a count
 /// and false beyond (the worker's refusal of a peer is: a longer list only makes the answer larger).
@@ -2166,43 +2191,39 @@ fn fit_at_the_floor<T: Serialize>(
     resources: &[kr_protocol::gateway::PendingResource],
 ) -> Fit {
     let bound = FLOOR - FRAME_LENGTH_PREFIX_LEN;
-    let shown_len = |count: usize| {
-        worker_answer(make, one, resources, count)
-            .map(|(frame, carried)| (frame_len(&shown(&frame)), carried))
+    // The answer as a device is shown it, and the pages it carries, at a count the worker answers.
+    let shown_answer = |count: usize| {
+        worker_answer(make, one, resources, count).map(|(frame, carried)| (shown(&frame), carried))
     };
-    let is_over = |count: usize| shown_len(count).is_some_and(|(frame, _)| frame > bound);
-    let worker_limit = largest_count(|count| shown_len(count).is_some());
-    // The first count the door's frame is over is found by counting up and not by halving: the frame
-    // does not grow with the count alone.
-    let mut counts: Vec<usize> = (0..=worker_limit.min(SCAN_EXACT)).collect();
-    counts.extend((SCAN_EXACT + SCAN_STRIDE..=worker_limit).step_by(SCAN_STRIDE));
-    if counts.last() != Some(&worker_limit) {
-        counts.push(worker_limit);
-    }
-    let first_sampled_over = counts.iter().position(|count| is_over(*count));
-    // Between two sampled counts the first one over is found by counting up.
-    let first_over = first_sampled_over.map(|at| {
-        let from = if at == 0 { 0 } else { counts[at - 1] + 1 };
-        (from..=counts[at])
-            .find(|count| is_over(*count))
-            .unwrap_or(counts[at])
-    });
+    let worker_limit = largest_count(|count| worker_answer(make, one, resources, count).is_some());
+    // The frame does not grow with the count alone, so every count is tried and none is skipped.
+    let frames: Vec<Option<usize>> = (0..=worker_limit)
+        .map(|count| shown_answer(count).map(|(frame, _)| frame_len(&frame)))
+        .collect();
+    let is_over = |count: usize| frames[count].is_some_and(|frame| frame > bound);
+    let first_over = (0..=worker_limit).find(|count| is_over(*count));
     let fit = first_over.map_or(worker_limit, |count| count.saturating_sub(1));
-    let (frame, carried) = shown_len(fit).expect("the worker answers at the fit");
-    let over = first_over.map_or(0, |count| shown_len(count).map_or(0, |(frame, _)| frame));
-    let above: Vec<usize> = first_over.map_or_else(Vec::new, |count| {
-        (count..=worker_limit).step_by(SCAN_STRIDE).collect()
+    let fits_again = first_over.map_or_else(Vec::new, |count| {
+        (count + 1..=worker_limit)
+            .filter(|above| frames[*above].is_some_and(|frame| frame <= bound))
+            .collect()
     });
-    let over_above_the_fit = (
-        above.iter().filter(|count| is_over(**count)).count(),
-        above.len(),
-    );
+    let (at_the_fit, carried) = shown_answer(fit).expect("the worker answers at the fit");
+    let over_frame = first_over.map(|count| {
+        shown_answer(count)
+            .expect("the worker answers at the first count over")
+            .0
+    });
     Fit {
         fit,
         worker_limit,
         carried,
-        frames: (frame, over),
-        over_above_the_fit,
+        frames: (
+            frame_len(&at_the_fit),
+            over_frame.as_ref().map_or(0, frame_len),
+        ),
+        fits_again,
+        printed: std::iter::once(at_the_fit).chain(over_frame).collect(),
     }
 }
 
@@ -2214,7 +2235,9 @@ fn fit_at_the_floor<T: Serialize>(
 /// refusal at its own length, which can be longer, and checks the frame against the bound at the
 /// floor. The case builds both answers with the page cut by the worker's own routine
 /// (`RecoveryCopies::begin` with the bounds the service works out), for three forms of refusal and
-/// for the widest and the smallest resources, with live instances, and records how many fit.
+/// for the widest and the smallest resources, with live instances. Every count of instances from none
+/// to the worker's own refusal is tried, and the case records the count to which every count fits,
+/// and the counts above the first one over that fit again.
 #[test]
 fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
     let subscribe = |agent_resources: AgentResourceSnapshot, agent_instances: AgentInstanceList| {
@@ -2253,6 +2276,7 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
     ];
     let mut table = String::from("MEASURE | the subscribe and agent.instances answers\n");
     let mut at_the_cap = Vec::new();
+    let mut host_naming = Vec::new();
     for (form, refusal) in &forms {
         let one = live_instance(refusal.clone());
         for (resources_name, resources) in [
@@ -2268,20 +2292,26 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
             ] {
                 writeln!(
                     table,
-                    "MEASURE | {kind}, {form}, {resources_name} | fit at the floor {} | the worker refuses the peer from {} instances | page carries {} resources at the fit | frame at the fit {} | frame at the first count over {} | sampled counts above the fit that are over the bound, up to the worker's refusal: {} of {}",
+                    "MEASURE | {kind}, {form}, {resources_name} | every count to {} fits at the floor | the worker refuses the peer from {} instances | page carries {} resources at that count | frame at that count {} | frame at the first count over {} | counts above the first count over that fit again, up to the worker's refusal: {:?}",
                     found.fit,
                     found.worker_limit + 1,
                     found.carried,
                     found.frames.0,
                     found.frames.1,
-                    found.over_above_the_fit.0,
-                    found.over_above_the_fit.1
+                    found.fits_again
                 )
                 .expect("a string takes a write");
+                assert!(
+                    found.printed.iter().all(encoder_accepts),
+                    "the transport's encoder refuses a printed frame: {kind}, {form}, {resources_name}"
+                );
                 if refusal.as_ref().is_some_and(|text| text.len() == 512)
                     && resources_name == "widest resources"
                 {
                     at_the_cap.push((kind, found.fit, found.carried));
+                }
+                if refusal.as_deref() == Some("/") && resources_name == "widest resources" {
+                    host_naming.push((kind, found.fit, found.fits_again));
                 }
             }
         }
@@ -2320,6 +2350,15 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
     assert!(
         at_the_cap.iter().all(|(_, fit, _)| *fit < 64),
         "fewer than 64 instances fit at the floor beside a full page of resources with refusals of the cap: {at_the_cap:?}"
+    );
+    // The page is cut to whole resources, so the frame does not grow with the count alone: some
+    // counts above the first count over fit again, and "every count to N fits" is not "N is the
+    // most that fits". Beside a refusal that names the host, the room the cut leaves decides.
+    assert!(
+        host_naming
+            .iter()
+            .all(|(_, fit, again)| again.first().is_some_and(|first| *first > *fit + 1)),
+        "counts above the first count over fit again beside a short refusal that names the host: {host_naming:?}"
     );
 }
 
