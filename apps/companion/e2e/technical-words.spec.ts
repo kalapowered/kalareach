@@ -537,12 +537,24 @@ test('the setup card title of an application identifier, at the largest text siz
   expect(reading?.lines, 'the identifier is drawn on lines').toBeGreaterThan(1)
 })
 
-test('is named to a screen reader by the source text of an identifier with hyphens, dots and an underscore in it', async ({
+test('is named, by the accessible-name algorithm, by the source text of an identifier with hyphens, dots and an underscore in it', async ({
+  page
+}) => {
+  // The name is computed by the test driver's own implementation of the algorithm in both engines. The
+  // case below reads Chromium's own tree, the one a screen reader there reads.
+  const identifier = 'com.kala-reach.my-app_x=y'
+  await openSetup(page, { application_id: identifier })
+  await expect(page.getByRole('heading', { name: identifier, exact: true })).toBeVisible()
+})
+
+test('is named in the engine accessibility tree by the source text of an identifier with hyphens, dots and an underscore in it', async ({
   browserName,
   context,
   page
 }) => {
-  test.skip(browserName !== 'chromium', "only Chromium lets the test driver read the engine's accessibility tree")
+  // The driver reads an engine's tree through that engine's own protocol, and only Chromium's (a
+  // DevTools session) offers one: WebKit has no such session, so this case runs there as the case above.
+  test.skip(browserName !== 'chromium', "only Chromium's protocol lets the test driver read the engine's accessibility tree")
   const identifier = 'com.kala-reach.my-app_x=y'
   await openSetup(page, { application_id: identifier })
   const session = await context.newCDPSession(page)
@@ -576,30 +588,40 @@ const COMMAND = [
   '--verbose'
 ]
 
+/**
+ * Every window width from the phone's narrowest, 320, to 1400, in steps of 20: 55 of them. A case
+ * reads at most 15, so that none comes near the suite's limit on a busy machine.
+ */
+const SWEEP_WIDTHS = Array.from({ length: 55 }, (_, index) => 320 + index * 20)
+const SWEEP_PER_CASE = 15
+
 test.describe('a command line quoted word by word', () => {
   for (const [size, ratio] of SIZES) {
-    test(`keeps each quoted word on one line where it fits there, ${size} text`, async ({ page }) => {
-      // Twenty-eight window widths, each measured word by word: more than the default allowance on a busy machine.
-      test.slow()
-      await openLaunchCommands(page, 'Start the debug server', COMMAND)
-      await setScale(page, ratio)
-      const height = page.viewportSize()?.height ?? 720
-      const quoted = COMMAND.map((word) => [`"${word}"`])
-      const split: string[] = []
-      for (let width = 320; width <= 1400; width += 40) {
-        await page.setViewportSize({ width, height })
-        await settle(page)
-        for (const reading of await read(page, '[data-testid="launch-commands-list"] p.mono', quoted)) {
-          if (reading.natural <= reading.room && reading.cut.length > 0) split.push(`${width} wide: ${reading.word}`)
-          expect(reading.outside, `${reading.word} beyond the line at ${width} wide`).toBe(false)
-          expect(reading.pageSideways, `the page scrolling sideways at ${width} wide`).toBe(0)
+    for (let from = 0; from < SWEEP_WIDTHS.length; from += SWEEP_PER_CASE) {
+      const widths = SWEEP_WIDTHS.slice(from, from + SWEEP_PER_CASE)
+      test(`keeps each quoted word on one line where it fits there, ${size} text, ${widths[0]} to ${widths[widths.length - 1]} wide`, async ({
+        page
+      }) => {
+        await openLaunchCommands(page, 'Start the debug server', COMMAND)
+        await setScale(page, ratio)
+        const height = page.viewportSize()?.height ?? 720
+        const quoted = COMMAND.map((word) => [`"${word}"`])
+        const split: string[] = []
+        for (const width of widths) {
+          await page.setViewportSize({ width, height })
+          await settle(page)
+          for (const reading of await read(page, '[data-testid="launch-commands-list"] p.mono', quoted)) {
+            if (reading.natural <= reading.room && reading.cut.length > 0) split.push(`${width} wide: ${reading.word}`)
+            expect(reading.outside, `${reading.word} beyond the line at ${width} wide`).toBe(false)
+            expect(reading.pageSideways, `the page scrolling sideways at ${width} wide`).toBe(0)
+          }
         }
-      }
-      expect(
-        { count: split.length, first: split.slice(0, 6) },
-        'quoted words a line ends inside although each fits a line'
-      ).toEqual({ count: 0, first: [] })
-    })
+        expect(
+          { count: split.length, first: split.slice(0, 6) },
+          'quoted words a line ends inside although each fits a line'
+        ).toEqual({ count: 0, first: [] })
+      })
+    }
   }
 })
 
