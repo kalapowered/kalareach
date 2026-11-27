@@ -713,9 +713,13 @@ async fn a_moment_the_boundary_reads_holds_for_every_later_decision() {
     drop(controller);
 }
 
-/// An offline bound the boundary finds run out on the continuous clock stops the batch, and
-/// the boundary writes nothing itself: it owes the record of the time the bound has spent, and
-/// the step outside the poll that settles the floor writes it down.
+/// KR-REQ-24.15: an offline bound the boundary finds run out on the continuous clock stops the
+/// batch, and the boundary writes nothing itself: it owes the record of the time the bound has
+/// spent, and the step outside the poll that settles the floor writes it down.
+///
+/// It shows the revalidation after a wake: an answer that was decided before a gap in which
+/// nothing ran is not written after it, because the write reads the continuous clock again at
+/// each poll and the answer holds only the bound's deadline across the gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bound_the_boundary_finds_run_out_is_written_down_outside_the_poll() {
     let temp = kr_ipc::testing::TempHost::create();

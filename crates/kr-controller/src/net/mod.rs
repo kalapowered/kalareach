@@ -4619,8 +4619,8 @@ pub(crate) mod tests {
     /// authority feed anchors the bound afresh. On clocks the test moves by hand, so no step
     /// depends on how much real time passes between two others.
     ///
-    /// It shows the wake half of the revalidation: the continuous clock counts a gap in which
-    /// nothing ran, and the first decision after it is refused whatever the wall clock then reads.
+    /// It shows the revalidation after a wake: the continuous clock counts a gap in which nothing
+    /// ran, and the first decision after it is refused whatever the wall clock then reads.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_runs_out_on_the_clock_it_was_anchored_on() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -4813,10 +4813,13 @@ pub(crate) mod tests {
         drop(controller);
     }
 
-    /// A lapse the continuous clock found is written down as the time the bound has spent, and a
-    /// write of it that failed is written once storage takes it, so a daemon started afterwards
-    /// with the request's reading still wound back refuses. The floor is not raised for it: the
-    /// lapse is not a reading of UTC.
+    /// KR-REQ-24.15: a lapse the continuous clock found is written down as the time the bound has
+    /// spent, and a write of it that failed is written once storage takes it, so a daemon started
+    /// afterwards with the request's reading still wound back refuses. The floor is not raised for
+    /// it: the lapse is not a reading of UTC.
+    ///
+    /// It shows the revalidation after a restart for a lapse that only the continuous clock
+    /// found: the time the lapse implied is on record, and the daemon that starts again refuses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_lapse_the_continuous_clock_found_is_written_down_once_storage_takes_it() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -4878,8 +4881,8 @@ pub(crate) mod tests {
     /// the record alone is enough is shown with clocks driven by hand in
     /// `a_restart_in_the_same_boot_adds_the_time_since_the_record`.
     ///
-    /// It shows the restart half of the revalidation: a bound that ran out while the daemon was
-    /// down is not revived by the daemon starting again.
+    /// It shows the revalidation after a restart: a bound that ran out while the daemon was down
+    /// is not revived by the daemon starting again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_bound_that_ran_out_while_the_daemon_was_down_is_refused_after_a_restart() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -4928,13 +4931,17 @@ pub(crate) mod tests {
         drop(controller);
     }
 
-    /// Push holds a rule's grant to the offline bound as a device's request is held, and writes down
-    /// what it finds the same way. With the wall clock still inside the bound, a rule admits
-    /// nothing once the bound has run out on the continuous clock; the time the bound spent is
-    /// written down at the refusal, and a write of it that failed stays owed until storage takes
-    /// it. A daemon started in another boot, whose wall clock and floor read the synchronisation
-    /// itself, takes the bound's time from that record and finds it run out, so the rule stays
-    /// refused. The control: inside the bound, the rule admits its recipient.
+    /// KR-REQ-24.15: push holds a rule's grant to the offline bound as a device's request is held,
+    /// and writes down what it finds the same way. With the wall clock still inside the bound, a
+    /// rule admits nothing once the bound has run out on the continuous clock; the time the bound
+    /// spent is written down at the refusal, and a write of it that failed stays owed until
+    /// storage takes it. A daemon started in another boot, whose wall clock and floor read the
+    /// synchronisation itself, takes the bound's time from that record and finds it run out, so
+    /// the rule stays refused. The control: inside the bound, the rule admits its recipient.
+    ///
+    /// It shows the revalidation after a wake, for push's rule: the first reading after the gap
+    /// admits nothing. It shows the revalidation after a reboot as far as the anchor a new boot
+    /// takes: that anchor is built by hand from the daemon's record, so no second daemon starts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn push_writes_down_the_time_an_offline_bound_spent_when_it_finds_it_run_out() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -5146,8 +5153,11 @@ pub(crate) mod tests {
         );
     }
 
-    /// A daemon restarted in the same boot adds the boot clock's time since the record, although
-    /// its wall clock and its floor read the synchronisation itself.
+    /// KR-REQ-24.15: a daemon restarted in the same boot adds the boot clock's time since the
+    /// record, although its wall clock and its floor read the synchronisation itself.
+    ///
+    /// It shows the revalidation after a restart on the record alone: the wall clock adds no time
+    /// here, so only the time on record can find the bound run out.
     #[test]
     fn a_restart_in_the_same_boot_adds_the_time_since_the_record() {
         let synchronised = 1_000_000;
@@ -5168,7 +5178,7 @@ pub(crate) mod tests {
     /// in the old boot that recorded three hundred milliseconds leaves them on record for the next
     /// boot, whose wall clock and floor read the synchronisation itself.
     ///
-    /// It shows the reboot half of the revalidation: a bound that spent its time in the old boot is
+    /// It shows the revalidation after a reboot: a bound that spent its time in the old boot is
     /// found run out in the new one, and the new boot does not start it again.
     #[test]
     fn a_reboot_keeps_the_time_a_boot_recorded() {
