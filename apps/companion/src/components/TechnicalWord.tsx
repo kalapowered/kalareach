@@ -11,19 +11,23 @@
  * What a person copies and what a screen reader reads is the source text. A place a line may end is
  * a `<wbr>` element, which adds no character; it is hidden from a screen reader because a visible
  * one makes Chromium's accessibility tree put a space at it in the name of the heading or the button
- * that holds the word. A run of hyphens and the letter after it are one box that cannot end a line,
- * so that the engine's own break after a hyphen does not open between the hyphens and the option's
- * name.
+ * that holds the word. The last hyphen of a run and the letter after it are one box that cannot end
+ * a line, so that the engine's own break after a hyphen does not open between the hyphens and the
+ * option's name. The hyphens before it are text like any other: a run wider than its line breaks
+ * inside, as the last step, and nothing is cut off.
  */
 
 import { Fragment, type ReactNode } from 'react'
 
 import { breakParts } from '../model/technical-word'
 
-/** A part, with each run of hyphens and the character after it in a box that does not break. */
+/**
+ * A part, with the last hyphen of each run and the character after it in a box that does not break.
+ * The hyphens before it stay text, so that a run wider than its line still breaks, as the last step.
+ */
 function Hyphens({ part }: { readonly part: string }): ReactNode {
-  // Splitting on a group keeps the runs, which sit at the odd places.
-  return part.split(/(-+[\s\S])/u).map((piece, index) =>
+  // Splitting on a group keeps the heads, which sit at the odd places.
+  return part.split(/(-[^-])/u).map((piece, index) =>
     index % 2 === 1 ? (
       // The pieces are positions in one part, and never reorder.
       <span key={index} className="technical-head">

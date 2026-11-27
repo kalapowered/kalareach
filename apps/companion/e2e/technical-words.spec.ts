@@ -6,8 +6,9 @@
  * `reach.co` and `mpanion`, or a pair of hyphens at the end of one line and the option's name on the
  * next. The rule held here: a line ends after a dot, a slash and the other separators, and before a
  * run of hyphens; inside a part only when that one part alone is wider than its line; nothing is cut
- * off or scrolls sideways; a quoted word of a command line stays on one line where it fits there; and
- * what a person copies is the source text, character for character.
+ * off, clipped by any ancestor or scrolling sideways, a run of hyphens wider than its line included;
+ * a quoted word of a command line stays on one line where it fits there; and what a person copies is
+ * the source text, character for character.
  *
  * Every reading is of the rendered line boxes (the rectangles of a range over each part), never of a
  * picture. The width is the part's own: each case looks for the width of the real page at which every
@@ -162,6 +163,74 @@ async function setScale(page: Page, ratio: number): Promise<void> {
 }
 
 /**
+ * Which characters of the text in the first element `selector` matches a person cannot see: each
+ * character's box is set against the window and against EVERY ancestor that clips what it holds, up
+ * to the root, not against the word's own element alone. Sideways, any overflow but visible clips: text
+ * is never reached by scrolling along a line. Down the page only hidden and clip do, and not above an
+ * ancestor that scrolls, which brings the rest into view. A character is named by itself and by the
+ * ancestor that hides it.
+ */
+function hiddenText(page: Page, selector: string): Promise<{ checked: number; hidden: string[] }> {
+  return page.evaluate((where) => {
+    const root = document.querySelector(where)
+    if (root === null) throw new Error(`nothing matches ${where}`)
+    const hidden: string[] = []
+    let checked = 0
+    const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+    for (let current = walk.nextNode(); current !== null; current = walk.nextNode()) {
+      const node = current as Text
+      const clippers: { name: string; left: number; right: number; top: number; bottom: number; x: boolean; y: boolean }[] = []
+      let scrolls = false
+      for (let up: Element | null = node.parentElement; up !== null; up = up.parentElement) {
+        const style = getComputedStyle(up)
+        const x = style.overflowX !== 'visible'
+        const clipsDown = style.overflowY === 'hidden' || style.overflowY === 'clip'
+        const scrollsDown = style.overflowY === 'auto' || style.overflowY === 'scroll'
+        // Below an ancestor that scrolls, what lies beyond a clip further up is brought into view by it.
+        const y = clipsDown && !scrolls
+        if (scrollsDown) scrolls = true
+        if (!x && !y) continue
+        const box = up.getBoundingClientRect()
+        // What overflow clips to is the padding box, inside the border.
+        clippers.push({
+          name: `${up.tagName.toLowerCase()}.${String(up.getAttribute('class') ?? '').replace(/\s+/g, '.')}`,
+          left: box.left + parseFloat(style.borderLeftWidth),
+          right: box.right - parseFloat(style.borderRightWidth),
+          top: box.top + parseFloat(style.borderTopWidth),
+          bottom: box.bottom - parseFloat(style.borderBottomWidth),
+          x,
+          y
+        })
+      }
+      for (let at = 0; at < node.length; at += 1) {
+        if (/\s/u.test(node.data.charAt(at))) continue
+        const range = document.createRange()
+        range.setStart(node, at)
+        range.setEnd(node, at + 1)
+        const rect = Array.from(range.getClientRects()).find((one) => one.width > 0)
+        if (rect === undefined) continue
+        checked += 1
+        const slack = 1
+        if (rect.left < -slack || rect.right > window.innerWidth + slack) {
+          hidden.push(`${node.data.charAt(at)} at ${Math.round(rect.left)} beyond the window`)
+          continue
+        }
+        for (const clip of clippers) {
+          const outside =
+            (clip.x && (rect.left < clip.left - slack || rect.right > clip.right + slack)) ||
+            (clip.y && (rect.top < clip.top - slack || rect.bottom > clip.bottom + slack))
+          if (outside) {
+            hidden.push(`${node.data.charAt(at)} at ${Math.round(rect.left)} clipped by ${clip.name}`)
+            break
+          }
+        }
+      }
+    }
+    return { checked, hidden: hidden.slice(0, 8) }
+  }, selector)
+}
+
+/**
  * The first window width, from the phone's narrowest, 320, up, at which the widest part of `parts`
  * fits the line it is drawn in and the whole word does not: the width at which a break must fall
  * between parts.
@@ -187,6 +256,8 @@ interface Kind {
   readonly parts: readonly string[]
   /** A word of this kind with one part wider than any line the page has. */
   readonly wide: readonly string[]
+  /** A word of this kind with a run of hyphens, between two letters, wider than any line the page has. */
+  readonly run: string
   /** A word of this kind short enough to fit on one line at the largest text size in a wide window. */
   readonly short: readonly string[]
 }
@@ -248,6 +319,9 @@ async function openLaunchCommands(page: Page, label: string, words: readonly str
 
 const LONG_PART = 'extraordinarilylongsegmentofaword'
 
+/** A hundred and sixty hyphens: a valid file name, and wider than the phone's line at any text size. */
+const HYPHENS = '-'.repeat(160)
+
 // Each is wider than any line the page has at the phone's narrowest, so that a break must fall
 // between parts, and each of its parts fits a line at the default text size and at the largest.
 const IDENTIFIER = ['com.', 'kalareach.', 'companion.', 'preview.', 'nightly']
@@ -263,6 +337,7 @@ const KINDS: readonly Kind[] = [
     shown: (word) => word,
     parts: IDENTIFIER,
     wide: ['com.', 'kalareach.', `${LONG_PART}${LONG_PART}`],
+    run: `a${HYPHENS}b`,
     short: ['to.', 'kala.', 'reach']
   },
   {
@@ -272,6 +347,7 @@ const KINDS: readonly Kind[] = [
     shown: (word) => word,
     parts: PATH,
     wide: ['/Users/', 'sam/', `${LONG_PART}${LONG_PART}/`, 'bin'],
+    run: `/Users/a${HYPHENS}b`,
     short: ['/usr/', 'local/', 'bin/', 'zsh']
   },
   {
@@ -282,6 +358,7 @@ const KINDS: readonly Kind[] = [
     shown: (word) => `"node" ${word}`,
     parts: OPTION,
     wide: [`"--${LONG_PART}${LONG_PART}"`],
+    run: `"a${HYPHENS}b"`,
     short: ['"--inspect"']
   },
   {
@@ -291,6 +368,7 @@ const KINDS: readonly Kind[] = [
     shown: (word) => word,
     parts: HOST,
     wide: ['sync.', `${LONG_PART}${LONG_PART}.`, 'com'],
+    run: `a${HYPHENS}b.com`,
     short: ['reach.', 'kala.', 'to']
   }
 ]
@@ -327,6 +405,20 @@ for (const kind of KINDS) {
           wider.filter((part) => reading?.cut.includes(part) !== true),
           'a part wider than its line is broken inside'
         ).toEqual([])
+        expect(reading?.outside, 'text beyond the line').toBe(false)
+        expect(reading?.sideways, 'content running past its box').toBe(0)
+        expect(reading?.pageSideways, 'the page scrolling sideways').toBe(0)
+      })
+
+      test('breaks a run of hyphens wider than its line as the last step, and hides none of it', async ({ page }) => {
+        await kind.open(page, kind.run)
+        await setScale(page, ratio)
+        await page.setViewportSize({ width: 320, height: page.viewportSize()?.height ?? 720 })
+        await settle(page)
+        const seen = await hiddenText(page, kind.selector)
+        expect(seen.checked, 'characters read').toBeGreaterThanOrEqual(kind.shown(kind.run).replace(/\s/gu, '').length)
+        expect(seen.hidden, 'characters that a clipping ancestor or the window edge hides').toEqual([])
+        const [reading] = await read(page, kind.selector, [[kind.run]])
         expect(reading?.outside, 'text beyond the line').toBe(false)
         expect(reading?.sideways, 'content running past its box').toBe(0)
         expect(reading?.pageSideways, 'the page scrolling sideways').toBe(0)

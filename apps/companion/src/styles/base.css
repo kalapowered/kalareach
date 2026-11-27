@@ -130,7 +130,8 @@ pre {
   overflow-wrap: anywhere;
 }
 
-/* A run of hyphens and the letter after it: the engine ends no line between them. */
+/* The last hyphen of a run and the letter after it: the engine ends no line between them. The hyphens
+   before it are text, so that a run wider than its line breaks like any other long word. */
 .technical-head {
   white-space: nowrap;
 }

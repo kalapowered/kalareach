@@ -25,11 +25,21 @@ describe('TechnicalWord', () => {
     expect(places).toHaveLength(4)
     // A place is hidden from a screen reader, which reads the words as they were.
     for (const place of places) expect(place.getAttribute('aria-hidden')).toBe('true')
-    // A run of hyphens and the letter after it are one box that cannot end a line.
+    // The last hyphen of a run and the letter after it are one box that cannot end a line.
     expect(Array.from(container.querySelectorAll('.technical-head')).map((head) => head.textContent)).toEqual([
       '-s',
-      '--l'
+      '-l'
     ])
+  })
+
+  it('keeps the hyphens of a long run before its last one as text that can break', () => {
+    const { container } = render(
+      <p>
+        <TechnicalWord text="a------b" />
+      </p>
+    )
+    expect(container.textContent).toBe('a------b')
+    expect(Array.from(container.querySelectorAll('.technical-head')).map((head) => head.textContent)).toEqual(['-b'])
   })
 
   it('draws a word with no separator as one box with no place to end a line', () => {
