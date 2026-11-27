@@ -29,6 +29,7 @@
 //! one, a token for a recording server, both thrown away with the run. Each request is run once: a
 //! result file that exists says its run was.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -88,10 +89,8 @@ fn parse(text: &str) -> Option<Request> {
     super::is_a_run_name(&request.run).then_some(request)
 }
 
-/// Reads the request a script left, when there is one that has not been run.
-#[must_use]
-pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
-    let directory = app.path().app_data_dir().ok()?.join("kr-probe");
+/// Reads the request a script left in `directory`, when there is one that has not been run.
+fn take_in(directory: &Path) -> Option<Request> {
     let text = std::fs::read_to_string(directory.join("push-request.json")).ok()?;
     let request = parse(&text)?;
     // A request is run once: the result file is the record that it was, and a relaunch for another
@@ -101,6 +100,12 @@ pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
         .join(format!("push-result-{}.txt", request.run))
         .exists())
     .then_some(request)
+}
+
+/// Reads the request a script left, when there is one that has not been run.
+#[must_use]
+pub fn take<R: Runtime>(app: &AppHandle<R>) -> Option<Request> {
+    take_in(&app.path().app_data_dir().ok()?.join("kr-probe"))
 }
 
 /// Runs what a request asks for, writing each check as it is made.
@@ -396,6 +401,45 @@ mod tests {
         assert!(
             parse(r#"{"run":"../live","origin":"http://127.0.0.1:8787"}"#).is_none(),
             "a run name that a result file cannot carry is refused"
+        );
+    }
+
+    /// A request in the application's probe directory is taken only for a run name that a result
+    /// file can carry, and only until that run has written its result file.
+    #[test]
+    fn a_request_is_taken_once_and_only_for_a_run_a_result_file_can_carry() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let request = directory.path().join("push-request.json");
+
+        assert!(
+            take_in(directory.path()).is_none(),
+            "with no request there is nothing to take"
+        );
+
+        std::fs::write(
+            &request,
+            r#"{"run":"../live","origin":"http://127.0.0.1:8787"}"#,
+        )
+        .expect("a request");
+        assert!(
+            take_in(directory.path()).is_none(),
+            "a run name that a result file cannot carry is not taken"
+        );
+
+        std::fs::write(
+            &request,
+            r#"{"run":"live","origin":"http://127.0.0.1:8787"}"#,
+        )
+        .expect("a request");
+        let taken = take_in(directory.path());
+        assert!(taken.is_some(), "a request for a valid run is taken");
+        assert_eq!(taken.map(|request| request.run).as_deref(), Some("live"));
+
+        std::fs::write(directory.path().join("push-result-live.txt"), "run=live\n")
+            .expect("a result file");
+        assert!(
+            take_in(directory.path()).is_none(),
+            "a run that has written its result file is not taken again"
         );
     }
 }
