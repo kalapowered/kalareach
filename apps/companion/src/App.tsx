@@ -19,7 +19,7 @@ import {
 import type { ActionRight } from '@kalareach/protocol'
 
 import { AccountPanel, useAccount } from './components/AccountPanel'
-import { Brand, Button, Sheet, Toast, useModalSurface } from './components/ui'
+import { Brand, Button, Sheet, Toast, closeWithSheets, useModalSurface } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
 import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
@@ -246,6 +246,14 @@ export function App(): ReactNode {
     inactive: [workspace, skipLink],
     still: true
   })
+  // An action that takes the person to another view closes what is over the page, as it closes the
+  // sheets, and the page is where the focus goes.
+  useEffect(() => {
+    if (!open) return
+    return closeWithSheets(() => {
+      closeNavigation('page')
+    })
+  }, [open, closeNavigation])
   // A choice in the drawer closes it and leaves the focus on the page that was chosen.
   const chose = (): void => {
     if (narrow) closeNavigation('page')

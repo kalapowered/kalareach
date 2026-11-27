@@ -805,6 +805,17 @@ export function closeSheets(): void {
   for (const close of Array.from(openSheets)) close()
 }
 
+/**
+ * Lets a surface that is not a sheet go with the sheets: `closeSheets` asks it to close for as long
+ * as it is registered. Returns the way to take it back.
+ */
+export function closeWithSheets(close: () => void): () => void {
+  openSheets.add(close)
+  return () => {
+    openSheets.delete(close)
+  }
+}
+
 /** What a surface that opens over the screen asks of `useModalSurface` beyond the keyboard. */
 export interface ModalSurfaceOptions {
   /** The control that takes the focus as the surface comes, in place of its first one. */

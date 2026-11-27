@@ -662,6 +662,54 @@ test.describe('the focus when the window widens over the drawer', () => {
   }
 })
 
+/** What a host asks the owner to confirm, for the message that says so. */
+const REQUEST = {
+  ceremony: 'touch_id' as const,
+  requests: [
+    {
+      reference: 'request-1',
+      host_name: 'studio',
+      title: 'Pair a new device',
+      detail: null,
+      value: 'f3c1 46fd',
+      facts: [],
+      notice: null,
+      statement: null,
+      placement: null,
+      reading: null,
+      expires_at_ms: Date.now() + 600_000,
+      checkable: true
+    }
+  ]
+}
+
+test.describe('a message that asks for confirmation while the drawer is open', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    test(`${width} points: its action closes the drawer and puts the focus on the request`, async ({ page }) => {
+      await openWindow(page, width, ratio)
+      await menuOf(page).click()
+      await itemOf(page, 'Hosts').click()
+      await expect(page.locator('.sidebar [aria-current="page"]')).toHaveText(/^Hosts/)
+      await menuOf(page).click()
+      await expect(drawerOf(page)).toBeVisible()
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, REQUEST)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('needs your confirmation')
+      await toast.getByRole('button', { name: 'Review' }).click()
+      await expect(drawerOf(page), 'the drawer is closed').toBeHidden()
+      await expectDrawerClosed(page)
+      await expect(page.locator('.sidebar [aria-current="page"]'), 'the view is the one that holds the request').toHaveText(/^Attention/)
+      await expect(page.getByTestId('confirmation-row'), 'the request holds the focus').toBeFocused()
+      expect(await page.evaluate(() => (document.querySelector('.workspace') as HTMLElement).inert), 'the page is not inert').toBe(false)
+    })
+  }
+})
+
 test.describe('the drawer on a page that scrolls', () => {
   for (const [width, ratio] of [
     [600, 1],
