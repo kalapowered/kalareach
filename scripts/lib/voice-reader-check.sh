@@ -91,7 +91,8 @@ chmod +x "$root/bin/rm"
 # The reader. It prints the text kept beside the picture it is given. Every read is recorded with the
 # home it was started with. FAKE_READER=fails makes each read fail (exit 2). FAKE_BAD_FIRST=N makes
 # the first N folders (by KR_READER_HOME, in the order they are first used) read wrong, leaving out
-# the first line of every text, as a wrong build of the system's programs leaves rows out. Like the
+# the first line of every text, as a wrong build of the system's programs leaves rows out.
+# FAKE_DROP_LAST=1 leaves out the last line of every text instead. Like the
 # system, it writes a file of compiled programs into the home folder it was started with
 # (CFFIXED_USER_HOME) the first time it runs there, unless FAKE_COMPILES=0.
 cat >"$root/reader-standin.sh" <<'STANDIN'
@@ -117,6 +118,8 @@ case "$name" in
 esac
 if [ "${FAKE_BAD_FIRST:-0}" -ge "$index" ]; then
     cat -- "${image%.png}.txt" 2>/dev/null | tail -n +2
+elif [ "${FAKE_DROP_LAST:-0}" = 1 ]; then
+    awk '{ line[NR] = $0 } END { for (i = 1; i < NR; i++) print line[i] }' "${image%.png}.txt" 2>/dev/null
 else
     cat -- "${image%.png}.txt" 2>/dev/null
 fi
@@ -248,6 +251,60 @@ make_tree fixture-complete
 run_script fixture-complete
 expect "the whole set: twelve reads" test "$(reads fixture-complete)" = 12
 expect "the whole set: the script says they read as drawn" says "$(out fixture-complete)" "the text reader read the known pictures as drawn"
+
+# ---- The rows of a text --------------------------------------------------------------------------
+
+# The fixtures of a case, and a text with its final line feed taken away.
+fixture_of() { printf '%s/%s/tree/apps/companion/test/voice/reader-fixtures/%s' "$root" "$1" "$2"; }
+without_final_line_feed() { printf '%s' "$(cat "$1")" >"$1.new" && mv "$1.new" "$1"; }
+ends_without_line_feed() { [ -n "$(tail -c 1 "$1")" ]; }
+
+# A last line with no line feed is a row like any other: the same rows as with it. A reader that gives
+# none of a one-line text must be refused for it, and one that leaves out the last line of a page must
+# be refused for the page, whether or not the file ends with a line feed.
+make_tree last-line-one-good
+without_final_line_feed "$(fixture_of last-line-one-good one-line.txt)"
+run_script last-line-one-good
+expect "a one-line text with no final line feed: the file has none" ends_without_line_feed "$(fixture_of last-line-one-good one-line.txt)"
+expect "a one-line text with no final line feed: its line is required and read" says "$(check_log last-line-one-good)" "one-line: every line of its text: passed; it must be passed"
+expect "a one-line text with no final line feed: the whole set reads as drawn" says "$(out last-line-one-good)" "the text reader read the known pictures as drawn"
+
+make_tree last-line-one-bad
+without_final_line_feed "$(fixture_of last-line-one-bad one-line.txt)"
+run_script last-line-one-bad FAKE_BAD_FIRST=9
+expect "a one-line text with no final line feed: a reader that gives none is refused" says "$(check_log last-line-one-bad)" "one-line: every line of its text: refused; it must be passed"
+expect "a one-line text with no final line feed: no wanted row is dropped to an empty-picture check" never_says "$(check_log last-line-one-bad)" "one-line: no text in a picture without any"
+
+make_tree last-line-page-with
+run_script last-line-page-with FAKE_DROP_LAST=1
+expect "a whole-page text with its final line feed: a reader that drops the last line is refused" says "$(check_log last-line-page-with)" "whole-page: every line of its text: refused; it must be passed"
+
+make_tree last-line-page-without
+without_final_line_feed "$(fixture_of last-line-page-without whole-page.txt)"
+run_script last-line-page-without FAKE_DROP_LAST=1
+expect "a whole-page text with no final line feed: the file has none" ends_without_line_feed "$(fixture_of last-line-page-without whole-page.txt)"
+expect "a whole-page text with no final line feed: a reader that drops the last line is refused" says "$(check_log last-line-page-without)" "whole-page: every line of its text: refused; it must be passed"
+
+# A row of only spacing is no row, for a text that must hold words and for the text of no-text, by the
+# rule the check before any reading uses; a text with nothing but spacing, where words are wanted, is
+# refused before any reading.
+make_tree rows-spaces-between
+printf 'Alpha beta\n   \nGamma delta\n' >"$(fixture_of rows-spaces-between line-tokens.txt)"
+run_script rows-spaces-between
+expect "a row of spaces between two lines: the text is read" says "$(check_log rows-spaces-between)" "line-tokens: every line of its text: passed; it must be passed"
+expect "a row of spaces between two lines: the whole set reads as drawn" says "$(out rows-spaces-between)" "the text reader read the known pictures as drawn"
+
+make_tree rows-no-text-spaces
+printf '   \n\n  \n' >"$(fixture_of rows-no-text-spaces no-text.txt)"
+run_script rows-no-text-spaces
+expect "a no-text file of only spaces: the picture is held to read nothing" says "$(check_log rows-no-text-spaces)" "no-text: no text in a picture without any: passed; it must be passed"
+expect "a no-text file of only spaces: the whole set reads as drawn" says "$(out rows-no-text-spaces)" "the text reader read the known pictures as drawn"
+
+make_tree rows-text-spaces-only
+printf '   \n  \n' >"$(fixture_of rows-text-spaces-only line-tokens.txt)"
+run_script rows-text-spaces-only
+expect "a text of only spaces where words are wanted: the reader reads nothing" no_reads rows-text-spaces-only
+expect "a text of only spaces where words are wanted: the log names the file" says "$(check_log rows-text-spaces-only)" "line-tokens.txt has no words"
 
 # ---- A text that does not match, and a reading that fails ----------------------------------------
 

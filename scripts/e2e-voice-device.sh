@@ -400,9 +400,24 @@ reader_fixtures=(
     no-text one-line whole-page
 )
 
+# Sets reader_rows to the rows of a fixture's text: each line that is not only spacing, the last line
+# included when the file ends without a line feed. The check of the fixtures and the check of the
+# known pictures both take their rows from here, so that a text the one accepts is the text the other
+# asserts, line for line.
+reader_rows=()
+read_reader_rows() {
+    local row
+    reader_rows=()
+    while IFS= read -r row || [ -n "$row" ]; do
+        [ -z "$(printf '%s' "$row" | tr -d '[:space:]')" ] || reader_rows+=("$row")
+    done <"$1"
+}
+
 # Whether all of those pictures are there before the reader reads any: each has a picture that is not
-# empty and a text file that can be read, the text has a line of words, except that of no-text, which
-# has none because its picture shows none, and no other file stands beside them. Without this the
+# empty and a text file that can be read, the text has at least one row, except that of no-text, which
+# has none because its picture shows none, and no other file stands beside them (a file whose name
+# starts with a dot, such as a folder viewer's own, is not looked at). A row is a line that is not
+# only spacing; a row of only punctuation is one, and no phrase of it is ever read. Without this the
 # check passes with whatever is left: a deleted pair is a picture less, and a missing text file is
 # no words wanted, which a reader that gives nothing then meets. Each fault is written to the log.
 check_the_reader_fixtures() {
@@ -420,14 +435,15 @@ check_the_reader_fixtures() {
         if [ ! -f "$dir/$name.txt" ] || [ ! -r "$dir/$name.txt" ]; then
             printf '%s.txt is missing or cannot be read\n' "$name" >>"$log_file"
             ok=1
-        elif [ "$name" = no-text ]; then
-            if [ -n "$(tr -d '[:space:]' <"$dir/$name.txt")" ]; then
+        else
+            read_reader_rows "$dir/$name.txt"
+            if [ "$name" = no-text ] && [ "${#reader_rows[@]}" -ne 0 ]; then
                 printf 'no-text.txt has words, and its picture shows none\n' >>"$log_file"
                 ok=1
+            elif [ "$name" != no-text ] && [ "${#reader_rows[@]}" -eq 0 ]; then
+                printf '%s.txt has no words, so nothing would be required of the reader\n' "$name" >>"$log_file"
+                ok=1
             fi
-        elif [ -z "$(tr -d '[:space:]' <"$dir/$name.txt")" ]; then
-            printf '%s.txt has no words, so nothing would be required of the reader\n' "$name" >>"$log_file"
-            ok=1
         fi
     done
     for file in "$dir"/*; do
@@ -484,18 +500,15 @@ for base, folders, names in os.walk(top):
 # match (the log then shows the text the reader gave), and 2 when a reading failed or could not be
 # made, which says nothing about the text and is never taken for a mismatch.
 check_the_reader_on_known_pictures() {
-    local dir="$here/apps/companion/test/voice/reader-fixtures" picture name rows row verdict mismatch=0 error=0
+    local dir="$here/apps/companion/test/voice/reader-fixtures" picture name verdict mismatch=0 error=0
     printf 'known pictures, read with the programs kept in %s\n' "${reader_home:?}" >>"$artefacts/reader-check.log"
     for name in "${reader_fixtures[@]}"; do
         picture="$dir/$name.png"
-        rows=()
-        while IFS= read -r row; do
-            [ -z "$row" ] || rows+=("$row")
-        done <"$dir/$name.txt"
-        if [ "${#rows[@]}" -eq 0 ]; then
+        read_reader_rows "$dir/$name.txt"
+        if [ "$name" = no-text ]; then
             reader_verdict passed "$name: no text in a picture without any" image_reads_nothing "$picture"
         else
-            reader_verdict passed "$name: every line of its text" image_shows "$picture" "${rows[@]}"
+            reader_verdict passed "$name: every line of its text" image_shows "$picture" ${reader_rows[@]+"${reader_rows[@]}"}
         fi
         verdict=$?
         case "$verdict" in
