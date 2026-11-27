@@ -252,8 +252,18 @@ html[data-input='keyboard'] *::after {
  *
  * The declarations for the pressed controls are important: the component and view styles load after
  * this file and state the press with rules of equal weight, which would win over these.
+ *
+ * The press shows as a state layer instead: while the pointer is down, the control's own surface
+ * takes a tint of its label's colour, one flat colour over whatever background the control has. A
+ * dark label darkens a light surface and a light label lightens a dark one, in every tone and both
+ * themes, and a focus ring is not touched. The tint leaves each label at least 4.5:1 (3:1 for a
+ * glyph) against the pressed surface; the motion spec samples it.
  */
 @media (prefers-reduced-motion: reduce) {
+  :root {
+    --press-tint: 10%;
+  }
+
   *,
   *::before,
   *::after {
@@ -274,5 +284,15 @@ html[data-input='keyboard'] *::after {
   .nav-item:active,
   .session-row:active {
     transform: none !important;
+  }
+
+  .btn:active:not(:disabled),
+  .icon-btn:active:not(:disabled),
+  .nav-item:active:not(:disabled),
+  .session-row:active:not(:disabled) {
+    background-image: linear-gradient(
+      color-mix(in srgb, currentColor var(--press-tint), transparent),
+      color-mix(in srgb, currentColor var(--press-tint), transparent)
+    ) !important;
   }
 }

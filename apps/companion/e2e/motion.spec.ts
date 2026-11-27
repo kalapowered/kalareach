@@ -413,6 +413,72 @@ async function held(page: Page, control: Locator, during: () => Promise<void>): 
   }
 }
 
+type Rgb = readonly [number, number, number]
+
+/**
+ * The colour of the pixel 3 px below the middle of a control's top edge, as the engine drew it:
+ * clear of the border, of the rounded corners and of the label, which is the control's own surface.
+ * The screenshot of that one pixel is decoded in `probe`, a page of its own, so the page under test
+ * is not touched.
+ */
+async function surfaceOf(page: Page, probe: Page, control: Locator): Promise<Rgb> {
+  const box = await control.boundingBox()
+  if (!box) throw new Error('the control has no box to sample')
+  const png = (await page.screenshot({
+    clip: { x: Math.round(box.x + box.width / 2), y: Math.round(box.y) + 3, width: 1, height: 1 }
+  })) as unknown as Uint8Array
+  const data = await probe.evaluate(async (bytes) => {
+    const image = new Image()
+    image.src = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: 'image/png' }))
+    await image.decode()
+    const canvas = document.createElement('canvas')
+    canvas.width = 1
+    canvas.height = 1
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('no canvas to decode with')
+    context.drawImage(image, 0, 0)
+    return Array.from(context.getImageData(0, 0, 1, 1).data)
+  }, Array.from(png))
+  return [data[0] ?? 0, data[1] ?? 0, data[2] ?? 0]
+}
+
+/** A colour as the messages of the case print it. */
+function show(colour: Rgb): string {
+  return colour.join(',')
+}
+
+/** The colour of the control's label. */
+async function labelOf(control: Locator): Promise<Rgb> {
+  const colour = await control.evaluate((node) => getComputedStyle(node).color)
+  const [r, g, b] = (colour.match(/[\d.]+/g) ?? []).map(Number)
+  return [r ?? 0, g ?? 0, b ?? 0]
+}
+
+/** The WCAG contrast ratio of two colours. */
+function contrast(a: Rgb, b: Rgb): number {
+  const luminance = ([r, g, b]: Rgb): number => {
+    const channel = (value: number): number => {
+      const s = value / 255
+      return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4
+    }
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+  }
+  const [x, y] = [luminance(a), luminance(b)]
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05)
+}
+
+/**
+ * Whether `to` is `from` tinted toward `label`: some channel has moved by at least 6 of 255, and no
+ * channel has moved away from the label, past the one step that rounding can account for.
+ */
+function tintedToward(from: Rgb, to: Rgb, label: Rgb): boolean {
+  const moved = from.map((value, channel) => (to[channel] ?? 0) - value)
+  return (
+    Math.max(...moved.map(Math.abs)) >= 6 &&
+    moved.every((delta, channel) => Math.abs(delta) <= 1 || delta * ((label[channel] ?? 0) - (from[channel] ?? 0)) > 0)
+  )
+}
+
 test.describe('motion', () => {
   // KR-REQ-13.20: every transition and animation the application's own stylesheets declare lasts 0
   // or 120 to 200 ms, as the engine reads it, including a declaration nested inside another rule; a
@@ -582,53 +648,105 @@ test.describe('motion', () => {
   })
 
   // KR-REQ-13.20: with reduced motion a press keeps its feedback and loses its movement. A button,
-  // an icon button, a navigation item and a session row are each held down by a real pointer press:
-  // the engine computes no transform for the control, and no transition or animation of a transform
-  // runs on it. A switch's thumb stands in its new place at once. Without reduced motion the same
-  // press scales a button, so the case cannot pass on a page where nothing ever scales.
-  test('a held press moves no control with reduced motion, and scales a button without it', async ({
+  // an icon button, a navigation item and a session row are each held down by a real pointer press,
+  // in the light and the dark theme: the engine computes no transform for the control, and no
+  // transition or animation of a transform runs on it. The press shows as a tint of the label's own
+  // colour over the control's surface: the pixel sampled inside the control moves toward the label's
+  // colour from the same pixel with the pointer resting on the control, and, with the pointer slid
+  // off while the press is held (as on a touch screen, where nothing hovers), from the pixel at
+  // rest; the label keeps its contrast against both. A switch's thumb stands in its new place at once. Without
+  // reduced motion the same press scales a button and tints nothing, so the case cannot pass on a
+  // page where nothing ever scales.
+  test('a held press moves no control with reduced motion and tints it, and scales a button without it', async ({
     page
   }) => {
-    await page.emulateMedia({ reducedMotion: 'reduce' })
-    await page.goto('/harness.html')
-    await page.evaluate(startTransformRecord)
+    const probe = await page.context().newPage()
 
-    const keepsStill = async (kind: string, control: Locator): Promise<void> => {
-      await held(page, control, async () => {
-        const pressed = await shown(control)
-        expect(pressed.transform, `${kind}: the transform of the pressed control`).toBe('none')
-        expect(pressed.moving, `${kind}: animations of a transform while it is pressed`).toEqual([])
-        expect(pressed.runs, `${kind}: transitions of a transform that started on it`).toBe(0)
-      })
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ reducedMotion: 'reduce', colorScheme })
+      await page.goto('/harness.html')
+      await page.evaluate(startTransformRecord)
+
+      // `floor` is the contrast the label needs against the pressed surface: 4.5 for text, 3 for a
+      // glyph that has no text.
+      const answers = async (kind: string, control: Locator, floor: number): Promise<void> => {
+        const where = `${kind}, ${colorScheme} theme`
+        await control.scrollIntoViewIfNeeded()
+        const box = await control.boundingBox()
+        if (!box) throw new Error(`${where}: no box to press`)
+        const rest = await surfaceOf(page, probe, control)
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+        await twoFrames(page)
+        const hovered = await surfaceOf(page, probe, control)
+        await held(page, control, async () => {
+          const pressed = await shown(control)
+          expect(pressed.transform, `${where}: the transform of the pressed control`).toBe('none')
+          expect(pressed.moving, `${where}: animations of a transform while it is pressed`).toEqual([])
+          expect(pressed.runs, `${where}: transitions of a transform that started on it`).toBe(0)
+
+          // With the pointer on the control, the press is a tint over the hover's surface.
+          const surface = await surfaceOf(page, probe, control)
+          const label = await labelOf(control)
+          expect(
+            tintedToward(hovered, surface, label),
+            `${where}: pressed ${show(surface)} against hover ${show(hovered)}`
+          ).toBe(true)
+          expect(
+            contrast(label, surface),
+            `${where}: the label ${show(label)} against the pressed surface ${show(surface)}`
+          ).toBeGreaterThanOrEqual(floor)
+
+          // With the pointer slid off and the press still held, as on a touch screen where nothing
+          // hovers, it is a tint over the surface at rest.
+          await page.mouse.move(1, 1)
+          await twoFrames(page)
+          expect(await control.evaluate((node) => node.matches(':active')), `${where}: still pressed`).toBe(true)
+          const alone = await surfaceOf(page, probe, control)
+          expect(
+            tintedToward(rest, alone, label),
+            `${where}: pressed ${show(alone)} against rest ${show(rest)}`
+          ).toBe(true)
+          expect(
+            contrast(label, alone),
+            `${where}: the label ${show(label)} against the pressed surface ${show(alone)}, no hover`
+          ).toBeGreaterThanOrEqual(floor)
+        })
+      }
+
+      const sessions = page.getByRole('button', { name: 'Sessions', exact: true })
+      await answers('navigation item', sessions, 4.5)
+      await answers('quiet button', page.getByTestId('acknowledge').first(), 4.5)
+      await answers('button', page.getByRole('button', { name: 'Open session' }).first(), 4.5)
+      await sessions.click()
+      await answers('current navigation item', sessions, 4.5)
+      await answers('primary button', page.getByRole('button', { name: 'New session', exact: true }), 4.5)
+      const row = page.getByTestId('session-row-1')
+      await answers('session row', row, 4.5)
+      await row.click()
+      await answers('settings button', page.getByTestId('open-settings'), 4.5)
+      await answers('danger button', page.getByTestId('close-session'), 4.5)
+      await page.getByTestId('open-settings').click()
+      await answers('icon button', page.getByRole('button', { name: 'Close settings', exact: true }), 3)
+
+      await page.getByRole('button', { name: 'Sharing' }).click()
+      const toggle = page.getByRole('switch', { name: 'Let a viewer answer questions' })
+      const thumb = toggle.locator('.switch-thumb')
+      const before = await shown(thumb)
+      await toggle.click()
+      await twoFrames(page)
+      const after = await shown(thumb)
+      const end =
+        (await toggle.getAttribute('aria-checked')) === 'true'
+          ? 'matrix(1, 0, 0, 1, 14, 0)'
+          : 'matrix(1, 0, 0, 1, 0, 0)'
+      expect(after.transform, `the thumb two frames after the switch is pressed, ${colorScheme} theme`).toBe(end)
+      expect(after.transform, 'the thumb has moved').not.toBe(before.transform)
+      expect(after.moving, 'animations of the thumb').toEqual([])
+      expect(after.runs, 'transitions of the thumb that started').toBe(0)
     }
 
-    const sessions = page.getByRole('button', { name: 'Sessions', exact: true })
-    await keepsStill('navigation item', sessions)
-    await sessions.click()
-    await keepsStill('primary button', page.getByRole('button', { name: 'New session', exact: true }))
-    const row = page.getByTestId('session-row-1')
-    await keepsStill('session row', row)
-    await row.click()
-    await keepsStill('button', page.getByTestId('open-settings'))
-    await keepsStill('danger button', page.getByTestId('close-session'))
-    await page.getByTestId('open-settings').click()
-    await keepsStill('icon button', page.getByRole('button', { name: 'Close settings', exact: true }))
-
-    await page.getByRole('button', { name: 'Sharing' }).click()
-    const toggle = page.getByRole('switch', { name: 'Let a viewer answer questions' })
-    const thumb = toggle.locator('.switch-thumb')
-    const before = await shown(thumb)
-    await toggle.click()
-    await twoFrames(page)
-    const after = await shown(thumb)
-    const end =
-      (await toggle.getAttribute('aria-checked')) === 'true' ? 'matrix(1, 0, 0, 1, 14, 0)' : 'matrix(1, 0, 0, 1, 0, 0)'
-    expect(after.transform, 'the thumb two frames after the switch is pressed').toBe(end)
-    expect(after.transform, 'the thumb has moved').not.toBe(before.transform)
-    expect(after.moving, 'animations of the thumb').toEqual([])
-    expect(after.runs, 'transitions of the thumb that started').toBe(0)
-
-    await page.emulateMedia({ reducedMotion: 'no-preference' })
+    // Without reduced motion the press is the scale and nothing else: no tint.
+    await page.emulateMedia({ reducedMotion: 'no-preference', colorScheme: 'light' })
     await page.goto('/harness.html')
     await page.getByRole('button', { name: 'Sessions', exact: true }).click()
     const create = page.getByRole('button', { name: 'New session', exact: true })
@@ -636,6 +754,11 @@ test.describe('motion', () => {
       await expect
         .poll(async () => (await shown(create)).scale, { message: 'the scale of a pressed button without reduced motion' })
         .toBeCloseTo(0.97, 2)
+      expect(
+        await create.evaluate((node) => getComputedStyle(node).backgroundImage),
+        'a pressed button without reduced motion has no tint'
+      ).toBe('none')
     })
+    await probe.close()
   })
 })
