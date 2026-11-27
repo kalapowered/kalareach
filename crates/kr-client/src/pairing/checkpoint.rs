@@ -79,7 +79,7 @@ const LOCK_WITHIN: Duration = Duration::from_secs(2);
 /// A device that pairs with a host again is given a new identity, so the new pairing is another one.
 /// The host's identity is what the host declared, so two hosts can declare one: the endpoint tells
 /// them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PairingId {
     /// The host's device identity.
     pub host_device_id: DeviceId,
@@ -87,6 +87,17 @@ pub struct PairingId {
     pub host_endpoint_id: EndpointKey,
     /// The identity the host gave this device.
     pub device_id: DeviceId,
+}
+
+impl std::fmt::Debug for PairingId {
+    /// The two device identities; never the endpoint, which is a key a host sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PairingId")
+            .field("host_device_id", &self.host_device_id)
+            .field("device_id", &self.device_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PairingId {
@@ -147,7 +158,7 @@ pub enum Intended {
 }
 
 /// A read of one pairing that completed, and what it answered.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Told {
     host_device_id: DeviceId,
@@ -156,6 +167,20 @@ struct Told {
     answer: Intended,
     /// When the answer last changed, in UTC milliseconds.
     at_ms: u64,
+}
+
+impl std::fmt::Debug for Told {
+    /// The two device identities, the answer and when it changed; never the endpoint, which is a
+    /// key a host sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Told")
+            .field("host_device_id", &self.host_device_id)
+            .field("device_id", &self.device_id)
+            .field("answer", &self.answer)
+            .field("at_ms", &self.at_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Told {
@@ -203,7 +228,6 @@ pub enum SnapshotCause {
 }
 
 /// The checkpoints as a restore reads them.
-#[derive(Debug)]
 pub enum Held {
     /// There is no store of paired hosts: this computer has paired with no host, as on a host that
     /// restores its own backup.
@@ -228,6 +252,27 @@ pub enum Held {
         /// The kind of reason.
         cause: SnapshotCause,
     },
+}
+
+impl std::fmt::Debug for Held {
+    /// Which read it is, the entries (each prints its generation only) and the count owed; never
+    /// the hosts the list holds, which are keys and names that a host sent.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("Absent"),
+            Self::Read { entries, owed, .. } => formatter
+                .debug_struct("Read")
+                .field("entries", entries)
+                .field("owed", owed)
+                .finish_non_exhaustive(),
+            Self::Unreadable { file, why, cause } => formatter
+                .debug_struct("Unreadable")
+                .field("file", file)
+                .field("why", why)
+                .field("cause", cause)
+                .finish(),
+        }
+    }
 }
 
 /// Whether a host owes a checkpoint, and whether it is to be asked.
