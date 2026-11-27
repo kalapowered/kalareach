@@ -328,6 +328,9 @@ pub(super) async fn dial(dial: &PairedDial) -> Result<NetworkTransport, DialFail
         pairing::transport_gave_up_unanswered,
     )
     .await;
+    if outcome.is_ok() {
+        dial.from.keep();
+    }
     outcome.map_err(|error| DialFailed {
         error,
         first,

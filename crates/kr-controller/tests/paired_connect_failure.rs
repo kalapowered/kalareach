@@ -17,7 +17,8 @@ use kr_transport::TransportError;
 use kr_transport::config::EndpointConfig;
 use net_support::connect_report::{chain_of, layer_of};
 use net_support::{
-    Device, Host, loopback, pair_keeping_the_invitation, pair_with, paired_dial, proposal,
+    Device, Host, RawDevice, loopback, pair_keeping_the_invitation, pair_with, paired_dial,
+    proposal,
 };
 
 /// The text a panic carries.
@@ -345,5 +346,16 @@ async fn a_paired_dial_keeps_its_endpoint_only_once_it_connects() {
         1,
         "the endpoint a connection was made over is not with the device once its dial is gone"
     );
+
+    // A connection that a raw reader holds is made through the dial's report and not through
+    // `try_dial`, and its dial is gone at once: its endpoint is with the device too, or the
+    // connection ends with the dial.
+    let raw = RawDevice::connect(&host, &device, &record).await;
+    assert_eq!(
+        device.dialers_kept(),
+        2,
+        "the endpoint a raw reader's connection was made over is not with the device"
+    );
+    drop(raw);
     drop(reached);
 }

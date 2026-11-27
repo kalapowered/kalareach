@@ -2137,10 +2137,7 @@ impl PairedDial {
     /// the process logged ([`connect_report`]).
     pub async fn dial(&self) -> NetworkTransport {
         match connect_report::dial(self).await {
-            Ok(transport) => {
-                self.from.keep();
-                transport
-            }
+            Ok(transport) => transport,
             Err(failed) => failed.into_panic(),
         }
     }
