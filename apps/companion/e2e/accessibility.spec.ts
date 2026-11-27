@@ -3216,8 +3216,10 @@ function distanceTo(x: number, y: number, rect: Rectangle): number {
 }
 
 /**
- * The points inside the stand-in box that lie farther than half the least size from every line rectangle of the label's text, as many
- * as `most`, spread along the box: the blank room at the ends of the lines, which no line's reach covers. The label's own inline box
+ * Up to `most` sample points inside the stand-in box, spread along it, each farther than half the least size from every line rectangle
+ * of the label's text (the distance is Euclidean and the samples lie on a grid of 3 points). The test is a distance, not the press's
+ * target: a line's target is a rectangle, so a point can lie farther than half the least size from a line and still be in a corner of
+ * that line's target, and the case does not check the samples against the targets. The label's own inline box
  * spans the stand-in box's whole width on the last row (the box sits on one line of the label, at its baseline) and takes hits there,
  * and the engines send a tap near a link's element to it: the points keep the least size and a margin of 8 points from it.
  */
@@ -3255,7 +3257,7 @@ test.describe('the words of a link', () => {
       expect(whole.length, 'rectangles that a range over the whole label gives').toBe(lines.length + 1)
       const height = Math.max(...lines.map((line) => line[3] - line[1]))
       expect(Math.max(...whole.map((rect) => rect[3] - rect[1])), 'the tallest rectangle of the range over the whole label, over one line').toBeGreaterThan(height * 2)
-      test.info().annotations.push({ type: 'measure', description: `${whole.map((rect) => `${String(Math.round(rect[2] - rect[0]))}x${String(Math.round(rect[3] - rect[1]))}`).join(' ')} (the last of the range is the box)` })
+      test.info().annotations.push({ type: 'measure', description: `${whole.map((rect) => `${String(Math.round(rect[2] - rect[0]))}x${String(Math.round(rect[3] - rect[1]))}`).join(' ')} (the first of the range is the box)` })
       // The page's reader, as the harness's record lists it, gives the lines and not that box.
       expectSameRects(await recordedWords(page, WORDS_BOXED), await textLinesOf(page, WORDS_BOXED), 'the rectangles of the words the record lists')
     })

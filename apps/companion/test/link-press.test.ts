@@ -90,8 +90,9 @@ beforeEach(() => {
   )
   // jsdom has no hit test: the element at a point is the one whose made box holds it.
   Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: hitAt })
-  // jsdom has no layout: the words of a link are read one text node at a time, and the made page gives the text of a
-  // label the box of the label, so a range over the label's text node is the label's box.
+  // jsdom has no layout: the made page gives the text of a label the box of the label. The mock answers a range over the
+  // label and a range over its text node alike (one read of the label, the label's box), so no case here tells a reader
+  // that ranges over each text node from one that ranges over the label; the browser cases do.
   Object.defineProperty(Range.prototype, 'getClientRects', {
     configurable: true,
     value(this: Range) {
