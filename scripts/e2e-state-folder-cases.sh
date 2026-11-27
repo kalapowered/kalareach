@@ -1218,6 +1218,17 @@ expect "the lookup says nothing of what the interpreter prints on either stream"
 mk "$g/home"
 gone_setup='export PYTHONHOME="$g/home"' gone_status "$g/dir" absent
 expect "the lookup of a name that is not there reads 0 with PYTHONHOME naming an empty folder" 0 "$gs"
+# The flag -S: the interpreter reads no site files. The interpreter below is linked in a folder shaped like a virtual
+# environment (pyvenv.cfg beside bin, a path file in its site-packages) whose path file ends the process with the
+# status of "gone"; without the flag the path file runs and a name that is there reads 0.
+py_exe="$(python3 -c 'import sys; print(sys.executable)')"
+py_tag="$(python3 -c 'import sys; print("python%d.%d" % sys.version_info[:2])')"
+mk "$g/venv/bin" "$g/venv/lib/$py_tag/site-packages"
+ln -s "$py_exe" "$g/venv/bin/python3"
+printf 'home = %s\ninclude-system-site-packages = false\n' "${py_exe%/*}" > "$g/venv/pyvenv.cfg"
+printf 'import os; os._exit(10)\n' > "$g/venv/lib/$py_tag/site-packages/stop.pth"
+gone_path="$g/venv/bin" gone_status "$g/dir" .kr-e2e-owner
+expect "the lookup of a name that is there reads 1 with a virtual environment whose path file ends with 10" 1 "$gs"
 
 # Where the interpreter is unavailable the cleanup's sentence says that the marker, and the folder that the walk
 # made, may still be there: the state could not be shown, which is not the same as clean.
