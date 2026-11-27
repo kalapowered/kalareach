@@ -93,6 +93,21 @@ stop_of() {
   esac
 }
 
+# What the sentences name: KR_E2E_STATE and the path $1 where a wrapper named a folder, the temporary
+# directory $2 where none did.
+subject_of() {
+  if [ -n "$1" ]; then
+    printf 'KR_E2E_STATE %s' "$1"
+  else
+    printf 'the temporary directory %s' "$2"
+  fi
+}
+
+# The sentence for a run with no wrapper and a temporary directory $1 that the rule refuses.
+tmp_sentence() {
+  printf 'e2e: refusing the temporary directory %s: it must be a folder that belongs to this account (the temporary directory may belong to root), with no symbolic link in its path, closed to writes by its group and others (the temporary directory may instead carry the sticky bit)' "$1"
+}
+
 # The sentence of the rule, for the path $1.
 sentence() {
   printf 'e2e: refusing KR_E2E_STATE %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name' "$1"
@@ -102,10 +117,10 @@ sentence() {
 # gives (the check's second refusal of that name).
 changed_clause='; the path leads to a folder other than the one it names'
 
-# The sentence for a folder of the chain that its group or others can write, for the path $1, the
-# folder $2 and its mode $3.
+# The sentence for a folder of the chain that its group or others can write, for the path $1 (empty for
+# a run with no wrapper), the folder $2 and its mode $3.
 mode_sentence() {
-  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has mode %s; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w' "$1" "$2" "$3"
+  printf 'e2e: refusing %s: its folder %s has mode %s; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w' "$(subject_of "$1" "${run_tmp:-$t}")" "$2" "$3"
 }
 
 # The sentence for a folder or marker that could not be written, for the path $1; it ends with the
@@ -200,6 +215,8 @@ expect_refused() {
     expected="$(write_sentence "$state")"
   elif [ "$refusal" = mode ]; then
     expected="$(mode_sentence "$state" "$refusal_folder" "$refusal_mode")"
+  elif [ -z "$state" ]; then
+    expected="$(tmp_sentence "${run_tmp:-$t}")"
   else
     expected="$(sentence "$state")"
   fi
@@ -370,6 +387,9 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
   mk "$t/admin-$script"
   refusal=mode refusal_folder="$t" refusal_mode=drwxrwxrwx run_ls='4242 drwxrwxrwx 5 0 0 4096 Nov 26 20:50 .' expect_refused "a temporary directory that the administrator owns and every account can write, not sticky" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
   run_ls="4242 drwxrwxrwt 5 $other_account $other_account 4096 Nov 26 20:50 ." expect_refused "a sticky temporary directory that another account owns" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
+  # The same rule holds with no wrapper: the temporary directory is checked in every run.
+  refusal=mode refusal_folder="$scratch/R777-$script" refusal_mode=drwxrwxrwx run_tmp="$scratch/R777-$script" expect_refused "no state folder named, and a temporary directory that every account can write, not sticky" "$script" "" ""
+  run_ls="4242 drwxrwxrwt 5 $other_account $other_account 4096 Nov 26 20:50 ." expect_refused "no state folder named, and a sticky temporary directory that another account owns" "$script" "" ""
   # A first folder that another account made: the top of the file system is the temporary directory,
   # and the folder below it belongs to the administrator.
   if [ "$caller" -ne 0 ]; then
@@ -510,26 +530,52 @@ for variant in same opened link folder other-marker name; do
     ok "entering the state folder after: $variant: status $wanted, nothing changed"
   fi
 done
-# A run with no folder named by a wrapper enters the folder it is given, and with none given it fails.
+# ONE way in: a run with no wrapper holds the temporary directory to the rule, makes its root in the
+# physical name that the check leaves in E2E_STATE_TMP, and walks its own folder with e2e_state_folder_take
+# like a folder that a wrapper named; it then enters that folder like any other. Nothing is entered
+# before a folder is taken, whatever is given.
 mk "$t/enter/own"
 rc="$(
   # shellcheck source=scripts/lib/e2e-state-folder.sh
 . "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
   export KR_E2E_STATE=""
   e2e_state_folder_check
-  e2e_state_folder_enter "$t/enter/own" && [ "$PWD" = "$t/enter/own" ]
-  echo "$?"
+  run="$(mktemp -d "${E2E_STATE_TMP%/}/own.XXXXXX")"
+  e2e_state_folder_take "the run's state folder $run/s" "$run/s" "${run##*/}"
+  mode="$(stat -c %a "$run/s")"
+  marker="$(cat "$run/s/.kr-e2e-owner")"
+  listed="$(ls -di "$run/s")"
+  cd / && e2e_state_folder_enter && [ "$PWD" = "$run/s" ]
+  entered=$?
+  echo "${E2E_STATE_TMP}|$([ "$E2E_STATE_FOLDER" = "$run/s" ] && echo folder)|$mode|$([ "$marker" = "${run##*/}" ] && echo marked)|$([ "${listed%% *}" = "$E2E_STATE_FOLDER_ID" ] && echo inode)|$entered"
 )"
-expect "a run with no folder named by a wrapper enters its own folder" 0 "$rc"
+expect "a run with no wrapper walks its own folder and enters it like any other" "$t|folder|700|marked|inode|0" "$rc"
 rc="$(
   # shellcheck source=scripts/lib/e2e-state-folder.sh
 . "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
   export KR_E2E_STATE=""
   e2e_state_folder_check
-  e2e_state_folder_enter > /dev/null 2>&1
+  e2e_state_folder_enter "$t/enter/own" > /dev/null 2>&1
   echo "$?"
 )"
-expect "a run with no folder named by a wrapper and none given enters nothing" 1 "$rc"
+expect "a run that has taken no folder enters nothing, whatever it is given" 1 "$rc"
+# The run's own folder is walked like the others: a root of the run that others can write is refused.
+mk "$t/enter/openrun"
+chmod 777 "$t/enter/openrun"
+before="$(snapshot "$t/enter/openrun")"
+out="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
+  export KR_E2E_STATE=""
+  e2e_state_folder_check
+  e2e_state_folder_take "the run's state folder $t/enter/openrun/s" "$t/enter/openrun/s" "openrun-owner" 2>&1
+)"
+code=$?
+expect "the run's own folder below a root that others can write is refused" "1|e2e: refusing the run's state folder $t/enter/openrun/s: its folder $t/enter/openrun has mode drwxrwxrwx; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w" "$code|$out"
+expect "nothing is made below it" "$before" "$(snapshot "$t/enter/openrun")"
 
 echo "== a folder on the way that is not the one its name gives"
 # A path that passes every look of the rule and then reaches another folder: another account that
@@ -902,6 +948,25 @@ if grep -Fxq 'state_owner="${work##*/}"' "$update" && grep -Fxq 'work="$(cd -P "
 else
   fail "e2e-update.sh does not take the owner word from the name of its physical work folder"
 fi
+
+echo "== scripts/e2e-desktop.sh, scripts/e2e-permissions.sh: the run's own folder is walked like any other"
+# On Linux both scripts stop before they make their run's root, so the lines that do it are read as text.
+take_text="e2e_state_folder_take \"the run's state folder \$run_root/s\" \"\$run_root/s\" \"\${run_root##*/}\""
+for script in e2e-desktop.sh e2e-permissions.sh; do
+  cases=$((cases + 1))
+  file="$root/scripts/$script"
+  if ! grep -Fq 'mktemp -d "${E2E_STATE_TMP%/}/' "$file"; then
+    fail "$script does not make its run's root below the physical temporary directory that the check gave"
+  elif ! grep -Fq -- "$take_text" "$file"; then
+    fail "$script does not walk its own state folder with e2e_state_folder_take"
+  elif ! grep -Fqx 'state_dir="$E2E_STATE_FOLDER"' "$file"; then
+    fail "$script does not take its state folder's name from E2E_STATE_FOLDER"
+  elif grep -Fq 'mkdir -m 700 "$state_dir"' "$file" || grep -Fq 'e2e_state_folder_enter "' "$file"; then
+    fail "$script still makes its own state folder by hand or enters one by a name it was given"
+  else
+    ok "$script walks its own state folder like a named one and enters every folder the same way"
+  fi
+done
 
 echo "e2e-state-folder-cases: $cases cases, scratch folders under $scratch"
 exit "$failed"

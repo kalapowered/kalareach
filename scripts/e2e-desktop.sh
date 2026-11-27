@@ -92,17 +92,18 @@ else
 fi
 
 # The run's own root, on the internal disk, with the binaries beside it.
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-desktop.XXXXXX")"
+run_root="$(mktemp -d "${E2E_STATE_TMP%/}/kalareach-desktop.XXXXXX")"
 # Every folder this run makes has mode 700 whatever mask the account runs with: the host's own roots
 # are owner-only and it checks them rather than assuming, and a folder this run created with
 # anything looser would be refused.
 mkdir -m 700 "$run_root/bin" "$run_root/r" "$run_root/evidence"
 # The state folder a wrapper named is the one e2e_state_folder_check made or took: its physical
-# name, with mode 700 already set from inside it. Where none was named, it is this run's own.
-state_dir="${E2E_STATE_FOLDER:-$run_root/s}"
+# name, with mode 700 already set from inside it. Where none was named, the run's own folder is made
+# and walked the same way now that its root exists, so that it is used the same way too.
 if [ -z "${E2E_STATE_FOLDER:-}" ]; then
-  mkdir -m 700 "$state_dir"
+  e2e_state_folder_take "the run's state folder $run_root/s" "$run_root/s" "${run_root##*/}"
 fi
+state_dir="$E2E_STATE_FOLDER"
 # The build products, wherever this workspace's build cache is. They are copied to the internal
 # disk before anything is started, because a process a service manager launches asks the person at
 # the machine for permission the first time it reaches a removable volume.
@@ -128,7 +129,7 @@ defined_jobs() {
   (
     # Read from inside the state folder, looked at again there, never by the name a wrapper gave:
     # a folder that is no longer the one that was checked names no job to unload.
-    if ! e2e_state_folder_enter "$state_dir"; then
+    if ! e2e_state_folder_enter; then
       : >"$run_root/evidence/state-folder-changed"
       exit 0
     fi
@@ -261,7 +262,7 @@ echo "starting the control daemon"
 # The daemon is started from the state folder's own working directory and then moved to the run's
 # root: the state folder is looked at again from inside before the daemon is given its name.
 (
-  if ! e2e_state_folder_enter "$state_dir"; then
+  if ! e2e_state_folder_enter; then
     echo "e2e: the state folder is no longer the one that was checked" >&2
     exit 1
   fi

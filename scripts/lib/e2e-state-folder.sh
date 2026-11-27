@@ -6,9 +6,13 @@
 # `KR_E2E_STATE` when it is set, so that a later run finds it. A wrapper that names the folder
 # could name the person's own state folder, and the demonstration would then start a daemon in it.
 # A script sources this file and calls `e2e_state_folder_check` before it makes or starts
-# anything, the log directory included. The check returns at once when KR_E2E_STATE is not set
-# (or is empty, which the scripts read as not set), and otherwise ends the script with status 1 and
-# says why unless all of these hold:
+# anything, the log directory included. In every run the check holds the temporary directory to
+# the rule below for it, and leaves its physical name in E2E_STATE_TMP, which is where the script
+# makes the root of its run. When KR_E2E_STATE is not set (or is empty, which the scripts read as not
+# set), the run's own state folder, made in that root, gets the same walk through
+# `e2e_state_folder_take` once it is made, so that a folder is used the same way whoever named it.
+# When KR_E2E_STATE is set, the check ends the script with status 1 and says why unless all of
+# these hold:
 #
 #   * the path has no `.`, `..` or empty component (so no `//` and no trailing `/`) and holds no
 #     line feed;
@@ -243,6 +247,11 @@ e2e_state_folder_walk() {
   e2e_state_folder_here || e2e_state_folder_fail 1
   tmp="$e2e_state_folder_name"
   e2e_state_folder_look root . || e2e_state_folder_look_failed $? "$tmp"
+  # With no path, the walk ends at the temporary directory and gives its inode and its name.
+  if [ -z "$state" ]; then
+    printf '%s %s' "$e2e_state_folder_ino" "$tmp" 2> /dev/null || e2e_state_folder_fail 3
+    return 0
+  fi
   # The name without its last slash, so that the top of the file system is read like any folder.
   base="${tmp%/}"
   case "$state" in
@@ -303,68 +312,102 @@ e2e_state_folder_walk() {
 # e2e_state_folder_check: see above. It runs in the script's own shell, so that its refusal ends
 # the script.
 e2e_state_folder_check() {
+  E2E_STATE_TMP=""
   E2E_STATE_FOLDER=""
   E2E_STATE_FOLDER_ID=""
   E2E_STATE_FOLDER_OWNER=""
-  local state="${KR_E2E_STATE:-}"
-  [ -n "$state" ] || return 0
-  local owner="${KR_E2E_STATE_OWNER:-}"
-  local result code=0 left
+  local state="${KR_E2E_STATE:-}" owner="${KR_E2E_STATE_OWNER:-}"
 
-  # The owner word: 8 to 64 characters from a short list. The list is written out, since a range
-  # such as `A-Za-z` is read by collation under some locales.
-  case "$owner" in
-    *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) e2e_state_folder_refuse "$state" ;;
-  esac
-  if [ "${#owner}" -lt 8 ] || [ "${#owner}" -gt 64 ]; then
-    e2e_state_folder_refuse "$state"
+  if [ -n "$state" ]; then
+    e2e_state_folder_subject="KR_E2E_STATE $state"
+    e2e_state_folder_wrapped=1
+    # The owner word: 8 to 64 characters from a short list. The list is written out, since a range
+    # such as `A-Za-z` is read by collation under some locales.
+    case "$owner" in
+      *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) e2e_state_folder_refuse ;;
+    esac
+    if [ "${#owner}" -lt 8 ] || [ "${#owner}" -gt 64 ]; then
+      e2e_state_folder_refuse
+    fi
+    # The path as it was written: no component that names the same or the parent folder, no empty one.
+    case "$state" in
+      *$'\n'* | *//* | */ | */. | */./* | */.. | */../*) e2e_state_folder_refuse ;;
+    esac
+  else
+    e2e_state_folder_subject="the temporary directory ${TMPDIR:-/tmp}"
+    e2e_state_folder_wrapped=0
   fi
 
-  # The path as it was written: no component that names the same or the parent folder, no empty one.
-  case "$state" in
-    *$'\n'* | *//* | */ | */. | */./* | */.. | */../*) e2e_state_folder_refuse "$state" ;;
-  esac
+  # The temporary directory is checked in EVERY run, wrapper or none: the scripts make their own root
+  # in it and read job labels from below it. The walk with no path ends at the root and leaves its
+  # physical name, which is where the scripts make that root.
+  e2e_state_folder_ask "" ""
+  # Read by the scripts that source this file.
+  # shellcheck disable=SC2034
+  E2E_STATE_TMP="${e2e_state_folder_answer#* }"
+  [ -z "$state" ] || e2e_state_folder_take "KR_E2E_STATE $state" "$state" "$owner"
+}
 
-  # The rest runs in a subshell, which changes folders and prints where it ended. The `x` after it
-  # keeps a line feed at the end of the name.
-  result="$(
-    if (e2e_state_folder_walk "$state" "$owner"); then code=0; else code=$?; fi
+# e2e_state_folder_ask <path> <owner>: runs the walk in a subshell, which changes folders and prints
+# where it ended, and leaves what it printed in e2e_state_folder_answer and its status in
+# e2e_state_folder_code. The `x` after the output keeps a line feed at the end of a name.
+e2e_state_folder_ask() {
+  local code=0
+  e2e_state_folder_answer="$(
+    if (e2e_state_folder_walk "$1" "$2"); then code=0; else code=$?; fi
     printf x
     exit "$code"
   )" || code=$?
-  result="${result%x}"
-  # The walk's status carries what it could not remove in its upper bits (see e2e_state_folder_fail).
-  left=$(((code >> 4) & 3))
-  code=$((code & 15))
-  case "$code" in
-    0) ;;
-    3) e2e_state_folder_write_failed "$state" "$left" ;;
-    4) e2e_state_folder_open "$state" "${result%% *}" "${result#* }" "$left" ;;
-    5) e2e_state_folder_refuse "$state" "the path leads to a folder other than the one it names" "$left" ;;
-    6) e2e_state_folder_listed "$state" "$result" "$left" ;;
-    *) e2e_state_folder_refuse "$state" "" "$left" ;;
-  esac
-  E2E_STATE_FOLDER_ID="${result%% *}"
-  E2E_STATE_FOLDER="${result#* }"
-  E2E_STATE_FOLDER_OWNER="$owner"
+  e2e_state_folder_answer="${e2e_state_folder_answer%x}"
+  e2e_state_folder_code="$code"
+  e2e_state_folder_report
 }
 
-# e2e_state_folder_enter [<own folder>]: changes into the state folder and looks again at what it is
-# in: the physical name that the system gives (`/bin/pwd -P`), the ORIGINAL inode (the one the walk
-# listed from inside the parent, before it entered the folder, which is what E2E_STATE_FOLDER_ID
-# holds), and the marker. It returns 1 where any of them differs. It reaches the folder by its name
-# and tests nothing of the parent: the inode and the name are what make the folder the one that was
-# checked, and only the account that owns a folder can change its mode or its owner, so the folder
+# e2e_state_folder_report: says why the last walk refused and ends the script, or returns for one that
+# passed. The walk's status carries what it could not remove in its upper bits (see
+# e2e_state_folder_fail).
+e2e_state_folder_report() {
+  local left=$(((e2e_state_folder_code >> 4) & 3)) code=$((e2e_state_folder_code & 15))
+  local result="$e2e_state_folder_answer"
+  case "$code" in
+    0) ;;
+    3) e2e_state_folder_write_failed "$left" ;;
+    4) e2e_state_folder_open "${result%% *}" "${result#* }" "$left" ;;
+    5) e2e_state_folder_refuse "the path leads to a folder other than the one it names" "$left" ;;
+    6) e2e_state_folder_listed "$result" "$left" ;;
+    *) e2e_state_folder_refuse "" "$left" ;;
+  esac
+}
+
+# e2e_state_folder_take <subject> <path> <owner>: walks <path> like a state folder that a wrapper
+# named, with the owner word <owner>, and leaves it in E2E_STATE_FOLDER, E2E_STATE_FOLDER_ID and
+# E2E_STATE_FOLDER_OWNER. A refusal names <subject> and ends the script. The check calls it for the
+# wrapper's folder; a script with no wrapper calls it for the folder of its own run, after it has made
+# the run's root in E2E_STATE_TMP, so that every use of the state folder runs the same way.
+e2e_state_folder_take() {
+  e2e_state_folder_subject="$1"
+  case "$1" in
+    "KR_E2E_STATE "*) e2e_state_folder_wrapped=1 ;;
+    *) e2e_state_folder_wrapped=0 ;;
+  esac
+  e2e_state_folder_ask "$2" "$3"
+  E2E_STATE_FOLDER_ID="${e2e_state_folder_answer%% *}"
+  E2E_STATE_FOLDER="${e2e_state_folder_answer#* }"
+  E2E_STATE_FOLDER_OWNER="$3"
+}
+
+# e2e_state_folder_enter: changes into the state folder and looks again at what it is in: the physical
+# name that the system gives (`/bin/pwd -P`), the ORIGINAL inode (the one the walk listed from inside
+# the parent, before it entered the folder, which is what E2E_STATE_FOLDER_ID holds), and the marker.
+# It returns 1 where any of them differs, and where no state folder was taken: there is ONE way in,
+# for a folder that a wrapper named and for the folder of a run's own. It reaches the folder by its
+# name and tests nothing of the parent: the inode and the name are what make the folder the one that
+# was checked, and only the account that owns a folder can change its mode or its owner, so the folder
 # gets no second owner and mode test. The caller runs it in a subshell and does its work in the
-# working directory. Where no wrapper named a folder (the check left E2E_STATE_FOLDER empty), it
-# changes into the folder given as the argument, which is inside the run's own root.
+# working directory.
 e2e_state_folder_enter() {
   local line inode _
-  if [ -z "${E2E_STATE_FOLDER:-}" ]; then
-    [ -n "${1:-}" ] || return 1
-    CDPATH='' cd -P -- "$1" 2> /dev/null || return 1
-    return 0
-  fi
+  [ -n "${E2E_STATE_FOLDER:-}" ] || return 1
   CDPATH='' cd -P -- "$E2E_STATE_FOLDER" 2> /dev/null || return 1
   e2e_state_folder_here && [ "$e2e_state_folder_name" = "$E2E_STATE_FOLDER" ] || return 1
   line="$(ls -di -- . 2> /dev/null)" || return 1
@@ -383,41 +426,49 @@ e2e_state_folder_left_words() {
   esac
 }
 
-# e2e_state_folder_refuse <path> [<words> [<left>]]: says that the rule is not met and ends the
-# script. Where the check gives words, they follow the sentence after a semicolon, and what the walk
-# could not remove follows them; all are fixed words of the check, never a name that arrived.
+# The sentences name the subject of the walk that refused (e2e_state_folder_subject): `KR_E2E_STATE`
+# and its path where a wrapper named the folder, `the temporary directory` for the root rule that
+# every run is held to, and the run's own folder for a run with no wrapper.
+
+# e2e_state_folder_refuse [<words> [<left>]]: says that the rule is not met and ends the script. Where
+# the check gives words, they follow the sentence after a semicolon, and what the walk could not remove
+# follows them; all are fixed words of the check, never a name that arrived.
 e2e_state_folder_refuse() {
-  local words="${2:-}" left
-  left="$(e2e_state_folder_left_words "${3:-0}")"
+  local words="${1:-}" left
+  left="$(e2e_state_folder_left_words "${2:-0}")"
   [ -z "$left" ] || words="${words:+$words; }$left"
-  printf 'e2e: refusing KR_E2E_STATE %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name%s\n' "$1" "${words:+; $words}" >&2
+  if [ "$e2e_state_folder_wrapped" = 1 ]; then
+    printf 'e2e: refusing %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name%s\n' "$e2e_state_folder_subject" "${words:+; $words}" >&2
+  else
+    printf 'e2e: refusing %s: it must be a folder that belongs to this account (the temporary directory may belong to root), with no symbolic link in its path, closed to writes by its group and others (the temporary directory may instead carry the sticky bit)%s\n' "$e2e_state_folder_subject" "${words:+; $words}" >&2
+  fi
   exit 1
 }
 
-# e2e_state_folder_open <path> <mode> <folder> [<left>]: says which folder of the chain can be written
-# by its group or by others, with its mode, and ends the script.
+# e2e_state_folder_open <mode> <folder> [<left>]: says which folder of the chain can be written by its
+# group or by others, with its mode, and ends the script.
 e2e_state_folder_open() {
   local left
-  left="$(e2e_state_folder_left_words "${4:-0}")"
-  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has mode %s; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w%s\n' "$1" "$3" "$2" "${left:+; $left}" >&2
+  left="$(e2e_state_folder_left_words "${3:-0}")"
+  printf 'e2e: refusing %s: its folder %s has mode %s; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w%s\n' "$e2e_state_folder_subject" "$2" "$1" "${left:+; $left}" >&2
   exit 1
 }
 
-# e2e_state_folder_listed <path> <folder> [<left>]: says which folder of the chain has an access list
-# entry, which can let another account write it whatever its mode says, and ends the script.
+# e2e_state_folder_listed <folder> [<left>]: says which folder of the chain has an access list entry,
+# which can let another account write it whatever its mode says, and ends the script.
 e2e_state_folder_listed() {
   local left
-  left="$(e2e_state_folder_left_words "${3:-0}")"
-  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has an access list entry, which can let another account write it; every folder from the temporary directory down to the state folder must have none, so remove the list, for example with chmod -N%s\n' "$1" "$2" "${left:+; $left}" >&2
+  left="$(e2e_state_folder_left_words "${2:-0}")"
+  printf 'e2e: refusing %s: its folder %s has an access list entry, which can let another account write it; every folder from the temporary directory down to the state folder must have none, so remove the list, for example with chmod -N%s\n' "$e2e_state_folder_subject" "$1" "${left:+; $left}" >&2
   exit 1
 }
 
-# e2e_state_folder_write_failed <path> [<left>]: says that the folder, its mode, its owner marker or
-# the hand-over of the result could not be written, and ends the script. It says that nothing was
-# kept only where the walk removed everything it made; otherwise it says what is left.
+# e2e_state_folder_write_failed [<left>]: says that the folder, its mode, its owner marker or the
+# hand-over of the result could not be written, and ends the script. It says that nothing was kept
+# only where the walk removed everything it made; otherwise it says what is left.
 e2e_state_folder_write_failed() {
   local left
-  left="$(e2e_state_folder_left_words "${2:-0}")"
-  printf 'e2e: could not prepare KR_E2E_STATE %s: its folder, its mode or its owner marker could not be written; %s\n' "$1" "${left:-nothing that this check made was kept}" >&2
+  left="$(e2e_state_folder_left_words "${1:-0}")"
+  printf 'e2e: could not prepare %s: its folder, its mode or its owner marker could not be written; %s\n' "$e2e_state_folder_subject" "${left:-nothing that this check made was kept}" >&2
   exit 1
 }

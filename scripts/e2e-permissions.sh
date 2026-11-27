@@ -128,17 +128,18 @@ if [ -z "$checks_binary" ] || [ ! -x "$checks_binary" ]; then
 fi
 
 # The run's own root, on the internal disk, with the binaries beside it.
-run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-permissions.XXXXXX")"
+run_root="$(mktemp -d "${E2E_STATE_TMP%/}/kalareach-permissions.XXXXXX")"
 # Every folder this run makes has mode 700 whatever mask the account runs with: the host's own roots
 # are owner-only and it checks them rather than assuming.
 mkdir -m 700 "$run_root/bin" "$run_root/r" "$run_root/evidence" "$run_root/scratch" \
   "$run_root/authorised"
 # The state folder a wrapper named is the one e2e_state_folder_check made or took: its physical
-# name, with mode 700 already set from inside it. Where none was named, it is this run's own.
-state_dir="${E2E_STATE_FOLDER:-$run_root/s}"
+# name, with mode 700 already set from inside it. Where none was named, the run's own folder is made
+# and walked the same way now that its root exists, so that it is used the same way too.
 if [ -z "${E2E_STATE_FOLDER:-}" ]; then
-  mkdir -m 700 "$state_dir"
+  e2e_state_folder_take "the run's state folder $run_root/s" "$run_root/s" "${run_root##*/}"
 fi
+state_dir="$E2E_STATE_FOLDER"
 programs="${KR_E2E_PROGRAMS:-${CARGO_TARGET_DIR:-$root/target}/debug}"
 for binary in kr-controller kr-worker kr; do
   if [ ! -x "$programs/$binary" ]; then
@@ -167,7 +168,7 @@ defined_jobs() {
   (
     # Read from inside the state folder, looked at again there, never by the name a wrapper gave:
     # a folder that is no longer the one that was checked names no job to unload.
-    if ! e2e_state_folder_enter "$state_dir"; then
+    if ! e2e_state_folder_enter; then
       : >"$run_root/evidence/state-folder-changed"
       exit 0
     fi
@@ -277,7 +278,7 @@ echo "starting the control daemon"
 # platform's own credential store.
 # The state folder is looked at again from inside before the daemon is given its name.
 (
-  if ! e2e_state_folder_enter "$state_dir"; then
+  if ! e2e_state_folder_enter; then
     echo "e2e: the state folder is no longer the one that was checked" >&2
     exit 1
   fi
@@ -613,7 +614,7 @@ echo "5. no account of any kind on this path"
 # what setup wrote, so this is checked by looking at it rather than by asserting it.
 # It looks from inside the state folder, looked at again there.
 if ! account_files="$(
-  e2e_state_folder_enter "$state_dir" \
+  e2e_state_folder_enter \
     && { find . -type f \( -name '*account*' -o -name '*stripe*' \
       -o -name '*firebase*' -o -name '*cloudflare*' -o -name '*apple*' \) 2>/dev/null || true; }
 )"; then
