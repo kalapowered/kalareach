@@ -510,12 +510,19 @@ mod tests {
         for len in [0, 1, MAX_PROOF_CIPHERTEXT] {
             let held = proof(len);
             let bytes = kr_cbor::to_canonical_vec(&held).expect("encodes");
-            let read: SealedCheckpointProof =
-                wire::decode(&bytes, &Limits::DEFAULT).expect("a box within the bound reads");
-            assert_eq!(read, held, "{len} bytes in CBOR");
+            let read = wire::decode::<SealedCheckpointProof>(&bytes, &Limits::DEFAULT);
+            assert_eq!(
+                read.as_ref().ok(),
+                Some(&held),
+                "{len} bytes in CBOR: a box within the bound reads: {read:?}"
+            );
             let text = serde_json::to_string(&held).expect("writes");
-            let read: SealedCheckpointProof = serde_json::from_str(&text).expect("reads");
-            assert_eq!(read, held, "{len} bytes in JSON");
+            let read = serde_json::from_str::<SealedCheckpointProof>(&text);
+            assert_eq!(
+                read.as_ref().ok(),
+                Some(&held),
+                "{len} bytes in JSON: a box within the bound reads: {read:?}"
+            );
         }
         let past = proof(MAX_PROOF_CIPHERTEXT + 1);
         let bytes = kr_cbor::to_canonical_vec(&past).expect("encodes");
