@@ -56,14 +56,15 @@ scratch="$(mktemp -d "$tmp_real/e2e-state-folder-cases.XXXXXX")" || exit 2
 t="$scratch/T"
 o="$scratch/O"
 mk "$t" "$o" || exit 2
-# A stand-in for `ls`: where FAKE_LS_LINE is set, the first `ls -ldn -- .` answers with that line, so
-# that the rule can be shown for a temporary directory that another account or the administrator
-# owns, which a run without those rights cannot make. Every other call is the real `ls`.
+# A stand-in for `ls`: where FAKE_LS_LINE is set, the first `ls -ldin -- .` (the library's one
+# listing of the temporary directory) answers with that line, so that the rule can be shown for a
+# temporary directory that another account or the administrator owns, which a run without those
+# rights cannot make. Every other call is the real `ls`.
 real_ls="$(command -v ls)" || exit 2
 mk "$scratch/fakebin" || exit 2
 cat > "$scratch/fakebin/ls" << 'FAKE'
 #!/bin/bash
-if [ -n "${FAKE_LS_LINE:-}" ] && [ "$*" = "-ldn -- ." ] && [ ! -e "$FAKE_LS_DONE" ]; then
+if [ -n "${FAKE_LS_LINE:-}" ] && [ "$*" = "-ldin -- ." ] && [ ! -e "$FAKE_LS_DONE" ]; then
   : > "$FAKE_LS_DONE"
   printf '%s\n' "$FAKE_LS_LINE"
   exit 0
@@ -362,8 +363,8 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
   refusal=mode refusal_folder="$scratch/R775-$script" refusal_mode=drwxrwxr-x run_tmp="$scratch/R775-$script" expect_refused "a temporary directory that its group can write, not sticky" "$script" "$scratch/R775-$script/mid/state" "$owner"
   # The same, where the administrator owns it, and where another account owns it even if sticky.
   mk "$t/admin-$script"
-  refusal=mode refusal_folder="$t" refusal_mode=drwxrwxrwx run_ls='drwxrwxrwx 5 0 0 4096 Nov 26 20:50 .' expect_refused "a temporary directory that the administrator owns and every account can write, not sticky" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
-  run_ls="drwxrwxrwt 5 $other_account $other_account 4096 Nov 26 20:50 ." expect_refused "a sticky temporary directory that another account owns" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
+  refusal=mode refusal_folder="$t" refusal_mode=drwxrwxrwx run_ls='4242 drwxrwxrwx 5 0 0 4096 Nov 26 20:50 .' expect_refused "a temporary directory that the administrator owns and every account can write, not sticky" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
+  run_ls="4242 drwxrwxrwt 5 $other_account $other_account 4096 Nov 26 20:50 ." expect_refused "a sticky temporary directory that another account owns" "$script" "$t/admin-$script/state" "$owner" "$t/admin-$script"
   # A first folder that another account made: the top of the file system is the temporary directory,
   # and the folder below it belongs to the administrator.
   if [ "$caller" -ne 0 ]; then
@@ -433,8 +434,8 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
   chmod 1777 "$scratch/R1777-$script"
   run_tmp="$scratch/R1777-$script" expect_accepted "a temporary directory that every account can write and that is sticky" "$script" "$scratch/R1777-$script/mid/state" "$owner"
   mk "$t/admin-ok-$script" "$t/admin-sticky-$script"
-  run_ls='drwxr-xr-x 5 0 0 4096 Nov 26 20:50 .' expect_accepted "a temporary directory that the administrator owns and others cannot write" "$script" "$t/admin-ok-$script/state" "$owner"
-  run_ls='drwxrwxrwt 5 0 0 4096 Nov 26 20:50 .' expect_accepted "a sticky temporary directory that the administrator owns" "$script" "$t/admin-sticky-$script/state" "$owner"
+  run_ls='4242 drwxr-xr-x 5 0 0 4096 Nov 26 20:50 .' expect_accepted "a temporary directory that the administrator owns and others cannot write" "$script" "$t/admin-ok-$script/state" "$owner"
+  run_ls='4242 drwxrwxrwt 5 0 0 4096 Nov 26 20:50 .' expect_accepted "a sticky temporary directory that the administrator owns" "$script" "$t/admin-sticky-$script/state" "$owner"
   mk "$scratch/own-$script"
   run_tmp="$tmp_real" expect_accepted "the temporary directory this run of the cases itself uses" "$script" "$scratch/own-$script/state" "$owner"
   expect_accepted "no state folder" "$script" "" ""
@@ -551,6 +552,193 @@ for victim in mid state; do
     ok "$label: refused with the clause, nothing written where the link points"
   fi
 done
+
+echo "== each folder is listed from inside its parent, and the folder that is entered is the one listed"
+# A case defines `stand_cd`, `stand_ls` or `stand_uname`, which stand in for `cd`, `ls` and `uname`
+# inside the subshell that stand_check runs the check in (so that no other case sees them), and
+# removes them after the call.
+# stand_check <temporary directory> <state>: sets `out` (what the check said, or `accepted` with the
+# inode and the name it left) and `code`.
+stand_check() {
+  local tmpdir="$1" state="$2"
+  out="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    if declare -F stand_cd > /dev/null; then cd() { stand_cd "$@"; }; fi
+    if declare -F stand_ls > /dev/null; then ls() { stand_ls "$@"; }; fi
+    if declare -F stand_uname > /dev/null; then uname() { stand_uname "$@"; }; fi
+    export TMPDIR="$tmpdir"
+    export KR_E2E_STATE="$state"
+    export KR_E2E_STATE_OWNER="$owner"
+    e2e_state_folder_check 2>&1
+    printf 'accepted %s %s\n' "$E2E_STATE_FOLDER_ID" "$E2E_STATE_FOLDER"
+  )"
+  code=$?
+}
+# said <label> <wanted>: the last stand_check ended with status 1 and said exactly <wanted>, or, where
+# <wanted> is `accepted`, went through.
+said() {
+  cases=$((cases + 1))
+  if [ "$2" = accepted ]; then
+    case "$out" in
+      "accepted "*) ok "$1" ;;
+      *) fail "$1: it said '$out', not an acceptance" ;;
+    esac
+  elif [ "$code" -ne 1 ]; then
+    fail "$1: it ended with status $code, not 1"
+  elif [ "$out" != "$2" ]; then
+    fail "$1: it said '$out', not '$2'"
+  else
+    ok "$1"
+  fi
+}
+# The sentence for a folder of the chain that has an access list entry, for the path $1 and the folder $2.
+acl_sentence() {
+  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has an access list entry, which can let another account write it; every folder from the temporary directory down to the state folder must have none, so remove the list, for example with chmod -N' "$1" "$2"
+}
+
+# Another closed folder of the caller's is put at the state folder's name after the listing and before
+# the change into it: the physical name stays right, so only the inode can refuse it.
+mk "$t/inode/mid/state"
+stand_cd() {
+  if [ "${3:-}" = ./state ]; then
+    mv -- "$t/inode/mid/state" "$t/inode/mid/state-aside"
+    mkdir -m 700 -- "$t/inode/mid/state"
+  fi
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/inode/mid/state"
+unset -f stand_cd
+said "another closed folder put at the state folder's name after its listing" "$(sentence "$t/inode/mid/state")$changed_clause"
+expect "the folder put there is not marked" absent "$(snapshot "$t/inode/mid/state/.kr-e2e-owner")"
+
+# The folder that the walk is in is renamed before it enters the state folder: the inode of the state
+# folder is right and its physical name is not.
+mk "$t/rename/mid/state"
+stand_cd() {
+  if [ "${3:-}" = ./state ]; then
+    mv -- "$t/rename/mid" "$t/rename/mid-aside"
+  fi
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/rename/mid/state"
+unset -f stand_cd
+said "a folder on the way renamed after the walk is in it" "$(sentence "$t/rename/mid/state")$changed_clause"
+expect "the folder reached by the renamed way is not marked" absent "$(snapshot "$t/rename/mid-aside/state/.kr-e2e-owner")"
+
+# A stand-in for `cd` enters another folder of the caller's and sets the shell's record of its
+# directory to the expected name: the record is no evidence, and the inode and the system's name are.
+mk "$t/rec/mid/state" "$t/rec/other/state"
+before="$(snapshot "$t/rec/other/state")"
+stand_cd() {
+  if [ "${3:-}" = ./state ]; then
+    builtin cd -P -- "$t/rec/other/state" && PWD="$t/rec/mid/state"
+    return
+  fi
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/rec/mid/state"
+unset -f stand_cd
+said "another folder of the caller's entered while the shell's record names the expected one" "$(sentence "$t/rec/mid/state")$changed_clause"
+expect "the other folder is as it was" "$before" "$(snapshot "$t/rec/other/state")"
+
+# The accepted folder is moved aside inside the stand-in for `cd`, after the listing, with its old name
+# a link to the same folder, and the record is set to the expected name: the inode is the listed one,
+# so only the system's physical name can refuse it.
+mk "$t/moved/mid/state"
+before="$(snapshot "$t/moved/mid/state")"
+stand_cd() {
+  if [ "${3:-}" = ./state ]; then
+    mv -- "$t/moved/mid/state" "$t/moved/mid/state-aside"
+    ln -s "$t/moved/mid/state-aside" "$t/moved/mid/state"
+    builtin cd -P -- ./state && PWD="$t/moved/mid/state"
+    return
+  fi
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/moved/mid/state"
+unset -f stand_cd
+said "the folder moved aside after its listing, its old name a link to it, the record set to the old name" "$(sentence "$t/moved/mid/state")$changed_clause"
+expect "the moved folder is as it was" "$before" "$(snapshot "$t/moved/mid/state-aside")"
+
+# The temporary directory's name is the system's: a record that names it otherwise does not change it.
+mk "$t/rootname/mid/state"
+stand_cd() {
+  builtin cd "$@" || return
+  if [ "${3:-}" = "$t" ]; then
+    PWD=/not/the/name
+  fi
+}
+stand_check "$t" "$t/rootname/mid/state"
+unset -f stand_cd
+said "a temporary directory whose name the shell's record gets wrong" accepted
+
+# The state folder is a link that points nowhere: it is a link, not a name that is free.
+mk "$t/dangling"
+ln -s "$o/dangling-target" "$t/dangling/state"
+stand_check "$t" "$t/dangling/state"
+said "a state folder that is a dangling link" "$(sentence "$t/dangling/state")"
+expect "the dangling link is not followed to make a folder" absent "$(snapshot "$o/dangling-target")"
+
+# The owner look reads an entry of another account's (the administrator's `usr`) from the folder
+# that the administrator owns and from the caller's own folder by its path: both are refused. A folder of
+# the caller's passes.
+if [ "$caller" -ne 0 ]; then
+  mk "$t/ownlook/mine"
+  rc="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    cd / && e2e_state_folder_look own ./usr > /dev/null 2>&1
+    echo "$?"
+  )"
+  expect "the owner look refuses ./usr read from the top of the file system" 1 "$rc"
+  rc="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    cd "$t" && e2e_state_folder_look own /usr > /dev/null 2>&1
+    echo "$?"
+  )"
+  expect "the owner look refuses /usr read from a folder that the caller owns" 1 "$rc"
+  rc="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    cd "$t/ownlook" && e2e_state_folder_look own ./mine > /dev/null 2>&1
+    echo "$?"
+  )"
+  expect "the owner look passes a folder of the caller's that others cannot write" 0 "$rc"
+fi
+
+# The macOS form of the listing, shown on Linux with a stand-in `uname` and a stand-in `ls` that answers
+# the listing's `-ldine` the way macOS does: the entry's own line, then one line for each access list
+# entry. The folder with such a line is refused, a closed folder with none is accepted, a sticky
+# temporary directory passes whatever it carries. A folder with a real access list on a real macOS is not
+# made here: this script runs only on Linux, and nothing of it runs on a Mac.
+acl_entry=none
+stand_uname() { printf 'Darwin\n'; }
+stand_ls() {
+  if [ "${1:-}" = -ldine ]; then
+    command ls -ldin "${@:2}" || return
+    if [ "${3:-}" = "$acl_entry" ]; then
+      printf ' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow add_file\n'
+    fi
+  else
+    command ls "$@"
+  fi
+}
+mk "$t/acl-state/mid/state" "$t/acl-mid/mid/state" "$t/acl-root/mid/state" "$t/acl-none/mid/state" "$scratch/R1777-acl/mid/state"
+chmod 1777 "$scratch/R1777-acl"
+acl_entry=./state stand_check "$t" "$t/acl-state/mid/state"
+said "a state folder with an access list entry (the macOS listing)" "$(acl_sentence "$t/acl-state/mid/state" "$t/acl-state/mid/state")"
+acl_entry=./mid stand_check "$t" "$t/acl-mid/mid/state"
+said "a folder on the way with an access list entry (the macOS listing)" "$(acl_sentence "$t/acl-mid/mid/state" "$t/acl-mid/mid")"
+acl_entry=. stand_check "$t" "$t/acl-root/mid/state"
+said "a closed temporary directory with an access list entry (the macOS listing)" "$(acl_sentence "$t/acl-root/mid/state" "$t")"
+acl_entry=none stand_check "$t" "$t/acl-none/mid/state"
+said "a closed chain with no access list entry (the macOS listing)" accepted
+acl_entry=. stand_check "$scratch/R1777-acl" "$scratch/R1777-acl/mid/state"
+said "a sticky temporary directory with an access list entry (the macOS listing)" accepted
+unset -f stand_uname stand_ls
+echo "  skipped: a folder with a real access list on a real macOS (macOS only: this script runs only on Linux, and nothing of it runs on a Mac)"
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"
