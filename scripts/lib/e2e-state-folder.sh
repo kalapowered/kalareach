@@ -554,7 +554,7 @@ e2e_state_folder_left_words() {
     4) printf 'the folder that the check made may still be there, since it could not be read' ;;
     5) printf 'the owner marker that the check wrote is still in the folder, and the folder that the check made may still be there, since it could not be read' ;;
     6) printf 'the owner marker that the check wrote may still be in the folder, since it could not be read' ;;
-    7) printf 'the folder that the check made and its owner marker may still be there, since they could not be read' ;;
+    7) printf 'the folder that the check made is still there or could not be read, and the owner marker that the check wrote may still be in it, since the marker could not be read' ;;
   esac
 }
 

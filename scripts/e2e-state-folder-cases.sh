@@ -145,7 +145,7 @@ left_both='the folder that the check made, with its owner marker, is still there
 left_unread='the folder that the check made may still be there, since it could not be read'
 left_marker_unread_folder='the owner marker that the check wrote is still in the folder, and the folder that the check made may still be there, since it could not be read'
 left_marker_unread='the owner marker that the check wrote may still be in the folder, since it could not be read'
-left_both_unread='the folder that the check made and its owner marker may still be there, since they could not be read'
+left_both_unread='the folder that the check made is still there or could not be read, and the owner marker that the check wrote may still be in it, since the marker could not be read'
 
 # What $1 holds at every depth: each entry's name, kind, mode, owner and link target, the folder's
 # own included, and a checksum of each file; or `absent`; or, for a link, where it points and what
