@@ -1361,5 +1361,14 @@ else
   ok "the header and the workflow's comment name the limit"
 fi
 
+# The step that runs these cases carries the condition of the steps before it, so that a failed earlier step
+# does not skip them.
+cases=$((cases + 1))
+if [ "$(awk '/- name: State folder cases/ { getline; print; exit }' "$root/.github/workflows/core-ci.yml")" = '        if: ${{ !cancelled() }}' ]; then
+  ok "the workflow runs the state folder cases whatever an earlier step did"
+else
+  fail "the workflow runs the state folder cases whatever an earlier step did: the line after the step's name is not its condition"
+fi
+
 echo "e2e-state-folder-cases: $cases cases, scratch folders under $scratch"
 exit "$failed"

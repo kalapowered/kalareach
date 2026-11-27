@@ -573,6 +573,7 @@ jobs:
       # runner's temporary folder whatever the mask, so the step needs no container and no system
       # setting.
       - name: State folder cases
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           cases_root="$(mktemp -d "$RUNNER_TEMP/state-folder-cases.XXXXXX")"
