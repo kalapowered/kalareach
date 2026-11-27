@@ -161,9 +161,10 @@ pub fn validate_definition(definition: &WorkflowDefinition, grant: &Grant) -> Re
 
     let mut shell_nodes = Vec::new();
     for node in &definition.nodes {
-        // A command is run as a session's root through a POSIX shell, and a reviewer is started as
-        // one by the same launch, which this platform has not. A definition that holds either is
-        // refused when it is offered rather than at each dispatch.
+        // A command runs as the root of a session through a POSIX shell, and a review asks the
+        // rights of a program start for the reviewer's program. A platform that cannot launch a
+        // program that way refuses a definition that holds either when it is offered, rather than
+        // at each dispatch.
         if cfg!(windows) && needs_root_program(node.action_kind) {
             return Err(AutomationError::ActionUnavailable {
                 action_kind: node.action_kind,
