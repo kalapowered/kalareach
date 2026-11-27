@@ -84,6 +84,8 @@ describe('the identity setup checks before anything else', () => {
       /Install a signed build before granting anything/
     )
     expect(screen.getByTestId('setup-signature').textContent).toMatch(/ad-hoc signature/)
+    // The identifier the signature is on is a technical word.
+    expect(screen.getByTestId('setup-signature').querySelector('.technical-word')).not.toBeNull()
   })
 
   it('states what no check can establish, wherever the identity is shown', async () => {

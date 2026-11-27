@@ -304,6 +304,8 @@ describe('the code', () => {
     )
     // It does not claim the email was sent beside the line that says that is not known.
     expect(within(setup.panel).getByTestId('delete-account-lead')).toHaveTextContent('may have been sent')
+    // The address the code may have gone to is a technical word.
+    expect(within(setup.panel).getByTestId('delete-account-lead').querySelector('.technical-word')).not.toBeNull()
   })
 
   it('offers the dangerous control last but for Cancel', async () => {
