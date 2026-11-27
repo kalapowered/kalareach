@@ -565,6 +565,11 @@ mod tests {
     /// holds, so its write cannot complete until the worker reads it. A worker that never reads is
     /// therefore met by a write that is still waiting when the worker closes, whatever the
     /// scheduler does, and nothing but the worker's close or shutdown ends that write.
+    ///
+    /// That holds where the two buffers of a local socket hold less than the hello, about 1 MiB.
+    /// The system's default sizes on macOS and Linux do, by a wide margin; this code does not set
+    /// or read the sizes, so a host that raised them past the hello would let the write finish
+    /// before the close, and the cases would then pass without reaching a failed write.
     #[cfg(unix)]
     async fn bridge_meets(action: WorkerAction) -> Result<(), ExchangeError> {
         let host = kr_ipc::testing::TempHost::create();
@@ -770,6 +775,8 @@ mod tests {
     }
 
     /// A worker that reads the hello and then closes is a refusal too, from the read that follows.
+    /// This case holds the read side of the same answer and is green with or without the mapping of
+    /// a failed hello write.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_worker_that_reads_the_hello_and_closes_is_a_refusal() {
