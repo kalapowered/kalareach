@@ -100,7 +100,10 @@ pub fn write_wait(folder: &std::path::Path, line: &str) -> Result<(), String> {
         .append(true)
         .open(folder.join(WAIT_RECORD))
         .map_err(|error| failed("the file could not be opened", &error))?;
-    writeln!(file, "{line}").map_err(|error| failed("the line could not be written", &error))
+    // The line and its newline go out in one write, so that two waits that end at the same time
+    // cannot mix their lines in the file.
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(|error| failed("the line could not be written", &error))
 }
 
 fn wait_not_kept(why: &str) -> String {
