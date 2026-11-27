@@ -354,6 +354,25 @@ async function expectFocusOnPage(page: Page, label: string | RegExp): Promise<vo
   }
 }
 
+/**
+ * A person can see where `control` is, so a focus on it is seen: the control is drawn inside the
+ * window, and what the window shows at its centre is the control and nothing over it.
+ */
+async function expectDrawnInWindow(control: Locator, what: string): Promise<void> {
+  await expect(control, `${what}: it is drawn`).toBeVisible()
+  const seen = await control.evaluate((element) => {
+    const box = element.getBoundingClientRect()
+    const x = box.x + box.width / 2
+    const y = box.y + box.height / 2
+    return {
+      inside: box.width > 0 && box.height > 0 && x >= 0 && y >= 0 && x <= window.innerWidth && y <= window.innerHeight,
+      uncovered: element.contains(document.elementFromPoint(x, y))
+    }
+  })
+  expect(seen.inside, `${what}: it lies inside the window`).toBe(true)
+  expect(seen.uncovered, `${what}: nothing is over it`).toBe(true)
+}
+
 /** Presses Shift+Tab until the focus is on `menu`. */
 async function backToMenu(page: Page, menu: Locator): Promise<void> {
   for (let press = 0; press < 10; press += 1) {
@@ -776,9 +795,13 @@ test.describe('the window as it is at 721 points and wider', () => {
     await expect(current, 'the focus stays on the item it was on').toBeFocused()
     await page.getByRole('button', { name: /^Hosts/ }).click()
     await expect(page.locator('.sidebar [aria-current="page"]')).toHaveText(/^Hosts/)
-    // Narrowed again, the drawer is closed and ready, and nothing travelled to put it there.
+    // Narrowed again, the drawer is closed and ready, nothing travelled to put it there, and the
+    // focus, which the sidebar's item has, is on "Menu".
+    await page.getByRole('button', { name: /^Hosts/ }).focus()
     await watchTravel(page)
     await page.setViewportSize({ width: 600, height: HEIGHT })
+    await expect(menuOf(page), 'the sidebar item that had the focus hands it to "Menu"').toBeFocused()
+    await expectDrawnInWindow(menuOf(page), 'the focus on "Menu"')
     await expect(menuOf(page)).toHaveAttribute('aria-expanded', 'false')
     await expect(drawerOf(page)).toBeHidden()
     await expect.poll(() => sidebarLeft(page)).toBeLessThanOrEqual(-238)
@@ -832,6 +855,56 @@ test.describe('the focus when the window widens over the drawer', () => {
       await page.keyboard.press('Escape')
       await expect(sheet).toBeHidden()
       await expect(currentItem(page), 'the focus returns to the item of the destination that is shown').toBeFocused()
+    })
+  }
+})
+
+/**
+ * A window narrowed below 720 points puts the sidebar out of reach: it is the closed drawer, and
+ * "Menu" is the control that stands for it. Whatever of the sidebar had the focus, and whatever was
+ * to return the focus to it, goes to "Menu", which is drawn inside the window with nothing over it.
+ * The drawer does not open: a resize is not an act that the drawer answers.
+ */
+test.describe('the focus when the window narrows over the standing sidebar', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    for (const [what, control] of [
+      ['the item of the destination that is shown', '.sidebar [aria-current="page"]'],
+      ['the Account item', '.sidebar .nav-item-account']
+    ] as const) {
+      test(`${width} points: ${what} had the focus, and "Menu" has it now`, async ({ page }) => {
+        await openWindow(page, 800, ratio)
+        await expect(menuOf(page)).toHaveCount(0)
+        await page.locator(control).focus()
+        await expect(page.locator(control)).toBeFocused()
+        await page.setViewportSize({ width, height: HEIGHT })
+        await expect(menuOf(page), 'the focus is on "Menu"').toBeFocused()
+        await expectDrawnInWindow(menuOf(page), 'the focus on "Menu"')
+        await expect(menuOf(page), 'the drawer did not open').toHaveAttribute('aria-expanded', 'false')
+        await expectDrawerClosed(page)
+      })
+    }
+
+    test(`${width} points: Account was opened from the wide sidebar, and closing it after the window narrowed returns to "Menu"`, async ({
+      page
+    }) => {
+      await openWindow(page, 800, ratio)
+      // By the keyboard: a press does not give a button the focus in every engine, and where it has
+      // none to give there is no control that the focus could return to.
+      await page.locator('.sidebar .nav-item-account').focus()
+      await page.keyboard.press('Enter')
+      const sheet = page.getByRole('dialog', { name: 'Account' })
+      await expect(sheet).toBeVisible()
+      await page.setViewportSize({ width, height: HEIGHT })
+      await expect(menuOf(page)).toBeVisible()
+      await page.keyboard.press('Escape')
+      await expect(sheet).toBeHidden()
+      await expect(menuOf(page), 'the focus returns to "Menu"').toBeFocused()
+      await expectDrawnInWindow(menuOf(page), 'the focus on "Menu"')
+      await expect(menuOf(page), 'the drawer did not open').toHaveAttribute('aria-expanded', 'false')
+      await expectDrawerClosed(page)
     })
   }
 })

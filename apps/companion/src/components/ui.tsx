@@ -821,9 +821,9 @@ export interface ModalSurfaceOptions {
   /** The control that takes the focus as the surface comes, in place of its first one. */
   readonly firstStop?: () => HTMLElement | null
   /**
-   * Where the focus goes as the surface goes when the element that had it as the surface came is no
-   * longer in the page (a control that the window's new form took away): a surface that went to the
-   * page's body would leave the person nowhere.
+   * Where the focus goes as the surface goes when the element that had it as the surface came cannot
+   * hold the focus now (a control that the window's new form took away, or one that it hid): a surface
+   * that went to the page's body would leave the person nowhere.
    */
   readonly whenGone?: () => HTMLElement | null
   /**
@@ -923,7 +923,12 @@ export function useModalSurface(
       const lost = active === null || active === document.body
       if (asked.returnTo === undefined) {
         const from = restoreFocus.current
-        if (lost) (from !== null && !from.isConnected ? asked.whenGone?.() : from)?.focus()
+        if (lost && from !== null) {
+          // Whether the control can hold the focus now is asked of the page, not of the control: it can
+          // be in the page and still be hidden or inert, as the sidebar is once the window has narrowed.
+          from.focus()
+          if (document.activeElement !== from) asked.whenGone?.()?.focus()
+        }
       } else if (lost || element.contains(active)) {
         // What closed the surface said where the focus goes; a focus left inside it would be lost
         // to the page's body as the surface is hidden.

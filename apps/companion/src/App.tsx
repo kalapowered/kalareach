@@ -89,18 +89,28 @@ function useClipped(ref: RefObject<HTMLElement | null>, text: string | null): { 
 /**
  * Whether the window is narrow now, and again each time it becomes or stops being so. The element
  * that has the focus when the window changes form is kept in `held`: the change is told before the
- * page is drawn again, while the controls the new form takes away are still there.
+ * page is drawn again, while the controls the new form takes away are still there. An engine that
+ * draws the new form first has taken the focus off a control that the form hides, and `held` is that one.
  */
 function useNarrow(held: { current: Element | null }): boolean {
   const subscribe = useCallback(
     (notify: () => void): (() => void) => {
       const query = window.matchMedia(NARROW)
+      let form = query.matches
+      // An engine may draw the new form before it tells of the change, and by then it has taken the
+      // focus off a control that the new form hides: that control is the one that held it.
+      const blurred = (event: FocusEvent): void => {
+        if (query.matches !== form && event.target instanceof Element) held.current = event.target
+      }
       const changed = (): void => {
-        held.current = document.activeElement
+        form = query.matches
+        held.current ??= document.activeElement
         notify()
       }
+      document.addEventListener('focusout', blurred, true)
       query.addEventListener('change', changed)
       return () => {
+        document.removeEventListener('focusout', blurred, true)
         query.removeEventListener('change', changed)
       }
     },
@@ -260,12 +270,20 @@ export function App(): ReactNode {
       null,
     []
   )
-  // A window widened past the drawer's width takes "Menu" and "Close menu" away. When one of them
-  // had the focus it goes to the item of the destination that is shown, where the sidebar now stands.
+  // A window that changes form takes some controls away. Narrowed, the sidebar becomes the closed
+  // drawer, and a control of it that had the focus hands it to "Menu", the control that now stands for
+  // the sidebar; the drawer does not open, for a resize is not an act that it answers. Widened,
+  // "Menu" and "Close menu" go, and when one of them had the focus it goes to the item of the
+  // destination that is shown, where the sidebar now stands.
   useLayoutEffect(() => {
     const held = heldAtChange.current
     heldAtChange.current = null
-    if (narrow || !(held instanceof HTMLElement) || !held.hasAttribute('data-menu-control')) return
+    if (!(held instanceof HTMLElement)) return
+    if (narrow) {
+      if (sidebar.current?.contains(held) === true) menu.current?.focus()
+      return
+    }
+    if (!held.hasAttribute('data-menu-control')) return
     const item = firstStop()
     focusAfter.current = item
     item?.focus()
