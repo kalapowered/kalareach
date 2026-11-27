@@ -1516,6 +1516,54 @@ fn kr_req_12_19_a_package_that_names_the_digest_beats_one_whose_range_admits_the
     );
 }
 
+/// KR-REQ-12.19: a signed record whose version for the program's build is no package version names
+/// no version. The package that holds it neither covers the program nor refuses it, so it ranks
+/// with a package that knows nothing of the build: its range is not applied to text that is no
+/// version, and a tie names no version for it. The same record naming a version binds the package.
+#[test]
+fn kr_req_12_19_a_build_record_whose_version_is_no_package_version_names_no_version() {
+    let claims = |version: &'static str| {
+        Setup::with(fixture::COMMAND, move |store, bin| {
+            let program = bin.join(fixture::COMMAND);
+            vec![
+                Claim::new("one")
+                    .range(">=1.0.0, <2.0.0")
+                    .named(version)
+                    .package(store, &program),
+                Claim::new("two").package(store, &program),
+            ]
+        })
+    };
+
+    let setup = claims("latest");
+    let recognition = decision(&setup);
+    assert_eq!(
+        tied(&recognition),
+        Some(vec!["kalareach/one".to_owned(), "kalareach/two".to_owned()]),
+        "a record that names \"latest\" makes its package neither cover the program nor refuse it"
+    );
+    let versions: Vec<Option<&str>> = match &recognition {
+        Recognition::Tied(tie) => tie
+            .packages
+            .iter()
+            .map(|package| package.version.as_deref())
+            .collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(
+        versions,
+        vec![None, None],
+        "the tie names no version for either package"
+    );
+
+    let setup = claims("1.4.0");
+    assert_eq!(
+        selected(&decision(&setup)).as_deref(),
+        Some("kalareach/one"),
+        "the same record naming a version that the range admits binds the package"
+    );
+}
+
 /// KR-REQ-12.19: a package that covers the version beats one that names an installation location
 /// and refuses it, and with no record of the version the location decides as before.
 #[test]
