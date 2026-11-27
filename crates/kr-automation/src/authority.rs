@@ -85,10 +85,10 @@ pub const fn node_rights(action_kind: WorkflowActionKind) -> &'static [ActionRig
             ActionRight::SessionClose,
             ActionRight::WorkspaceManage,
         ],
-        // A review starts the reviewer, an agent, as the root of a session of its own, which a node
-        // that runs a command does too: it needs the rights of that and of the copy of the version
-        // it reviews. It then asks the agent to do something, which is `agent.prompt`, and reads
-        // it back through the session it ran in, which is `session.view`.
+        // A review node asks the rights of a program start, as a node that runs a command does:
+        // the rights of that and of the copy of the version it reviews. It then asks the agent to
+        // do something, which is `agent.prompt`, and reads it back through the session it ran in,
+        // which is `session.view`.
         WorkflowActionKind::RequestReview => &[
             ActionRight::TerminalInput,
             ActionRight::SessionCreate,
@@ -196,14 +196,14 @@ pub fn check_node(
             node.node_id, grant.grant_id
         )));
     }
-    // A review node starts the reviewer, a program of the definition's choosing, as the root of a
-    // session of its own in the selected environment, so it is held to the same grant.
+    // A review node asks the rights of a program start in a session that does not exist yet, so
+    // it is held to the same grant as a node that runs a command.
     if node.action_kind == WorkflowActionKind::RequestReview
         && !matches!(grant.session_selector, SessionSelector::Any)
     {
         return Err(AutomationError::PermissionDenied(format!(
-            "node {} starts the reviewer as the root of a session of its own, and grant {} does \
-             not select every session in the environment",
+            "node {} asks for a session that does not exist yet, so its grant must select every \
+             session in the environment, and grant {} does not",
             node.node_id, grant.grant_id
         )));
     }

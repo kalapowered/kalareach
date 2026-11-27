@@ -413,8 +413,8 @@ fn run_tests_stays_refused_on_windows_when_offered() {
     );
 }
 
-/// KR-REQ-25.14: a review node starts the reviewer as the root of a session through the platform's
-/// own launch, which Windows has not for it, so a definition that holds one is refused when it is
+/// KR-REQ-25.14: a review node asks the rights of a program start through the platform's own
+/// launch, which Windows has not for it, so a definition that holds one is refused when it is
 /// offered on Windows, as one that holds a command node is.
 #[cfg(windows)]
 #[test]
@@ -430,7 +430,7 @@ fn a_review_node_is_refused_when_offered_on_windows() {
         vec![],
     );
     let refusal = validate_definition(&definition, &make_dummy_grant(test_grant_id(1), true))
-        .expect_err("Windows starts no reviewer as the root of a session");
+        .expect_err("Windows offers no program start for a review node");
     assert!(
         matches!(
             refusal,

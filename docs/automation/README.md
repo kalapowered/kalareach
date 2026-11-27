@@ -151,8 +151,9 @@ it dispatches and once more where the node's effect begins.
   under such a grant earlier is refused when a run is admitted, and a run already under way pauses
   its node and itself when dispatch reaches a node its grant does not authorise, with that refusal.
   A `create_session` node that names the shell its session runs is held to the same grant, because a
-  named shell runs a program the definition chose. A `request_review` node is held to it as well,
-  because it starts the reviewer as the root of a session of its own.
+  named shell runs a program the definition chose. A `request_review` node is held to it as well:
+  it asks the rights of a program start in a session that does not exist when the grant is issued,
+  so only a grant that selects every session covers it.
 * **A capture node's session is one the grant selects.** A `capture_changeset` node that names a
   session records its version for that session, and a version recorded for a session is review
   work in it. If the definition's grant does not select that session, the definition is refused at

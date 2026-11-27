@@ -1377,8 +1377,8 @@ async fn a_command_that_declares_another_environment_installs_nowhere() {
     assert!(refusal.contains("its own environment"), "{refusal}");
 }
 
-/// The rights a review node needs: it starts the reviewer as the root of a session that it creates
-/// and closes, in a copy of the version that it makes, and prompts it and reads it back.
+/// The rights a review node needs: it asks the rights of a program start in a session that it
+/// creates and closes, in a copy of the version that it makes, and prompts it and reads it back.
 const REVIEW_RIGHTS: [ActionRight; 6] = [
     ActionRight::TerminalInput,
     ActionRight::SessionCreate,
@@ -1424,10 +1424,10 @@ fn review_dispatch_refusal(grant: &kr_protocol::grant::Grant, workflow: u8) -> R
         .map_err(|refusal| refusal.to_string())
 }
 
-/// Section 23's rule that a composite action intersects every right it needs: a review node starts
-/// the reviewer as the root of a session of its own, which is what a command node does, so it needs
-/// the rights of one and the two rights of a prompt, and a grant missing any one of the six installs
-/// it nowhere and does not authorise its dispatch.
+/// Section 23's rule that a composite action intersects every right it needs: a review node asks
+/// the rights of a program start, as a command node does, so it needs the rights of one and the two
+/// rights of a prompt, and a grant missing any one of the six installs it nowhere and does not
+/// authorise its dispatch.
 #[tokio::test]
 async fn a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_each() {
     let grant_id = test_grant_id(23);
@@ -1473,9 +1473,9 @@ async fn a_review_node_needs_the_six_rights_and_the_grant_is_refused_without_eac
         .expect("and authorises its dispatch");
 }
 
-/// A review node starts the reviewer as the root of a session of its own, in the selected
-/// environment, so a grant that selects one named session, or none, is refused for it as for a
-/// command node, at install and before each dispatch.
+/// A review node asks for a session that does not exist yet, in the selected environment, so a
+/// grant that selects one named session, or none, is refused for it as for a command node, at
+/// install and before each dispatch.
 #[tokio::test]
 async fn a_review_node_needs_a_grant_that_selects_every_session() {
     use kr_protocol::grant::SessionSelector;
@@ -1505,9 +1505,9 @@ async fn a_review_node_needs_a_grant_that_selects_every_session() {
         for refusal in refusals {
             assert!(
                 refusal.contains(
-                    "node review starts the reviewer as the root of a session of its own, and \
-                     grant"
-                ) && refusal.contains("does not select every session in the environment"),
+                    "node review asks for a session that does not exist yet, so its grant must \
+                     select every session in the environment, and grant"
+                ) && refusal.contains("does not"),
                 "{refusal}"
             );
         }

@@ -58,7 +58,7 @@ pub const fn produced_event(action_kind: WorkflowActionKind) -> Option<&'static 
 /// Whether a node of `action_kind` creates a session of its own, which spends the chain's
 /// session allowance and needs the right to create one.
 ///
-/// A review node does: its reviewer is the root of a session of its own.
+/// A review node does: it asks for a session of its own.
 #[must_use]
 pub const fn creates_session(action_kind: WorkflowActionKind) -> bool {
     matches!(
@@ -80,9 +80,10 @@ pub const fn runs_a_command(action_kind: WorkflowActionKind) -> bool {
     )
 }
 
-/// Whether a node of `action_kind` starts a program of its own as the root of a session it creates,
-/// which this platform must be able to launch for a definition that holds one to be offered: a
-/// command is run through a POSIX shell, and a review starts the reviewer agent.
+/// Whether a node of `action_kind` asks the rights of a program start, as the root of a session it
+/// creates: a definition that holds one is offered only where this platform can launch a program
+/// that way. A command is run through a POSIX shell, and a review asks for the reviewer agent's
+/// program.
 #[must_use]
 pub const fn needs_root_program(action_kind: WorkflowActionKind) -> bool {
     runs_a_command(action_kind) || matches!(action_kind, WorkflowActionKind::RequestReview)
@@ -917,7 +918,7 @@ mod tests {
         assert!(validate_definition(&def, &dummy_grant()).is_ok());
     }
 
-    /// A command node and a review node start a program of their own as the root of a session they
+    /// A command node and a review node ask the rights of a program start in a session they
     /// create, and every node that creates a session charges one to its chain.
     #[test]
     fn the_kinds_that_start_a_root_program_and_that_charge_a_session() {

@@ -574,9 +574,9 @@ async fn a_command_node_spends_the_chains_session_allowance_too() {
     .await;
 }
 
-/// KR-REQ-25.16: a review node starts the reviewer as the root of a session of its own, so its one
-/// action charges one session to its chain, and the chain's default ten are the whole allowance for
-/// reviews as for every other node that creates a session.
+/// KR-REQ-25.16: a review node asks for a session of its own, so its one action charges one
+/// session to its chain, and the chain's default ten are the whole allowance for reviews as for
+/// every other node that creates a session.
 #[tokio::test]
 async fn a_review_node_charges_one_session_to_its_chain() {
     let clock = Arc::new(ManualClock::new(1_000));

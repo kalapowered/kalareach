@@ -1753,11 +1753,11 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-automation --test causal_budget self_retrigger_is_refused_without_explicit_recurrence
 
-      # A review node starts the reviewer as the root of a session through the same launch that a
-      # command node needs, which this platform has not, so a definition that holds one is refused
-      # when it is offered, whatever its workspace, its instructions or its grant. These cases hold
-      # that refusal and, with it, the one for a test run; the rights and the selector that the
-      # host asks of a review node before a dispatch are asked here as on every platform.
+      # A review node asks the rights of a program start through the same launch that a command
+      # node needs, which this platform has not, so a definition that holds one is refused when it
+      # is offered, whatever its workspace, its instructions or its grant. These cases hold that
+      # refusal and, with it, the one for a test run; the rights and the selector that the host
+      # asks of a review node before a dispatch are asked here as on every platform.
       - name: Test that a review node is refused where no program can be started
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-automation --test definitions -- --exact a_review_node_is_refused_when_offered_on_windows run_tests_stays_refused_on_windows_when_offered a_review_node_naming_a_shared_working_tree_is_refused_when_offered a_review_nodes_instructions_with_any_of_the_nine_markers_are_refused_when_offered
