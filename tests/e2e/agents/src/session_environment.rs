@@ -1151,15 +1151,23 @@ mod tests {
     }
 
     /// A zsh the capability cases can run: the system's, or where the host has none (the build
-    /// host's image carries no `zsh`) the managed package's own, which `KR_SHELL_PACKAGES` names.
-    fn zsh_for_the_capability_cases() -> Option<String> {
+    /// host's image carries no `zsh`) the managed package's own, which the crate's resolver finds.
+    /// Where there is neither, the case fails when the run requires the shell packages and skips
+    /// otherwise.
+    fn zsh_for_the_capability_cases(case: &str) -> Option<String> {
         if let Some(system) = system_zsh() {
             return Some(system.to_owned());
         }
-        let package = std::path::Path::new(&std::env::var_os("KR_SHELL_PACKAGES")?).join("zsh");
-        let current = std::fs::read_to_string(package.join("current")).ok()?;
-        let binary = package.join(current.trim()).join("bin").join("zsh");
-        binary.is_file().then(|| binary.display().to_string())
+        match kr_e2e_m1b::shells::managed_zsh() {
+            Ok(shell) => Some(shell.executable.display().to_string()),
+            Err(why) if kr_e2e_m1b::shells::required() => {
+                panic!("the {case} case's managed shell: {why}")
+            }
+            Err(why) => {
+                eprintln!("skipping: the {case} case: {why}");
+                None
+            }
+        }
     }
 
     /// What the check reads of one part: its names and the snapshot it states.
@@ -1203,8 +1211,7 @@ mod tests {
     /// comes first, and the list does not hold the capability's name.
     #[test]
     fn a_shell_that_holds_the_line_capability_at_one_typed_line_and_not_at_the_next_is_one_list() {
-        let Some(zsh) = zsh_for_the_capability_cases() else {
-            eprintln!("skipping: no zsh, system or managed, for the capability cases");
+        let Some(zsh) = zsh_for_the_capability_cases("line capability") else {
             return;
         };
         let zsh = zsh.as_str();
@@ -1241,8 +1248,7 @@ mod tests {
     /// is a list that changed, and the reading says so, whichever name it is.
     #[test]
     fn a_shell_that_holds_another_name_at_one_typed_line_and_not_at_the_next_is_refused() {
-        let Some(zsh) = zsh_for_the_capability_cases() else {
-            eprintln!("skipping: no zsh, system or managed, for the capability cases");
+        let Some(zsh) = zsh_for_the_capability_cases("control") else {
             return;
         };
         let zsh = zsh.as_str();
