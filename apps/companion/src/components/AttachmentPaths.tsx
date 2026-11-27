@@ -77,7 +77,9 @@ function FilePath({
       data-testid="attachment-path-row"
       data-path={elsewhere ? 'elsewhere' : (state?.kind ?? 'none')}
     >
-      <p className="eyebrow">{attachment.name}</p>
+      <p className="eyebrow">
+        <TechnicalWord text={attachment.name} />
+      </p>
       {elsewhere ? (
         <p className="small" data-testid="attachment-path-refusal">
           This file was sent for another session. Take it off the draft and attach it again here.

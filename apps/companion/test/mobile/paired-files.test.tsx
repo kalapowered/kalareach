@@ -18,6 +18,7 @@ import { MobileApp } from '../../src/mobile/MobileApp'
 import { HANDED_FILE_LIMIT } from '../../src/mobile/model/media'
 import type { AccountView } from '../../src/model/account'
 import * as words from '../../src/model/transfer-words'
+import { technicalWordText } from '../technical-word-text'
 
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -81,7 +82,7 @@ async function pick(person: ReturnType<typeof userEvent.setup>, name = 'report.p
 
 const line = () => screen.getByTestId('upload-line').textContent
 const lineOfFile = (name: string) =>
-  within(screen.getAllByTestId('m-upload').find((row) => within(row).queryByText(name) !== null) as HTMLElement)
+  within(screen.getAllByTestId('m-upload').find((row) => within(row).queryByText(technicalWordText(name)) !== null) as HTMLElement)
 
 async function started(controls: FakeHostControls, count = 1) {
   await waitFor(() => {
@@ -310,7 +311,7 @@ describe('a file picked on a phone paired with a host', () => {
     expect(lineOfFile('stuck-1.bin').getByTestId('upload-line')).toHaveTextContent(
       words.sentence(words.CANNOT_RESUME)
     )
-    expect(screen.queryByText('other-1.bin')).toBeNull()
+    expect(screen.queryByText(technicalWordText('other-1.bin'))).toBeNull()
     await person.click(within(lineOfFile('published-1.bin').getByTestId('upload-line').parentElement as HTMLElement).getByRole('button', { name: 'Add to draft' }))
     await waitFor(() => {
       expect(controls.pairedUploads.binds).toHaveLength(1)

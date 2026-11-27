@@ -15,6 +15,7 @@
 
 import type { ReactNode } from 'react'
 
+import { TechnicalWord } from '../../components/TechnicalWord'
 import { Button } from '../../components/ui'
 import { canCancel, lineOf, type UploadRow } from '../../model/paired-uploads'
 import { describeBytes } from '../model/media'
@@ -67,7 +68,9 @@ export function UploadRowView({
     <div className="m-upload" data-testid="m-upload" data-phase={phase} data-tone={line.tone}>
       <div className="m-upload-head">
         {attachment === null ? null : <AttachmentThumb attachment={attachment} />}
-        <span className="m-attachment-name">{row.name}</span>
+        <span className="m-attachment-name">
+          <TechnicalWord text={row.name} />
+        </span>
         <span className="m-row-detail">{describeBytes(row.byteLen)}</span>
       </div>
       <p className="m-upload-line" data-testid="upload-line">

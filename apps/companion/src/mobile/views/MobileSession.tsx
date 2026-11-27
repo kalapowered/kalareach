@@ -184,6 +184,8 @@ interface ReadNode {
   readonly text: string
   /** True when the text is Markdown the allowlisted renderer draws. */
   readonly markdown?: boolean
+  /** True when the text is made of technical words, paths here, that break at their separators. */
+  readonly technical?: boolean
 }
 
 /** No image has been imported: a renderer never fetches one on a person's behalf. */
@@ -1526,7 +1528,7 @@ export function MobileSession({
                       })}
                     </div>
                   ) : (
-                    <p>{node.text}</p>
+                    <p>{node.technical === true ? <TechnicalWord text={node.text} /> : node.text}</p>
                   )}
                 </div>
               ))
@@ -1759,7 +1761,9 @@ export function MobileSession({
                     data-upload={attachment.upload}
                   >
                     <AttachmentThumb attachment={attachment} />
-                    <span className="m-attachment-name">{attachment.name}</span>
+                    <span className="m-attachment-name">
+                      <TechnicalWord text={attachment.name} />
+                    </span>
                     <span className="m-row-detail">
                       {`${describeBytes(attachment.byteLen)} · ${UPLOAD_WORDS[attachment.upload]}`}
                     </span>
@@ -2447,10 +2451,13 @@ function readNode(item: ConversationItem, index: number): ReadNode {
     }
     case 'diff': {
       const files = (body['files'] as { path?: string; added?: number; removed?: number }[]) ?? []
-      return read(
-        nodeKindLabel(kind),
-        files.map((file) => `${file.path ?? ''} +${file.added ?? 0} −${file.removed ?? 0}`).join(', ')
-      )
+      return {
+        ...read(
+          nodeKindLabel(kind),
+          files.map((file) => `${file.path ?? ''} +${file.added ?? 0} −${file.removed ?? 0}`).join(', ')
+        ),
+        technical: true
+      }
     }
     case 'approval_ref':
       return read(nodeKindLabel(kind), 'A decision is waiting in the inbox.')
