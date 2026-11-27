@@ -309,6 +309,8 @@ FEATURE_ROWS = [
      OTHER),
     ('tests-1', 'rmcp', 'client transport-child-process',
      OTHER),
+    ('tests-1', 'rusqlite', 'serialize',
+     "asked for by kr-e2e-m1b's manifest through its default `legs` feature, and kr-e2e-agents builds that package with it; both are tests-2's and no tests-1 package depends on either; it adds rusqlite's `serialize` module (the connection's `serialize` and `deserialize` methods and the data types they use), turns on no feature of libsqlite3-sys, so the bundled SQLite is the same, and changes no item that exists without it"),
     ('tests-1', 'rustix', 'pipe stdio',
      OTHER),
     ('tests-1', 'rustix', 'thread',
