@@ -626,7 +626,7 @@ describe('pairing with a host', () => {
       controls.setPairing({
         hosts: [
           { reference: 'studio-ref', in_use: false, name: 'studio', mark: '3fa9-1c07-b2e4-77ab', owner: true, authority: 'manage the host as an owner', grant_expires_at_ms: null, in_contact: true },
-          { reference: 'box-ref', in_use: false, name: 'build box', mark: '77bc-db3b-2424-b1f2', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
+          { reference: 'box-ref', in_use: false, name: 'second computer', mark: '77bc-db3b-2424-b1f2', owner: false, authority: 'view sessions', grant_expires_at_ms: null, in_contact: null }
         ]
       })
     })
