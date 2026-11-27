@@ -64,10 +64,12 @@ STANDIN
 chmod +x "$root/bin/swiftc"
 
 # Node, which the script starts after the known pictures to draw its own: records the environment it was
-# started in, and stops.
+# started in, and stops with status 1, or with status 0 when FAKE_NODE=ok (it draws nothing; the
+# stand-in reader answers the checks' two pictures by their names).
 cat >"$root/bin/node" <<'STANDIN'
 #!/bin/bash
 printf 'CFFIXED_USER_HOME=%s\n' "${CFFIXED_USER_HOME-unset}" >>"$FAKE_DIR/node.log"
+[ "${FAKE_NODE:-}" != ok ] || exit 0
 exit 1
 STANDIN
 chmod +x "$root/bin/node"
@@ -117,7 +119,8 @@ chmod +x "$root/bin/rm"
 
 # The reader. It prints the text kept beside the picture it is given. Every read is recorded with the
 # home it was started with. FAKE_READER=fails makes each read fail (exit 2), and FAKE_READER=aborts
-# makes each write a line to its error output and exit 134. FAKE_BAD_FIRST=N makes
+# makes each write a line to its error output and exit 134. FAKE_FAIL_ON=<picture name> makes the read
+# of that one picture fail (exit 2). FAKE_BAD_FIRST=N makes
 # the first N folders (by KR_READER_HOME, in the order they are first used) read wrong, leaving out
 # the first line of every text, as a wrong build of the system's programs leaves rows out.
 # FAKE_DROP_LAST=1 leaves out the last line of every text instead. Like the
@@ -129,13 +132,17 @@ cat >"$root/reader-standin.sh" <<'STANDIN'
 image=$1
 name=${image##*/}
 home=${KR_READER_HOME-unset}
-printf '%s home=%s cffixed=%s\n' "$name" "$home" "${CFFIXED_USER_HOME-unset}" >>"$FAKE_DIR/reads.log"
+printf '%s home=%s cffixed=%s pid=%s\n' "$name" "$home" "${CFFIXED_USER_HOME-unset}" "$$" >>"$FAKE_DIR/reads.log"
 if [ -n "${CFFIXED_USER_HOME-}" ] && [ "${FAKE_COMPILES:-1}" != 0 ]; then
     programs="$CFFIXED_USER_HOME/Library/Caches/read-text-bin/com.apple.e5rt.e5bundlecache"
     [ "${FAKE_COMPILES:-1}" != other ] || programs="$CFFIXED_USER_HOME/Library/Preferences"
     if [ ! -d "$programs" ]; then
         mkdir -p "$programs" && printf 'programs for %s\n' "$CFFIXED_USER_HOME" >"$programs/program"
     fi
+fi
+if [ "${FAKE_FAIL_ON:-}" = "$name" ]; then
+    printf 'fake reader: cannot read %s\n' "$name" >&2
+    exit 2
 fi
 [ "${FAKE_READER:-good}" != fails ] || exit 2
 if [ "${FAKE_READER:-good}" = aborts ]; then
@@ -199,7 +206,7 @@ run_script() {
 out() { printf '%s/%s/out.log' "$root" "$1"; }
 # The script makes its own evidence folder under the case's TMPDIR when none is given to it, and the
 # run starts from an empty environment, so nothing the driver's caller set reaches it.
-art_of() { local d; for d in "$root/$1"/tmp/*/voice-device; do printf '%s' "$d"; return; done; }
+art_of() { local d; for d in "$root/$1"/tmp*/*/voice-device; do printf '%s' "$d"; return; done; }
 check_log() { printf '%s/reader-check.log' "$(art_of "$1")"; }
 fake() { printf '%s/%s/fake/%s' "$root" "$1" "$2"; }
 rc_is() { [ "$(cat "$root/$1/rc")" = "$2" ]; }
@@ -369,6 +376,16 @@ expect "an aborting reader: the log shows its error output" says "$(check_log re
 expect "an aborting reader: the log shows no other status for it" never_says "$(check_log reader-aborts)" "exit status 2"
 expect "an aborting reader: the run fails with exit 2" rc_is reader-aborts 2
 
+# One picture that cannot be read and the others read wrong in one check: the failed reading outranks
+# the mismatch, so the run stops after that check and builds nothing again.
+make_tree reader-error-and-mismatch
+run_script reader-error-and-mismatch FAKE_FAIL_ON=one-line.png FAKE_BAD_FIRST=9
+expect "an error and a mismatch in one check: one check" test "$(checks reader-error-and-mismatch)" = 1
+expect "an error and a mismatch in one check: the log shows both" test "$(grep -c 'what the reader gave for\|the reader failed on one-line.png' "$(check_log reader-error-and-mismatch)")" -ge 2
+expect "an error and a mismatch in one check: the run says the reader failed" says "$(out reader-error-and-mismatch)" "the text reader failed on a known picture"
+expect "an error and a mismatch in one check: the run does not build again" never_says "$(out reader-error-and-mismatch)" "building its recognition programs again"
+expect "an error and a mismatch in one check: the run fails with exit 2" rc_is reader-error-and-mismatch 2
+
 # Four mismatches, each with a folder of its own: four checks, no cause claimed.
 make_tree reader-mismatches
 run_script reader-mismatches FAKE_BAD_FIRST=9
@@ -421,11 +438,30 @@ expect "TypeScript launch: the reader starts with CFFIXED_USER_HOME set to the f
 no_folder_no_reading() { ! FAKE_DIR="$root/launch-environment/fake" typescript_start >/dev/null 2>&1; }
 expect "TypeScript launch: no folder, no reading" no_folder_no_reading
 
+# The reader replaces the wrapper: the process that was started is the reader, so that a signal sent
+# to it, the TypeScript's time limit for one, reaches the reader.
+pid_file="$root/launch-environment/started-pid"
+KR_READER_HOME="$root/launch-environment/exec-home" FAKE_DIR="$root/launch-environment/fake" \
+    bash -c '"$0" "$1" >/dev/null 2>&1 & printf "%s\n" "$!" >"$2"; wait' "$wrapper" "$picture" "$pid_file"
+expect "exec: the reader's process is the one that was started" \
+    awk -v started="pid=$(cat "$pid_file" 2>/dev/null)" '$4 == started { found = 1 } END { exit !found }' "$reads_file"
+
 # The wrapper is the only name the reader goes by: the compiler writes the reader elsewhere, the
 # script passes the wrapper to the TypeScript, and the TypeScript holds no other name.
 expect "one name: the compiler writes the reader to read-text-bin" grep -qx -- "$(art_of launch-environment)/read-text-bin" "$(fake launch-environment swiftc-out.log)"
 expect "one name: the script gives the TypeScript the wrapper" grep -qF -- '"http://localhost:$port" "$ocr" "$shots"' "$here/scripts/e2e-voice-device.sh"
 expect "one name: the TypeScript names no compiled reader" never_says "$here/apps/companion/test/voice/assert-voice-surface.ts" "read-text-bin"
+
+# A path with an equals sign in it is the reader's path like any other: it is not read as a setting of
+# the environment.
+make_tree wrapper-equals-sign
+mkdir -p "$root/wrapper-equals-sign/tmp=3"
+run_script wrapper-equals-sign TMPDIR="$root/wrapper-equals-sign/tmp=3"
+expect "an equals sign in the path: the reader is started for each picture" test "$(reads wrapper-equals-sign)" = 12
+expect "an equals sign in the path: the whole set reads as drawn" says "$(out wrapper-equals-sign)" "the text reader read the known pictures as drawn"
+expect "an equals sign in the path: the reader's folder is still set in its launch environment" awk '
+    { home = $2; sub("home=", "", home); started = $3; sub("cffixed=", "", started); if (home != started) bad = 1 }
+    END { exit bad }' "$(fake wrapper-equals-sign reads.log)"
 
 # The files the system compiled are written to the log for each build, each build in a folder of its
 # own, with a SHA-1 for each file.
@@ -496,6 +532,15 @@ fi
 chmod 755 "$root/listing-locked/probe"
 
 # ---- What the mode reports -----------------------------------------------------------------------
+
+# A run in which the reader reads every known picture as drawn and the picture checks hold ends with
+# exit 0: the cases above show the decisions up to the checks, this shows the whole mode through.
+make_tree success
+run_script success FAKE_NODE=ok
+expect "a whole run: the picture checks are reported held" says "$(out success)" "the picture checks refused each picture made to fail them and passed the one made to pass"
+expect "a whole run: the run completes" says "$(out success)" "run complete"
+expect "a whole run: it exits 0" rc_is success 0
+expect "a whole run: its folder is removed" test "$(removals success)" = 1
 
 # The mode checks the reader and qualifies nothing, and says so instead of a qualification summary.
 make_tree summary

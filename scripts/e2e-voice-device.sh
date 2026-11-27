@@ -309,13 +309,19 @@ SWIFT
         return 1
     }
     # The only name the reader is held by, here and in the TypeScript that reads screenshots with it.
-    # It starts the compiled reader with the folder for the system's compiled programs set in the
-    # reader's launch environment, before its process starts and for no other program, and it refuses
-    # to start the reader without a folder, so that no reading goes into the system's default one.
+    # It sets the folder for the system's compiled programs in the reader's launch environment, before
+    # the reader's process starts, and this script adds it to no other program's environment (a caller
+    # may already have exported it). It refuses to start the reader without a folder; whether the
+    # system then keeps its programs there is shown by the program record in the log, not by this
+    # wrapper. The variable is exported, not given through env, which reads an operand with an equals
+    # sign as an assignment, and a path may hold one; the reader replaces the wrapper, so that a
+    # signal sent to the process that was started reaches the reader.
     cat >"$artefacts/read-text" <<'WRAPPER'
 #!/bin/sh
 : "${KR_READER_HOME:?the text reader has no folder for its recognition programs}"
-exec env CFFIXED_USER_HOME="$KR_READER_HOME" "${0%/*}/read-text-bin" "$@"
+CFFIXED_USER_HOME="$KR_READER_HOME"
+export CFFIXED_USER_HOME
+exec "${0%/*}/read-text-bin" "$@"
 WRAPPER
     chmod +x "$artefacts/read-text"
     ocr="$artefacts/read-text"
