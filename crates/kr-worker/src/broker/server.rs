@@ -8,8 +8,8 @@
 //! below it ([`Owned`]), how an ending comes out ([`Retirement`], [`Ended`] and [`Emptiness`]), the
 //! server's input, and the five seconds an ending has before anything in it is forced. How a server
 //! is started and its tree ended is the platform's: a process group and signals on Unix, a job
-//! object on Windows, whose ending is one function ([`end_tree`]) over what a job lets be read and
-//! done to it ([`Tree`]).
+//! object on Windows, whose ending is one function (`end_tree`) over what a job lets be read and
+//! done to it (`Tree`).
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
