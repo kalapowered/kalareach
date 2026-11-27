@@ -204,7 +204,21 @@
   position: sticky;
   bottom: 0;
   padding: var(--gap-3) 0;
-  background: linear-gradient(to top, var(--bg) 60%, transparent);
+  /* Every control stands on a solid ground: the page's text never shows through behind Back or Continue. */
+  background: var(--bg);
+}
+
+/*
+ * The soft edge where the content meets the bar lies above the bar's box, never inside it. It is two
+ * spacing units tall whatever the bar's height, which changes when the two controls stack.
+ */
+.setup-controls::before {
+  content: '';
+  position: absolute;
+  inset: auto 0 100%;
+  height: calc(var(--gap-3) * 2);
+  background: linear-gradient(to top, var(--bg), transparent);
+  pointer-events: none;
 }
 
 /* ---- Inside a card ---------------------------------------------------------------------------- */
@@ -408,13 +422,17 @@
 }
 
 /*
- * The floating controls are a material over the content, so reduced transparency makes them solid
- * rather than a gradient the content shows through.
+ * The floating controls are a material over the content. Where transparency is reduced, or the
+ * system sets the colours (some engines then drop a gradient altogether), the soft edge gives way
+ * to a line along the bar's top.
  */
-@media (prefers-reduced-transparency: reduce) {
+@media (prefers-reduced-transparency: reduce), (forced-colors: active) {
   .setup-controls {
-    background: var(--bg);
     border-top: 1px solid var(--line);
+  }
+
+  .setup-controls::before {
+    display: none;
   }
 }
 

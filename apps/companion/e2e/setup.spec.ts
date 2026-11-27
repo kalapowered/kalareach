@@ -1057,6 +1057,456 @@ test.describe('the first-start assistant', () => {
     }
   }
 
+  // ---- The bar under Back and Continue ------------------------------------------------------------
+  //
+  // KR-REQ-03.29: the bar at the foot of a card is one material over the content. Whatever lies
+  // behind a control of it stands on a solid ground, so the page's text never shows through behind
+  // Back or Continue, at any window and any text size. The soft edge belongs where the content
+  // meets the bar, above the controls.
+
+  /** The windows the bar is held in: the narrowest phone's, a phone's and a desktop's. */
+  const BAR_WINDOWS = [
+    [320, 568],
+    [390, 844],
+    [1280, 720]
+  ] as const
+
+  /** The largest size first: it is where the two controls stack, and where the fault shows most. */
+  const BAR_SIZES = [
+    ['largest', LARGEST],
+    ['default', 1]
+  ] as const
+
+  /** The steps the bar is read on: the first, where Back is off, and a later one, where it is on. */
+  const BAR_STEPS = ['identity', 'capabilities'] as const
+
+  /** A box that a probe hides keeps its room, so nothing moves when the page's content is hidden. */
+  const PROBE_HIDDEN = '[data-probe-hidden] { visibility: hidden !important; }'
+
+  /** Opens a step of the setup view at a window and a text size, with the pointer out of the way. */
+  async function openForBar(
+    page: Page,
+    name: string,
+    width: number,
+    height: number,
+    ratio: number
+  ): Promise<void> {
+    // The setup view is opened from the desktop layout, whatever window an earlier read left.
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await openSetup(page)
+    await page.addStyleTag({ content: PROBE_HIDDEN })
+    if (name !== 'identity') await step(page, name)
+    await sizeTo(page, width, height, ratio)
+    await page.mouse.move(0, 0)
+    await settled(page)
+  }
+
+  /** Waits for every motion that has an end (a step's arrival, a colour that changes) to end. */
+  async function settled(page: Page): Promise<void> {
+    await page.evaluate(() =>
+      Promise.all(
+        document
+          .getAnimations()
+          .filter((each) => Number.isFinite(Number(each.effect?.getComputedTiming().endTime)))
+          .map((each) => each.finished.catch(() => undefined))
+      )
+    )
+  }
+
+  /** Hides the page's content, the bar, both or neither, without moving anything. */
+  async function hideForProbe(page: Page, what: { content: boolean; bar: boolean }): Promise<void> {
+    await page.evaluate((hide) => {
+      const bar = document.querySelector('.setup-controls')
+      if (!bar) throw new Error('the setup bar is not on the page')
+      for (const marked of Array.from(document.querySelectorAll('[data-probe-hidden]'))) {
+        marked.removeAttribute('data-probe-hidden')
+      }
+      if (hide.bar) bar.setAttribute('data-probe-hidden', '')
+      if (!hide.content) return
+      // Everything that is neither the bar nor holds it is the page's content.
+      const holders = new Set<Element>()
+      for (let each: Element | null = bar; each !== null; each = each.parentElement) holders.add(each)
+      for (const holder of holders) {
+        for (const sibling of Array.from(holder.parentElement?.children ?? [])) {
+          if (!holders.has(sibling)) sibling.setAttribute('data-probe-hidden', '')
+        }
+      }
+    }, what)
+  }
+
+  /**
+   * What the window shows inside a box, as the bytes of a picture of it. The picture holds only the
+   * pixels that lie wholly inside the box, so a pixel that the box shares with what lies beside it
+   * is not read as the box's.
+   */
+  async function pictureOf(
+    page: Page,
+    box: { x: number; y: number; width: number; height: number }
+  ): Promise<Uint8Array> {
+    const left = Math.ceil(box.x)
+    const top = Math.ceil(box.y)
+    const picture: unknown = await page.screenshot({
+      clip: {
+        x: left,
+        y: top,
+        width: Math.floor(box.x + box.width) - left,
+        height: Math.floor(box.y + box.height) - top
+      }
+    })
+    if (!(picture instanceof Uint8Array)) throw new Error('the screenshot is not a picture')
+    return picture
+  }
+
+  function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    return a.length === b.length && a.every((byte, at) => byte === b[at])
+  }
+
+  /** Scrolls the page to a share of its length, waits for the frame that draws it and says where it stands. */
+  async function scrollShare(page: Page, share: number): Promise<number> {
+    return page.evaluate(async (at) => {
+      const top = Math.round((document.documentElement.scrollHeight - window.innerHeight) * at)
+      window.scrollTo({ top, behavior: 'instant' })
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            resolve()
+          })
+        })
+      })
+      return Math.round(window.scrollY)
+    }, share)
+  }
+
+  /**
+   * Where the page shows through behind a box of the bar. The box is drawn twice, over the content
+   * and with the content hidden; a solid ground reads the same both ways, to the byte. It is read at
+   * four places in the page so that text lies under the bar somewhere, and a read of the same box
+   * with the bar hidden proves that some did: a comparison that never had content beneath it would
+   * pass for the wrong reason.
+   */
+  async function showingThrough(
+    page: Page,
+    where: string,
+    targets: [string, () => Locator][]
+  ): Promise<string[]> {
+    const found: string[] = []
+    let contentBeneath = false
+    for (const share of [0.05, 0.25, 0.5, 0.75]) {
+      const scrolled = await scrollShare(page, share)
+      for (const [label, target] of targets) {
+        const box = await target().boundingBox()
+        if (!box) {
+          found.push(`${where}: ${label} is not on the page`)
+          continue
+        }
+        await hideForProbe(page, { content: false, bar: false })
+        const shown = await pictureOf(page, box)
+        await hideForProbe(page, { content: true, bar: false })
+        const hidden = await pictureOf(page, box)
+        await hideForProbe(page, { content: false, bar: true })
+        const beneath = await pictureOf(page, box)
+        await hideForProbe(page, { content: true, bar: true })
+        const nothing = await pictureOf(page, box)
+        await hideForProbe(page, { content: false, bar: false })
+        if (!sameBytes(beneath, nothing)) contentBeneath = true
+        if (!sameBytes(shown, hidden)) {
+          found.push(`${where}: the page shows through behind ${label}, at scroll ${scrolled}`)
+        }
+      }
+    }
+    if (!contentBeneath) found.push(`${where}: no content lay under the bar at any place, so the read proved nothing`)
+    return found
+  }
+
+  /** The bar's controls, each asked for again when it is read. */
+  const barControls = (page: Page): [string, () => Locator][] => [
+    ['Back', () => page.locator('.setup-controls').getByRole('button').first()],
+    ['Continue', () => page.locator('.setup-controls').getByRole('button').last()]
+  ]
+
+  // The ground behind each control is solid, in both colour modes, on the first step (Back off) and
+  // on a later one (Back on): the box of each control reads the same with the page's content over
+  // it and with the content hidden.
+  for (const [width, height] of BAR_WINDOWS) {
+    for (const [size, ratio] of BAR_SIZES) {
+      test(`keeps a solid ground behind every control of the setup bar at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        const found: string[] = []
+        for (const name of BAR_STEPS) {
+          await openForBar(page, name, width, height, ratio)
+          for (const mode of ['light', 'dark'] as const) {
+            await page.evaluate((next) => {
+              document.documentElement.dataset.theme = next
+            }, mode)
+            await settled(page)
+            found.push(
+              ...(await showingThrough(page, `the ${name} step, ${mode}`, barControls(page)))
+            )
+          }
+        }
+        expect(found, 'where the page shows through behind a control').toEqual([])
+      })
+
+      test(`keeps both controls of the setup bar inside the window and a target's size at the ${size} text size, ${width} wide`, async ({
+        page
+      }) => {
+        for (const name of BAR_STEPS) {
+          await openForBar(page, name, width, height, ratio)
+          for (const share of [0, 0.5]) {
+            await scrollShare(page, share)
+            // The size of a target, from the token itself and not from what a control says of it.
+            const token = await page.evaluate(() => {
+              const probe = document.createElement('div')
+              probe.style.cssText = 'position:absolute;visibility:hidden;height:var(--target)'
+              document.body.append(probe)
+              const size = probe.getBoundingClientRect().height
+              probe.remove()
+              return size
+            })
+            expect(token, 'the token that sizes a target').toBeGreaterThan(0)
+            expect(await page.evaluate(() => window.scrollX), 'the page scrolled sideways').toBe(0)
+            for (const [label, target] of barControls(page)) {
+              const where = `the ${name} step, ${label}, scroll ${String(share)}`
+              const box = await target().boundingBox()
+              expect(box, `${where}: on the page`).not.toBeNull()
+              expect(box?.x ?? -1, `${where}: left edge`).toBeGreaterThanOrEqual(-0.5)
+              expect((box?.x ?? 0) + (box?.width ?? 0), `${where}: right edge`).toBeLessThanOrEqual(width + 0.5)
+              expect(box?.y ?? -1, `${where}: top edge`).toBeGreaterThanOrEqual(-0.5)
+              expect((box?.y ?? 0) + (box?.height ?? 0), `${where}: bottom edge`).toBeLessThanOrEqual(height + 0.5)
+              expect(box?.height ?? 0, `${where}: height`).toBeGreaterThanOrEqual(token - 0.1)
+              expect(box?.width ?? 0, `${where}: width`).toBeGreaterThanOrEqual(token - 0.1)
+            }
+          }
+        }
+      })
+    }
+  }
+
+  /** The bar's own material and its soft edge, as the page's style gives them. */
+  function barMaterial(page: Page): Promise<{
+    ownImage: string
+    ownAlpha: number
+    top: string
+    edgeShown: boolean
+    edgeImage: string
+    edgeHeight: number
+    edgeBottom: number
+    edgeEvents: string
+    barHeight: number
+    unit: number
+  }> {
+    return page.evaluate(() => {
+      const bar = document.querySelector('.setup-controls')
+      if (!bar) throw new Error('the setup bar is not on the page')
+      const own = getComputedStyle(bar)
+      const edge = getComputedStyle(bar, '::before')
+      // The spacing unit the soft edge is sized in, read from the token as the page resolves it.
+      const probe = document.createElement('div')
+      probe.style.cssText = 'position:absolute;visibility:hidden;height:var(--gap-3)'
+      document.body.append(probe)
+      const unit = probe.getBoundingClientRect().height
+      probe.remove()
+      const color = /rgba?\(([^)]*)\)/.exec(own.backgroundColor)?.[1]?.split(',') ?? []
+      return {
+        ownImage: own.backgroundImage,
+        ownAlpha: color.length === 4 ? Number(color[3]) : color.length === 3 ? 1 : 0,
+        top: `${own.borderTopWidth} ${own.borderTopStyle}`,
+        edgeShown: edge.content !== 'none' && edge.display !== 'none',
+        edgeImage: edge.backgroundImage,
+        edgeHeight: parseFloat(edge.height),
+        edgeBottom: parseFloat(edge.bottom),
+        edgeEvents: edge.pointerEvents,
+        barHeight: bar.getBoundingClientRect().height,
+        unit
+      }
+    })
+  }
+
+  // The soft edge lies wholly above the bar's box: the box itself is a flat, opaque material, and a
+  // gradient that takes no pointer events ends where the box begins. Its height is two spacing
+  // units, so it does not grow with the bar when the two controls stack.
+  for (const [width, height, size, ratio] of [
+    [320, 568, 'largest', LARGEST],
+    [1280, 720, 'default', 1]
+  ] as const) {
+    test(`puts the soft edge of the setup bar above its box at the ${size} text size, ${width} wide`, async ({
+      page
+    }) => {
+      await openForBar(page, 'capabilities', width, height, ratio)
+      const material = await barMaterial(page)
+      expect(material.ownImage, "the bar's own box has no gradient").toBe('none')
+      expect(material.ownAlpha, "the bar's own box is opaque").toBe(1)
+      expect(material.edgeShown, 'the bar has a soft edge').toBe(true)
+      expect(material.edgeImage, 'the soft edge is a gradient').toContain('linear-gradient')
+      expect(material.edgeEvents, 'the soft edge takes no pointer events').toBe('none')
+      expect(material.edgeHeight, 'the soft edge is two spacing units tall').toBeCloseTo(material.unit * 2, 0)
+      expect(material.edgeBottom, 'the soft edge ends where the bar begins').toBeGreaterThanOrEqual(
+        material.barHeight - 0.5
+      )
+    })
+  }
+
+  /**
+   * Puts the window in reduced transparency. Chromium takes the setting through its protocol, and
+   * the media query then matches. The other engines have no switch for it, so the rule the page
+   * ships for it is applied as written, which shows what that form draws and not that the query
+   * matches.
+   */
+  async function reduceTransparency(page: Page, browserName: string): Promise<void> {
+    if (browserName === 'chromium') {
+      const session = await page.context().newCDPSession(page)
+      await session.send('Emulation.setEmulatedMedia', {
+        features: [{ name: 'prefers-reduced-transparency', value: 'reduce' }]
+      })
+      expect(
+        await page.evaluate(() => window.matchMedia('(prefers-reduced-transparency: reduce)').matches),
+        'the window is in reduced transparency'
+      ).toBe(true)
+      return
+    }
+    const applied = await page.evaluate(() => {
+      const style = document.createElement('style')
+      let rules = 0
+      for (const sheet of Array.from(document.styleSheets)) {
+        for (const rule of Array.from(sheet.cssRules)) {
+          if (
+            rule instanceof CSSMediaRule &&
+            /prefers-reduced-transparency/.test(rule.conditionText || rule.media.mediaText)
+          ) {
+            for (const inner of Array.from(rule.cssRules)) {
+              style.append(`${inner.cssText}\n`)
+              rules += 1
+            }
+          }
+        }
+      }
+      document.head.append(style)
+      return rules
+    })
+    expect(applied, "the page's reduced-transparency rules").toBeGreaterThan(0)
+  }
+
+  /** What the bar must be where its soft edge gives way to a line: solid, with a top line, and no fade. */
+  async function solidWithALine(page: Page, form: string): Promise<void> {
+    const material = await barMaterial(page)
+    expect(material.ownImage, `${form}: the bar's own box has no gradient`).toBe('none')
+    expect(material.ownAlpha, `${form}: the bar's own box is opaque`).toBe(1)
+    expect(material.edgeShown, `${form}: no soft edge`).toBe(false)
+    expect(material.top, `${form}: the bar keeps its top line`).toBe('1px solid')
+  }
+
+  // In reduced transparency the bar is solid, with a line along its top, and there is no soft edge:
+  // the whole bar and each control read the same over the content and with it hidden.
+  for (const [width, height, size, ratio] of [
+    [320, 568, 'largest', LARGEST],
+    [1280, 720, 'default', 1]
+  ] as const) {
+    test(`keeps the setup bar solid in reduced transparency at the ${size} text size, ${width} wide`, async ({
+      page,
+      browserName
+    }) => {
+      await openForBar(page, 'capabilities', width, height, ratio)
+      await reduceTransparency(page, browserName)
+      await settled(page)
+      await solidWithALine(page, 'reduced transparency')
+      expect(
+        await showingThrough(page, 'reduced transparency', [
+          ['the bar', () => page.locator('.setup-controls')],
+          ...barControls(page)
+        ]),
+        'where the page shows through'
+      ).toEqual([])
+    })
+
+    // Forced colours: the page's colours are replaced, and a gradient is dropped in some engines, so
+    // the bar stays a solid ground with its line and the soft edge is not drawn.
+    test(`keeps the setup bar solid in forced colours at the ${size} text size, ${width} wide`, async ({ page }) => {
+      await openForBar(page, 'capabilities', width, height, ratio)
+      await page.emulateMedia({ forcedColors: 'active' })
+      expect(
+        await page.evaluate(() => window.matchMedia('(forced-colors: active)').matches),
+        'the window is in forced colours'
+      ).toBe(true)
+      await settled(page)
+      await solidWithALine(page, 'forced colours')
+      expect(
+        await showingThrough(page, 'forced colours', [
+          ['the bar', () => page.locator('.setup-controls')],
+          ...barControls(page)
+        ]),
+        'where the page shows through'
+      ).toEqual([])
+    })
+  }
+
+  // At the end of the scroll the last line of a step's content lies wholly above the soft edge and
+  // the bar, so a person can always bring it clear of both.
+  for (const [width, height, size, ratio] of [
+    [320, 568, 'largest', LARGEST],
+    [390, 844, 'default', 1],
+    [1280, 720, 'default', 1]
+  ] as const) {
+    test(`leaves the last line of every step clear of the setup bar at the ${size} text size, ${width} wide`, async ({
+      page
+    }) => {
+      const found: string[] = []
+      for (const name of ['identity', 'permissions', 'capabilities', 'host', 'ready'] as const) {
+        await openForBar(page, name, width, height, ratio)
+        await scrollShare(page, 1)
+        const end = await page.evaluate(() => {
+          const bar = document.querySelector('.setup-controls')
+          if (!(bar instanceof HTMLElement) || !bar.parentElement) throw new Error('the setup bar is not on the page')
+          const scope = bar.parentElement
+          let bottom = Number.NEGATIVE_INFINITY
+          let words = ''
+          const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT)
+          for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (bar.contains(node) || !(node.textContent ?? '').trim()) continue
+            if (!(bar.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_PRECEDING)) continue
+            const range = document.createRange()
+            range.selectNodeContents(node)
+            for (const rect of Array.from(range.getClientRects())) {
+              if (rect.width < 2 || rect.height < 2) continue
+              // A line that is not drawn (hidden, or cut off by a box that holds it) is not the last line.
+              let drawn = true
+              for (let each = node.parentElement; each && drawn; each = each === scope ? null : each.parentElement) {
+                const style = getComputedStyle(each)
+                if (style.display === 'none' || style.visibility === 'hidden') drawn = false
+                else if (style.overflow !== 'visible') {
+                  const box = each.getBoundingClientRect()
+                  drawn = rect.bottom > box.top && rect.top < box.bottom && rect.right > box.left && rect.left < box.right
+                }
+              }
+              if (drawn && rect.bottom > bottom) {
+                bottom = rect.bottom
+                words = (node.textContent ?? '').trim().slice(0, 30)
+              }
+            }
+          }
+          const edge = parseFloat(getComputedStyle(bar, '::before').height)
+          return {
+            bottom: bottom + window.scrollY,
+            words,
+            barTop: bar.getBoundingClientRect().top + window.scrollY,
+            edge: Number.isFinite(edge) ? edge : 0
+          }
+        })
+        if (!Number.isFinite(end.bottom)) {
+          found.push(`the ${name} step has no last line to read`)
+          continue
+        }
+        const room = end.barTop - end.bottom
+        if (room < end.edge - 0.5) {
+          found.push(
+            `the ${name} step: "${end.words}" ends ${room.toFixed(1)} above the bar, under a soft edge ${end.edge.toFixed(1)} tall`
+          )
+        }
+      }
+      expect(found, 'last lines that the soft edge or the bar covers').toEqual([])
+    })
+  }
+
   test('draws in both colour modes from the same tokens', async ({ page }) => {
     await openSetup(page)
     await step(page, 'capabilities')
