@@ -66,8 +66,8 @@
 # listing, or a name that ends in a line feed and was cut there), the refusal adds fixed words after
 # the rule's sentence. A refusal has no effect. The check makes the one folder and the one file it
 # names, and when it cannot finish it removes the marker and the folder that it made, and nothing
-# else; where it cannot remove one of them, or cannot read the folder to tell whether it is gone, the
-# refusal says what is left or that the folder may be left, and never that nothing was kept.
+# else; where it cannot remove one of them, or cannot show by reading the directory that one of them is
+# gone, the refusal says what is left or what may be left, and never that nothing was kept.
 #
 # What the check does not stop. The started program inherits its working directory, and the product
 # turns that into a name and opens each file by that name, so the check holds only for as long as
@@ -251,49 +251,77 @@ e2e_state_folder_mark() {
   e2e_state_folder_marker_ok "$owner" || return 3
 }
 
+# e2e_state_folder_gone <name>: tells whether <name>, a name in the working directory, is gone. It reads
+# the directory and looks for the name in what it holds: a test of the name itself gives the same
+# answer for a name that is not there and for one that cannot be looked at (a folder that cannot be
+# searched, an input or output error), so a failed test shows nothing. It returns 0 where the directory
+# was read and does not hold the name, 1 where it holds it, and 2 where it could not be read, which
+# shows neither. `LC_ALL=C` only fixes the bytes of the names; no message is read.
+e2e_state_folder_gone() {
+  local names
+  names="$(LC_ALL=C ls -A -- . 2> /dev/null && printf x)" || return 2
+  case $'\n'"$names" in
+    *$'\n'"$1"$'\n'*) return 1 ;;
+  esac
+  return 0
+}
+
 # e2e_state_folder_fail <status>: ends the walk. It first removes what the walk made and nothing
 # else: the marker (a file of that one name, in the folder the walk is in) and the folder (an empty
-# one, removed from its parent). It ends with the status plus 16 for what it could not remove or could
-# not show to be gone, so that the check can say what is left: 1 for the marker, 2 for the folder, 4
-# for a folder that could not be read and may still be there (5 with the marker). The mode of a folder
-# that was there is changed last of all and only when nothing can fail after it, so no status leaves a
-# folder that was there with another mode.
+# one, removed from its parent). A removal counts only where its command succeeded or the directory
+# was read and does not hold the name (e2e_state_folder_gone); anything else is left or unresolved. It
+# ends with the status plus 16 for what it could not remove or could not show to be gone, so that the
+# check can say what is left: 1 for the marker, 2 for the folder, 3 for both, 4 for a folder that could
+# not be read and may still be there, 5 for a marker that is there with such a folder, 6 for a marker
+# that could not be read, 7 for such a marker with a folder that is there or could not be read. A
+# removed folder takes its marker with it. The mode of a folder that was there is changed last of all
+# and only when nothing can fail after it, so no status leaves a folder that was there with another
+# mode.
 e2e_state_folder_fail() {
-  local status="$1" left=0
+  local status="$1" left marker=0 folder=0
   if [ "$e2e_state_folder_marked" = 1 ]; then
-    rm -f -- .kr-e2e-owner 2> /dev/null
-    if [ -e .kr-e2e-owner ] || [ -L .kr-e2e-owner ]; then
-      left=1
+    if ! rm -f -- .kr-e2e-owner 2> /dev/null; then
+      e2e_state_folder_gone .kr-e2e-owner
+      marker=$?
     fi
   fi
   if [ -n "$e2e_state_folder_made" ]; then
     e2e_state_folder_unmake
-    case $? in
-      0) ;;
-      1) left=$((left | 2)) ;;
-      *) left=$((left | 4)) ;;
-    esac
+    folder=$?
+    [ "$folder" != 0 ] || marker=0
   fi
+  case "$marker$folder" in
+    00) left=0 ;;
+    10) left=1 ;;
+    01) left=2 ;;
+    11) left=3 ;;
+    02) left=4 ;;
+    12) left=5 ;;
+    20) left=6 ;;
+    *) left=7 ;;
+  esac
   exit $((status + 16 * left))
 }
 
 # e2e_state_folder_unmake: removes the folder that the walk made, from its parent, which it reaches by
 # the parent's physical name and checks by that name; the folder is removed only while its name still
-# has the inode that the walk listed after it made it. It returns 0 where the folder is gone, 1 where
-# it is still there (another folder at that name is not the walk's to remove), and 2 where the folder
-# could not be listed and the name is still there: a listing that fails does not show that the folder
-# is gone, so only a name that is neither a file nor a link counts as removed, and nothing is removed
-# without the listing's inode.
+# has the inode that the walk listed after it made it. It returns 0 where the folder is gone (removed,
+# or the parent was read and does not hold the name), 1 where it is still there (another folder at that
+# name is not the walk's to remove), and 2 where that cannot be told: the parent could not be entered
+# or is not the folder expected, or the folder could not be listed and the parent could not be read to
+# show the name gone. Nothing is removed without the listing's inode.
 e2e_state_folder_unmake() {
-  CDPATH='' cd -P -- "$e2e_state_folder_parent" 2> /dev/null || return 1
-  e2e_state_folder_here && [ "$e2e_state_folder_name" = "$e2e_state_folder_parent" ] || return 1
+  CDPATH='' cd -P -- "$e2e_state_folder_parent" 2> /dev/null || return 2
+  e2e_state_folder_here && [ "$e2e_state_folder_name" = "$e2e_state_folder_parent" ] || return 2
   if ! e2e_state_folder_list "./$e2e_state_folder_made"; then
-    [ ! -e "./$e2e_state_folder_made" ] && [ ! -L "./$e2e_state_folder_made" ] && return 0
+    e2e_state_folder_gone "$e2e_state_folder_made" && return 0
     return 2
   fi
   [ "$e2e_state_folder_ino" = "$e2e_state_folder_made_inode" ] || return 1
-  rmdir -- "./$e2e_state_folder_made" 2> /dev/null
-  [ ! -e "./$e2e_state_folder_made" ] && [ ! -L "./$e2e_state_folder_made" ]
+  if rmdir -- "./$e2e_state_folder_made" 2> /dev/null; then
+    return 0
+  fi
+  e2e_state_folder_gone "$e2e_state_folder_made"
 }
 
 # e2e_state_folder_walk <path> <owner>: the check proper, run in a subshell. It ends with status 0
@@ -506,14 +534,17 @@ e2e_state_folder_kr() {
 
 # e2e_state_folder_left_words <left>: the fixed words that say what the walk made and could not remove
 # (1 the marker, 2 the folder, 3 both, 4 a folder that could not be read and may still be there, 5 the
-# same with the marker); nothing for 0.
+# marker, which is there, with such a folder, 6 a marker that could not be read and may still be there,
+# 7 such a marker with a folder that is there or could not be read); nothing for 0.
 e2e_state_folder_left_words() {
   case "$1" in
     1) printf 'the owner marker that the check wrote is still in the folder' ;;
     2) printf 'the empty folder that the check made is still there' ;;
     3) printf 'the folder that the check made, with its owner marker, is still there' ;;
     4) printf 'the folder that the check made may still be there, since it could not be read' ;;
-    5) printf 'the owner marker that the check wrote is still in the folder, which could not be read to remove it' ;;
+    5) printf 'the owner marker that the check wrote is still in the folder, and the folder that the check made may still be there, since it could not be read' ;;
+    6) printf 'the owner marker that the check wrote may still be in the folder, since it could not be read' ;;
+    7) printf 'the folder that the check made and its owner marker may still be there, since they could not be read' ;;
   esac
 }
 

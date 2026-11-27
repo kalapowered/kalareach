@@ -143,6 +143,9 @@ left_marker='the owner marker that the check wrote is still in the folder'
 left_folder='the empty folder that the check made is still there'
 left_both='the folder that the check made, with its owner marker, is still there'
 left_unread='the folder that the check made may still be there, since it could not be read'
+left_marker_unread_folder='the owner marker that the check wrote is still in the folder, and the folder that the check made may still be there, since it could not be read'
+left_marker_unread='the owner marker that the check wrote may still be in the folder, since it could not be read'
+left_both_unread='the folder that the check made and its owner marker may still be there, since they could not be read'
 
 # What $1 holds at every depth: each entry's name, kind, mode, owner and link target, the folder's
 # own included, and a checksum of each file; or `absent`; or, for a link, where it points and what
@@ -682,9 +685,9 @@ for victim in mid state; do
 done
 
 echo "== each folder is listed from inside its parent, and the folder that is entered is the one listed"
-# A case defines `stand_cd`, `stand_ls`, `stand_uname`, `stand_rm` or `stand_chmod`, which stand in for
-# `cd`, `ls`, `uname`, `rm` and `chmod` inside the subshell that stand_check runs the check in (so that
-# no other case sees them), and removes them after the call.
+# A case defines `stand_cd`, `stand_ls`, `stand_uname`, `stand_rm`, `stand_chmod` or `stand_rmdir`, which
+# stand in for `cd`, `ls`, `uname`, `rm`, `chmod` and `rmdir` inside the subshell that stand_check runs
+# the check in (so that no other case sees them), and removes them after the call.
 # stand_check <temporary directory> <state>: sets `out` (what the check said, or `accepted` with the
 # inode and the name it left) and `code`.
 stand_check() {
@@ -693,7 +696,7 @@ stand_check() {
     # shellcheck source=scripts/lib/e2e-state-folder.sh
 . "$root/scripts/lib/e2e-state-folder.sh"
     local fn
-    for fn in cd ls uname rm chmod; do
+    for fn in cd ls uname rm chmod rmdir; do
       if declare -F "stand_$fn" > /dev/null; then
         eval "$fn() { stand_$fn \"\$@\"; }"
       fi
@@ -961,15 +964,21 @@ expect "the folder that the walk made is where it was moved" yes "$([ -d "$t/idc
 # the entry `./state` from its `unl_from`-th call on (call 1 finds the folder absent, call 2 follows the
 # `mkdir`, and the cleanup's is call 3 where the walk got that far), and where `unl_gone` names a folder
 # it first removes that one folder with `rmdir`: the one folder that the case's own walk made, a literal
-# path under the case's scratch folder, and only in the last of the three cases.
+# path under the case's scratch folder, and only in the case that shows a folder that is gone. Where
+# `unl_deny` names a folder (the parent that the cleanup stands in, a literal path under the case's
+# scratch folder) it first takes every permission from it, so that the tests of a name and the read of
+# the directory fail too while the folder stands; the case gives the permissions back, and runs only
+# for an account that a mode stops (root is not).
 unl_from=0
 unl_gone=""
+unl_deny=""
 unl_count=""
 stand_ls() {
   if [ "${3:-}" = ./state ]; then
     printf x >> "$unl_count"
     if [ "$(wc -c < "$unl_count" | tr -d ' ')" -ge "$unl_from" ]; then
       [ -z "$unl_gone" ] || rmdir -- "$unl_gone"
+      [ -z "$unl_deny" ] || command chmod 000 -- "$unl_deny"
       return 1
     fi
   fi
@@ -988,15 +997,98 @@ unl_from=2 unl_gone="" unl_count="$scratch/unl-count-first"
 stand_check "$t" "$t/unl/first/state"
 said "a cleanup listing that fails after the first listing of the made folder failed" "$(sentence "$t/unl/first/state"); $left_unread"
 expect "the folder whose listings failed is still there" yes "$([ -d "$t/unl/first/state" ] && echo yes || echo no)"
-# The folder is gone when the cleanup's listing fails: the name is neither a file nor a link, so nothing
-# is left and the sentence says that nothing was kept.
+# The folder is gone when the cleanup's listing fails: the parent was read and does not hold the name,
+# so nothing is left and the sentence says that nothing was kept.
 stand_chmod() { return 1; }
 unl_from=3 unl_gone="$t/unl/gone/state" unl_count="$scratch/unl-count-gone"
 stand_check "$t" "$t/unl/gone/state"
 unset -f stand_chmod
 said "a cleanup listing that fails after the made folder is gone" "$(write_sentence "$t/unl/gone/state")"
 expect "the folder that was gone is not there" no "$([ -d "$t/unl/gone/state" ] && echo yes || echo no)"
+# The same where the parent also holds a folder whose name starts with the same letters: the name is
+# matched whole, so the longer name does not show the folder to be there.
+mk "$t/unl/longer/state-longer"
+stand_chmod() { return 1; }
+unl_from=3 unl_gone="$t/unl/longer/state" unl_count="$scratch/unl-count-longer"
+stand_check "$t" "$t/unl/longer/state"
+unset -f stand_chmod
+said "a folder with a longer name beside a made folder that is gone" "$(write_sentence "$t/unl/longer/state")"
+unl_gone=""
+# The listing fails and so does every test of the name, because the parent has no permission left: the
+# folder stands, and the sentence says that it may be there.
+if [ "$caller" -ne 0 ]; then
+  mk "$t/unl/denied"
+  stand_chmod() { return 1; }
+  unl_from=3 unl_deny="$t/unl/denied" unl_count="$scratch/unl-count-denied"
+  stand_check "$t" "$t/unl/denied/state"
+  unset -f stand_chmod
+  chmod 755 "$t/unl/denied"
+  unl_deny=""
+  said "a cleanup whose listing and name tests both fail while the folder stands" "$(write_sentence "$t/unl/denied/state" "$left_unread")"
+  expect "the folder whose listing and name tests failed is still there" yes "$([ -d "$t/unl/denied/state" ] && echo yes || echo no)"
+  # The same, with the marker: its removal fails, the marker can be read as there, and the folder cannot
+  # be read.
+  mk "$t/unl/markered"
+  stand_chmod() { return 1; }
+  stand_rm() { return 1; }
+  unl_from=3 unl_deny="$t/unl/markered" unl_count="$scratch/unl-count-markered"
+  stand_check "$t" "$t/unl/markered/state"
+  unset -f stand_chmod stand_rm
+  chmod 755 "$t/unl/markered"
+  unl_deny=""
+  said "a marker that is still there beside a folder that cannot be listed" "$(write_sentence "$t/unl/markered/state" "$left_marker_unread_folder")"
+else
+  echo "  skipped: a parent without permissions (an account that a mode does not stop)"
+fi
 unset -f stand_ls
+
+# The cleanup cannot enter the parent folder: it cannot tell whether the folder is there, so the
+# sentence says that it may be.
+mk "$t/pcd/mid"
+stand_chmod() { return 1; }
+stand_cd() {
+  [ "${3:-}" != "$t/pcd/mid" ] || return 1
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/pcd/mid/state"
+unset -f stand_chmod stand_cd
+said "a cleanup that cannot enter the parent folder" "$(write_sentence "$t/pcd/mid/state" "$left_unread")"
+expect "the folder whose parent could not be entered is still there" yes "$([ -d "$t/pcd/mid/state" ] && echo yes || echo no)"
+# A marker whose removal command reports a failure but that is not there: the directory shows it gone,
+# so nothing is left. The stand-in removes that one marker, a literal path under the case's scratch folder.
+mk "$t/mkg/exist/state"
+stand_chmod() { return 1; }
+stand_rm() { command rm -f -- "$t/mkg/exist/state/.kr-e2e-owner"; return 1; }
+stand_check "$t" "$t/mkg/exist/state"
+unset -f stand_chmod stand_rm
+said "a marker whose removal reports a failure but that is gone" "$(write_sentence "$t/mkg/exist/state")"
+if [ "$caller" -ne 0 ]; then
+  # The removal of the folder fails and the parent then has no permission left: the tests of the name
+  # fail while the folder stands.
+  mk "$t/rmd"
+  stand_chmod() { return 1; }
+  stand_rmdir() { command chmod 000 -- .; return 1; }
+  stand_check "$t" "$t/rmd/state"
+  unset -f stand_chmod stand_rmdir
+  chmod 755 "$t/rmd"
+  said "a removal of the folder that fails while its name cannot be tested" "$(write_sentence "$t/rmd/state" "$left_unread")"
+  expect "the folder whose removal failed is still there" yes "$([ -d "$t/rmd/state" ] && echo yes || echo no)"
+  # The removal of the marker fails and the folder then has no permission left: the marker cannot be
+  # read as there or gone. Where the folder was there before the walk, only the marker may remain; where
+  # the walk made it, the folder is there with it.
+  mk "$t/mku/exist/state" "$t/mku/new"
+  stand_chmod() { return 1; }
+  stand_rm() { command chmod 000 -- .; return 1; }
+  stand_check "$t" "$t/mku/exist/state"
+  chmod 755 "$t/mku/exist/state"
+  said "a marker that cannot be removed or found in a folder that was there" "$(write_sentence "$t/mku/exist/state" "$left_marker_unread")"
+  stand_check "$t" "$t/mku/new/state"
+  chmod 755 "$t/mku/new/state"
+  unset -f stand_chmod stand_rm
+  said "a marker that cannot be removed or found in a folder that the walk made" "$(write_sentence "$t/mku/new/state" "$left_both_unread")"
+else
+  echo "  skipped: a folder without permissions (an account that a mode does not stop)"
+fi
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"
