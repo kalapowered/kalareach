@@ -4619,23 +4619,32 @@ async fn a_tie_of_two_entries_is_decided_by_the_hash_and_then_the_endpoint_in_ei
             served: Some(served),
             accept: None,
         };
-        scenario(small)
-            .says(&world, "the smaller hash is offered", "offered 5")
-            .await;
-        scenario(large)
-            .says(
-                &world,
-                "the larger hash is another manifest",
-                &format!("other manifest at 5 by host {holder:02x}"),
-            )
-            .await;
-        scenario(&three)
-            .says(
-                &world,
-                "an older generation is held back",
-                &format!("replayed under 5 by host {holder:02x}"),
-            )
-            .await;
+        let (restored, listed) = scenario(small).said(&world).await;
+        assert_eq!(
+            restored, "offered 5",
+            "the smaller hash is offered: a restore"
+        );
+        assert_eq!(listed, "offered 5", "the smaller hash is offered: the list");
+        let other = format!("other manifest at 5 by host {holder:02x}");
+        let (restored, listed) = scenario(large).said(&world).await;
+        assert_eq!(
+            restored, other,
+            "the larger hash is another manifest: a restore"
+        );
+        assert_eq!(
+            listed, other,
+            "the larger hash is another manifest: the list"
+        );
+        let replayed = format!("replayed under 5 by host {holder:02x}");
+        let (restored, listed) = scenario(&three).said(&world).await;
+        assert_eq!(
+            restored, replayed,
+            "an older generation is held back: a restore"
+        );
+        assert_eq!(
+            listed, replayed,
+            "an older generation is held back: the list"
+        );
     }
 
     // One manifest, two hosts: the smaller endpoint is the holder named.
@@ -4643,18 +4652,22 @@ async fn a_tie_of_two_entries_is_decided_by_the_hash_and_then_the_endpoint_in_ei
         vec![at(0x42, small), at(0x52, small)],
         vec![at(0x52, small), at(0x42, small)],
     ] {
-        Scenario {
+        let (restored, listed) = Scenario {
             bundle: Vec::new(),
             entries,
             served: Some(&three),
             accept: None,
         }
-        .says(
-            &world,
-            "the smaller endpoint",
-            "replayed under 5 by host 42",
-        )
+        .said(&world)
         .await;
+        assert_eq!(
+            restored, "replayed under 5 by host 42",
+            "the smaller endpoint: a restore"
+        );
+        assert_eq!(
+            listed, "replayed under 5 by host 42",
+            "the smaller endpoint: the list"
+        );
     }
 }
 
