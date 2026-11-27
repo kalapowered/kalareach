@@ -9,6 +9,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useLayoutEffect,
   useRef,
   useState,
   useSyncExternalStore,
@@ -52,21 +53,31 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
  */
 const NARROW = '(max-width: 720px)'
 
-function subscribeNarrow(notify: () => void): () => void {
-  const query = window.matchMedia(NARROW)
-  query.addEventListener('change', notify)
-  return () => {
-    query.removeEventListener('change', notify)
-  }
-}
-
 function isNarrow(): boolean {
   return window.matchMedia(NARROW).matches
 }
 
-/** Whether the window is narrow now, and again each time it becomes or stops being so. */
-function useNarrow(): boolean {
-  return useSyncExternalStore(subscribeNarrow, isNarrow, () => false)
+/**
+ * Whether the window is narrow now, and again each time it becomes or stops being so. The element
+ * that has the focus when the window changes form is kept in `held`: the change is told before the
+ * page is drawn again, while the controls the new form takes away are still there.
+ */
+function useNarrow(held: { current: Element | null }): boolean {
+  const subscribe = useCallback(
+    (notify: () => void): (() => void) => {
+      const query = window.matchMedia(NARROW)
+      const changed = (): void => {
+        held.current = document.activeElement
+        notify()
+      }
+      query.addEventListener('change', changed)
+      return () => {
+        query.removeEventListener('change', changed)
+      }
+    },
+    [held]
+  )
+  return useSyncExternalStore(subscribe, isNarrow, () => false)
 }
 
 /**
@@ -173,7 +184,8 @@ export function App(): ReactNode {
   // open the page behind takes no focus and no scroll, and the drawer closes by Escape, by a press
   // outside it, by its own control or by a choice. Where the focus goes then is decided by how it
   // closed: back to the control that opened it, or onto the page that was chosen.
-  const narrow = useNarrow()
+  const heldAtChange = useRef<Element | null>(null)
+  const narrow = useNarrow(heldAtChange)
   const [wasNarrow, setWasNarrow] = useState(narrow)
   const [navigationOpen, setNavigationOpen] = useState(false)
   // Motion answers a person's own act. The drawer goes out by a transition only once a person has
@@ -215,6 +227,19 @@ export function App(): ReactNode {
       null,
     []
   )
+  // A window widened past the drawer's width takes "Menu" and "Close menu" away. When one of them
+  // had the focus it goes to the item of the destination that is shown, where the sidebar now stands.
+  useLayoutEffect(() => {
+    const held = heldAtChange.current
+    heldAtChange.current = null
+    if (narrow || !(held instanceof HTMLElement) || !held.hasAttribute('data-menu-control')) return
+    const item = firstStop()
+    focusAfter.current = item
+    item?.focus()
+  }, [narrow, firstStop])
+  // Where the focus goes as Account closes when the control that led there is gone: to "Menu" in the
+  // window's narrow form, and in the wide one, which has no "Menu", to the shown destination's item.
+  const whenMenuIsGone = useCallback(() => menu.current ?? firstStop(), [firstStop])
   useModalSurface(sidebar, open, closeToMenu, {
     firstStop,
     returnTo: focusAfter,
@@ -385,6 +410,7 @@ export function App(): ReactNode {
         title="Account"
         description="Sessions keep running while this is open."
         closeLabel="Close the account panel"
+        focusWhenGone={whenMenuIsGone}
         onClose={() => {
           setAccountOpen(false)
         }}

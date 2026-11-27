@@ -613,6 +613,55 @@ test.describe('the window as it is at 721 points and wider', () => {
   })
 })
 
+/**
+ * A window widened past 720 points takes "Menu" and "Close menu" away. Whatever of them had the focus,
+ * and whatever was to return the focus to them, goes to the item of the destination that is shown.
+ */
+test.describe('the focus when the window widens over the drawer', () => {
+  const currentItem = (page: Page): Locator => page.locator('.sidebar [aria-current="page"]')
+
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    test(`${width} points: "Close menu" had the focus, and the shown destination's item has it now`, async ({ page }) => {
+      await openWindow(page, width, ratio)
+      await menuOf(page).click()
+      await expect(drawerOf(page)).toBeVisible()
+      await closeOf(page).focus()
+      await expect(closeOf(page)).toBeFocused()
+      await page.setViewportSize({ width: 800, height: HEIGHT })
+      await expect(menuOf(page)).toHaveCount(0)
+      await expect(currentItem(page), 'the focus is on the item of the destination that is shown').toBeFocused()
+      await expect(currentItem(page)).toHaveText(/^Attention/)
+    })
+
+    test(`${width} points: "Menu" had the focus, and the shown destination's item has it now`, async ({ page }) => {
+      await openWindow(page, width, ratio)
+      await menuOf(page).focus()
+      await expect(menuOf(page)).toBeFocused()
+      await page.setViewportSize({ width: 800, height: HEIGHT })
+      await expect(menuOf(page)).toHaveCount(0)
+      await expect(currentItem(page), 'the focus is on the item of the destination that is shown').toBeFocused()
+    })
+
+    test(`${width} points: Account was opened from the drawer, and closing it after the window widened returns to the item`, async ({
+      page
+    }) => {
+      await openWindow(page, width, ratio)
+      await menuOf(page).click()
+      await itemOf(page, /^Account/).click()
+      const sheet = page.getByRole('dialog', { name: 'Account' })
+      await expect(sheet).toBeVisible()
+      await page.setViewportSize({ width: 800, height: HEIGHT })
+      await expect(menuOf(page)).toHaveCount(0)
+      await page.keyboard.press('Escape')
+      await expect(sheet).toBeHidden()
+      await expect(currentItem(page), 'the focus returns to the item of the destination that is shown').toBeFocused()
+    })
+  }
+})
+
 test.describe('the drawer on a page that scrolls', () => {
   for (const [width, ratio] of [
     [600, 1],

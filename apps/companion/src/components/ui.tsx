@@ -810,6 +810,12 @@ export interface ModalSurfaceOptions {
   /** The control that takes the focus as the surface comes, in place of its first one. */
   readonly firstStop?: () => HTMLElement | null
   /**
+   * Where the focus goes as the surface goes when the element that had it as the surface came is no
+   * longer in the page (a control that the window's new form took away): a surface that went to the
+   * page's body would leave the person nowhere.
+   */
+  readonly whenGone?: () => HTMLElement | null
+  /**
    * The control the focus goes to as the surface goes, in place of the one that had it as the
    * surface came: a press does not give a button the focus in every engine, so that one can be the
    * page's body. It is read as the surface goes, so what closes the surface can say where.
@@ -905,7 +911,8 @@ export function useModalSurface(
       const active = document.activeElement
       const lost = active === null || active === document.body
       if (asked.returnTo === undefined) {
-        if (lost) restoreFocus.current?.focus()
+        const from = restoreFocus.current
+        if (lost) (from !== null && !from.isConnected ? asked.whenGone?.() : from)?.focus()
       } else if (lost || element.contains(active)) {
         // What closed the surface said where the focus goes; a focus left inside it would be lost
         // to the page's body as the surface is hidden.
@@ -947,7 +954,8 @@ export function Sheet({
   onClose,
   children,
   footer,
-  messageAt = 'foot'
+  messageAt = 'foot',
+  focusWhenGone
 }: {
   readonly open: boolean
   readonly title: string
@@ -964,6 +972,8 @@ export function Sheet({
    * above a footer that only leads elsewhere, puts it above the body instead, away from them.
    */
   readonly messageAt?: 'foot' | 'head'
+  /** Where the focus goes as the surface closes when the control that opened it has gone from the page. */
+  readonly focusWhenGone?: () => HTMLElement | null
 }): ReactNode {
   const sheetRef = useRef<HTMLDivElement | null>(null)
   const scrimRef = useRef<HTMLDivElement | null>(null)
@@ -1078,7 +1088,7 @@ export function Sheet({
     }
   }, [open, mounted, place, reduced])
 
-  useModalSurface(sheetRef, mounted, close)
+  useModalSurface(sheetRef, mounted, close, { whenGone: focusWhenGone })
 
   if (!mounted) return null
 
