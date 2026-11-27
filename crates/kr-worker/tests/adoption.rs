@@ -3370,6 +3370,76 @@ fn kr_req_12_07_a_process_that_ended_before_the_second_identity_is_not_adopted()
     assert_eq!(setup.adoptions.adopted(&started.process), None);
 }
 
+/// How long a case waits for the child it ended to become a zombie, before it calls that a failure:
+/// shorter than the five seconds after which a look stopped at a pause goes on by itself.
+const ZOMBIE_WAIT: Duration = Duration::from_secs(3);
+
+/// Holds a child this test started and collects it when dropped, so that no way out of the test, a
+/// failed assertion included, leaves it uncollected. The only signal it sends is the one through the
+/// child's own handle.
+struct Collected(Started);
+
+impl Drop for Collected {
+    fn drop(&mut self) {
+        let _ = self.0.child.kill();
+        let _ = self.0.child.wait();
+    }
+}
+
+/// Returns whether `pid`, a child of this process that was ended and not collected, is a zombie:
+/// on Linux its state is `Z`, and on macOS the kernel reads no arguments of it.
+fn is_a_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        arguments_of(pid).is_none()
+    }
+}
+
+/// KR-REQ-12.07: a process that ends after its arguments were read and is not yet collected, a
+/// zombie when the look asks whether it still runs, is not adopted. The kernel keeps its start
+/// identity but no longer names its image, so only the test that it still runs refuses it.
+#[test]
+fn kr_req_12_07_a_process_that_became_a_zombie_before_the_test_that_it_still_runs_is_not_adopted() {
+    let setup = Setup::new();
+    let mut started = Collected(setup.start());
+    let foreground = Setup::foreground(&started.0, Vec::new());
+    let pid = started.0.child.id();
+    let told = setup.look_with_stops(
+        &foreground,
+        vec![at(setup.adoptions.pause_after_arguments(), || {
+            started
+                .0
+                .child
+                .kill()
+                .expect("the child this test started ends");
+            let ended = std::time::Instant::now();
+            while !is_a_zombie(pid) {
+                assert!(
+                    ended.elapsed() < ZOMBIE_WAIT,
+                    "the child did not become a zombie within {ZOMBIE_WAIT:?} of its end"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })],
+    );
+    assert!(
+        is_a_zombie(pid),
+        "the child is still an uncollected zombie when the look ends"
+    );
+    assert!(
+        told.is_empty(),
+        "a process that ended before the test that it still runs is not adopted: {told:?}"
+    );
+    assert_eq!(setup.adoptions.adopted(&started.0.process), None);
+}
+
 /// KR-REQ-12.07, a stated limit: a program whose file is replaced before the look opens it. Linux
 /// opens the image the process runs and reads its path afterwards with the suffix that says it is
 /// deleted, so the look refuses it and no later look recognises it. macOS opens and compares the
