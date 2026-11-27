@@ -739,7 +739,9 @@ pub struct ConnectionState {
     /// failure just before the replacement, so the page says so whenever this grows.
     pub replaced: u64,
     /// While no connection is held and a try to reach the host in use has run past `SLOW_TRY`
-    /// without ending, which kind of host that try is for; null otherwise.
+    /// without ending, which kind of host that try is for; null otherwise. The field describes one
+    /// published revision of the state: a revision that shows a mark can still be delivered after
+    /// the owner has cleared its own state, so a mark read here can be one the owner has dropped.
     ///
     /// Null proves nothing: a try can be running with no mark. A mark is taken only when the
     /// standing words are those of a host that was not reached (a try that failed, or a connection
@@ -749,8 +751,12 @@ pub struct ConnectionState {
     /// that writes the try's result or finds nothing to reach, when the task that runs the try
     /// unwinds from a panic, and in any other write of the reason; between the end of the try and
     /// that commit it still shows. The reason is not changed while the mark shows. A try for the
-    /// host on this machine has no bound of its own, so the mark stays for as long as that host
-    /// holds its socket open and sends nothing.
+    /// host on this machine has no bound of its own, so an eligible mark can remain indefinitely
+    /// while that host holds its socket open and sends nothing; another state change (a new
+    /// choice, a forget or another write of the reason) can still clear it. A try for a paired
+    /// host runs under three timeouts of 20 seconds, one after another (the dial, the host's
+    /// information and the open of the connection); that is no promise that the try ends within
+    /// 60 seconds by the wall clock.
     pub still_reaching: Option<Reaching>,
 }
 
