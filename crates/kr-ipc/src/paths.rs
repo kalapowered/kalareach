@@ -5445,38 +5445,56 @@ mod tests {
         [("plain", plain), ("verbatim", verbatim)]
     }
 
-    /// A write to a destination whose parent holds a NUL is refused and makes nothing in the
-    /// folder it was meant for. The system reads a name only as far as its first NUL, so a name
-    /// that is not refused makes the part before it: here a file `a`.
+    /// What a write to a destination whose parent holds a NUL does, in each spelling: its result,
+    /// and the names that stand in the folder it was meant for afterwards. The system reads a name
+    /// only as far as its first NUL, so a name that is not refused makes the part before it: here
+    /// a file `a`.
     #[cfg(windows)]
-    fn assert_a_nul_in_a_parent_makes_nothing(write: fn(&Path, &[u8]) -> Result<()>) {
+    fn writes_to_a_nul_in_a_parent(
+        write: fn(&Path, &[u8]) -> Result<()>,
+    ) -> Vec<(&'static str, Result<()>, Vec<String>)> {
         let directory = Inheriting::new("nul-in-a-parent");
-        for (spelling, destination) in destinations_with_a_nul_in_a_parent(&directory.0) {
-            let written = write(&destination, b"content");
-            assert!(
-                written.is_err(),
-                "a {spelling} name with a NUL in a parent is refused: {written:?}"
-            );
-            assert_eq!(
-                names_in(&directory.0),
-                Vec::<String>::new(),
-                "{spelling}: nothing is made in the folder, not even the part of the name before the NUL"
-            );
-        }
+        destinations_with_a_nul_in_a_parent(&directory.0)
+            .into_iter()
+            .map(|(spelling, destination)| {
+                let written = write(&destination, b"content");
+                (spelling, written, names_in(&directory.0))
+            })
+            .collect()
     }
 
     /// The replacing writer refuses a destination whose parent holds a NUL and makes nothing.
     #[cfg(windows)]
     #[test]
     fn the_replacing_writer_refuses_a_nul_in_a_parent_and_makes_nothing() {
-        assert_a_nul_in_a_parent_makes_nothing(write_owner_only_file);
+        for (spelling, written, names) in writes_to_a_nul_in_a_parent(write_owner_only_file) {
+            assert!(
+                written.is_err(),
+                "a {spelling} name with a NUL in a parent is refused: {written:?}"
+            );
+            assert_eq!(
+                names,
+                Vec::<String>::new(),
+                "{spelling}: nothing is made in the folder, not even the part of the name before the NUL"
+            );
+        }
     }
 
     /// The creating writer refuses a destination whose parent holds a NUL and makes nothing.
     #[cfg(windows)]
     #[test]
     fn the_creating_writer_refuses_a_nul_in_a_parent_and_makes_nothing() {
-        assert_a_nul_in_a_parent_makes_nothing(create_new_owner_only_file);
+        for (spelling, written, names) in writes_to_a_nul_in_a_parent(create_new_owner_only_file) {
+            assert!(
+                written.is_err(),
+                "a {spelling} name with a NUL in a parent is refused: {written:?}"
+            );
+            assert_eq!(
+                names,
+                Vec::<String>::new(),
+                "{spelling}: nothing is made in the folder, not even the part of the name before the NUL"
+            );
+        }
     }
 
     /// The directory writer refuses a destination whose parent holds a NUL and makes nothing.
@@ -5504,10 +5522,13 @@ mod tests {
     #[cfg(windows)]
     const LONG_FOLDER_LENGTH: usize = 240;
 
-    /// A write to a destination below the short path limit, whose temporary name is past it, is
-    /// written whole and published, and nothing else is left in the folder.
+    /// What a write to a destination below the short path limit, whose temporary name is past it,
+    /// does: its result, what the destination holds afterwards, and the names that stand beside
+    /// the destination.
     #[cfg(windows)]
-    fn assert_a_temporary_name_past_the_limit_is_written(write: fn(&Path, &[u8]) -> Result<()>) {
+    fn write_where_only_the_temporary_name_is_past_the_limit(
+        write: fn(&Path, &[u8]) -> Result<()>,
+    ) -> (Result<()>, Vec<u8>, Vec<String>) {
         use std::os::windows::ffi::OsStrExt as _;
 
         let directory = Inheriting::new("long-temporary-name");
@@ -5527,34 +5548,44 @@ mod tests {
             "the destination is the length the case is made for"
         );
         let written = write(&destination, b"whole");
-        assert!(
-            written.is_ok(),
-            "the write is made where its temporary name is past the limit and the destination is not: {written:?}"
-        );
-        assert_eq!(
-            std::fs::read(&destination).expect("the destination reads"),
-            b"whole",
-            "the destination holds what was written"
-        );
-        assert_eq!(
-            names_in(&folder),
-            vec!["file".to_owned()],
-            "nothing is left beside the destination"
-        );
+        let held = std::fs::read(&destination).unwrap_or_default();
+        (written, held, names_in(&folder))
     }
 
     /// The replacing writer writes whole where only its temporary name is past the short limit.
     #[cfg(windows)]
     #[test]
     fn the_replacing_writer_publishes_where_only_its_temporary_name_is_past_the_limit() {
-        assert_a_temporary_name_past_the_limit_is_written(write_owner_only_file);
+        let (written, held, left) =
+            write_where_only_the_temporary_name_is_past_the_limit(write_owner_only_file);
+        assert!(
+            written.is_ok(),
+            "the write is made where its temporary name is past the limit and the destination is not: {written:?}"
+        );
+        assert_eq!(held, b"whole", "the destination holds what was written");
+        assert_eq!(
+            left,
+            vec!["file".to_owned()],
+            "nothing is left beside the destination"
+        );
     }
 
     /// The creating writer writes whole where only its temporary name is past the short limit.
     #[cfg(windows)]
     #[test]
     fn the_creating_writer_publishes_where_only_its_temporary_name_is_past_the_limit() {
-        assert_a_temporary_name_past_the_limit_is_written(create_new_owner_only_file);
+        let (written, held, left) =
+            write_where_only_the_temporary_name_is_past_the_limit(create_new_owner_only_file);
+        assert!(
+            written.is_ok(),
+            "the write is made where its temporary name is past the limit and the destination is not: {written:?}"
+        );
+        assert_eq!(held, b"whole", "the destination holds what was written");
+        assert_eq!(
+            left,
+            vec!["file".to_owned()],
+            "nothing is left beside the destination"
+        );
     }
 
     /// The variable that names the folder in which the two cases below meet.
