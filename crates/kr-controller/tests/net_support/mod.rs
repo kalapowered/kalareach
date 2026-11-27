@@ -1816,6 +1816,12 @@ impl Device {
         &self.endpoint
     }
 
+    /// The socket addresses this device's own endpoint holds for `host`: the ones it dialled, and
+    /// the ones an earlier incarnation of the host answered at.
+    pub async fn addresses_held_for(&self, host: &Host) -> Vec<std::net::SocketAddr> {
+        held_addresses(&self.endpoint, endpoint_id_of(host)).await
+    }
+
     /// The identity this device presents once the host has given it `device_id`.
     pub fn paired_identity(&self, device_id: DeviceId) -> Arc<LocalIdentity> {
         self.paired_identity_receiving(device_id, kr_protocol::hello::ReceiveLimits::default())
@@ -2067,6 +2073,12 @@ impl PairedDial {
         .await
     }
 
+    /// The socket addresses the endpoint this dial goes out from holds for the host: none until
+    /// the endpoint has dialled it, and then the addresses it dialled and learned.
+    pub async fn addresses_held_for_the_host(&self) -> Vec<std::net::SocketAddr> {
+        held_addresses(&self.from.endpoint().await, self.addr.id).await
+    }
+
     /// Shuts the endpoint this dial goes out from, so that every connect of it fails at once: for
     /// a case that shows what a connect that cannot be made says.
     pub async fn shut_its_endpoint(&self) {
@@ -2227,6 +2239,30 @@ pub fn paired_dial_through(
     dial
 }
 
+/// The identity a device dials `host` by.
+fn endpoint_id_of(host: &Host) -> iroh::EndpointId {
+    iroh::PublicKey::from_bytes(host.network.endpoint_id().as_bytes())
+        .expect("a usable endpoint identity")
+}
+
+/// The socket addresses `endpoint` holds for `peer`, in order; none when it holds nothing for it.
+async fn held_addresses(endpoint: &Endpoint, peer: iroh::EndpointId) -> Vec<std::net::SocketAddr> {
+    let mut held = endpoint
+        .remote_info(peer)
+        .await
+        .map(|info| {
+            info.addrs()
+                .filter_map(|address| match address.addr() {
+                    iroh::TransportAddr::Ip(socket) => Some(*socket),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    held.sort();
+    held
+}
+
 fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
     let pairing = host.network.pairing();
     let host_record = PairedPeer {
@@ -2235,10 +2271,7 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
         authorisation: pairing.identity().keys.authorisation,
         endpoint_id: host.network.endpoint_id(),
     };
-    let addr = EndpointAddr::new(
-        iroh::PublicKey::from_bytes(host.network.endpoint_id().as_bytes())
-            .expect("a usable endpoint identity"),
-    );
+    let addr = EndpointAddr::new(endpoint_id_of(host));
     PairedDial {
         from: DialFrom::Fresh {
             keys: device.keys.transport.clone(),

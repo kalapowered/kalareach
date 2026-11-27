@@ -1,7 +1,8 @@
 //! What the test helper's connect of a paired device says when it fails for good: the layer that
 //! failed, the error's chain, how long the host and the dial had been up, every attempt with what
 //! the dial offered and what the dialling endpoint knew of the host, and the lines the process
-//! logged.
+//! logged. And that the helper's dial reaches a host that came back on another port while another
+//! host answers at the address it left.
 
 mod net_support;
 
@@ -12,8 +13,11 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::invitation::InviteEntry;
 use kr_protocol::rights::ActionRight;
 use kr_transport::TransportError;
+use kr_transport::config::EndpointConfig;
 use net_support::connect_report::{chain_of, layer_of};
-use net_support::{Device, Host, pair_keeping_the_invitation, paired_dial, proposal};
+use net_support::{
+    Device, Host, loopback, pair_keeping_the_invitation, pair_with, paired_dial, proposal,
+};
 
 /// The text a panic carries.
 fn said(panic: Box<dyn std::any::Any + Send>) -> String {
@@ -178,4 +182,94 @@ fn each_failure_of_the_transport_is_named_by_its_layer() {
         )))
         .ends_with("the connection could not be established: planted text")
     );
+}
+
+/// A host that comes back on another port, while another host of the same machine answers at the
+/// address it left, is reached by the device it was paired with, as that device, every time.
+///
+/// An endpoint that dialled the host before its restart still holds the address the host left, and
+/// a dial from it offers that address beside the new one: the stranger's answer there carries a key
+/// that is not the host's, and ends the dial with a certificate that is not the one dialled, in
+/// about half the dials. So the case does not count dials. It shows that the device's own endpoint
+/// holds the address the host left (the case sets its own trap), that the endpoint the helper
+/// dials from holds no address of the host before it dials, that the dial then connects, and that
+/// the endpoint holds the host's new address and not the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_address_it_left() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(
+        &host,
+        &device,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let [left] = host.network().bound_sockets()[..] else {
+        panic!("the host is bound to one socket");
+    };
+    let stopped = host.shut_down().await;
+    let stranger = Host::start_with_endpoint(
+        &DeviceKeys::generate().expect("a stranger's owner keys"),
+        EndpointConfig {
+            bind_addr: Some(left),
+            ..loopback()
+        },
+    )
+    .await;
+    assert_eq!(
+        stranger.network().bound_sockets(),
+        [left],
+        "the stranger stands at the address the host left"
+    );
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let [now] = host.network().bound_sockets()[..] else {
+        panic!("the restarted host is bound to one socket");
+    };
+    assert_ne!(left, now, "the host came back on another port");
+
+    // The trap: the endpoint the device paired from still holds the address the host left. A case
+    // that cannot set it shows nothing about the dial.
+    let trap = device.addresses_held_for(&host).await;
+    assert!(
+        trap.contains(&left),
+        "the case did not set its trap: the device's own endpoint holds {trap:?} for the host, \
+         not the address {left} the host left, so a dial from it would not meet the stranger"
+    );
+
+    let dial = paired_dial(&host, &device, &record);
+    let before = dial.addresses_held_for_the_host().await;
+    assert!(
+        before.is_empty(),
+        "the endpoint the dial goes out from holds {before:?} for the host before its first \
+         dial, and carries an address of an earlier host (the device's own endpoint holds \
+         {trap:?})"
+    );
+
+    // The host selects the paired record by the key the dial's endpoint proves, so a connection
+    // that is authorised is the original paired device's.
+    let reached = dial.try_dial().await;
+    assert!(
+        reached.is_ok(),
+        "the device did not reach its host at {now} while another host answered at {left}: {}",
+        reached
+            .as_ref()
+            .err()
+            .map_or_else(String::new, |error| format!(
+                "{}: {}",
+                layer_of(error),
+                chain_of(error)
+            ))
+    );
+
+    let after = dial.addresses_held_for_the_host().await;
+    assert!(
+        after.contains(&now) && !after.contains(&left),
+        "after the dial the endpoint holds {after:?} for the host: it should hold the new \
+         address {now} and not the old one {left}"
+    );
+    drop(reached);
+    drop(stranger);
 }
