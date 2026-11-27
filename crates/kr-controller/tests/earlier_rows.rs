@@ -1422,7 +1422,8 @@ fn registry_with_a_log(directory: &Path, version: i64) -> std::path::PathBuf {
 }
 
 /// The version, the schema's text and a digest over the rows of every table, as a read-only
-/// connection reads them through the log.
+/// connection reads them through the log. SQLite's own sequence table is one of the tables: the
+/// registry has tables that count automatically, and a counter that moved is a row that changed.
 fn what_a_reader_sees(path: &Path) -> (i64, Vec<(String, String, String)>, u64) {
     use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 
@@ -1442,10 +1443,9 @@ fn what_a_reader_sees(path: &Path) -> (i64, Vec<(String, String, String)>, u64) 
         .collect::<Result<_, _>>()
         .expect("every row");
     let mut digest = DefaultHasher::new();
-    for (_, table, _) in schema
-        .iter()
-        .filter(|(kind, name, _)| kind == "table" && !name.starts_with("sqlite_"))
-    {
+    for (_, table, _) in schema.iter().filter(|(kind, name, _)| {
+        kind == "table" && (!name.starts_with("sqlite_") || name == "sqlite_sequence")
+    }) {
         let mut statement = connection
             .prepare(&format!("SELECT * FROM \"{table}\""))
             .expect("a table reads");
@@ -1498,41 +1498,59 @@ fn an_update_refuses_a_registry_at_17_or_20_by_its_version_in_a_folder_that_take
     }
 }
 
-/// KR-REQ-23.45: a registry that a newer daemon left with a log that holds writes is refused, and
-/// the refusal adds nothing to what the database's own recovery does: the version, the schema's
-/// text and every table's rows, read through the log, are the same before and after. The log is the
-/// only place that holds the version here, so the file alone would read as a supported registry.
+/// KR-REQ-23.45: a registry that a newer daemon left with a log that holds writes is refused by a
+/// daemon's start and by an update, and the refusal adds nothing to what the database's own
+/// recovery does: the version, the schema's text and every table's rows (SQLite's own sequence
+/// table among them), read through the log, are the same before and after. The log is the only
+/// place that holds the version here, so the file alone would read as a supported registry. An
+/// update leaves 23 for the reader to refuse in its own words, so it returns no registry there.
 #[test]
 fn a_refused_registry_with_a_log_that_holds_writes_reads_the_same_after_the_refusal() {
-    for version in [17_i64, 20, 23] {
-        let temp = tempfile::tempdir().expect("a directory on the internal disk");
-        let path = registry_with_a_log(temp.path(), version);
-        let alone = kr_controller::registry::open_immutable(&path)
-            .expect("the file alone reads")
-            .query_row("SELECT version FROM schema_version", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("a version");
-        assert_eq!(
-            alone,
-            kr_controller::registry::SCHEMA_VERSION,
-            "the file alone records a supported version: the log holds the one under test"
-        );
-        let before = what_a_reader_sees(&path);
-        assert_eq!(before.0, version, "read through the log");
-        let refusal = match open_registry(&path) {
-            Err(error) => error.to_string(),
-            Ok(_) => panic!("a registry at {version} is refused"),
-        };
-        assert!(
-            refusal.contains(&format!("schema version {version}")),
-            "{refusal}"
-        );
-        assert_eq!(
-            what_a_reader_sees(&path),
-            before,
-            "the refusal at {version} changed nothing a reader sees"
-        );
+    let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    for opener in [Opener::Open, Opener::BringForward] {
+        for version in [17_i64, 20, 23] {
+            let what = format!("{opener:?} at {version}");
+            let temp = tempfile::tempdir().expect("a directory on the internal disk");
+            let path = registry_with_a_log(temp.path(), version);
+            let alone = kr_controller::registry::open_immutable(&path)
+                .expect("the file alone reads")
+                .query_row("SELECT version FROM schema_version", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("a version");
+            assert_eq!(
+                alone,
+                kr_controller::registry::SCHEMA_VERSION,
+                "the file alone records a supported version: the log holds the one under test"
+            );
+            let before = what_a_reader_sees(&path);
+            assert_eq!(before.0, version, "read through the log: {what}");
+            assert!(
+                before
+                    .1
+                    .iter()
+                    .any(|(kind, name, _)| kind == "table" && name == "sqlite_sequence"),
+                "the file has SQLite's sequence table, which the digest takes: {what}"
+            );
+            let outcome: Result<(), String> = match opener {
+                Opener::Open => open_registry(&path).map(drop).map_err(|e| e.to_string()),
+                Opener::BringForward => {
+                    kr_controller::registry::Registry::bring_forward(&path, environment)
+                        .map(|carried| assert!(carried.is_none(), "{what}: {carried:?}"))
+                        .map_err(|e| e.to_string())
+                }
+            };
+            match (opener == Opener::Open || version != 23, outcome) {
+                (true, Err(refusal)) if refusal.contains(&format!("schema version {version}")) => {}
+                (false, Ok(())) => {}
+                (_, other) => panic!("{what}: not refused as it should be: {other:?}"),
+            }
+            assert_eq!(
+                what_a_reader_sees(&path),
+                before,
+                "{what}: the refusal changed something a reader sees"
+            );
+        }
     }
 }
 
