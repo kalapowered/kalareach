@@ -3436,6 +3436,11 @@ processes the closure terminated and anything that survived it.
 }
 ```
 
+A record that was held to a size limit lists some of its entries and counts the rest. Its
+`terminated` and `surviving` then list only the entries the record names, and the document gains
+one text member, `not_listed`, that says how many of the ended processes and how many of the other
+entries are not listed. The member is absent when the record counts nothing.
+
 `kr new --json` adds four members to the session object. `presentation` is `attach`, `terminal` or
 `invisible`. `presentation_error` says why the session could not be shown that way, and is null
 when it was. `execution_context_chosen` says whether `--desktop` or `--headless` was given. `outcome`
