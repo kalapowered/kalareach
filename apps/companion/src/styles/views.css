@@ -1585,8 +1585,13 @@
        stays in the line of the words, on the first. */
     align-self: center;
     /* The bar stays in place, so what it holds is bounded: at the largest text size a long reason
-       would otherwise fill the window and stay over the page. The words scroll inside their box. */
+       would otherwise fill the window and stay over the page. The words scroll inside their box.
+       The box is sized from the words' own line: two whole lines to read and the half of a third,
+       which the fade below cuts and so says that more follows; never under 12 % of the window, so a
+       reason that fits at the ordinary size shows whole, and never over 20 %. Where `lh` is not
+       known the first declaration stands. */
     max-block-size: 12vh;
+    max-block-size: clamp(12vh, 2.5lh, 20vh);
     overflow: hidden auto;
     overscroll-behavior: contain;
   }
@@ -1596,6 +1601,9 @@
   .topbar .connection[data-more='true'] {
     -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
     mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
+    /* Only the half line that peeks fades: the two whole lines above it stay as they are. */
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 0.5lh), transparent);
   }
 
   main {

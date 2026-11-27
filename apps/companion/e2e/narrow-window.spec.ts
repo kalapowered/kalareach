@@ -50,6 +50,9 @@ const DESTINATIONS: readonly (string | RegExp)[] = [
   /^Set up/
 ]
 
+/** A reason for no contact that is a few words, as the host most often gives one. */
+const SHORT_REASON = 'The host is not running.'
+
 /** A reason for no contact as long as the host's own words can be, with a path that has no place to break. */
 const LONG_REASON =
   'Not in contact: the host at /var/lib/someone/Application Support/KalaReach/sockets/controller-0123456789abcdef0123456789abcdef.sock refused the connection, and the retry twenty seconds later did not get through either.'
@@ -670,6 +673,37 @@ test.describe('the words in the top bar', () => {
     const state = await shown(page)
     expect(state.mask, 'no fade').toBe('none')
     expect(state.line, 'a plain line at the lower edge').not.toBe('none')
+  })
+
+  test('the window of the words is two whole lines and the half of a third, and the fade leaves the two lines alone', async ({
+    page
+  }) => {
+    await openWindow(page, 480, LARGEST)
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, LONG_REASON)
+    await expect(wordsOf(page)).toHaveAttribute('data-more', 'true')
+    const read = await page.evaluate(() => {
+      const element = document.querySelector('.topbar .connection') as HTMLElement
+      const style = getComputedStyle(element)
+      const fade = /calc\(100% - ([\d.]+)px\)/.exec(style.maskImage || style.webkitMaskImage || '')
+      return { box: element.clientHeight, line: parseFloat(style.lineHeight), fade: fade ? parseFloat(fade[1] ?? 'NaN') : Number.NaN }
+    })
+    expect(read.box, 'two whole lines are in the window').toBeGreaterThanOrEqual(2 * read.line - 1)
+    expect(read.box, 'a third line is cut, and says that more follows').toBeLessThan(3 * read.line)
+    expect(read.box - read.fade, 'the fade starts after the second line: the two are not faded').toBeGreaterThanOrEqual(2 * read.line - 1)
+  })
+
+  test('a short reason at the largest size fits its window: no stop, no role and no fade', async ({ page }) => {
+    await openWindow(page, 480, LARGEST)
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, SHORT_REASON)
+    await expect(wordsOf(page)).toContainText('not running')
+    await expect(wordsOf(page)).not.toHaveAttribute('tabindex', /.*/)
+    const state = await shown(page)
+    expect(state.more).toBeNull()
+    expect(state.mask).toBe('none')
   })
 })
 
@@ -1319,6 +1353,11 @@ test.describe('the pictures', () => {
           await page.screenshot({ path: shot(`${name}-open`) })
           await page.keyboard.press('Escape')
           await expect(drawerOf(page)).toBeHidden()
+          await page.evaluate((reason) => {
+            window.krTestHost?.setConnected(false, reason)
+          }, SHORT_REASON)
+          await expect(page.locator('.topbar .connection')).toContainText('not running')
+          await page.screenshot({ path: shot(`${name}-closed-short-reason`) })
           await page.evaluate((reason) => {
             window.krTestHost?.setConnected(false, reason)
           }, LONG_REASON)
