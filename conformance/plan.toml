@@ -2865,7 +2865,7 @@ target = '--test push_device'
 cases = ['a_phone_registers_through_the_real_provider']
 [ignored_run.runs]
 kind = 'by_hand'
-why = 'it needs a gateway that sends through a real sender account to the provider and an Android emulator with Google Play services, which no step of this repository has, so a person runs it beside both'
+why = 'its case a_phone_registers_through_the_real_provider needs one thing that no step of this repository has, a gateway that sends through a real sender account to the provider, so a person runs it beside such a gateway'
 
 [[ignored_run]]
 package = 'kr-transport'
