@@ -327,7 +327,7 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
 
     let record = Record::default();
     let retirement = server.retire(&record, Instant::now().into()).await;
-    assert_eq!(retirement.ended, Ended::Input);
+    assert_eq!(retirement.ended, Ended::Input, "{retirement:?}");
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
@@ -348,7 +348,7 @@ async fn kr_req_07_66_a_server_that_ignores_its_input_is_forced_when_the_window_
     let begun = Instant::now();
     let watching = watch_until_gone(vec![server.identity().clone(), command.clone()]);
     let retirement = server.retire(&record, begun.into()).await;
-    assert_eq!(retirement.ended, Ended::Force);
+    assert_eq!(retirement.ended, Ended::Force, "{retirement:?}");
     assert!(retirement.forced.contains(server.identity()));
     assert!(
         retirement.forced.contains(&command),
@@ -410,7 +410,7 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
     let begun = Instant::now();
     let watching = watch_until_gone(vec![command.clone()]);
     let retirement = server.retire(&record, begun.into()).await;
-    assert_eq!(retirement.ended, Ended::Already);
+    assert_eq!(retirement.ended, Ended::Already, "{retirement:?}");
     assert_eq!(retirement.forced, vec![command.clone()]);
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
@@ -454,7 +454,7 @@ async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_
     let retirement = server
         .retire(&Record::default(), Instant::now().into())
         .await;
-    assert_eq!(retirement.ended, Ended::Already);
+    assert_eq!(retirement.ended, Ended::Already, "{retirement:?}");
     assert_eq!(retirement.forced, vec![command.clone()]);
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
