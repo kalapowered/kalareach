@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+pub mod connect_report;
 pub mod environment;
 pub mod lane;
 pub mod pairing;
@@ -258,6 +259,8 @@ pub struct Host {
     boot: Option<BootIdentity>,
     /// What else the host was started with, which a restart keeps.
     waits: Waits,
+    /// When the start of this daemon returned, which a failed connect reports its age from.
+    started: std::time::Instant,
     // Declared last: the directory is removed after every field above has let go of its files.
     temp: kr_ipc::testing::TempHost,
     work: kr_ipc::testing::PrivateTempDir,
@@ -1082,6 +1085,7 @@ impl Host {
         boot: Option<BootIdentity>,
         waits: Waits,
     ) -> Self {
+        connect_report::install_capture();
         if let Some(address) = settings
             .endpoint
             .bind_addr
@@ -1261,6 +1265,7 @@ impl Host {
             clocks,
             boot,
             waits,
+            started: std::time::Instant::now(),
         }
     }
 
@@ -1904,6 +1909,23 @@ pub async fn pair_with(
     owner: &DeviceKeys,
     proposal: ProposedGrant,
 ) -> DeviceRecord {
+    pair_keeping_the_invitation(host, device, owner, proposal)
+        .await
+        .0
+}
+
+/// Runs the pairing [`pair_with`] does, and returns the invitation it was made under and the value
+/// both devices showed, for a suite that looks for them somewhere they must not be.
+pub async fn pair_keeping_the_invitation(
+    host: &Host,
+    device: &Device,
+    owner: &DeviceKeys,
+    proposal: ProposedGrant,
+) -> (
+    DeviceRecord,
+    kr_protocol::invitation::PairInviteResult,
+    String,
+) {
     let signer = pairing::Signer::OwnerDevice(owner);
     let mut client = host.client().await;
     let invited = pairing::invite_direct(
@@ -1958,7 +1980,11 @@ pub async fn pair_with(
         status.status
     );
     connection.close(0u32.into(), b"paired");
-    host.record_of(confirmed.device_id)
+    (
+        host.record_of(confirmed.device_id),
+        invited,
+        verification_value,
+    )
 }
 
 /// Connects a paired device to the host it was paired with.
@@ -1975,6 +2001,8 @@ pub struct PairedDial {
     addr: EndpointAddr,
     identity: Arc<LocalIdentity>,
     host_record: PairedPeer,
+    /// When the host's start returned, for the report of a connect that fails.
+    host_started: std::time::Instant,
 }
 
 impl PairedDial {
@@ -1995,9 +2023,14 @@ impl PairedDial {
         .await
     }
 
-    /// One connection of the device's to the host, authorised as the device.
+    /// One connection of the device's to the host, authorised as the device. When it cannot be
+    /// made the case fails with the layer that failed, the error's chain, each attempt and what
+    /// the process logged ([`connect_report`]).
     pub async fn dial(&self) -> NetworkTransport {
-        self.try_dial().await.expect("the paired device connects")
+        match connect_report::dial(self).await {
+            Ok(transport) => transport,
+            Err(failed) => failed.into_panic(),
+        }
     }
 
     /// One connection of the device's to the host, authorised as the device, kept as the
@@ -2158,6 +2191,7 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
         addr,
         identity: device.paired_identity(record.device_id),
         host_record,
+        host_started: host.started,
     }
 }
 
@@ -2204,9 +2238,10 @@ impl Drop for RawDevice {
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
-        Self::admitted(host, device, record)
-            .await
-            .expect("the paired device connects")
+        match Self::dialled(paired_dial(host, device, record)).await {
+            Ok(device) => device,
+            Err(failed) => failed.into_panic(),
+        }
     }
 
     /// Connects a paired device that says it can receive `max_receive` and no more.
@@ -2216,9 +2251,10 @@ impl RawDevice {
         record: &DeviceRecord,
         max_receive: kr_protocol::hello::ReceiveLimits,
     ) -> Self {
-        Self::dialled(paired_dial_receiving(host, device, record, max_receive))
-            .await
-            .expect("the paired device connects")
+        match Self::dialled(paired_dial_receiving(host, device, record, max_receive)).await {
+            Ok(device) => device,
+            Err(failed) => failed.into_panic(),
+        }
     }
 
     /// Connects a device under the identity `record` gave it, and returns why the host did not let
@@ -2233,11 +2269,13 @@ impl RawDevice {
         device: &Device,
         record: &DeviceRecord,
     ) -> std::result::Result<Self, kr_client::ClientError> {
-        Self::dialled(paired_dial(host, device, record)).await
+        Self::dialled(paired_dial(host, device, record))
+            .await
+            .map_err(|failed| failed.error)
     }
 
-    async fn dialled(dial: PairedDial) -> std::result::Result<Self, kr_client::ClientError> {
-        let transport = dial.try_dial().await?;
+    async fn dialled(dial: PairedDial) -> std::result::Result<Self, connect_report::DialFailed> {
+        let transport = connect_report::dial(&dial).await?;
         let first = {
             use kr_client::transport::ControlTransport as _;
             transport.initial_action_window().action_window_id.clone()
