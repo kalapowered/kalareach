@@ -3178,6 +3178,8 @@ test.describe("moving a raw view's window", () => {
 // The wheel of a raw view in control mode, with a modifier held, with a pointer button held, and over
 // a program that does not read the wheel. Each case runs a scripted host in a real browser engine:
 // the events come from the engine's own input path, with no device, no native code and no touchpad.
+// One wheel does not: in the held-pointer case, a single wheel is dispatched from the page with the
+// held button set, because the test tool's wheel function does not send the held buttons.
 test.describe('the wheel of a raw view in control mode', () => {
   /** How many moves the page has made with its view. */
   const moves = (page: Page): Promise<number> =>
@@ -3289,7 +3291,11 @@ test.describe('the wheel of a raw view in control mode', () => {
   // KR-REQ-13.18: while a pointer button is held and moving over the surface in control mode, a wheel
   // turn goes to the program at the cell under the pointer and the window does not move, and the same
   // wheel after the release goes to it again. It shows a pointer held in a scripted host in a real
-  // engine, not a touchpad's own wheel events, which no browser test of ours can send.
+  // engine, not a touchpad's own wheel events, which no browser test of ours can send. One of its three
+  // wheels does not come from the engine's input: the one turned while the button is down is followed
+  // by a wheel that the page dispatches with the held button set (buttons 1), because the test tool's
+  // wheel function does not send the held buttons. Only that wheel shows a view that reads the held
+  // button from the wheel event; the other two show it with the pointer held and the event without.
   test('a wheel turned while a pointer button is held and moving goes to the program, and again after the release', async ({
     page
   }) => {
@@ -3311,18 +3317,30 @@ test.describe('the wheel of a raw view in control mode', () => {
     await page.mouse.wheel(0, 2 * cell.height)
     await expect.poll(() => turned(page)).toBe(2)
     expect(await moves(page)).toBe(moved)
+    // One more row, still with the button down, and this one comes from the page, not from the engine's
+    // input: a wheel event with buttons 1, as a mouse's own wheel has with a button held.
+    await page.getByTestId('terminal-grid').dispatchEvent('wheel', {
+      deltaY: cell.height,
+      clientX: x,
+      clientY: cell.y + 4.5 * cell.height,
+      buttons: 1,
+      bubbles: true,
+      cancelable: true
+    })
+    await expect.poll(() => turned(page)).toBe(3)
     await page.mouse.up()
 
-    // The same wheel after the release.
+    // The same two rows after the release.
     await page.mouse.wheel(0, 2 * cell.height)
-    await expect.poll(() => turned(page)).toBe(4)
+    await expect.poll(() => turned(page)).toBe(5)
     const wheels = (await programInputs(page)).filter((input) => input.kind === 'wheel')
     for (const input of wheels) {
       expect(input).toMatchObject({ kind: 'wheel', take: 1, column: 4, line: 4, shift: false, control: false })
     }
     await expect(surface).toHaveAttribute('data-wheel-to-application', String(wheels.length))
-    // The first was turned with the button down, the second with none, and the view took both.
+    // The first two were turned with the button down, the third with none, and the view took all three.
     expect(await wheelsSeen(page)).toEqual([
+      { held: true, cancelled: true },
       { held: true, cancelled: true },
       { held: false, cancelled: true }
     ])
