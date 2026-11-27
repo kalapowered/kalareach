@@ -9,11 +9,16 @@
 //! recorded as a native terminal instance with the profile it was observed running, and bound to
 //! that package in the same step. The package is the one the software development kit's rule
 //! selects among every package the admissions this worker holds admit, with nothing selected: the
-//! worker reads every rule as a guess, and a rule that names the installation location outranks one
-//! that names only the executable among the packages of one publisher through one repository.
-//! Packages that recognise the program equally well are not chosen between: the program is adopted
-//! as a native terminal instance bound to none of them, and its announcement names the packages
-//! that tie. A package with no connector table is adopted and bound the same way. An adopted
+//! worker reads every rule as a guess. Among the packages of one publisher through one repository,
+//! a package that covers the program's version outranks one that says nothing about it, and that
+//! one outranks a package that refuses it; then a rule that names the installation location
+//! outranks one that names only the executable. A package's version of the program is the one its
+//! own signed builds name for the digest of the program's bytes, so the program is decided twice:
+//! by its path alone, to see whether it is worth reading, and again with its digest once it has
+//! been read, and the second answer is the one used. Packages that recognise the program equally
+//! well are not chosen between: the program is adopted as a native terminal instance bound to none
+//! of them, and its announcement names the packages that tie, with what each makes of the version.
+//! A package with no connector table is adopted and bound the same way. An adopted
 //! instance gets no registration, no endpoint and no credential, so none of its bridges is
 //! admitted, and its announcement says so; the process it was found running as places the
 //! questions it asks, and nothing more. It is watched by its identity and ended when it exits. A
@@ -63,6 +68,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use kr_plugin_sdk::matching::Coverage;
 use kr_protocol::broker::{
     AgentOwnership, AuthenticationState, BinaryIdentity, IntegrationMode, LaunchProfile,
 };
@@ -73,7 +79,7 @@ use kr_protocol::root::CommandBypassReason;
 use kr_protocol::scalars::{Nullable, Uuid};
 
 use crate::broker::Broker;
-use crate::broker::binder::{MatchedExecutable, Recognition, Tie};
+use crate::broker::binder::{MatchedExecutable, Recognition, Tie, TiedPackage};
 use crate::broker::image::HashedFiles;
 
 /// How often the foreground is looked at while a look is likely to find something: while a command
@@ -94,20 +100,80 @@ pub const ADOPTED_REFUSAL: &str = "it was not launched through the integration, 
                                    registration names it and none of its bridges is admitted";
 
 /// Why a tied program's bridges are refused, as its announcement says: the packages that recognise
-/// it equally well, named, and that the host chose none of them.
+/// it equally well, each with the protocol and ranges its decision read and what it makes of the
+/// program's version, and that the host chose none of them. Packages of one publisher through one
+/// repository that all make the same of the version are named together; packages that do not come
+/// from one publisher through one repository were not ranked by the version, and the words say so.
+/// The words end in a letter or a digit, since a view puts a full stop of its own after them.
 fn tie_refusal(tie: &Tie) -> String {
-    let names: Vec<&str> = tie
-        .packages
-        .iter()
-        .map(|package| package.plugin_id.as_str())
-        .collect();
-    let named = match names.as_slice() {
+    let listed = |parts: Vec<String>| match parts.as_slice() {
         [rest @ .., last] if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-        _ => names.join(", "),
+        _ => parts.join(", "),
+    };
+    let named = |package: &TiedPackage| {
+        let mut detail: Vec<String> = package.protocol.iter().cloned().collect();
+        if !package.ranges.is_empty() {
+            detail.push(package.ranges.join(" and "));
+        }
+        if detail.is_empty() {
+            package.plugin_id.to_string()
+        } else {
+            format!("{} ({})", package.plugin_id, detail.join(", "))
+        }
+    };
+    // What a package makes of the version, said of one package and said of several together.
+    let makes = |package: &TiedPackage| match (package.coverage, package.version.as_deref()) {
+        (Coverage::Covers, Some(version)) => (
+            format!("covers version {version}"),
+            format!("each cover version {version}"),
+        ),
+        (Coverage::Excludes, Some(version)) => (
+            format!("refuses version {version}"),
+            format!("each refuse version {version}"),
+        ),
+        (_, Some(version)) => (
+            format!("declares no range for version {version}"),
+            format!("each declare no range for version {version}"),
+        ),
+        (_, None) => (
+            "has no signed record of this build".to_owned(),
+            "each have no signed record of this build".to_owned(),
+        ),
+    };
+    let clauses: Vec<(String, String)> = tie.packages.iter().map(makes).collect();
+    let together = clauses
+        .first()
+        .filter(|first| tie.one_publisher && clauses.iter().all(|clause| clause == *first));
+    let body = if let Some((_, each)) = together {
+        format!(
+            "{} {each}",
+            listed(tie.packages.iter().map(named).collect())
+        )
+    } else {
+        let apart = listed(
+            tie.packages
+                .iter()
+                .zip(&clauses)
+                .map(|(package, (one, _))| format!("{} {one}", named(package)))
+                .collect(),
+        );
+        if tie.one_publisher {
+            apart
+        } else {
+            let preferred = if tie.packages.len() == 2 {
+                "neither"
+            } else {
+                "none"
+            };
+            format!(
+                "{apart}, and they come from different publishers or repositories, so \
+                 {preferred} is preferred"
+            )
+        }
     };
     format!(
-        "it was not launched through the integration, and {named} recognise it equally well, so \
-         no package was chosen for it and none of its bridges is admitted"
+        "it was not launched through the integration, and {body}, so no package was chosen for it \
+         and none of its bridges is admitted"
     )
 }
 
@@ -520,10 +586,14 @@ impl Adoptions {
         // and a profile records is the same path as text, as before.
         let image = crate::questions::binding::executable_path_of(pid)?;
         let executable = image.display().to_string();
-        let recognition = match self.broker.recognise(&executable, None) {
-            Recognition::Nothing => return None,
-            found => found,
-        };
+        // Decided by the path alone, which is a superset of any decision with the digest: it says
+        // only whether the program is worth reading.
+        if matches!(
+            self.broker.recognise(&executable, None),
+            Recognition::Nothing
+        ) {
+            return None;
+        }
         // Asked only once the process runs the program: a launch registers the process that
         // presents itself before that process execs, so a program the integration launched is held
         // by now, and one it did not launch never will be.
@@ -564,6 +634,14 @@ impl Adoptions {
         }
         #[cfg(feature = "testing")]
         stop_if_armed(&self.bracket_pause);
+        // Decided again, now that the digest of the bytes is known and by the snapshot held now:
+        // each package's own signed records say which version the program is. That answer, and not
+        // the first, is the profile's, the announcement's and the binding's; where it finds no
+        // package, nothing is adopted.
+        let recognition = match self.broker.recognise(&executable, Some(&hashed.digest)) {
+            Recognition::Nothing => return None,
+            found => found,
+        };
         let now = kr_ipc::now_ms();
         let profile = LaunchProfile {
             profile_id: crate::broker::profiles::new_profile_id(now).ok()?,
@@ -1294,8 +1372,47 @@ mod tests {
                 one_publisher: true,
             })
         };
+        let covering = |name: &str, protocol: Option<&str>, coverage: Coverage| TiedPackage {
+            plugin_id: PluginId::new(name).expect("an identifier"),
+            protocol: protocol.map(str::to_owned),
+            ranges: vec![">=1.0.0, <2.0.0".to_owned()],
+            version: Some("1.4.0".to_owned()),
+            coverage,
+        };
         let refusals = [
             ("an adopted program", ADOPTED_REFUSAL.to_owned()),
+            (
+                "a tie of packages that each cover a version",
+                tie_refusal(&Tie {
+                    packages: vec![
+                        covering("kalareach/a", Some("p-one"), Coverage::Covers),
+                        covering("kalareach/b", None, Coverage::Covers),
+                    ],
+                    one_publisher: true,
+                }),
+            ),
+            (
+                "a tie of packages that make different things of a version",
+                tie_refusal(&Tie {
+                    packages: vec![
+                        covering("kalareach/a", None, Coverage::Covers),
+                        covering("kalareach/b", None, Coverage::Excludes),
+                        covering("kalareach/c", None, Coverage::Neutral),
+                    ],
+                    one_publisher: true,
+                }),
+            ),
+            (
+                "a tie of packages of different publishers",
+                tie_refusal(&Tie {
+                    packages: vec![
+                        covering("kalareach/a", None, Coverage::Covers),
+                        covering("vendor/b", None, Coverage::Covers),
+                        covering("vendor/c", None, Coverage::Covers),
+                    ],
+                    one_publisher: false,
+                }),
+            ),
             (
                 "a tie of two packages",
                 tied(&["kalareach/claude-one", "kalareach/claude-two"]),
