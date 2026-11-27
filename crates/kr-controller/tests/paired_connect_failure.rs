@@ -2,7 +2,8 @@
 //! failed, the error's chain, how long the host and the dial had been up, every attempt with what
 //! the dial offered and what the dialling endpoint knew of the host, and the lines the process
 //! logged. And that the helper's dial reaches a host that came back on another port while another
-//! host answers at the address it left.
+//! host answers at the address it left. And that a dial the host refuses leaves no endpoint with its
+//! device.
 
 mod net_support;
 
@@ -285,4 +286,64 @@ async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_addr
     );
     drop(reached);
     drop(stranger);
+}
+
+/// A paired dial that fails leaves no endpoint with its device, and one that connects leaves its
+/// endpoint there, so that the connection stays up. A retry loop that makes a new dial for each
+/// refusal therefore keeps no socket for the refusals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paired_dial_keeps_its_endpoint_only_once_it_connects() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let device = Device::create().await;
+    let record = pair_with(
+        &host,
+        &device,
+        &owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    // A device the host never paired dials as the paired device's record, and the host refuses it.
+    let unpaired = Device::create().await;
+    assert_eq!(
+        unpaired.dialers_kept(),
+        0,
+        "a device that has not dialled keeps nothing"
+    );
+
+    for attempt in 1..=3 {
+        let refused = paired_dial(&host, &unpaired, &record).try_dial().await;
+        assert!(
+            refused.is_err(),
+            "attempt {attempt}: the host connected a device it never paired"
+        );
+    }
+    assert_eq!(
+        unpaired.dialers_kept(),
+        0,
+        "three dials that the host refused left their endpoints with the device"
+    );
+
+    let shut = paired_dial(&host, &device, &record);
+    shut.shut_its_endpoint().await;
+    assert!(
+        shut.try_dial().await.is_err(),
+        "a dial from a shut endpoint connected"
+    );
+    assert_eq!(
+        device.dialers_kept(),
+        0,
+        "a dial whose endpoint was shut left it with the device"
+    );
+
+    let dial = paired_dial(&host, &device, &record);
+    let reached = dial.try_dial().await;
+    assert!(reached.is_ok(), "the paired device did not reach its host");
+    drop(dial);
+    assert_eq!(
+        device.dialers_kept(),
+        1,
+        "the endpoint a connection was made over is not with the device once its dial is gone"
+    );
+    drop(reached);
 }

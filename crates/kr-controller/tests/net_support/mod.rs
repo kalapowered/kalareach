@@ -1740,8 +1740,8 @@ pub struct Device {
     keys: DeviceKeys,
     endpoint: Endpoint,
     identity: Arc<LocalIdentity>,
-    /// The endpoints its paired dials went out from, held for as long as the device is, so that a
-    /// connection made over one stays up ([`PairedDial`]).
+    /// The endpoints its paired dials made a connection over, held for as long as the device is, so
+    /// that the connection stays up ([`PairedDial`]). A dial that fails adds none.
     dialers: Arc<std::sync::Mutex<Vec<Endpoint>>>,
 }
 
@@ -1820,6 +1820,15 @@ impl Device {
     /// the ones an earlier incarnation of the host answered at.
     pub async fn addresses_held_for(&self, host: &Host) -> Vec<std::net::SocketAddr> {
         held_addresses(&self.endpoint, endpoint_id_of(host)).await
+    }
+
+    /// How many endpoints the device keeps for its paired dials: one for each dial that made a
+    /// connection, and none for a dial that did not.
+    pub fn dialers_kept(&self) -> usize {
+        self.dialers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// The identity this device presents once the host has given it `device_id`.
@@ -2026,31 +2035,65 @@ pub struct PairedDial {
 enum DialFrom {
     /// The device's own endpoint, for a dial through a relay, which the endpoint is bound to.
     Kept(Endpoint),
-    /// An endpoint bound at the first dial, over loopback, with the device's identity.
+    /// An endpoint over loopback with the device's identity, bound at its first use: the first
+    /// dial, the first read of the addresses it holds, or the first shut. The dial holds it for as
+    /// long as the dial lives, and the device's list takes it only once a connection is made over
+    /// it, so a dial that fails leaves no socket behind it.
     Fresh {
         keys: kr_crypto::keys::TransportIdentityKeyPair,
         bound: Arc<tokio::sync::OnceCell<Endpoint>>,
-        /// The device's list, which holds the endpoint for as long as the device lives.
+        /// The device's list, which holds the endpoint for as long as the device lives once a
+        /// connection is made over it, so that the connection stays up.
         kept: Arc<std::sync::Mutex<Vec<Endpoint>>>,
+        /// Whether the endpoint is in `kept` already, so that a second connection over it does
+        /// not add it again.
+        is_kept: Arc<std::sync::atomic::AtomicBool>,
     },
 }
 
 impl DialFrom {
+    /// A fresh endpoint of `device`'s identity, not yet bound.
+    fn fresh(device: &Device) -> Self {
+        Self::Fresh {
+            keys: device.keys.transport.clone(),
+            bound: Arc::default(),
+            kept: Arc::clone(&device.dialers),
+            is_kept: Arc::default(),
+        }
+    }
+
     async fn endpoint(&self) -> Endpoint {
         match self {
             Self::Kept(endpoint) => endpoint.clone(),
-            Self::Fresh { keys, bound, kept } => bound
+            Self::Fresh { keys, bound, .. } => bound
                 .get_or_init(|| async {
-                    let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), keys)
+                    kr_transport::endpoint::bind_dialer(&loopback(), keys)
                         .await
-                        .expect("a dialling endpoint");
-                    kept.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(endpoint.clone());
-                    endpoint
+                        .expect("a dialling endpoint")
                 })
                 .await
                 .clone(),
+        }
+    }
+
+    /// Hands a fresh endpoint to the device's list, once, after a connection is made over it.
+    fn keep(&self) {
+        let Self::Fresh {
+            bound,
+            kept,
+            is_kept,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let Some(endpoint) = bound.get() else {
+            return;
+        };
+        if !is_kept.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            kept.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(endpoint.clone());
         }
     }
 }
@@ -2064,13 +2107,17 @@ impl PairedDial {
     ///
     /// Returns the client's error when the host refuses the connection or it cannot be made.
     pub async fn try_dial(&self) -> std::result::Result<NetworkTransport, kr_client::ClientError> {
-        pairing::connect_until_answered(
+        let outcome = pairing::connect_until_answered(
             &self.from.endpoint().await,
             self.addr.clone(),
             &self.identity,
             &self.host_record,
         )
-        .await
+        .await;
+        if outcome.is_ok() {
+            self.from.keep();
+        }
+        outcome
     }
 
     /// The socket addresses the endpoint this dial goes out from holds for the host: none until
@@ -2090,7 +2137,10 @@ impl PairedDial {
     /// the process logged ([`connect_report`]).
     pub async fn dial(&self) -> NetworkTransport {
         match connect_report::dial(self).await {
-            Ok(transport) => transport,
+            Ok(transport) => {
+                self.from.keep();
+                transport
+            }
             Err(failed) => failed.into_panic(),
         }
     }
@@ -2116,6 +2166,7 @@ impl PairedDial {
         )
         .await
         .expect("the host is reachable");
+        self.from.keep();
         let authorised =
             kr_transport::handshake::connect(&connection, &self.identity, &self.host_record)
                 .await
@@ -2273,11 +2324,7 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
     };
     let addr = EndpointAddr::new(endpoint_id_of(host));
     PairedDial {
-        from: DialFrom::Fresh {
-            keys: device.keys.transport.clone(),
-            bound: Arc::default(),
-            kept: Arc::clone(&device.dialers),
-        },
+        from: DialFrom::fresh(device),
         addr,
         identity: device.paired_identity(record.device_id),
         host_record,
