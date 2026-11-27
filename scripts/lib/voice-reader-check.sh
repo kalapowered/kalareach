@@ -270,7 +270,9 @@ expect "four mismatches: four folders are removed" test "$(removals reader-misma
 expect "four mismatches: the run says four checks did not match" says "$(out reader-mismatches)" "did not match a known picture in four checks"
 expect "four mismatches: the run clears the page of nothing" never_says "$(out reader-mismatches)" "the page is not at fault"
 expect "four mismatches: the run names no builder of the wrong text" never_says "$(out reader-mismatches)" "gave wrong text"
-expect "four mismatches: the log shows the text the reader gave" says "$(check_log reader-mismatches)" "what the reader gave for whole-page"
+expect "four mismatches: the log names the picture whose text it shows" says "$(check_log reader-mismatches)" "what the reader gave for whole-page"
+second_row="$(awk 'NR == 2 { print; exit }' "$fixtures_of_repo/whole-page.txt")"
+expect "four mismatches: the log shows the text the reader gave" says "$(check_log reader-mismatches)" "    $second_row"
 expect "four mismatches: the run fails with exit 2" rc_is reader-mismatches 2
 
 # Two mismatches and then a good folder: the third check passes. The two rejected folders are removed
