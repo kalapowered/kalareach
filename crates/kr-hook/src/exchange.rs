@@ -37,6 +37,13 @@ pub enum ExchangeError {
         detail: String,
     },
     /// The worker closed the connection without admitting this bridge.
+    ///
+    /// This says that the connection ended and that no admission came. It does not say why: a
+    /// worker that refused the bridge, one that could not place the process that connected and one
+    /// that died after it accepted the connection all read the same here, and so does the
+    /// operating system's own close of what a worker left open. It is the one answer to that event
+    /// whichever side was first: a read of the admission that finds the connection closed, and the
+    /// write of the hello that finds it closed, are the same refusal.
     Refused,
     /// The worker did not answer in time.
     TimedOut,
@@ -114,10 +121,20 @@ impl Exchange {
     /// observation is written, so a write behind the hello can find the connection gone. A caller
     /// that writes ahead therefore reads the worker's answer before it counts a failed write.
     ///
+    /// The worker's close can also come before the hello itself is written: the connection is made
+    /// before the hello is built, and the worker may accept it, find nothing it can admit and close
+    /// it in between. A hello that finds the connection closed by the other end (a broken pipe, a
+    /// reset or an aborted connection) is [`ExchangeError::Refused`], the same answer as a read of
+    /// the admission that finds it closed. That claims that the connection closed and that no
+    /// admission came. It does not claim why: a worker that died after it accepted the connection
+    /// leaves the same error behind as one that refused the bridge. A write that fails for any other
+    /// reason stays [`ExchangeError::Broken`] with the system's words.
+    ///
     /// # Errors
     ///
     /// Returns [`ExchangeError`] when the registration does not frame as JSON lines, the endpoint
-    /// cannot be reached, or the hello cannot be written.
+    /// cannot be reached, or the hello cannot be written, and [`ExchangeError::Refused`] when the
+    /// worker had closed the connection before the hello was written.
     pub async fn open(registration: &Registration, bridge: Bridge) -> Result<Self, ExchangeError> {
         if registration.framing != FramingName::JsonLines {
             return Err(ExchangeError::Registration(RegistrationError::Malformed {
@@ -132,8 +149,24 @@ impl Exchange {
             outgoing: Outgoing { writer },
         };
         let hello = registration.hello(Some(bridge))?;
-        exchange.outgoing.write_line(hello.expose()).await?;
+        exchange.introduce(hello.expose()).await?;
         Ok(exchange)
+    }
+
+    /// Writes the hello, and says a connection the other end had already closed is a refusal.
+    async fn introduce(&mut self, hello: &[u8]) -> Result<(), ExchangeError> {
+        check_line(hello)?;
+        self.outgoing
+            .put(hello)
+            .await
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => ExchangeError::Refused,
+                _ => ExchangeError::Broken {
+                    detail: error.to_string(),
+                },
+            })
     }
 
     /// Waits for the worker to say it admitted this bridge.
@@ -237,21 +270,32 @@ impl Outgoing {
     }
 
     async fn write_line(&mut self, body: &[u8]) -> Result<(), ExchangeError> {
-        if body.len() > MAX_MESSAGE_BYTES {
-            return Err(ExchangeError::Oversized { bytes: body.len() });
-        }
-        if body.contains(&b'\n') {
-            return Err(ExchangeError::Malformed {
-                detail: "carries a newline, which would end it early".to_owned(),
-            });
-        }
-        let broken = |error: std::io::Error| ExchangeError::Broken {
+        check_line(body)?;
+        self.put(body).await.map_err(|error| ExchangeError::Broken {
             detail: error.to_string(),
-        };
-        self.writer.write_all(body).await.map_err(broken)?;
-        self.writer.write_all(b"\n").await.map_err(broken)?;
-        self.writer.flush().await.map_err(broken)
+        })
     }
+
+    /// Writes one checked message and its newline.
+    async fn put(&mut self, body: &[u8]) -> std::io::Result<()> {
+        self.writer.write_all(body).await?;
+        self.writer.write_all(b"\n").await?;
+        self.writer.flush().await
+    }
+}
+
+/// Refuses a message the exchange could not carry whole: one past the bound, or one that holds a
+/// newline, which would end it early.
+fn check_line(body: &[u8]) -> Result<(), ExchangeError> {
+    if body.len() > MAX_MESSAGE_BYTES {
+        return Err(ExchangeError::Oversized { bytes: body.len() });
+    }
+    if body.contains(&b'\n') {
+        return Err(ExchangeError::Malformed {
+            detail: "carries a newline, which would end it early".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Reads one line of at most [`MAX_MESSAGE_BYTES`] and its newline, without the newline.
@@ -610,6 +654,115 @@ mod tests {
             matches!(answer, Err(ExchangeError::Refused)),
             "a worker that takes nothing more is a refusal: {answer:?}"
         );
+    }
+
+    /// A writer whose every write fails with the kind it was given, as a connection does that the
+    /// other end has closed or that the system has failed.
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::from(self.0)))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// What the exchange makes of a hello of `size` bytes whose write fails with `kind`.
+    async fn introduction_failing_with(kind: std::io::ErrorKind, size: usize) -> ExchangeError {
+        let mut exchange = Exchange {
+            incoming: Incoming {
+                reader: BufReader::new(Box::new(tokio::io::empty())),
+            },
+            outgoing: Outgoing {
+                writer: Box::new(FailingWriter(kind)),
+            },
+        };
+        exchange
+            .introduce(&vec![b'x'; size])
+            .await
+            .expect_err("the write fails")
+    }
+
+    /// The three kinds of a failed write that say the other end closed the connection are each the
+    /// refusal, whatever the system's words for them are.
+    #[tokio::test]
+    async fn each_kind_of_a_closed_connection_is_a_refusal_when_the_hello_is_written() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let error = introduction_failing_with(kind, 8).await;
+            assert!(
+                matches!(error, ExchangeError::Refused),
+                "{kind:?} is a closed connection: {error:?}"
+            );
+        }
+    }
+
+    /// A write that fails for any other reason is not a closed connection, and keeps the system's
+    /// words, as does a hello the exchange refuses to write at all, even where the writer would have
+    /// said the connection was closed.
+    #[tokio::test]
+    async fn a_write_that_fails_for_another_reason_keeps_its_own_words() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = introduction_failing_with(kind, 8).await;
+            assert!(
+                matches!(&error, ExchangeError::Broken { detail }
+                    if *detail == std::io::Error::from(kind).to_string()),
+                "{kind:?} stays a failure of the exchange, with the system's words: {error:?}"
+            );
+        }
+        let oversized =
+            introduction_failing_with(std::io::ErrorKind::BrokenPipe, MAX_MESSAGE_BYTES + 1).await;
+        assert!(
+            matches!(oversized, ExchangeError::Oversized { .. }),
+            "a hello past the bound is never written: {oversized:?}"
+        );
+    }
+
+    /// Whichever side is first, the worker's close is the same event and the exchange says it in
+    /// the same words: the hook prints them after its own name, and exits and answers the same
+    /// whatever they are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_orders_of_a_refusal_say_the_same_words() {
+        let expected = "the worker closed the connection without admitting this bridge";
+        let orders = [
+            WorkerAction::ClosesUnread,
+            WorkerAction::ReadsTheHelloThenCloses,
+            #[cfg(target_os = "linux")]
+            WorkerAction::StopsReading,
+        ];
+        for order in orders {
+            let said = bridge_meets(order)
+                .await
+                .expect_err("the bridge is not admitted")
+                .to_string();
+            assert_eq!(said, expected, "{order:?}");
+        }
     }
 
     /// A worker that reads the hello and then closes is a refusal too, from the read that follows.
