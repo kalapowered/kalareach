@@ -158,14 +158,18 @@ A rule is exact only for a program whose distribution the host has established a
 names. A host that has established none, as the worker has not for a program it finds running,
 reads every rule as `inferred`, whatever the rule declares: a name on disk says nothing about which
 product is installed. No host path establishes a distribution, so a rule reads as `inferred` wherever it is
-evaluated, and the distribution member and the `exact` level are for a host that can. Where several packages recognise a program equally well, a rule that also
-names the installation location, by the path segments the program's directory ends with, outranks
-one that names only the executable, when one publisher published all the packages left through one
-repository. Two products of one publisher that share a command name are told apart this way, while
+evaluated, and the distribution member and the `exact` level are for a host that can. Where several packages recognise a program equally well, a package that covers the version of the
+program, by the range of its rule and the range its connector table is qualified for read against the
+version its own signed builds name for the program, outranks one that says nothing about it, and that
+outranks one that refuses it, when one publisher published all the packages through one repository;
+then a rule that also names the installation location, by the path segments the program's directory
+ends with, outranks one that names only the executable, when one publisher published all the packages
+left through one repository. Two products of one publisher that share a command name are told apart this way, while
 both packages are admitted. Packages of different publishers, or of one publisher's name from
 different repositories, and packages of one publisher whose rules name no location, that recognise
 a program equally well are a conflict, and neither is bound. The worker still records such a program it finds running as a
-native terminal instance, and its announcement names the packages that tie.
+native terminal instance, and its announcement names the packages that tie with what each makes of
+the version.
 
 ### Command integration
 

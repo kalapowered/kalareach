@@ -502,7 +502,8 @@ fn the_kimi_distribution_is_told_by_its_installation_location() {
 
 /// KR-REQ-12.19, KR-REQ-12.23, KR-REQ-12.24: the two OpenCode profiles recognise one program
 /// identically, and the worker chooses neither for it: which API family a build serves is not told
-/// by its name, its version or its location. The program is still the person's own agent and
+/// by its name or its location, and both profiles are qualified for the same version, so neither
+/// covers a version the records name better than the other. The program is still the person's own agent and
 /// still runs as typed, so it is found running as a native terminal instance bound to no package,
 /// and the announcement names the two profiles and says that none was chosen. The terminal is all
 /// that instance has: no binding, so no observation and no action is claimed for it.

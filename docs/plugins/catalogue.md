@@ -375,17 +375,30 @@ but no host call uses it (the catalogue's search is a text search); the one plac
 application meets the rules is the worker's binder, which reads the rules of every admitted
 package. An explicit selection, where a caller supplies one, wins a conflict
 outright (no host call supplies one, so a person settles a conflict by disabling or removing one
-of the packages); an exact rule beats an inferred one; of the rules left, one that matched
-an installation location the package names beats one that matched only the executable's name, when
-one publisher published all the packages left through one repository; equal rules are a conflict
-the person settles, not one the host settles for them. A rule is exact only for a program whose distribution the host has
+of the packages); a package that covers the version of the program beats one that says nothing
+about it, and that beats one that refuses it, when one publisher published all the packages that
+recognise the program through one repository; an exact rule beats an inferred one; of the rules
+left, one that matched an installation location the package names beats one that matched only the
+executable's name, when one publisher published all the packages left through one repository;
+equal rules are a conflict the person settles, not one the host settles for them. A rule is exact only for a program whose distribution the host has
 established as the one it names, which the worker does not for a program it finds running, so there
 every rule counts as inferred. A worker applies the same rule to the packages left after it has
-refused any two that integrate one command. A program the command integration
+refused any two that integrate one command. A package covers a version when the range of its rule
+and the range its connector table is qualified for both admit it, refuses it when one of them does
+not, and says nothing about it when it declares neither or when no signed record of its own names the
+program: the version is the one a package's own signed builds name for the digest of the program's
+bytes, so the worker decides by the program's path alone to see whether the program is worth reading
+and decides again with the digest once it has read it. A package that is alone is bound whatever it
+says of the version, and its connector table is refused for a version it is not qualified for, as
+before. The signed records of a package of another publisher, or of the same publisher name through
+another repository, rank nothing against the packages of another: they are that package's own claim
+and the host cannot check them, so such packages that recognise a program equally well still
+conflict. A program the command integration
 launched is bound to the connector its command resolved. A program found running that the
 integration did not launch is bound to the one admitted package that recognises it, which need not
 have a connector table. A program that two packages recognise equally well is adopted as a native
-terminal instance bound to neither, and its announcement names the packages that tie. An instance
+terminal instance bound to neither, and its announcement names the packages that tie with the protocol and ranges
+of each and what each makes of the version. An instance
 nothing recognised when it started, or that tied, is bound once exactly one package that recognises
 its program is admitted, and the views are told what it is then.
 

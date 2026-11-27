@@ -199,10 +199,11 @@ integration off, after a refused or retired launch, in a pipeline or another for
 ask about, or from a shell that does not ask. Four times a second, while a command has the terminal,
 the worker looks at the terminal's foreground process group. It adopts a process there that the
 root shell started itself, that no launch holds, and whose executable an admitted package recognises,
-by the match rules of the catalogue: the worker reads every rule as a guess, a rule that names
-the installation location outranks one that names only the executable among the packages of one
-publisher through one repository, and a program two packages recognise equally well is adopted
-bound to neither. It records the process as a native terminal
+by the match rules of the catalogue: the worker reads every rule as a guess, a package that covers
+the program's version, as its own signed builds name it, outranks one that says nothing about it and
+that one a package that refuses it, a rule that names the installation location outranks one that
+names only the executable, both among the packages of one publisher through one repository, and a
+program two packages recognise equally well is adopted bound to neither. It records the process as a native terminal
 instance and, when exactly one package recognises it, binds it to that package in the same step.
 The record holds the executable and argument
 vector the kernel reports, the executable's digest, and the reason the shell's question about it was
