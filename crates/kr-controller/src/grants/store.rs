@@ -964,8 +964,8 @@ impl GrantDirectory {
     ///
     /// A grant has none when an earlier release wrote it, when a repair put the registry back, when
     /// it was written while the boot was one the host could not tell apart, or when the counter read
-    /// zero at its decision: the text made for it between that decision and this start is never
-    /// served, and the guard logs nothing.
+    /// zero at its decision: the text made for it before the first start that gives it a point is
+    /// never served.
     ///
     /// `settled_ms` is the host's settled reading of UTC, taken **before** this call and outside
     /// any transaction: it takes the policy lock and may write through this store, and a

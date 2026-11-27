@@ -280,9 +280,8 @@ impl StartPoint {
     /// millisecond of its boot, so a zero is a counter that failed to answer, and a point at zero
     /// would be before every text the boot made: the text made before the decision would be
     /// served. The sample is still recorded, and the access has no point. The cost: the text made
-    /// for that access between this decision and the host's next start in a boot whose counter
-    /// answers is never served, because the point that start gives lies after it. Nothing is
-    /// logged: the boot is not spoiled, so [`Observed::report`] has nothing to say.
+    /// for that access before the first start that gives it a point is never served, because that
+    /// point lies after it.
     ///
     /// Call it after the caller's refusal checks, as the last statement before the point's write,
     /// so that what can fail after it is the write and the commit. The caller writes the point with

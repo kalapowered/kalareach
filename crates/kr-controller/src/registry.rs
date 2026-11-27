@@ -625,16 +625,16 @@ impl Registry {
     /// both are left, `None`, for [`Registry::open_to_read`] to read. Neither is one past that
     /// version, one with no version or several, an empty file, a link or what is not a file: they
     /// are left, `None`, for [`Registry::open_to_read`] to refuse in its own words. A registry
-    /// that lost an evidence table
-    /// is refused here, by the table's name, because opening it would make that table again,
-    /// empty. A registry at version 17 or 20, which no release wrote, is refused here by its
-    /// version, in the look, before the file is opened for writing. The file is opened for writing without being created, and the name is checked to
-    /// still name the file that was looked at and to record the same version on that connection, so
-    /// a file replaced by another regular file between the look and the open is refused, and never
-    /// made new. A file replaced by another kind of file in that window is the owner's race, as it
-    /// is for [`Registry::open_to_read`], which looks at the name and then opens it: the caller
-    /// holds the environment's lock, and nothing here closes that window. The log is taken in once
-    /// more at the end, so the file alone holds what was written.
+    /// that lost an evidence table is refused here, by the table's name, because opening it would
+    /// make that table again, empty. A registry at version 17 or 20, which no release wrote, is
+    /// refused here by its version, after the log is taken in and the lost-table check, and before
+    /// the file is opened for the migration. The file is opened for writing without being created,
+    /// and the name is checked to still name the file that was looked at and to record the same
+    /// version on that connection, so a file replaced by another regular file between the look and
+    /// the open is refused, and never made new. A file replaced by another kind of file in that
+    /// window is the owner's race, as it is for [`Registry::open_to_read`], which looks at the name
+    /// and then opens it: the caller holds the environment's lock, and nothing here closes that
+    /// window. The log is taken in once more at the end, so the file alone holds what was written.
     ///
     /// A step commits whole, or leaves the registry at the version it began from with whatever it
     /// did that it can run again over (the step to version 7 rewrites the recorded create requests,
@@ -939,15 +939,9 @@ impl Registry {
             read_stall: crate::attention::Pause::default(),
         };
         // The version is read, and a version this build does not open is refused, before the first
-        // statement of ours that can write. Setting the journal mode rewrites the file's header when
-        // the file is not in write-ahead mode, so a refused registry would not be left as it was by
-        // a refusal that came after it. What the connection did before this, its first read,
-        // writes nothing of ours. SQLite's own recovery can write at that read: it rolls back a
-        // rollback journal that a stop left (an opener that cannot write does not), and in
-        // write-ahead mode it makes the log and the index where there are none. When the last
-        // connection closes, an empty log and the index are removed, and a log that holds data is
-        // checkpointed into the file: the file's bytes can change after a refusal, and its
-        // version, its schema and its rows do not.
+        // statement of ours that can write, which is the setting of the journal mode below. The
+        // connection's first read, before this, is the open's `PRAGMA user_version`: it writes
+        // nothing of ours.
         let recorded = registry.recorded_version()?;
         if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
             return Err(refused_version(version));

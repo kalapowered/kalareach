@@ -313,11 +313,8 @@ mod apple {
     /// host's record of boots treats that zero as follows. In a boot whose recorded high is above
     /// zero it is a reading below the high, and the boot is spoiled. A boot's first record keeps it
     /// as a high of zero, which every later reading passes, so the next reading is not lost. A
-    /// decision never takes a start point at zero, so that access has no point: the text made for
-    /// it between that decision and the host's next start in a boot whose counter answers is never
-    /// served, and the guard logs nothing. Within the point's own boot a stamp that reads zero is
-    /// withheld, since no point is below it; the zero stamp of a later boot is admitted, as is
-    /// every stamp of a later boot.
+    /// decision never takes a start point at zero. Within the point's own boot a stamp must read
+    /// above the point's reading, so a stamp that reads zero is withheld.
     pub fn raw_elapsed_ms() -> u64 {
         let mut time = libc::timespec {
             tv_sec: 0,
