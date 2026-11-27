@@ -715,7 +715,10 @@ async fn kr_req_12_27_a_worker_that_closes_without_admitting_is_one_refusal_in_e
 ///
 /// `cat` ends only when its input closes, and the test holds that input open: only the guard can
 /// end it while the test still holds the input. The handle is the test's again once the guard is
-/// gone, and a process that was ended and collected has its status ready without a wait.
+/// gone, and its status check then finds an exit that is not a success, which a `cat` left running
+/// does not give. That check itself collects a process that has exited, so the case shows that the
+/// guard ended the process, not that the guard's own wait ran. It does not run the guard's other
+/// two paths either: a failed `try_wait` and the runner's bound on how long it waits for a process.
 #[cfg(unix)]
 #[test]
 fn a_process_a_test_started_is_ended_when_the_test_unwinds() {
