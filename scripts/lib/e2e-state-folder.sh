@@ -21,12 +21,11 @@
 #     folder lies in a subfolder of that directory, with no symbolic link on the way down;
 #   * the temporary directory belongs to the caller or to root and is closed to writes by group and
 #     others (with no access list entry on macOS), or has the sticky bit and, on macOS, no access list
-#     entry that allows another account to write its security information (`writesecurity`: mode,
-#     owner and list), to change its owner (`chown`) or to delete from it (`delete_child`), and no
-#     line that cannot be read as an `allow` or a `deny` entry, so that nobody else can rename or
-#     remove an entry that is not theirs. A `deny` entry grants nothing and is accepted; an entry for
-#     `delete_child` is refused without a proof that it overrides the sticky bit, since refusing
-#     more is the safe side;
+#     entry that allows anything and no line that cannot be read as an `allow` or a `deny` entry, so
+#     that nobody else can rename or remove an entry that is not theirs, take the sticky bit away or
+#     rename the folder itself. A list of the rights that can do this would have to name every one, and
+#     a right that it missed would pass; so no right is named. An entry that only denies grants nothing
+#     and is accepted;
 #   * every folder from the first subfolder down to the state folder belongs to the caller, is
 #     closed to writes by group and others and, on macOS, has no access list entry, so that no other
 #     account can rename, replace or link away anything in the chain (on Linux the group bits of the
@@ -82,17 +81,17 @@
 # something this check establishes. Another account is stopped only where it cannot write a folder
 # of the chain, by its mode, its owner and, on macOS, its access list; on Linux the group bits of the
 # mode mask a list, and a list cannot give another account the right to change a folder's mode or
-# owner. The access list rule for a sticky temporary directory rests on the system manual's text for
-# each right: a real macOS folder with an access list entry is not exercised by the cases.
+# owner. The access list rule for a sticky temporary directory names no right, so it does not rest on
+# the manual's text for one: it reads the entry lines of the listing and nothing else of its format (a
+# listing that leaves them out shows no list), and a real macOS folder with an access list entry is
+# not exercised by the cases.
 
 # e2e_state_folder_list <entry>: reads <entry> (a name in the working directory, `.`, or a path) with
 # ONE listing that does not follow a link, and leaves what it shows in e2e_state_folder_ino (the
 # inode), e2e_state_folder_mode (the kind and the mode, 10 characters), e2e_state_folder_uid (the
 # owner), e2e_state_folder_acl (1 where the listing has a line after the entry's own) and
-# e2e_state_folder_acl_grants (1 where one of those lines is an `allow` entry that grants the right to
-# write the folder's security information (mode, owner and list: `writesecurity`), to change its owner
-# (`chown`) or to delete or rename what it holds (`delete_child`), or is not readable as an `allow` or
-# a `deny` entry; a `deny` entry grants nothing). On macOS the listing is asked for the access list
+# e2e_state_folder_acl_grants (1 where one of those lines is not a `deny` entry: an entry that allows
+# any right, or a line that cannot be read, may grant something; a `deny` entry grants nothing). On macOS the listing is asked for the access list
 # entries (`-e`, with `-n`, so that a principal prints as one word), each of which prints on a line of
 # its own as ` <number>: <principal> [inherited ]allow|deny <right>,<right>...`: the `@` mark that an
 # extended attribute puts after the mode hides the `+` mark of a list, so the mark cannot show a list
@@ -100,7 +99,7 @@
 # can give another account the right to change a folder's mode or owner. It returns 1 where the entry
 # cannot be listed.
 e2e_state_folder_list() {
-  local flags=-ldin line entries entry word rights _
+  local flags=-ldin line entries entry word _
   if [ "$(uname -s)" = Darwin ]; then
     flags=-ldine
   fi
@@ -114,17 +113,12 @@ e2e_state_folder_list() {
       e2e_state_folder_acl=1
       entries="${line#*$'\n'}"
       while IFS= read -r entry; do
-        read -r _ _ word rights <<< "$entry"
+        read -r _ _ word _ <<< "$entry"
         if [ "$word" = inherited ]; then
-          read -r _ _ _ word rights <<< "$entry"
+          read -r _ _ _ word _ <<< "$entry"
         fi
         case "$word" in
           deny) ;;
-          allow)
-            case ",$rights," in
-              *,writesecurity,* | *,chown,* | *,delete_child,*) e2e_state_folder_acl_grants=1 ;;
-            esac
-            ;;
           *) e2e_state_folder_acl_grants=1 ;;
         esac
       done <<< "$entries"
@@ -135,7 +129,7 @@ e2e_state_folder_list() {
 # e2e_state_folder_look <root|own> <entry>: lists <entry> (see above) and judges it, with the one
 # owner and mode test of that folder. A root is the temporary directory: it belongs to the caller or
 # to root, and is closed to writes by group and others (with no access list entry) or has the sticky
-# bit (with no access list entry that grants a right named at `list` above). Any other folder belongs
+# bit (with no access list entry that is not a `deny` entry, see `list` above). Any other folder belongs
 # to the caller, is closed to writes by group and others and has no access list entry. It returns 0
 # for a folder that passes, 4 for one whose owner is right and whose mode is too open (the mode is
 # left in e2e_state_folder_seen), 6 for one with an access list entry that the rule refuses, and 1
@@ -157,8 +151,8 @@ e2e_state_folder_judge() {
   if [ "$kind" = root ]; then
     [ "$uid" = "$(id -u)" ] || [ "$uid" = 0 ] || return 1
     # A sticky root that anyone can write is accepted only once its access list is read: an entry that
-    # lets another account write the folder's security information or change its owner can take the
-    # sticky bit away, and one that lets it delete from the folder can rename what is below it.
+    # allows anything may let another account take the sticky bit away or rename the folder itself, so
+    # a sticky root with one is refused, whatever right it names.
     case "${perms:9:1}" in
       t | T)
         [ "$e2e_state_folder_acl_grants" = 0 ] || return 6
@@ -576,12 +570,12 @@ e2e_state_folder_open() {
   exit 1
 }
 
-# e2e_state_folder_listed <folder> [<left>]: says which folder of the chain has an access list entry,
-# which can let another account write it whatever its mode says, and ends the script.
+# e2e_state_folder_listed <folder> [<left>]: says which folder of the chain has an access list entry
+# that the rule does not accept, and what to do about it, and ends the script.
 e2e_state_folder_listed() {
   local left
   left="$(e2e_state_folder_left_words "${2:-0}")"
-  printf 'e2e: refusing %s: its folder %s has an access list entry, which can let another account write it; every folder from the temporary directory down to the state folder must have none, so remove the list, for example with chmod -N%s\n' "$e2e_state_folder_subject" "$1" "${left:+; $left}" >&2
+  printf 'e2e: refusing %s: its folder %s has an access list entry that the rule does not accept, since an entry can let another account write the folder whatever its mode says; every folder from the temporary directory down to the state folder must have none, except that a temporary directory with the sticky bit may have entries that only deny; remove the list, for example with chmod -N, or make the temporary directory a private folder of your own by setting TMPDIR%s\n' "$e2e_state_folder_subject" "$1" "${left:+; $left}" >&2
   exit 1
 }
 
