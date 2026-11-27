@@ -6,16 +6,27 @@
  * at. The engine breaks such a word wherever the line ends, in the middle of a part. The parts
  * below are the places it may end a line instead.
  *
- * A line may end after a dot, a slash, a backslash, a colon, an at sign, an underscore or an
- * equals sign, and before a run of hyphens, so that an option keeps its hyphens: `--cache-dir`
- * ends a line at `--cache` and never between `--` and `cache`. These never end a line: a separator
- * that opens a word (the slash of a path, the dot of `.local`), a dot between two digits (an
- * address or a version is one number), and a run of hyphens that opens a word or follows a quote.
- * A word with a space in it keeps its spaces as the places the engine breaks at already.
+ * A line may end at an internal dot that a letter or an underscore follows. Where the part after the
+ * dot is short, four characters or fewer, the line ends before the dot, so that a familiar ending
+ * stays whole (`KalaReach` and `.app`, `archive` and `.tar` and `.gz`). Where it is longer, the line
+ * ends after the dot: a dot in front would only make the part wider, and a part wider than its line is
+ * cut sooner (`com.` and `kalareach.` and `companion`). A line may also end before an at sign (`git`
+ * and `@host`) and before a run of hyphens, so that an option keeps its hyphens: `--cache-dir` ends a
+ * line at `--cache` and never between `--` and `cache`. It may end after a run of underscores, and
+ * after a run of slashes, backslashes, colons and equals signs: a run of such separators is one place,
+ * after its last character. These never end a line: a separator that opens a word (the slash of a
+ * path, the dot of `.local`, the underscores of `__init__`), a dot that a digit follows (an address,
+ * a version or a file's number is not cut, and no line starts with `.1`), a dot that closes a word
+ * (the stop of a sentence, the root dot of a host name), and a run of hyphens that opens a word or
+ * follows a quote. A word with a space in it keeps its spaces as the places the engine breaks at
+ * already.
  */
 
-/** Characters after which a run ends a line when a word character follows. */
-const AFTER_RUN = new Set(['/', '\\', ':', '@', '='])
+/** The longest part after a dot that keeps the dot in front of it. */
+const SHORT_PART = 4
+
+/** Separators after which a run ends a line when a word follows. */
+const AFTER_RUN = new Set(['/', '\\', ':', '='])
 
 const OPENERS = new Set(['"', "'", '`', '(', '[', '{', '<'])
 
@@ -23,8 +34,24 @@ function isWordCharacter(character: string | undefined): boolean {
   return character !== undefined && /[\p{L}\p{N}]/u.test(character)
 }
 
+function isLetter(character: string | undefined): boolean {
+  return character !== undefined && /\p{L}/u.test(character)
+}
+
 function isDigit(character: string | undefined): boolean {
   return character !== undefined && /\p{N}/u.test(character)
+}
+
+/** Whether `character` ends the part that follows a dot: a separator, a space, or the word's end. */
+function endsPart(character: string | undefined): boolean {
+  return character === undefined || /[\s._/\\:=@-]/u.test(character)
+}
+
+/** How many characters the part that starts at `from` has, up to the next separator or the word's end. */
+function partLength(characters: readonly string[], from: number): number {
+  let end = from
+  while (!endsPart(characters[end])) end += 1
+  return end - from
 }
 
 /** Whether `character` starts a word: the text start, a space, or an opening quote or bracket. */
@@ -41,44 +68,79 @@ export function breakParts(text: string): readonly string[] {
   const parts: string[] = []
   let current = ''
   for (let at = 0; at < characters.length; at += 1) {
-    const character = characters[at]
-    const before = characters[at - 1]
-    const after = characters[at + 1]
-    if (character === '-' && before !== '-' && isWordCharacter(before)) {
-      // Before a run of hyphens that follows a letter or a digit, unless a digit stands on both sides.
-      let end = at
-      while (characters[end] === '-') end += 1
-      const following = characters[end]
-      if (isWordCharacter(following) && !(isDigit(before) && isDigit(following))) {
-        parts.push(current)
-        current = ''
-      }
+    if (at > 0 && endsLineBefore(characters, at)) {
+      parts.push(current)
+      current = ''
     }
-    current += character
-    if (!endsLineAfter(characters, at, before, after)) continue
-    parts.push(current)
-    current = ''
+    current += characters[at]
   }
   if (current !== '') parts.push(current)
   return parts.filter((part) => part !== '')
 }
 
-/** Whether a line may end right after the character at `at`. */
-function endsLineAfter(
-  characters: readonly string[],
-  at: number,
-  before: string | undefined,
-  after: string | undefined
-): boolean {
-  const character = characters[at]
-  if (character === '.' || character === '_') {
-    // Between two word characters only, and not between two digits.
-    return isWordCharacter(before) && isWordCharacter(after) && !(character === '.' && isDigit(before) && isDigit(after))
-  }
-  if (!AFTER_RUN.has(character) || AFTER_RUN.has(after ?? '')) return false
-  // The end of a run of such characters: not one that opens its word, and one a word follows.
+/** Where the run of `character` that ends at `at` (inclusive) starts. */
+function runStart(characters: readonly string[], at: number, inRun: (character: string) => boolean): number {
   let start = at
-  while (start > 0 && AFTER_RUN.has(characters[start - 1])) start -= 1
+  while (start > 0 && inRun(characters[start - 1])) start -= 1
+  return start
+}
+
+/** Whether the run of underscores that ends at `at` opens its word, as the first ones of `__init__` do. */
+function underscoresOpen(characters: readonly string[], at: number): boolean {
+  const start = runStart(characters, at, (character) => character === '_')
+  return !isWordCharacter(characters[start - 1])
+}
+
+/** Whether a line may end right before the character at `at`, which is not the first. */
+function endsLineBefore(characters: readonly string[], at: number): boolean {
+  const character = characters[at]
+  const before = characters[at - 1]
+  const after = characters[at + 1]
+  // The character before is a word character, or the last underscore of a run that closes a part.
+  const closesPart = isWordCharacter(before) || (before === '_' && !underscoresOpen(characters, at - 1))
+  if (character === '.') {
+    if (!closesPart) return runAfterSeparator(characters, at)
+    // Before an internal dot that a letter or an underscore follows, where the part after it is short.
+    // A dot that opens or closes a word is no place, and neither is one that a digit follows: a line
+    // that starts with `.1` reads as a fraction, so `libfoo.so.1` ends a line before `.so` and not
+    // before the `.1`.
+    return (isLetter(after) || after === '_') && partLength(characters, at + 1) <= SHORT_PART
+  }
+  // After an internal dot, where the part that follows it is longer.
+  if (before === '.' && dotLeavesLine(characters, at - 1)) return true
+  if (character === '@') return closesPart ? isWordCharacter(after) : runAfterSeparator(characters, at)
+  if (character === '-') {
+    // Before a run of hyphens that follows a letter or a digit, unless a digit stands on both sides.
+    if (before === '-' || !isWordCharacter(before)) return runAfterSeparator(characters, at)
+    let end = at
+    while (characters[end] === '-') end += 1
+    const following = characters[end]
+    return isWordCharacter(following) && !(isDigit(before) && isDigit(following))
+  }
+  if (before === '_') return !underscoresOpen(characters, at - 1) && isWordCharacter(character)
+  return runAfterSeparator(characters, at)
+}
+
+/** Whether the line ends after the dot at `dot`: an internal dot that a letter follows and a long part. */
+function dotLeavesLine(characters: readonly string[], dot: number): boolean {
+  const before = characters[dot - 1]
+  const closesPart = isWordCharacter(before) || (before === '_' && !underscoresOpen(characters, dot - 1))
+  return closesPart && isLetter(characters[dot + 1]) && partLength(characters, dot + 1) > SHORT_PART
+}
+
+/**
+ * Whether the run of separators that ends right before `at` closes a part, and what follows it may
+ * start the next: a word, or a dot, an underscore, an at sign or a hyphen that a word follows.
+ */
+function runAfterSeparator(characters: readonly string[], at: number): boolean {
+  const before = characters[at - 1]
+  if (!AFTER_RUN.has(before)) return false
+  const character = characters[at]
+  if (AFTER_RUN.has(character)) return false
+  const start = runStart(characters, at - 1, (one) => AFTER_RUN.has(one))
+  // A run that opens its word (the slash of a path) belongs to what follows it.
   if (opensWord(characters[start - 1])) return false
-  return isWordCharacter(after) || after === '.' || after === '_'
+  // A dot that a digit follows starts no line, whatever stands before it.
+  if (character === '.') return !isDigit(characters[at + 1])
+  return isWordCharacter(character) || character === '_' || character === '@' || character === '-'
 }

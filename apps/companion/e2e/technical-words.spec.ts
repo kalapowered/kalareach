@@ -4,8 +4,9 @@
  * An application identifier, a path, a command's option and a host name have no space to end a line
  * at, so the engine ended one wherever the line ran out, in the middle of a part: `com.kala` and
  * `reach.co` and `mpanion`, or a pair of hyphens at the end of one line and the option's name on the
- * next. The rule held here: a line ends after a dot, a slash and the other separators, and before a
- * run of hyphens; inside a part only when that one part alone is wider than its line; nothing is cut
+ * next. The rule held here: a line ends at a dot (before it where a short part follows, after it where
+ * a longer one does), before an at sign and a run of hyphens, and after an underscore, a slash and the
+ * other separators; inside a part only when that one part alone is wider than its line; nothing is cut
  * off, clipped by any ancestor or scrolling sideways, a run of hyphens wider than its line included;
  * a quoted word of a command line stays on one line where it fits there; and what a person copies is
  * the source text, character for character.
@@ -327,7 +328,7 @@ const HYPHENS = '-'.repeat(160)
 const IDENTIFIER = ['com.', 'kalareach.', 'companion.', 'preview.', 'nightly']
 const PATH = ['/Users/', 'sam/', 'work/', 'kalareach/', 'target/', 'debug/', 'kalareach', '-companion']
 const OPTION = ['"--no', '-color', '-diagnostics', '-and', '-terminal', '-escapes=', 'always"']
-const HOST = ['settings.', 'synchronisation.', 'example', '-company.', 'com']
+const HOST = ['settings.', 'synchronisation.', 'example', '-company', '.com']
 
 const KINDS: readonly Kind[] = [
   {
@@ -338,7 +339,7 @@ const KINDS: readonly Kind[] = [
     parts: IDENTIFIER,
     wide: ['com.', 'kalareach.', `${LONG_PART}${LONG_PART}`],
     run: `a${HYPHENS}b`,
-    short: ['to.', 'kala.', 'reach']
+    short: ['to', '.kala.', 'reach']
   },
   {
     name: 'a path',
@@ -367,9 +368,9 @@ const KINDS: readonly Kind[] = [
     selector: '[data-testid="sync-service-changed"]',
     shown: (word) => word,
     parts: HOST,
-    wide: ['sync.', `${LONG_PART}${LONG_PART}.`, 'com'],
+    wide: ['sync.', `${LONG_PART}${LONG_PART}`, '.com'],
     run: `a${HYPHENS}b.com`,
-    short: ['reach.', 'kala.', 'to']
+    short: ['reach', '.kala', '.to']
   }
 ]
 
@@ -521,7 +522,7 @@ for (const kind of KINDS) {
   })
 }
 
-test('the setup card title of an application identifier, at the largest text size, ends a line only after a dot', async ({
+test('the setup card title of an application identifier, at the largest text size, ends a line only at a dot', async ({
   page
 }) => {
   const parts = ['com.', 'kalareach.', 'companion']

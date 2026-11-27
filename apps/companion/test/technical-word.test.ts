@@ -10,29 +10,54 @@ import { describe, expect, it } from 'vitest'
 import { breakParts } from '../src/model/technical-word'
 
 const ROWS: ReadonlyArray<readonly [string, readonly string[]]> = [
-  // An application identifier ends a line after each dot.
+  // An internal dot ends a line before it where the part after it is short (four characters or fewer),
+  // so that a familiar ending stays whole, and after it where that part is longer.
   ['com.kalareach.companion', ['com.', 'kalareach.', 'companion']],
+  ['com.apple.Terminal', ['com.', 'apple.', 'Terminal']],
+  ['Info.plist', ['Info.', 'plist']],
+  ['KalaReach.app', ['KalaReach', '.app']],
+  ['archive.tar.gz', ['archive', '.tar', '.gz']],
+  ['x.kala.verylongname', ['x', '.kala.', 'verylongname']],
   // A path ends a line after a slash; the slash and the dot that open a word stay with it.
   [
     '/Users/sam/.local/share/kalareach',
     ['/Users/', 'sam/', '.local/', 'share/', 'kalareach']
   ],
-  ['C:\\Program Files\\KalaReach\\kr.exe', ['C:\\', 'Program Files\\', 'KalaReach\\', 'kr.', 'exe']],
+  ['C:\\Program Files\\KalaReach\\kr.exe', ['C:\\', 'Program Files\\', 'KalaReach\\', 'kr', '.exe']],
+  ['node_modules/@types/node', ['node_', 'modules/', '@types/', 'node']],
   // An option keeps its hyphens: a line ends before a run of them, never after.
   ['"--inspect"', ['"--inspect"']],
   ['--cache-dir', ['--cache', '-dir']],
   ['--no-color=always', ['--no', '-color=', 'always']],
+  // An option with a negative value ends a line after the equals sign, before the sign.
+  ['--offset=-1', ['--offset=', '-1']],
   // A host name, an address and a URL.
-  ['reach.kala.to', ['reach.', 'kala.', 'to']],
-  ['https://reach.kala.to/pair?code=1', ['https://', 'reach.', 'kala.', 'to/', 'pair?code=', '1']],
+  ['reach.kala.to', ['reach', '.kala', '.to']],
+  ['https://reach.kala.to/pair?code=1', ['https://', 'reach', '.kala', '.to/', 'pair?code=', '1']],
   ['fe80::1c2d:3e4f', ['fe80::', '1c2d:', '3e4f']],
-  ['kr@reach.kala.to', ['kr@', 'reach.', 'kala.', 'to']],
-  // Words with an underscore, and words that open with one.
+  ['192.168.0.1:8080', ['192.168.0.1:', '8080']],
+  ['[2001:db8::1]:443', ['[2001:', 'db8::', '1]:', '443']],
+  ['kr@reach.kala.to', ['kr', '@reach', '.kala', '.to']],
+  // Words with an underscore end a line after it; a run of them, and a name that opens with one, do not split.
   ['kr_worker_main', ['kr_', 'worker_', 'main']],
-  ['__init__.py', ['__init__.py']],
+  ['__init__.py', ['__init__', '.py']],
+  ['_private_name.txt', ['_private_', 'name', '.txt']],
+  ['a__b', ['a__', 'b']],
+  ['a._b', ['a', '._b']],
+  // A run of separators of any kind is one place, after its last character.
+  ['a//::==b', ['a//::==', 'b']],
+  ['a..b', ['a..b']],
+  ['a---b', ['a', '---b']],
+  // A dot that opens or closes a word, or that a digit follows, never starts or ends a part of its own.
+  ['.local', ['.local']],
+  ['name.', ['name.']],
+  ['Done.', ['Done.']],
+  ['host.example.', ['host.', 'example.']],
+  ['log.2', ['log.2']],
+  ['libfoo.so.1', ['libfoo', '.so.1']],
   // A number is one word: no dot, comma or hyphen between two digits ends a line.
   ['192.168.0.1', ['192.168.0.1']],
-  ['1.2.3-rc.1', ['1.2.3', '-rc.', '1']],
+  ['1.2.3-rc.1', ['1.2.3', '-rc.1']],
   ['2026-11-26', ['2026-11-26']],
   // A word with a space keeps the space as a place the engine already breaks at.
   ['two words', ['two words']],
