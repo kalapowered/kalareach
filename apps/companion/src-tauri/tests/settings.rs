@@ -2710,13 +2710,8 @@ fn a_file_this_build_cannot_read_is_not_replaced_by_a_mode_read_elsewhere() {
     let directory = tempfile::tempdir().expect("a directory");
     let file = directory.path().join("settings.json");
     let newer = br#"{"version":99,"colour_mode":"sepia"}"#;
-    std::fs::write(&file, newer).expect("a newer build's file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
-            .expect("owner only");
-    }
+    kr_ipc::paths::write_owner_only_file(&file, newer)
+        .expect("a newer build's file, written as the product writes one");
     let settings = LocalSettings::open(directory.path());
     assert!(
         !settings
@@ -6640,11 +6635,7 @@ fn the_settings_the_bundle_saves_are_the_persons_choice_and_an_unreadable_file_i
     }
 
     let file = data.path().join(companion_tauri::settings::FILE);
-    std::fs::write(&file, b"this is not settings").expect("a file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
-    }
+    kr_ipc::paths::write_owner_only_file(&file, b"this is not settings")
+        .expect("a file as the product writes one");
     assert_eq!(local.for_backup(), Chosen::Unreadable);
 }

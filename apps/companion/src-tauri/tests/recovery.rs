@@ -4410,12 +4410,8 @@ async fn a_settings_file_that_cannot_be_read_keeps_what_the_bundle_holds() {
         .expect("kept");
     page.call("recovery_turn_on", json!({})).expect("on");
     let file = computer.data.path().join(companion_tauri::settings::FILE);
-    std::fs::write(&file, b"this is not settings").expect("a file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
-    }
+    kr_ipc::paths::write_owner_only_file(&file, b"this is not settings")
+        .expect("a file as the product writes one");
     let step = page
         .recovery
         .save_settings(&page.account)
@@ -6083,12 +6079,8 @@ async fn a_restore_puts_the_colour_mode_back_on_a_fresh_device_and_replaces_noth
     // A device whose settings file cannot be read is left as it is, and the answer says so.
     let (directory, unreadable) = fresh_device();
     let file = directory.path().join(companion_tauri::settings::FILE);
-    std::fs::write(&file, b"this is not settings").expect("a file");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("private");
-    }
+    kr_ipc::paths::write_owner_only_file(&file, b"this is not settings")
+        .expect("a file as the product writes one");
     assert_eq!(
         page.recovery
             .restore_settings_with(
