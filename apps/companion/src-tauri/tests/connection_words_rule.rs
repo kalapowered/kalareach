@@ -298,7 +298,7 @@ const EXCEPTIONS: [Exception; 83] = [
     },
     Exception {
         file: "contact.rs",
-        function: "of",
+        function: "Outcome::of",
         needle: "Asked::Connection",
         lines: 2,
         reason: "the one classification of a connection that was not opened: the host's bound and this computer's budget are refusals of the connection in their own words; it reads no code",

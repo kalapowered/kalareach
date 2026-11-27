@@ -23,7 +23,7 @@ use kr_protocol::rights::ActionRight;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter as _, Manager as _, Runtime};
 
-use crate::contact::{Adopt, Outcome, Reach, Target, Wrote};
+use crate::contact::{Adopt, Cause, ContactOwner, Outcome, Reach, Target, Wrote};
 use crate::device::Device;
 use crate::error::{CommandError, Result};
 use crate::state::{AppState, Started};
@@ -966,10 +966,7 @@ pub async fn keep<R, A, F>(
                 }
             }
             Attempt::Failed(unopened) => {
-                let outcome = Outcome::of(&unopened);
-                let reason = unopened.into_error().message;
-                if owner.failed(choice, last.as_ref(), outcome, &reason).value == Wrote::StaleChoice
-                {
+                if failed_try(&owner, choice, last.as_ref(), unopened) == Wrote::StaleChoice {
                     return;
                 }
                 if let Some(first) = first.take() {
@@ -1007,6 +1004,20 @@ pub async fn keep<R, A, F>(
         }
         tokio::time::sleep(backoff.disconnected()).await;
     }
+}
+
+/// Writes what a failed attempt for `choice` came to: how contact with the host stands, the words a
+/// person reads, and what those words are the words of, all read from the one failure.
+pub(crate) fn failed_try(
+    owner: &ContactOwner,
+    choice: u64,
+    last: Option<&Arc<Session>>,
+    unopened: Unopened,
+) -> Wrote {
+    let outcome = Outcome::of(&unopened);
+    let cause = Cause::of(&unopened);
+    let reason = unopened.into_error().message;
+    owner.failed(choice, last, outcome, cause, &reason).value
 }
 
 /// Supervises one connection the owner holds until it ends, and returns its session.
@@ -1124,10 +1135,12 @@ async fn supervise<R: Runtime>(
                     // admit the connection is a loss. One the host ended needs no word to the
                     // person.
                     if stopped != LeaseStop::ConnectionEnded {
+                        let (outcome, cause) = lease_stop_outcome(&session, &stopped);
                         drop(owner.lease_stopped(
                             choice,
                             &session,
-                            lease_stop_outcome(&session, &stopped),
+                            outcome,
+                            cause,
                             &stopped.to_string(),
                         ));
                     }
@@ -1147,12 +1160,19 @@ async fn supervise<R: Runtime>(
     session
 }
 
-/// What a stop of the lease reads as for the owner: the refusal the session kept from the host,
-/// when it kept one, and otherwise the reason the lease stopped.
-pub(crate) fn lease_stop_outcome(session: &Session, stopped: &LeaseStop) -> Outcome {
-    Outcome::of(&Unopened::of_link(crate::lease::failed_on(
-        session, stopped,
-    )))
+/// What a stop of the lease reads as for the owner, and what its words are the words of: the
+/// refusal the session kept from the host, when it kept one, and otherwise the reason the lease
+/// stopped.
+pub(crate) fn lease_stop_outcome(session: &Session, stopped: &LeaseStop) -> (Outcome, Cause) {
+    let unopened = Unopened::of_link(crate::lease::failed_on(session, stopped));
+    (Outcome::of(&unopened), Cause::of(&unopened))
+}
+
+/// What the end of the connection `session` runs on reads as for the owner, and what its words are
+/// the words of: an end this device made, or a refusal the session kept, is the answer of someone
+/// and any other end is a loss.
+pub(crate) fn end_outcome(session: &Session) -> (Outcome, Cause) {
+    lease_stop_outcome(session, &LeaseStop::ConnectionEnded)
 }
 
 /// Keeps the connection to the host on this machine, as the application's host: it is reached, and
@@ -1290,15 +1310,12 @@ pub async fn forward_events<R: Runtime>(
                         || "the connection to this host ended".to_owned(),
                         |end| end.error.message,
                     );
-                let unopened = Unopened::of_link(crate::lease::failed_on(
-                    &session,
-                    &LeaseStop::ConnectionEnded,
-                ));
-                drop(app.state::<AppState>().contact_owner().ended(
-                    &session,
-                    Outcome::of(&unopened),
-                    &why,
-                ));
+                let (outcome, cause) = end_outcome(&session);
+                drop(
+                    app.state::<AppState>()
+                        .contact_owner()
+                        .ended(&session, outcome, cause, &why),
+                );
                 return;
             }
         };

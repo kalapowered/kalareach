@@ -355,6 +355,33 @@ impl Outcome {
     }
 }
 
+/// What the standing words of a host's contact are the words of, which decides whether they still
+/// describe the host's state when the next try is under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    /// A try did not reach the host: the words describe a try that is over.
+    Unreached,
+    /// Words that are not a lost try's own: the host's answer, or the words of an end this device
+    /// made.
+    Answered,
+    /// Words this application wrote itself, with no try behind them.
+    Own,
+}
+
+impl Cause {
+    /// The ONE reading of a failure to reach a host as a cause: only a host that was not reached
+    /// has words that a later try outlasts. A new kind of failure has to be placed here, because
+    /// the match names every one.
+    #[must_use]
+    pub fn of(unopened: &Unopened) -> Self {
+        match unopened {
+            Unopened::Unreached(_) => Self::Unreached,
+            Unopened::NotAdmitted(_) | Unopened::Refused(..) | Unopened::HostFull => Self::Answered,
+            Unopened::BudgetFull => Self::Own,
+        }
+    }
+}
+
 /// The host in use, as the page names it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -497,6 +524,8 @@ struct State {
     link: u64,
     adoption: Option<Adoption>,
     reason: Option<String>,
+    /// What the words of `reason` are the words of.
+    cause: Cause,
     replaced: u64,
     hosts: BTreeMap<HostKey, Record>,
     /// The one source of generations and epochs.
@@ -523,7 +552,8 @@ impl State {
             slot: None,
             link: 0,
             adoption: None,
-            reason: Some("this application has not reached a host yet".to_owned()),
+            reason: None,
+            cause: Cause::Own,
             replaced: 0,
             hosts: BTreeMap::new(),
             counter: 0,
@@ -543,6 +573,10 @@ impl State {
                 others: Vec::new(),
             },
         };
+        state.set_reason(
+            Some("this application has not reached a host yet".to_owned()),
+            Cause::Own,
+        );
         state.last = state.visible();
         state
     }
@@ -550,6 +584,13 @@ impl State {
     fn next(&mut self) -> u64 {
         self.counter += 1;
         self.counter
+    }
+
+    /// The ONE write of the words a person reads while no connection is held, and of what they are
+    /// the words of: no other place assigns either.
+    fn set_reason(&mut self, reason: Option<String>, cause: Cause) {
+        self.reason = reason;
+        self.cause = cause;
     }
 
     fn record_of(target: &Target, generation: u64, epoch: u64) -> Record {
@@ -1068,7 +1109,7 @@ impl ContactOwner {
     pub fn choose(&self, target: &Target, reason: &str) -> Applied<u64> {
         self.commit(|state, disposal| {
             state.end_choice(disposal);
-            state.reason = Some(reason.to_owned());
+            state.set_reason(Some(reason.to_owned()), Cause::Own);
             let left = state.in_use.replace(target.key());
             let key = target.key();
             // A record of another pairing is a new record: what the old one held goes with it.
@@ -1133,7 +1174,7 @@ impl ContactOwner {
             if was_in_use {
                 state.end_choice(disposal);
                 state.in_use = None;
-                state.reason = Some(reason.to_owned());
+                state.set_reason(Some(reason.to_owned()), Cause::Own);
             }
             was_in_use
         })
@@ -1155,7 +1196,7 @@ impl ContactOwner {
                 return Reach::SlotBusy(connection);
             }
             let link = state.install(connection, disposal);
-            state.reason = None;
+            state.set_reason(None, Cause::Own);
             state.apply(Outcome::InContact);
             Reach::Reached(link)
         })
@@ -1167,6 +1208,7 @@ impl ContactOwner {
         choice: u64,
         last: Option<&Arc<Session>>,
         outcome: Outcome,
+        cause: Cause,
         reason: &str,
     ) -> Applied<Wrote> {
         self.commit(|state, disposal| {
@@ -1177,7 +1219,7 @@ impl ContactOwner {
                 return Wrote::SlotBusy;
             }
             disposal.connection(state.slot.take());
-            state.reason = Some(reason.to_owned());
+            state.set_reason(Some(reason.to_owned()), cause);
             state.apply(outcome);
             Wrote::Applied
         })
@@ -1191,6 +1233,7 @@ impl ContactOwner {
         choice: u64,
         session: &Arc<Session>,
         outcome: Outcome,
+        cause: Cause,
         reason: &str,
     ) -> Applied<bool> {
         self.commit(|state, disposal| {
@@ -1198,7 +1241,7 @@ impl ContactOwner {
                 return false;
             }
             disposal.connection(state.slot.take());
-            state.reason = Some(reason.to_owned());
+            state.set_reason(Some(reason.to_owned()), cause);
             state.apply(outcome);
             true
         })
@@ -1206,13 +1249,19 @@ impl ContactOwner {
 
     /// The connection `session` ended. Nothing is written when another connection has taken its
     /// place.
-    pub fn ended(&self, session: &Arc<Session>, outcome: Outcome, reason: &str) -> Applied<bool> {
+    pub fn ended(
+        &self,
+        session: &Arc<Session>,
+        outcome: Outcome,
+        cause: Cause,
+        reason: &str,
+    ) -> Applied<bool> {
         self.commit(|state, disposal| {
             if !state.holds(session) {
                 return false;
             }
             disposal.connection(state.slot.take());
-            state.reason = Some(reason.to_owned());
+            state.set_reason(Some(reason.to_owned()), cause);
             state.apply(outcome);
             true
         })
@@ -2107,7 +2156,7 @@ pub mod testing {
         pub fn install(&self, connection: Connection) -> super::Disposal {
             self.commit(|state, disposal| {
                 state.install(connection, disposal);
-                state.reason = None;
+                state.set_reason(None, super::Cause::Own);
             })
             .disposal
         }
@@ -2419,25 +2468,45 @@ pub mod tests {
         let reached = owner.reached(choice, None, busy);
         assert!(matches!(reached.value, Reach::SlotBusy(_)));
         assert_eq!(
-            owner.failed(choice + 1, None, Outcome::Lost, "no").value,
+            owner
+                .failed(choice + 1, None, Outcome::Lost, Cause::Unreached, "no")
+                .value,
             Wrote::StaleChoice
         );
         assert_eq!(
-            owner.failed(choice, None, Outcome::Lost, "no").value,
+            owner
+                .failed(choice, None, Outcome::Lost, Cause::Unreached, "no")
+                .value,
             Wrote::SlotBusy
         );
         let (other, _) = connection(4);
         assert!(
             !owner
-                .lease_stopped(choice, &other.session(), Outcome::Lost, "stopped")
+                .lease_stopped(
+                    choice,
+                    &other.session(),
+                    Outcome::Lost,
+                    Cause::Unreached,
+                    "stopped"
+                )
                 .value
         );
         assert!(
             !owner
-                .lease_stopped(choice + 1, &session, Outcome::Lost, "stopped")
+                .lease_stopped(
+                    choice + 1,
+                    &session,
+                    Outcome::Lost,
+                    Cause::Unreached,
+                    "stopped"
+                )
                 .value
         );
-        assert!(!owner.ended(&other.session(), Outcome::Lost, "ended").value);
+        assert!(
+            !owner
+                .ended(&other.session(), Outcome::Lost, Cause::Unreached, "ended")
+                .value
+        );
         assert_eq!(
             owner.revision(),
             before,
@@ -2450,9 +2519,9 @@ pub mod tests {
     async fn an_unchanged_outcome_makes_no_event() {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
-        let first = owner.failed(choice, None, Outcome::Lost, "no answer");
+        let first = owner.failed(choice, None, Outcome::Lost, Cause::Unreached, "no answer");
         assert_eq!(first.value, Wrote::Applied);
-        let again = owner.failed(choice, None, Outcome::Lost, "no answer");
+        let again = owner.failed(choice, None, Outcome::Lost, Cause::Unreached, "no answer");
         assert_eq!(again.value, Wrote::Applied, "the write is accepted");
         assert_eq!(again.revision, first.revision, "and tells nothing new");
     }
@@ -2461,9 +2530,9 @@ pub mod tests {
     async fn an_identical_refusal_keeps_the_epoch_and_makes_no_event() {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
-        drop(owner.failed(choice, None, refusal("not now"), "not now"));
+        drop(owner.failed(choice, None, refusal("not now"), Cause::Answered, "not now"));
         let told = owner.snapshot();
-        drop(owner.failed(choice, None, refusal("not now"), "not now"));
+        drop(owner.failed(choice, None, refusal("not now"), Cause::Answered, "not now"));
         assert_eq!(owner.snapshot(), told, "the epoch and the revision stand");
     }
 
@@ -2471,14 +2540,26 @@ pub mod tests {
     async fn a_different_refusal_moves_it() {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
-        drop(owner.failed(choice, None, refusal("not now"), "not now"));
+        drop(owner.failed(choice, None, refusal("not now"), Cause::Answered, "not now"));
         let told = owner.snapshot();
-        drop(owner.failed(choice, None, refusal("not ever"), "not ever"));
+        drop(owner.failed(
+            choice,
+            None,
+            refusal("not ever"),
+            Cause::Answered,
+            "not ever",
+        ));
         let now = owner.snapshot();
         assert_eq!(now.revision, told.revision + 1);
         assert!(now.inbox_epoch > told.inbox_epoch);
         // A recovery is no refusal: the epoch does not move for it.
-        drop(owner.failed(choice, None, Outcome::InContact, "answered"));
+        drop(owner.failed(
+            choice,
+            None,
+            Outcome::InContact,
+            Cause::Answered,
+            "answered",
+        ));
         assert_eq!(owner.snapshot().inbox_epoch, now.inbox_epoch);
     }
 
@@ -2546,6 +2627,7 @@ pub mod tests {
                             choice,
                             None,
                             Outcome::Lost,
+                            Cause::Unreached,
                             &format!("writer {writer} turn {turn}"),
                         ));
                     }
@@ -2588,7 +2670,13 @@ pub mod tests {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
         for turn in 0..299 {
-            drop(owner.failed(choice, None, Outcome::Lost, &format!("turn {turn}")));
+            drop(owner.failed(
+                choice,
+                None,
+                Outcome::Lost,
+                Cause::Unreached,
+                &format!("turn {turn}"),
+            ));
         }
         assert_eq!(owner.revision(), 300);
         assert_eq!(
@@ -2607,7 +2695,13 @@ pub mod tests {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
         for turn in 0..299 {
-            drop(owner.failed(choice, None, Outcome::Lost, &format!("turn {turn}")));
+            drop(owner.failed(
+                choice,
+                None,
+                Outcome::Lost,
+                Cause::Unreached,
+                &format!("turn {turn}"),
+            ));
         }
         told_all(&owner);
         let missed = owner.since(295);
@@ -2628,7 +2722,13 @@ pub mod tests {
         let owner = ContactOwner::new();
         let choice = owner.choose(&paired(1, 2), "reaching").value;
         for turn in 0..299 {
-            drop(owner.failed(choice, None, Outcome::Lost, &format!("turn {turn}")));
+            drop(owner.failed(
+                choice,
+                None,
+                Outcome::Lost,
+                Cause::Unreached,
+                &format!("turn {turn}"),
+            ));
         }
         told_all(&owner);
         // The oldest kept is 45.
@@ -2661,7 +2761,7 @@ pub mod tests {
         let now = Arc::new(AtomicU64::new(1_000));
         let owner = owner_at(&now);
         let first = owner.choose(&paired(1, 2), "reaching").value;
-        drop(owner.failed(first, None, Outcome::Lost, "no answer"));
+        drop(owner.failed(first, None, Outcome::Lost, Cause::Unreached, "no answer"));
         let (read, _) = connection(10);
         let (visit, _) = connection(11);
         owner.plant(host(1), read, visit);
@@ -2780,17 +2880,132 @@ pub mod tests {
         }
     }
 
+    /// Which cause each way of not reaching a host is known by, and that every writer keeps the
+    /// cause it is given beside the words: the cause of a stop of the lease and of an end is read
+    /// from the same failure as their outcome, so they cannot disagree.
+    #[tokio::test]
+    async fn every_unopened_variant_has_the_cause_it_is_known_by() {
+        use kr_client::organisation::LeaseStop;
+        use kr_protocol::error::ErrorCode;
+
+        for (unopened, cause) in [
+            (
+                Unopened::unreached(NotReached::NoAnswerInTime),
+                Cause::Unreached,
+            ),
+            (
+                Unopened::NotAdmitted(HostWords::said("not admitted")),
+                Cause::Answered,
+            ),
+            (
+                Unopened::Refused(Asked::HostInfo, CommandError::refused("no")),
+                Cause::Answered,
+            ),
+            (Unopened::HostFull, Cause::Answered),
+            (Unopened::BudgetFull, Cause::Own),
+        ] {
+            assert_eq!(Cause::of(&unopened), cause, "{unopened:?}");
+        }
+
+        // An end reads by what its session says: a plain end is a loss, and an end this device made
+        // or a refusal the host kept is the answer of someone.
+        let plain = connection(41).0.session();
+        assert_eq!(
+            crate::connection::end_outcome(&plain),
+            (Outcome::Lost, Cause::Unreached)
+        );
+        let (made, _, left) = connection_of_an_account(42);
+        left.store(true, Ordering::SeqCst);
+        let (outcome, cause) = crate::connection::end_outcome(&made.session());
+        assert!(matches!(outcome, Outcome::Refused { .. }), "{outcome:?}");
+        assert_eq!(cause, Cause::Answered, "an end this device made");
+        for code in [ErrorCode::PermissionDenied, ErrorCode::ResourceUnavailable] {
+            let kept = refused_session(code).await;
+            assert_eq!(
+                crate::connection::end_outcome(&kept).1,
+                Cause::Answered,
+                "a refusal the host kept: {code:?}"
+            );
+        }
+
+        // Every stop of the lease that is reported is the answer of someone, with no refusal kept
+        // and with one: the stop of an ended connection is not reported.
+        let stops = [
+            LeaseStop::SignIn,
+            LeaseStop::TokenRefused,
+            LeaseStop::NotAMember,
+            LeaseStop::Refused("a rule of the host"),
+            LeaseStop::Unusable,
+            LeaseStop::Later(Duration::from_secs(5)),
+            LeaseStop::Unreachable,
+            LeaseStop::AccountChanged,
+            LeaseStop::Presenting,
+        ];
+        let not_admitted = refused_session(ErrorCode::PermissionDenied).await;
+        let full = refused_session(ErrorCode::ResourceUnavailable).await;
+        for stop in &stops {
+            for (session, kind) in [
+                (&plain, "no refusal kept"),
+                (&not_admitted, "a refusal kept"),
+                (&full, "no room kept"),
+            ] {
+                assert_eq!(
+                    crate::connection::lease_stop_outcome(session, stop).1,
+                    Cause::Answered,
+                    "{stop:?}, {kind}"
+                );
+            }
+        }
+
+        // A failed try writes the cause of its own failure beside its words, each writer keeps the
+        // one it is given, and a choice, a forget and a reach write the application's own.
+        let owner = ContactOwner::new();
+        let choice = owner.choose(&paired(1, 2), "reaching").value;
+        assert_eq!(owner.lock().cause, Cause::Own, "a choice");
+        for (unopened, cause) in [
+            (
+                Unopened::unreached(NotReached::NoAnswerInTime),
+                Cause::Unreached,
+            ),
+            (
+                Unopened::NotAdmitted(HostWords::said("not admitted")),
+                Cause::Answered,
+            ),
+            (Unopened::BudgetFull, Cause::Own),
+        ] {
+            let debug = format!("{unopened:?}");
+            assert_eq!(
+                crate::connection::failed_try(&owner, choice, None, unopened),
+                Wrote::Applied
+            );
+            assert_eq!(owner.lock().cause, cause, "{debug}");
+        }
+        let (held, _) = connection(43);
+        let session = held.session();
+        drop(owner.reached(choice, None, held));
+        assert_eq!(owner.lock().cause, Cause::Own, "a reach");
+        drop(owner.ended(&session, Outcome::Lost, Cause::Unreached, "the end"));
+        assert_eq!(owner.lock().cause, Cause::Unreached, "an end");
+        let (held, _) = connection(44);
+        let session = held.session();
+        drop(owner.reached(choice, None, held));
+        drop(owner.lease_stopped(choice, &session, Outcome::Lost, Cause::Answered, "the stop"));
+        assert_eq!(owner.lock().cause, Cause::Answered, "a stop of the lease");
+        drop(owner.forget(host(1), "forgotten"));
+        assert_eq!(owner.lock().cause, Cause::Own, "a forget");
+    }
+
     #[tokio::test]
     async fn a_never_reached_local_loss_reads_unknown() {
         let now = Arc::new(AtomicU64::new(2_000));
         let owner = owner_at(&now);
         let choice = owner.choose(&Target::Local, "reaching").value;
-        drop(owner.failed(choice, None, refusal("refused"), "refused"));
+        drop(owner.failed(choice, None, refusal("refused"), Cause::Answered, "refused"));
         assert!(matches!(
             owner.snapshot().contact,
             HostContact::Refused { .. }
         ));
-        drop(owner.failed(choice, None, Outcome::Lost, "absent"));
+        drop(owner.failed(choice, None, Outcome::Lost, Cause::Unreached, "absent"));
         assert_eq!(
             owner.snapshot().contact,
             HostContact::Unknown,
@@ -2803,7 +3018,7 @@ pub mod tests {
         drop(reached);
         now.store(3_000, Ordering::SeqCst);
         let session = owner.held().expect("held").session();
-        drop(owner.ended(&session, Outcome::Lost, "ended"));
+        drop(owner.ended(&session, Outcome::Lost, Cause::Unreached, "ended"));
         assert_eq!(
             owner.snapshot().contact,
             HostContact::OutOfContact {
@@ -2846,7 +3061,7 @@ pub mod tests {
         let (choice, held, _) = reaching(&owner, 1);
         assert!(matches!(owner.adopt(choice, Some(&held)), Adopt::None));
         assert!(matches!(owner.adopt(choice + 1, Some(&held)), Adopt::Stale));
-        drop(owner.ended(&held, Outcome::Lost, "ended"));
+        drop(owner.ended(&held, Outcome::Lost, Cause::Unreached, "ended"));
         assert!(matches!(owner.adopt(choice, Some(&held)), Adopt::None));
     }
 
@@ -2922,7 +3137,7 @@ pub mod tests {
         let plain = connection(40).0.session();
         assert!(
             matches!(
-                crate::connection::lease_stop_outcome(&plain, &stopped),
+                crate::connection::lease_stop_outcome(&plain, &stopped).0,
                 Outcome::Refused { .. }
             ),
             "a lease that could not be given is a refusal in its words"
@@ -2930,14 +3145,14 @@ pub mod tests {
         let not_admitted = refused_session(ErrorCode::PermissionDenied).await;
         assert!(
             matches!(
-                crate::connection::lease_stop_outcome(&not_admitted, &stopped),
+                crate::connection::lease_stop_outcome(&not_admitted, &stopped).0,
                 Outcome::Lost
             ),
             "a connection the host did not admit is a loss, whatever the lease says"
         );
         let full = refused_session(ErrorCode::ResourceUnavailable).await;
         let Outcome::Refused { refusal, request } =
-            crate::connection::lease_stop_outcome(&full, &stopped)
+            crate::connection::lease_stop_outcome(&full, &stopped).0
         else {
             panic!("a host with no room is a refusal of the connection");
         };
@@ -3026,7 +3241,7 @@ pub mod tests {
         drop(
             state
                 .contact_owner()
-                .ended(&session, Outcome::Lost, "ended"),
+                .ended(&session, Outcome::Lost, Cause::Unreached, "ended"),
         );
         let Err(refused) = state.session() else {
             panic!("nothing is held once the connection has ended");
@@ -3097,6 +3312,7 @@ pub mod tests {
                 choice,
                 owner.held().map(|each| each.session()).as_ref(),
                 Outcome::Lost,
+                Cause::Unreached,
                 "no",
             ));
         });
@@ -3106,10 +3322,10 @@ pub mod tests {
         let counted = dropped_under_the_guard(|| {
             let owner = ContactOwner::new();
             let (choice, session, _) = reaching(&owner, 1);
-            drop(owner.lease_stopped(choice, &session, Outcome::Lost, "stopped"));
+            drop(owner.lease_stopped(choice, &session, Outcome::Lost, Cause::Unreached, "stopped"));
             let (choice, session, _) = reaching(&owner, 2);
             let _ = choice;
-            drop(owner.ended(&session, Outcome::Lost, "ended"));
+            drop(owner.ended(&session, Outcome::Lost, Cause::Unreached, "ended"));
         });
         assert_eq!(counted, 0, "E5 and E6");
 
