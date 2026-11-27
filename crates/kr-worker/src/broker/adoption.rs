@@ -980,6 +980,11 @@ pub fn arguments_from<R: std::io::Read>(mut open: impl FnMut() -> Option<R>) -> 
 /// reading with no zero byte at all is the one string a process that sets its title leaves, and
 /// names no script. An empty reading, as a process that has ended or is still being started gives,
 /// and a reading of one empty argument are read as nothing.
+///
+/// Two cuts cannot be told from what they look like, and are read as they stand: a reading cut
+/// right after a zero byte reads as a whole area, without the arguments after the cut, and a
+/// reading cut before its first zero byte reads as the one-string form, so a first argument that
+/// was cut is what is recorded.
 #[cfg(any(target_os = "linux", feature = "testing"))]
 #[must_use]
 pub fn parse_cmdline(bytes: &[u8]) -> Option<Arguments> {
