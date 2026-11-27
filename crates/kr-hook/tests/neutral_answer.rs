@@ -632,6 +632,83 @@ async fn a_worker_that_never_answers(named: Option<&str>) {
     }
 }
 
+/// KR-REQ-12.27: a worker that closes the connection without admitting the hook is the same event
+/// whether the hook's hello was written before the close or found the connection closed, and the
+/// hook says it in the same first line, answers `{}` and exits 0 either way.
+///
+/// The stand-in closes in the two ways a worker can: after reading the hello, and without reading
+/// anything. This case does not choose which side is first in the second way; the order of the
+/// hello's write and the close is made certain in the exchange's own cases, and what is held here
+/// is what the hook does with either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_27_a_worker_that_closes_without_admitting_is_one_refusal_in_either_order() {
+    const SAID: &str = "kr-hook: the worker closed the connection without admitting this bridge";
+
+    let placed = Placed::new();
+    let files = placed.host.root().join("files");
+    kr_ipc::paths::create_private_directory(&files).expect("a private directory");
+    let credential_file = files.join("credential");
+    kr_ipc::paths::create_new_owner_only_file(&credential_file, "5e".repeat(32).as_bytes())
+        .expect("the credential is written");
+    for hooks in every_application() {
+        let (event, payload) = &hooks.events[0];
+        let input = payload.to_string();
+        for reads_the_hello in [true, false] {
+            let case = format!(
+                "{} {event}, a worker that closes {}",
+                hooks.application,
+                if reads_the_hello {
+                    "after the hello"
+                } else {
+                    "without reading"
+                }
+            );
+            let Reached {
+                mut stream,
+                running,
+                ..
+            } = hook_reaching(
+                &files,
+                hooks.application,
+                &case,
+                |stand_in| {
+                    let registration = files.join(format!("registration.{}", hooks.application));
+                    std::fs::write(
+                        &registration,
+                        format!(
+                            "endpoint={}\nprofile=lp-1\n\
+                             instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                             credential={}\nframing=json_lines\n",
+                            stand_in.address,
+                            credential_file.display()
+                        ),
+                    )
+                    .expect("the registration is written");
+                    let mut command = placed.command(&[hooks.application, "hook"]);
+                    command.env("KR_REGISTRATION", &registration);
+                    let input = input.clone();
+                    tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()))
+                },
+                |ran| assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}"),
+            )
+            .await;
+            if reads_the_hello {
+                assert!(!read_line(&mut stream).await.is_empty(), "{case}: a hello");
+            }
+            drop(stream);
+            let ran = running.await.expect("the hook ran");
+            assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+            assert_eq!(ran.stdout, b"{}\n", "{case}");
+            assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
+            let first = ran.stderr.lines().next().unwrap_or_default();
+            let said = first
+                .rsplit_once(" (answered after ")
+                .map_or(first, |(said, _)| said);
+            assert_eq!(said, SAID, "{case}: {:?}", ran.stderr);
+        }
+    }
+}
+
 /// KR-REQ-12.27: a standard error nobody reads cannot hold a hook. With standard error a pipe that
 /// is full before the hook starts, every hook still writes `{}` and exits 0: a hook held by the
 /// pipe would never exit, which is what the wait here is for. The most a hook waits for a
