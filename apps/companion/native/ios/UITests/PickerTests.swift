@@ -2,10 +2,11 @@
 //  The file pickers, the camera and the terminal's keys, with a person at the phone (13.17).
 //
 //  Each of Photo library, Take a photo and Files opens the system's own picker or camera, which this
-//  test asserts and cancels by its own Cancel button, found by identifier only. Nothing is selected,
-//  captured, read or kept, and no picture is taken while one is up. The camera's permission prompt is
-//  answered, because it names this application and the test asked for the camera. A system Cancel
-//  that has no identifier leaves that leg open and the person at the phone cancels it by hand.
+//  test asserts and cancels by its own Cancel button. Nothing is selected, captured, read or kept, and
+//  no picture is taken while one is up. The camera's permission prompt is answered, because it names
+//  this application and the test asked for the camera. A system Cancel that cannot be told from every
+//  other button, by the rule in `pickerCancel`, leaves that leg open and the person at the phone
+//  cancels it by hand.
 //
 //  The accessory row's modifier states are read by their labels. A key press made here is the
 //  system's synthetic one; a physical keyboard is a different path and stays open.
@@ -21,12 +22,37 @@ final class PickerTests: HarnessTestCase {
         openFirstSession()
     }
 
+    /// The Cancel of the picker that is up, and how it was told, or nil when it cannot be told from every other button.
+    ///
+    /// A button is never taken by its label alone: the page and the menu of sources can have a Cancel of their own, and a tap on
+    /// that one would cancel the wrong thing. The photo library's Cancel has the identifier "Cancel". The Files picker's has
+    /// none (it is a button labelled "Cancel", read on the Simulator), so it is looked for by its label in the picker's own
+    /// navigation bar, which the system names `FullDocumentManagerViewControllerNavigationBar`: a bar outside the page that
+    /// holds no button of the page's. Exactly one such button must be there, or the picker has changed and none is tapped.
+    private func pickerCancel() -> (button: XCUIElement, how: String)? {
+        let named = app.buttons.matching(NSPredicate(format: "identifier == %@", "Cancel")).firstMatch
+        if named.exists { return (named, "identifier") }
+        let bar = app.navigationBars.matching(NSPredicate(format: "identifier == %@", "FullDocumentManagerViewControllerNavigationBar"))
+        let labelled = bar.buttons.matching(NSPredicate(format: "label == %@", "Cancel"))
+        if labelled.count == 1 { return (labelled.firstMatch, "label in the Files picker's navigation bar") }
+        return nil
+    }
+
+    private func waitForPickerCancel(timeout: TimeInterval) -> (button: XCUIElement, how: String)? {
+        let end = Date().addingTimeInterval(timeout)
+        repeat {
+            if let found = pickerCancel() { return found }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < end
+        return nil
+    }
+
     /// Opens one of the three attachment controls, asserts something came up, and cancels it.
     ///
     /// The control is a button over a file input: a tap on it raises the system's own menu of sources,
     /// which belongs to this application's window, and a tap on its entry raises the picker or the
-    /// camera. The Cancel button is looked for by identifier only; a system Cancel that has none leaves
-    /// the leg open and the person at the phone cancels it by hand.
+    /// camera. The Cancel button is the one `pickerCancel` tells; a picker whose Cancel it cannot tell
+    /// leaves the leg open and the person at the phone cancels it by hand.
     private func openAndCancel(_ control: String, entry: String?) throws {
         let button = app.buttons[control].firstMatch
         XCTAssertTrue(button.waitForExistence(timeout: 10), "no \(control) control")
@@ -40,19 +66,16 @@ final class PickerTests: HarnessTestCase {
         }
         // The camera asks first, the first time.
         answerPrompt(["Allow", "OK"], timeout: 5)
-        let cancel = app.buttons.matching(NSPredicate(format: "identifier == %@", "Cancel")).firstMatch
-        guard cancel.waitForExistence(timeout: 20) else {
+        guard let (cancel, how) = waitForPickerCancel(timeout: 20) else {
             #if targetEnvironment(simulator)
             if entry == nil { throw XCTSkip("the simulator has no camera") }
             #endif
-            say("PICKER \(control) opened, and its Cancel has no identifier: the person at the phone cancels it by hand")
-            throw XCTSkip("\(control) has no Cancel that can be told by identifier")
+            say("PICKER \(control) opened, and its Cancel cannot be told from every other button: the person at the phone cancels it by hand")
+            throw XCTSkip("\(control) has no Cancel that can be told from every other button")
         }
-        say("PICKER \(control) opened")
+        say("PICKER \(control) opened, its Cancel found by \(how)")
         cancel.tap()
-        eventually("the application to be back in front", timeout: 20) {
-            !app.buttons.matching(NSPredicate(format: "identifier == %@", "Cancel")).firstMatch.exists
-        }
+        eventually("the application to be back in front", timeout: 20) { !cancel.exists }
         XCTAssertEqual(draftText, "", "nothing was put on the draft")
         XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Remove '")).firstMatch.exists, "something was attached to the draft")
         say("PICKER \(control) cancelled")
