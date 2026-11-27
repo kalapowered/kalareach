@@ -1622,8 +1622,8 @@ impl DeviceDecision {
 
 /// How often this host writes down what its wall clock reads.
 ///
-/// It bounds how much real time can pass unrecorded, which is how far a clock can be stepped
-/// backwards without this host noticing.
+/// It is the usual gap between records, and so how far a clock can usually be stepped back
+/// unnoticed. A delayed task, a suspend or a failed write can leave a longer unrecorded gap.
 pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Keeps this host's records of the wall clock and of expiry moving while it is on the network.
@@ -3097,9 +3097,9 @@ impl Controller {
     /// Writes down the time the offline bound has spent, as the network's record task does at
     /// every mark.
     ///
-    /// It bounds how much of the bound's time a reboot can take away, the way the clock mark
-    /// bounds how far a clock can be stepped back unnoticed: a new boot keeps what was recorded,
-    /// and adds only what UTC shows.
+    /// A reboot loses the time since the last write that UTC does not show: usually less than one
+    /// mark, more after a delayed task, a suspend or a failed write. A new boot keeps what was
+    /// recorded and adds only what UTC shows.
     pub(crate) fn keep_offline_time(&self) {
         let policy = self
             .policy
@@ -4818,8 +4818,8 @@ pub(crate) mod tests {
     /// afterwards with the request's reading still wound back refuses. The floor is not raised for
     /// it: the lapse is not a reading of UTC.
     ///
-    /// It shows the revalidation after a restart for a lapse that only the continuous clock
-    /// found: the time the lapse implied is on record, and the daemon that starts again refuses.
+    /// It shows that a lapse only the continuous clock found is on record before the daemon stops,
+    /// and that the daemon started again refuses; its own UTC may refuse it without the record.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_offline_lapse_the_continuous_clock_found_is_written_down_once_storage_takes_it() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -4903,7 +4903,7 @@ pub(crate) mod tests {
     }
 
     /// The network's record task writes down the time the offline bound has spent, whether or not
-    /// anything asked, so a reboot loses no more than one mark of it; and it raises no floor.
+    /// anything asked, so a reboot loses only the time since the last write; it raises no floor.
     ///
     /// On clocks the test moves by hand: the continuous clock passes the time to be written down
     /// while the wall clock stands still, so a reading of the wall clock that anything else in the
@@ -4935,9 +4935,9 @@ pub(crate) mod tests {
     /// and writes down what it finds the same way. With the wall clock still inside the bound, a
     /// rule admits nothing once the bound has run out on the continuous clock; the time the bound
     /// spent is written down at the refusal, and a write of it that failed stays owed until
-    /// storage takes it. A daemon started in another boot, whose wall clock and floor read the
-    /// synchronisation itself, takes the bound's time from that record and finds it run out, so
-    /// the rule stays refused. The control: inside the bound, the rule admits its recipient.
+    /// storage takes it. An anchor taken in another boot, where the wall clock and the floor read
+    /// the synchronisation itself, takes the bound's time from that record and finds it run out.
+    /// The control: inside the bound, the rule admits its recipient.
     ///
     /// It shows the revalidation after a wake, for push's rule: the first reading after the gap
     /// admits nothing. It shows the revalidation after a reboot as far as the anchor a new boot
@@ -5156,8 +5156,8 @@ pub(crate) mod tests {
     /// KR-REQ-24.15: a daemon restarted in the same boot adds the boot clock's time since the
     /// record, although its wall clock and its floor read the synchronisation itself.
     ///
-    /// It shows the revalidation after a restart on the record alone: the wall clock adds no time
-    /// here, so only the time on record can find the bound run out.
+    /// It shows the revalidation after a restart by the boot clock's term alone: the wall clock
+    /// adds no time and the record holds none, so only that term finds the bound run out.
     #[test]
     fn a_restart_in_the_same_boot_adds_the_time_since_the_record() {
         let synchronised = 1_000_000;
