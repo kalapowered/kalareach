@@ -12,21 +12,30 @@
 //! What the run shows is the product's own path from a phone to its host and back: the phone is
 //! paired, turns notifications on, answers the challenge the gateway sends it, and is a destination
 //! the host delivers to; a question the worker asks is delivered through the gateway to the phone.
-//! No part of the provider is real, and no sender credential exists: what a real delivery would add
-//! is named in `docs/delivery/README.md`.
+//! In this case no part of the provider is real, and no sender credential exists: what a real
+//! delivery would add is named in `docs/delivery/README.md`.
+//!
+//! A second case, `a_phone_registers_through_the_real_provider`, is for a gateway whose sender
+//! account is a real one. It starts no stand-in and no worker, and reads only `KR_HARNESS_DIR`,
+//! `KR_HARNESS_PEER`, `KR_HARNESS_SECONDS` and `KR_PUSH_GATEWAY`. It pairs the phone, waits for the
+//! host to hold it as a destination, writes what the host holds, waits for the script to say that
+//! the phone has tried a registration with a token the provider does not know, and writes what the
+//! host holds again. A person runs it, and no step of this repository does.
 //!
 //! The script and this suite talk through files in `KR_HARNESS_DIR`, on the internal disk:
 //!
 //! | File | Written by | Holds |
 //! | --- | --- | --- |
-//! | `ready.json` | this suite | the provider stand-in's origin |
+//! | `ready.json` | this suite | the provider stand-in's origin; in the real-provider case, the gateway's |
 //! | `go` | the script | nothing; the phone is installed and the invitation may be issued |
 //! | `invitation.txt` | this suite | the direct invitation, with the host reachable at `KR_HARNESS_PEER` |
 //! | `inject-<n>.json` | this suite | one message to put on the phone: its kind and the provider's body |
 //! | `injected-<n>` | the script | nothing; the phone has had the message and had time to act on it |
 //! | `shown-<n>` | the script | nothing; a delivery is on the phone's screen |
+//! | `registered.json` | this suite | the real-provider case's report so far, when the destination appears or the wait for it ends |
+//! | `negative-done` | the script | nothing; the phone has tried the token the provider does not know, and stopped |
 //! | `finish` | the script | nothing; the phone is done |
-//! | `report.json` | this suite | what the host and the stand-in saw |
+//! | `report.json` | this suite | what the host and the stand-in saw; in the real-provider case, what the host saw |
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! and `10.0.2.2` for an emulator. `KR_PUSH_GATEWAY` is the gateway's origin, `KR_PUSH_FCM_PORT` the
@@ -103,7 +112,26 @@ struct Run {
     end: Instant,
 }
 
+/// The value of an environment variable the script sets, and a stop that names it when it is not.
+fn env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+}
+
 impl Run {
+    /// The run the script describes: its directory, and how long the whole run may last.
+    fn from_environment() -> Self {
+        Self {
+            directory: PathBuf::from(env("KR_HARNESS_DIR")),
+            end: Instant::now()
+                + Duration::from_secs(
+                    std::env::var("KR_HARNESS_SECONDS")
+                        .ok()
+                        .and_then(|seconds| seconds.parse().ok())
+                        .unwrap_or(1500),
+                ),
+        }
+    }
+
     fn left(&self) -> Duration {
         self.end.saturating_duration_since(Instant::now())
     }
@@ -285,6 +313,89 @@ fn destination_of(
         .expect("the daemon's journal")
 }
 
+/// How many destinations the daemon's journal holds.
+fn destination_count(host: &Host) -> usize {
+    host.controller()
+        .delivery()
+        .with(|producer| Ok(producer.journal().destinations().expect("a read").len()))
+        .expect("the daemon's journal")
+}
+
+/// The authorisation a push destination delivers under, when the destination is a push one.
+fn sender_record_of(record: &kr_delivery::destination::DestinationRecord) -> Option<String> {
+    match &record.destination {
+        kr_delivery::destination::Destination::Push(push) => {
+            Some(push.sender_record_id.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The identifier a sealed preview names its recipient by: a hash of the preview key, which
+/// reveals nothing of it.
+fn preview_key_id_of(push: &kr_delivery::destination::PushDestination) -> String {
+    kr_crypto::keys::key_id(
+        kr_protocol::pairing::KeyPurpose::NotificationPreview,
+        push.preview_keys.current.as_bytes(),
+    )
+    .as_bytes()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// Issues the phone's direct invitation, writes it where the script reads it, waits until the phone
+/// has redeemed it, and approves the device that did as the host's owner. Returns that device.
+async fn pair_a_phone(
+    run: &Run,
+    host: &Host,
+    owner: &DeviceKeys,
+    peer: &str,
+) -> kr_protocol::ids::DeviceId {
+    // The invitation lives for minutes, so it is issued only now, with the phone installed.
+    let mut client = host.client().await;
+    let signer = Signer::OwnerDevice(owner);
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &proposal(&[
+            ActionRight::SessionView,
+            ActionRight::QuestionRespond,
+            ActionRight::AgentApprovalRespond,
+        ]),
+        &signer,
+    )
+    .await
+    .expect("a direct invitation");
+    run.write("invitation.txt", &invitation_for(&invited, peer));
+
+    // The phone redeems it, and the host's owner approves the device that did.
+    let approval = async {
+        loop {
+            let status = calls::owner_status(&mut client, invited.invitation_id)
+                .await
+                .expect("the invitation's status");
+            if status.owner.0.and_then(|view| view.approval.0).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+    tokio::time::timeout(run.left(), approval)
+        .await
+        .expect("the phone redeemed the invitation");
+    let confirmed = calls::confirm_candidate(
+        host.environment_id,
+        &mut client,
+        invited.invitation_id,
+        &signer,
+    )
+    .await
+    .expect("the owner approves the phone");
+    confirmed.device_id
+}
+
 /// Every delivery the daemon's journal holds.
 fn deliveries_of(host: &Host) -> Vec<kr_delivery::journal::DeliveryRecord> {
     host.controller()
@@ -400,17 +511,7 @@ fn secret_store_holds(host: &Host, secret: &[u8]) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "started by scripts/e2e-push-device.sh beside a simulator or an emulator"]
 async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
-    let env = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"));
-    let run = Run {
-        directory: PathBuf::from(env("KR_HARNESS_DIR")),
-        end: Instant::now()
-            + Duration::from_secs(
-                std::env::var("KR_HARNESS_SECONDS")
-                    .ok()
-                    .and_then(|seconds| seconds.parse().ok())
-                    .unwrap_or(1500),
-            ),
-    };
+    let run = Run::from_environment();
     let peer = std::env::var("KR_HARNESS_PEER").unwrap_or_else(|_| "127.0.0.1".to_owned());
     let gateway = env("KR_PUSH_GATEWAY");
     let token = env("KR_PUSH_TOKEN");
@@ -445,48 +546,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
         "the script never said the phone was ready"
     );
 
-    // The invitation lives for minutes, so it is issued only now, with the phone installed.
-    let mut client = host.client().await;
-    let signer = Signer::OwnerDevice(&owner);
-    let invited = calls::invite_direct(
-        host.environment_id,
-        &mut client,
-        InviteGrantKind::SessionInvitation,
-        &proposal(&[
-            ActionRight::SessionView,
-            ActionRight::QuestionRespond,
-            ActionRight::AgentApprovalRespond,
-        ]),
-        &signer,
-    )
-    .await
-    .expect("a direct invitation");
-    run.write("invitation.txt", &invitation_for(&invited, &peer));
-
-    // The phone redeems it, and the host's owner approves the device that did.
-    let approval = async {
-        loop {
-            let status = calls::owner_status(&mut client, invited.invitation_id)
-                .await
-                .expect("the invitation's status");
-            if status.owner.0.and_then(|view| view.approval.0).is_some() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    };
-    tokio::time::timeout(run.left(), approval)
-        .await
-        .expect("the phone redeemed the invitation");
-    let confirmed = calls::confirm_candidate(
-        host.environment_id,
-        &mut client,
-        invited.invitation_id,
-        &signer,
-    )
-    .await
-    .expect("the owner approves the phone");
-    let device_id = confirmed.device_id;
+    let device_id = pair_a_phone(&run, &host, &owner, &peer).await;
     report.insert("device_id".to_owned(), json!(device_id.to_string()));
 
     // ---- Registration (16.06, 16.08, 16.11) -------------------------------------------------
@@ -602,19 +662,7 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
                 "preview_key_revision".to_owned(),
                 json!(push.preview_keys.revision),
             );
-            report.insert(
-                "preview_key_id".to_owned(),
-                json!(
-                    kr_crypto::keys::key_id(
-                        kr_protocol::pairing::KeyPurpose::NotificationPreview,
-                        push.preview_keys.current.as_bytes()
-                    )
-                    .as_bytes()
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-                ),
-            );
+            report.insert("preview_key_id".to_owned(), json!(preview_key_id_of(push)));
             report.insert("previews_enabled".to_owned(), json!(push.previews_enabled));
         }
         report.insert("destination_enabled".to_owned(), json!(record.enabled));
@@ -1450,5 +1498,112 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
     run.write("report.json", &Value::Object(report).to_string());
     run.appears("finish", run.left()).await;
     let _ = (Path::new(""), worker);
+    host.stop().await;
+}
+
+/// KR-REQ-16.06: runs the host for one phone that registers through a gateway whose sender account
+/// is a real one, from the invitation to the host holding the phone as a destination, and then
+/// reads the host again after the phone has tried a registration with a token the provider does
+/// not know.
+///
+/// For one delivery of the registration challenge through the provider's push service to a debug
+/// build on an Android emulator with Google Play services and no account, it shows that the
+/// gateway sent the challenge to the phone's own token, that the receiver answered it, that the
+/// gateway bound the token and then issued the sender authorisation, and that the host held the
+/// phone as a destination only after that. After the phone has tried a token the provider
+/// refuses, the host holds the same destination under the same authorisation. This case reads the
+/// host's side; the phone's, the gateway's and the provider's sides are read by whoever runs it.
+///
+/// It does not show a physical phone, its radio, its battery policy or a maker's limits on
+/// background work; a delivery to an application that is stopped or whose screen is off; an Apple
+/// device or Apple's push service; a release or store-signed build; the managed service's own
+/// gateway; or the refusals of a challenge that is not the pending one, which the other case
+/// shows. The host reaches no origin but the gateway's, on the loopback interface, and sends
+/// nothing to the provider: the gateway does, once for the challenge and once for the token it
+/// does not know. A person runs this case, and no step of this repository does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "run by a person beside an emulator and a gateway that sends to the real provider"]
+async fn a_phone_registers_through_the_real_provider() {
+    let run = Run::from_environment();
+    let peer = std::env::var("KR_HARNESS_PEER").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let gateway = env("KR_PUSH_GATEWAY");
+    let mut report = serde_json::Map::new();
+
+    // The daemon takes a credential only from the gateway this run stood its service at, and
+    // delivers only to loopback. There is no stand-in for the provider and no worker: the gateway
+    // reaches the provider itself.
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut stopped = host.shut_down().await;
+    stopped.account_service_stays_at(&gateway);
+    let host = stopped
+        .start_with_timer(Arc::new(kr_controller::quiet::RealTimer))
+        .await;
+    assert!(
+        host.controller()
+            .attach_delivery_transport(Arc::new(LoopbackOnly(ManagedTransports::new(
+                Outbound::Direct
+            )))),
+        "the daemon takes the run's transport"
+    );
+    run.write("ready.json", &json!({ "gateway": gateway }).to_string());
+    assert!(
+        run.appears("go", INVITATION_WAIT).await,
+        "the script never said the phone was ready"
+    );
+
+    let device_id = pair_a_phone(&run, &host, &owner, &peer).await;
+    report.insert("device_id".to_owned(), json!(device_id.to_string()));
+    // The phone is paired and has proved nothing yet: the host holds no destination for anyone.
+    report.insert(
+        "destinations_at_pairing".to_owned(),
+        json!(destination_count(&host)),
+    );
+
+    // The phone turned notifications on and proposed its own token; the gateway sent the
+    // challenge to the provider, the receiver answered it, and the gateway bound the token and
+    // issued the authorisation the phone handed the host.
+    let id =
+        kr_delivery::destination::DestinationId::new(device_id.to_string()).expect("an identifier");
+    let mut first_seen_ms = None;
+    let registered = until(REGISTRATION_WAIT.min(run.left()), || {
+        let held = destination_of(&host, &id).is_some();
+        if held {
+            first_seen_ms = Some(kr_ipc::now_ms().get());
+        }
+        held
+    })
+    .await;
+    report.insert("destination_present".to_owned(), json!(registered));
+    report.insert("destination_first_seen_ms".to_owned(), json!(first_seen_ms));
+    if let Some(record) = destination_of(&host, &id) {
+        report.insert("destination_enabled".to_owned(), json!(record.enabled));
+        report.insert(
+            "sender_record_id".to_owned(),
+            json!(sender_record_of(&record)),
+        );
+        if let kr_delivery::destination::Destination::Push(push) = &record.destination {
+            report.insert("preview_key_id".to_owned(), json!(preview_key_id_of(push)));
+        }
+    }
+    run.write(
+        "registered.json",
+        &Value::Object(report.clone()).to_string(),
+    );
+
+    // The script has the phone try a registration with a token the provider does not know, and
+    // says when it has ended. A run that registered nothing has no second step.
+    if registered && run.appears("negative-done", run.left()).await {
+        report.insert(
+            "destinations_after_negative".to_owned(),
+            json!(destination_count(&host)),
+        );
+        report.insert(
+            "sender_record_id_after_negative".to_owned(),
+            json!(destination_of(&host, &id).and_then(|record| sender_record_of(&record))),
+        );
+    }
+    run.write("report.json", &Value::Object(report).to_string());
+    run.appears("finish", run.left()).await;
     host.stop().await;
 }

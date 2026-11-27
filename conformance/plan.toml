@@ -2860,6 +2860,14 @@ kind = 'by_hand'
 why = 'scripts/e2e-voice-call-device.sh starts it, in its outage and delegating modes, beside the debug application on an iOS Simulator or an Android emulator inside the device lease of a Mac; a person runs that script and no step of this repository does'
 
 [[ignored_run]]
+package = 'kr-controller'
+target = '--test push_device'
+cases = ['a_phone_registers_through_the_real_provider']
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'it needs a gateway that sends through a real sender account to the provider and an Android emulator with Google Play services, which no step of this repository has, so a person runs it beside both'
+
+[[ignored_run]]
 package = 'kr-transport'
 target = '--test real_proxy'
 [ignored_run.runs]
