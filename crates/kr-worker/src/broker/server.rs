@@ -311,6 +311,13 @@ pub(crate) trait Tree: Send + Sync {
     /// Whether the server's own process is still running.
     fn root_running(&self) -> impl std::future::Future<Output = bool> + Send;
 
+    /// Waits for the server's own process to end, for no longer than `within`, and says whether it
+    /// has ended. It waits on the process itself and returns when it ends, so a process that the
+    /// system is still tearing down is found gone as soon as it is. A process that cannot be asked
+    /// about has not ended.
+    fn root_ended_within(&self, within: Duration)
+    -> impl std::future::Future<Output = bool> + Send;
+
     /// Closes the server's input, for every holder.
     fn close_input(&self);
 
@@ -407,7 +414,11 @@ async fn read_until_empty(
 /// reading that fails does not end the wait). Nothing is forced before then. A tree that is still
 /// not empty is terminated, and the processes the last reading before that showed are noted as
 /// forced, or as not ended when the terminate is refused. Then the tree is read until it is empty
-/// or [`FORCE_WAIT`] has passed, and the last reading is the emptiness: an empty one is
+/// or [`FORCE_WAIT`] after the terminate has passed. A tree that reads empty says nothing of the
+/// server's own process, which the system ends on its own time after the terminate: the server is
+/// waited for until the same moment, so that it is found gone as soon as it is, and is
+/// [`Ended::Alive`] only if it is still running then. The last reading is the emptiness: an empty
+/// one is
 /// [`Emptiness::Empty`] and a later empty one settles an earlier failed one; a held process is
 /// [`Emptiness::Nonempty`] and is named; a reading that failed, or that lists a process it could
 /// not ask about and holds none it could, is [`Emptiness::Unknown`].
@@ -454,20 +465,22 @@ pub(crate) async fn end_tree(
             }
         }
     }
-    let settled = read_until_empty(
-        tree,
-        Reading::of(tree).await,
-        tokio::time::Instant::now() + FORCE_WAIT,
-    )
-    .await;
+    // What a forced process has to be gone is counted from the terminate, for the tree and for the
+    // server alike: the wait for the server is what is left of it, and none after a tree that
+    // used it all.
+    let gone_by = tokio::time::Instant::now() + FORCE_WAIT;
+    let settled = read_until_empty(tree, Reading::of(tree).await, gone_by).await;
     let ended = if !running {
         Ended::Already
     } else if !running_at_the_end {
         Ended::Input
-    } else if tree.root_running().await {
-        Ended::Alive
-    } else {
+    } else if tree
+        .root_ended_within(gone_by.saturating_duration_since(tokio::time::Instant::now()))
+        .await
+    {
         Ended::Force
+    } else {
+        Ended::Alive
     };
     let emptiness = settled.emptiness();
     Retirement {
@@ -527,6 +540,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Call {
         RootRunning,
+        RootEndedWithin,
         CloseInput,
         Members,
         Terminate,
@@ -545,8 +559,14 @@ mod tests {
         root_ends_at: Option<Duration>,
         /// Whether the terminate ends the root.
         terminate_ends_root: bool,
+        /// How long after the terminate the root still reads as running, as a process does while
+        /// the system tears it down.
+        root_lag: Duration,
         terminate_answer: Result<(), String>,
-        terminated: Mutex<bool>,
+        /// When the terminate was made, if it was.
+        terminated: Mutex<Option<Instant>>,
+        /// How long the ending was asked to wait for the root, each time it asked.
+        waits: Mutex<Vec<Duration>>,
     }
 
     impl Fake {
@@ -561,8 +581,10 @@ mod tests {
                 after: Mutex::new(VecDeque::from([Ok(Vec::new())])),
                 root_ends_at: None,
                 terminate_ends_root: true,
+                root_lag: Duration::ZERO,
                 terminate_answer: Ok(()),
-                terminated: Mutex::new(false),
+                terminated: Mutex::new(None),
+                waits: Mutex::new(Vec::new()),
             }
         }
 
@@ -590,7 +612,7 @@ mod tests {
                 .collect()
         }
 
-        fn terminated(&self) -> bool {
+        fn terminated(&self) -> Option<Instant> {
             *self.terminated.lock().expect("the flag")
         }
     }
@@ -598,11 +620,26 @@ mod tests {
     impl Tree for Fake {
         async fn root_running(&self) -> bool {
             self.note(Call::RootRunning);
-            if self.terminated() && self.terminate_ends_root {
+            if let Some(at) = self.terminated()
+                && self.terminate_ends_root
+                && at.elapsed() >= self.root_lag
+            {
                 return false;
             }
             self.root_ends_at
                 .is_none_or(|ends| self.begun.elapsed() < ends)
+        }
+
+        async fn root_ended_within(&self, within: Duration) -> bool {
+            self.note(Call::RootEndedWithin);
+            self.waits.lock().expect("the waits").push(within);
+            let ends_in = match self.terminated() {
+                Some(at) if self.terminate_ends_root => self.root_lag.saturating_sub(at.elapsed()),
+                _ => Duration::MAX,
+            };
+            // The wait ends when the root does, or when the time given is over.
+            tokio::time::sleep(ends_in.min(within)).await;
+            ends_in <= within
         }
 
         fn close_input(&self) {
@@ -611,7 +648,7 @@ mod tests {
 
         async fn members(&self) -> Result<Vec<Member>, String> {
             self.note(Call::Members);
-            if !self.terminated() {
+            if self.terminated().is_none() {
                 return (self.before)(self.begun.elapsed());
             }
             let mut after = self.after.lock().expect("the readings");
@@ -624,7 +661,7 @@ mod tests {
 
         async fn terminate(&self) -> Result<(), String> {
             self.note(Call::Terminate);
-            *self.terminated.lock().expect("the flag") = true;
+            *self.terminated.lock().expect("the flag") = Some(Instant::now());
             self.terminate_answer.clone()
         }
     }
@@ -771,6 +808,12 @@ mod tests {
         assert_eq!(retirement.emptiness, Emptiness::Nonempty);
         assert_eq!(retirement.survivors, vec![process(COMMAND), process(12)]);
         // The reading went on for as long as a forced process is given to be gone, and no longer.
+        // Nothing of that time was left for the server, which was not waited for again.
+        let waits = tree.waits.lock().expect("the waits").clone();
+        assert!(
+            waits.iter().all(|wait| *wait <= Duration::from_millis(20)),
+            "{waits:?}"
+        );
         let ended_at = begun.elapsed();
         assert!(ended_at >= GRACE_WINDOW + FORCE_WAIT, "{ended_at:?}");
         assert!(
@@ -881,6 +924,63 @@ mod tests {
         assert_eq!(retirement.ended, Ended::Alive);
         assert_eq!(retirement.survivors, vec![process(ROOT)]);
         assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+    }
+
+    /// The system ends the processes of a terminated job on its own time: the job can read empty
+    /// while the server's own process still reads as running. The ending waits for the server and
+    /// finds it gone, so it is ended by force and not alive.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_66_a_server_still_ending_when_the_tree_reads_empty_is_forced_not_alive() {
+        let begun = Instant::now();
+        let mut tree = stubborn(begun);
+        tree.root_lag = Duration::from_millis(50);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.ended, Ended::Force);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert_eq!(retirement.forced, vec![process(ROOT), process(COMMAND)]);
+        assert!(retirement.survivors.is_empty());
+        // It was waited for on the process, for no longer than a forced process is given, and the
+        // wait ended as the process did.
+        let waits = tree.waits.lock().expect("the waits").clone();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert!(
+            waits[0] > tree.root_lag && waits[0] <= FORCE_WAIT,
+            "{waits:?}"
+        );
+        assert!(
+            begun.elapsed() < GRACE_WINDOW + Duration::from_millis(100),
+            "{:?}",
+            begun.elapsed()
+        );
+    }
+
+    /// A server that is still running when what a forced process is given is over is alive, though
+    /// its tree reads empty: it is waited for for that time and not longer, and never reported as
+    /// ended.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_66_a_server_still_running_after_the_wait_for_it_is_alive_not_forced() {
+        let begun = Instant::now();
+        let mut tree = stubborn(begun);
+        tree.terminate_ends_root = false;
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        assert_eq!(retirement.ended, Ended::Alive);
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        let waits = tree.waits.lock().expect("the waits").clone();
+        assert_eq!(waits.len(), 1, "{waits:?}");
+        assert!(
+            waits[0] > Duration::ZERO && waits[0] <= FORCE_WAIT,
+            "{waits:?}"
+        );
+        let ended_at = begun.elapsed();
+        assert!(ended_at >= GRACE_WINDOW + FORCE_WAIT, "{ended_at:?}");
+        assert!(
+            ended_at < GRACE_WINDOW + FORCE_WAIT + Duration::from_millis(100),
+            "{ended_at:?}"
+        );
     }
 
     /// The server's input is one pipe for every holder: a write that waits on a server that reads

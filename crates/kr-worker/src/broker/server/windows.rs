@@ -15,7 +15,10 @@
 //! its own child, so the ending is of the job: the input is closed, the job is waited for until the
 //! window is over to be empty (not only for the server to be gone: a command that is ending after
 //! the input closed is not forced early), and then terminated, and the job is read until it is
-//! empty or the time a forced process has to be gone is over. The steps and their order are
+//! empty or the time a forced process has to be gone is over. The system ends the processes of a
+//! terminated job on its own time, so a job can read empty while the server's own process still
+//! reads as running: the server is waited for, on the process itself, until the same moment, and
+//! is reported alive only if it is still running then. The steps and their order are
 //! [`super::end_tree`]'s, which a case runs over a tree that is a script; here the tree is the job.
 //! There is no request to terminate on Windows, so a server that ignores the end of its input is
 //! ended by force when the window is over, and the ending never ends a process the server's job
@@ -26,6 +29,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kr_ipc::identity::{START_VALUE_UNREAD, started_process_identity};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -67,7 +71,7 @@ impl Drop for GivenUp {
 pub struct Server {
     identity: ProcessStartIdentity,
     job: Arc<AgentJob>,
-    process: Mutex<Child>,
+    process: Arc<Mutex<Child>>,
     input: Input,
     output: Mutex<Option<Output>>,
     errors: Arc<Tail>,
@@ -214,7 +218,7 @@ impl Server {
         let server = Self {
             identity,
             job,
-            process: Mutex::new(child),
+            process: Arc::new(Mutex::new(child)),
             input: Input::new(input),
             output: Mutex::new(output),
             errors,
@@ -282,7 +286,9 @@ impl Server {
         if retirement.ended == Ended::Alive && !retirement.survivors.contains(&self.identity) {
             retirement.survivors.push(self.identity.clone());
         }
-        if retirement.emptiness == Emptiness::Empty {
+        // A server that is still running is not retired, whatever its job reads: dropping it ends
+        // its job again.
+        if retirement.emptiness == Emptiness::Empty && retirement.ended != Ended::Alive {
             self.retired.store(true, Ordering::Release);
         }
         retirement
@@ -300,6 +306,23 @@ impl Tree for Server {
                 .try_wait(),
             Ok(Some(_))
         )
+    }
+
+    async fn root_ended_within(&self, within: Duration) -> bool {
+        let process = Arc::clone(&self.process);
+        // The wait is the system's own wait on the process, which returns the moment it ends; the
+        // blocking pool takes it so that the runtime does not wait with it.
+        tokio::task::spawn_blocking(move || {
+            matches!(
+                process
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .wait_for(within),
+                Ok(Some(_))
+            )
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn close_input(&self) {
