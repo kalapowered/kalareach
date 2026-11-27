@@ -425,14 +425,15 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
 }
 
 /// KR-REQ-07.64: the command's own job nests under the server's and the session's, which does not
-/// stop the launch (the command started and says it is in a job of its own) or the ending (the
-/// nested job's processes are ended with the server's).
+/// stop the launch (the command started and says it is in a job of its own) or the ending. The
+/// server dies and its command outlives it in a job of its own that does not end it when it closes,
+/// so only the server's job, which holds the command as well, can end it, and the ending does.
 #[tokio::test]
 async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_ends_with_it() {
     let stand_in = stand_in();
     let session = session();
-    let server = start(&stand_in, &session, "", PLAIN).await;
-    let _conversation = to_the_approval(&server).await;
+    let server = start(&stand_in, &session, "die-first,job-stays-open", PLAIN).await;
+    let mut conversation = to_the_approval(&server).await;
     let command = command_of(&server).await;
     let pid = u32::try_from(command.pid.get()).expect("a process number");
     assert!(
@@ -447,10 +448,14 @@ async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_
         .expect("the server's job is read");
     assert!(held.contains(&pid), "{held:?}");
     assert!(matches!(session.job.member(pid), MemberReading::Held(_)));
+    dies_with_its_command_running(&server, &mut conversation).await;
+    assert!(!gone(&command), "the command outlived the server");
 
     let retirement = server
         .retire(&Record::default(), Instant::now().into())
         .await;
+    assert_eq!(retirement.ended, Ended::Already);
+    assert_eq!(retirement.forced, vec![command.clone()]);
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
     assert!(gone(&command));

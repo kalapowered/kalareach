@@ -109,7 +109,7 @@ impl Started {
     /// starts one. Where the job cannot be made or the command cannot join it, the command runs
     /// outside a job of its own, and the reason is said on the error stream.
     #[cfg(windows)]
-    fn start(words: &[String], leads_group: bool) -> std::io::Result<Self> {
+    fn start(words: &[String], leads_group: bool, job_stays_open: bool) -> std::io::Result<Self> {
         use crate::job::{CREATE_SUSPENDED, Job, resume};
 
         let mut command = Command::new(&words[0]);
@@ -128,7 +128,7 @@ impl Started {
                 let _ = child.start_kill();
                 return Err(std::io::Error::other("the command has no handle"));
             };
-            match Job::create() {
+            match Job::create(job_stays_open) {
                 Ok(made) => match made.assign(process) {
                     Ok(()) => job = Some(made),
                     Err(error) => {
@@ -332,7 +332,10 @@ impl Server {
     /// started.
     fn run_command(&mut self, words: &[String]) -> Option<usize> {
         let leads_group = !self.variants.command_shares_group;
+        #[cfg(unix)]
         let started = Started::start(words, leads_group);
+        #[cfg(windows)]
+        let started = Started::start(words, leads_group, self.variants.job_stays_open);
         match started {
             Ok(started) => {
                 // Said on the error stream, where a test that wants the command's identifier

@@ -3,8 +3,9 @@
 //! On Unix the server's command leads a process group of its own, and ending the group ends what
 //! the command started. A Windows process has no such group, so the pinned release's server puts
 //! each command it starts in a job object of its own and ends the job. The job has the limits the
-//! release gives it: it ends its processes when its last handle closes, and a process in it may
-//! start one that leaves it (`CREATE_BREAKAWAY_FROM_JOB`), where every job above it allows that.
+//! release gives it: it ends its processes when its last handle closes (not under the
+//! `job-stays-open` variant, which makes a command outlive a server that dies), and a process in it
+//! may start one that leaves it (`CREATE_BREAKAWAY_FROM_JOB`), where every job above it allows that.
 //!
 //! The command is created suspended and joins its job before it runs, so nothing it starts is
 //! outside the job. Where the job cannot be made, or the command cannot join it (a job that holds
@@ -44,13 +45,13 @@ unsafe extern "system" {
 pub struct Job(OwnedHandle);
 
 impl Job {
-    /// Makes a job that ends its processes when it is closed and lets a process in it start one
-    /// outside it.
+    /// Makes a job that lets a process in it start one outside it, and that ends its processes
+    /// when it is closed unless `stays_open` says it does not.
     ///
     /// # Errors
     ///
     /// Returns the system's failure.
-    pub fn create() -> io::Result<Self> {
+    pub fn create(stays_open: bool) -> io::Result<Self> {
         // SAFETY: no security attributes and no name are given, so the call reads nothing of ours.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
@@ -61,8 +62,11 @@ impl Job {
         // SAFETY: the structure is integers and pointers throughout, and all zeroes is the state
         // that means "no limit set", which is what every field but the flags should be.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        limits.BasicLimitInformation.LimitFlags =
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        limits.BasicLimitInformation.LimitFlags = if stays_open {
+            JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        } else {
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        };
         // SAFETY: the handle is this job's own and open for the call; the structure is a local and
         // its declared size is its own.
         let set = unsafe {

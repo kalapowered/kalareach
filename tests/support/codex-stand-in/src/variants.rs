@@ -63,6 +63,10 @@ pub struct Variants {
     pub command_shares_group: bool,
     /// The server exits when the approval it asked for is answered, leaving its command running.
     pub die_first: bool,
+    /// On Windows, the job a command runs in does not end its processes when its last handle
+    /// closes, so a command in a job of its own outlives a server that dies.
+    #[cfg(windows)]
+    pub job_stays_open: bool,
     /// The server writes a great deal to its standard error stream and goes on, in numbered lines.
     pub flood_stderr: bool,
     /// The server says its working directory and its environment on its error stream when it
@@ -186,6 +190,15 @@ impl Variants {
                 }
                 "command-shares-group" => variants.command_shares_group = true,
                 "die-first" => variants.die_first = true,
+                "job-stays-open" => {
+                    // Only a Windows job ends its processes when it is closed.
+                    #[cfg(unix)]
+                    panic!("`job-stays-open` needs a job, which this platform has none of");
+                    #[cfg(windows)]
+                    {
+                        variants.job_stays_open = true;
+                    }
+                }
                 "flood-stderr" => variants.flood_stderr = true,
                 "report-environment" => variants.report_environment = true,
                 "spawn-late" => variants.spawn_late = true,
