@@ -252,17 +252,18 @@ e2e_state_folder_mark() {
 
 # e2e_state_folder_gone <name>: tells whether <name>, one name in the working directory, is gone. It
 # returns 0 where the lookup of that name established absence, 1 where the name is there, and 2 where
-# neither could be shown. It makes ONE lookup of the name and nothing else: `python3` runs `lstat` on
+# neither could be shown. It makes ONE lookup of the name and no listing: `python3` runs `lstat` on
 # the name, relative to the working directory, and the system's own error tells "no such entry" (the
 # name is not there) from every other failure (a folder that cannot be searched, an input or output
 # error, a name that is too long), which a test of the name in the shell cannot do. No directory is
-# listed and no pattern is expanded, so no text of a listing, no shell option and no setting of the
-# caller can change the answer. The program is a constant text and the name is an argument after it,
-# never part of it; the flags are -I (the working directory is not on the import path, and the
-# PYTHON variables are ignored), -S (no site files) and -X utf8, and the program gives the lookup
-# the name's bytes as they arrived (os.fsencode), so that a name that is not valid text in the
-# caller's locale is looked up as it is. The program ends with 10 for gone and 11 for found, through
-# os._exit (with -S there is no exit()); every other end of the interpreter (it is absent, it does
+# listed and no pattern is expanded, so no text of a listing and no shell option can change the
+# answer. The program is a constant text and the name is an argument after it, never part of it; the
+# flags are -I (the working directory is not on the import path, and the PYTHON variables are
+# ignored), -S (no site files, so no path file of a virtual environment runs) and -X utf8 (the
+# argument is decoded as UTF-8 with surrogate escapes and encoded back the same way, so a name that
+# is not valid text in the caller's locale is looked up as the bytes that arrived; os.fsencode only
+# makes explicit what lstat does with a text name). The program ends with 10 for gone and 11 for
+# found, through os._exit (with -S there is no exit()); every other end of the interpreter (it does
 # not start, an exception, a signal, any other status) reads 2, and its output is discarded: the
 # walk's standard output is read as an answer. Where the name is not there, the program also shows
 # that the working directory is still the one it names: `getcwd` must succeed and the working
@@ -271,11 +272,15 @@ e2e_state_folder_mark() {
 # be one name: exactly one argument, and not empty, `.`, `..` or a name that holds a slash (a path
 # would be looked up through other folders). What this does not do: it gives no guarantee against
 # a change between the lookup and the caller's sentence or during the call (a process of the caller's
-# own account can change the folder); where the interpreter is absent every call reads 2, and the
-# cleanup's sentence then says that the state could not be shown, never that it is clean (a removal
-# that succeeded still counts as gone); a `python3` on the path that is not the interpreter can claim
-# anything, as every command on the path can; and on a network or user-space file system "no such
-# entry" is that file system's own answer, which a cache or a hidden name can give while the name stands.
+# own account can change the folder); where the interpreter is absent every call reads 2, unless a
+# function of the caller's shell answers for it, and the cleanup's sentence then says that the state
+# could not be shown, never that it is clean (a removal that succeeded still counts as gone). The
+# answer is the answer of the program that the word `python3` runs in the caller's shell, and that
+# program can claim anything, as every command that these scripts run by name can: a program on the
+# path, a shell function that the environment can carry, bash's handler for a command that is not
+# found, or a version manager's shim, which can choose the interpreter by a file in the working
+# directory or in a folder above it. On a network or user-space file system "no such entry" is that
+# file system's own answer, which a cache or a hidden name can give while the name stands.
 e2e_state_folder_gone() {
   local status=0
   [ "$#" -eq 1 ] || return 2
