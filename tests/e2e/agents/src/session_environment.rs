@@ -46,6 +46,14 @@ pub const SHORTEST_VALUE_CHECKED: usize = 8;
 /// The longest name the check reads, so that a row is one row of the screen.
 const NAME_CHARACTERS: usize = 60;
 
+/// The variable the shell integration exports for the line that is running and removes when the
+/// next prompt shows: the capability the worker gives each accepted line, which `kr detach` reads.
+/// A line the worker answers late runs without it, so the shell holds it at some typed lines of
+/// the check and not at others. The list of exported names that the check counts and digests
+/// leaves this one name out, so that the parts of one reading are one list whether the answer to
+/// a line came in time or not; every other name is counted and compared as before.
+pub const LINE_CAPABILITY: &str = "KR_DETACH_TOKEN";
+
 /// How a failure begins when the shell's environment is not as the harness gave it.
 pub const NOT_AS_GIVEN: &str = "the session's environment is not as the harness gave it:";
 
@@ -346,16 +354,18 @@ impl Expected {
     /// The line to type for the names the shell exports, from the one after `skipped` of its sorted
     /// list on, whose end row carries `tag`: each row carries the name's position in the shell's
     /// list, one row says how many names the shell exports, and one carries a digest of the whole
-    /// sorted list, so that the parts are read as one snapshot ([`Snapshot`]). It holds no value,
+    /// sorted list, so that the parts are read as one snapshot ([`Snapshot`]); the list leaves out
+    /// [`LINE_CAPABILITY`], which a line's own answer can give or not. It holds no value,
     /// refuses a shell in the states the value line refuses (`refusal_checks`), and unsets its own
     /// variables also where it stops part way.
     #[must_use]
     pub fn exported_line(skipped: usize, tag: usize) -> String {
         let (first, last) = (skipped + 1, skipped + PART_NAMES);
-        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else { @CHECKS@if [[ -n ${krenv_r// /} ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; else krenv_e=(${(ko)parameters[(R)*export*]}); krenv_i=@SKIPPED@; for krenv_n in ${krenv_e[@FIRST@,@LAST@]}; do krenv_i=$((krenv_i+1)); builtin print -r -- "@ROW@ exported $krenv_i $krenv_n"; done; builtin print -r -- "@ROW@ total ${#krenv_e}"; krenv_d=$(builtin print -rl -- "${(@)krenv_e}" | @PROGRAM@); builtin print -r -- "@ROW@ snapshot ${krenv_d[1,@DIGITS@]}"; builtin print -r -- "@ROW@ end @TAG@"; fi; } always { builtin unset krenv_e krenv_i krenv_n krenv_d krenv_r; }; fi"#;
+        let template = r#"if [[ @EXISTS@ ]]; then print -r -- "@ROW@ refused variable:krenv"; print -r -- "@ROW@ end @TAG@"; else { @CHECKS@if [[ -n ${krenv_r// /} ]]; then print -r -- "@ROW@ refused$krenv_r"; print -r -- "@ROW@ end @TAG@"; else krenv_e=(${(@)${(@ko)parameters[(R)*export*]}:#@CAPABILITY@}); krenv_i=@SKIPPED@; for krenv_n in ${krenv_e[@FIRST@,@LAST@]}; do krenv_i=$((krenv_i+1)); builtin print -r -- "@ROW@ exported $krenv_i $krenv_n"; done; builtin print -r -- "@ROW@ total ${#krenv_e}"; krenv_d=$(builtin print -rl -- "${(@)krenv_e}" | @PROGRAM@); builtin print -r -- "@ROW@ snapshot ${krenv_d[1,@DIGITS@]}"; builtin print -r -- "@ROW@ end @TAG@"; fi; } always { builtin unset krenv_e krenv_i krenv_n krenv_d krenv_r; }; fi"#;
         template
             .replace("@EXISTS@", &own_variable_exists())
             .replace("@CHECKS@", &refusal_checks())
+            .replace("@CAPABILITY@", LINE_CAPABILITY)
             .replace("@SKIPPED@", &skipped.to_string())
             .replace("@FIRST@", &first.to_string())
             .replace("@LAST@", &last.to_string())
@@ -1128,6 +1138,122 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).into_owned(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
+    }
+
+    /// An environment of more names than one part lists, so that the exported names are read in
+    /// two parts, with `held` besides.
+    fn environment_of_two_parts(held: &[&str]) -> Vec<(String, String)> {
+        let mut environment = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
+        environment
+            .extend((0..PART_NAMES + 2).map(|n| (format!("FLAKE_NAME_{n:02}"), "1".to_owned())));
+        environment.extend(held.iter().map(|name| ((*name).to_owned(), "1".to_owned())));
+        environment
+    }
+
+    /// A zsh the capability cases can run: the system's, or where the host has none (the build
+    /// host's image carries no `zsh`) the managed package's own, which `KR_SHELL_PACKAGES` names.
+    fn zsh_for_the_capability_cases() -> Option<String> {
+        if let Some(system) = system_zsh() {
+            return Some(system.to_owned());
+        }
+        let package = std::path::Path::new(&std::env::var_os("KR_SHELL_PACKAGES")?).join("zsh");
+        let current = std::fs::read_to_string(package.join("current")).ok()?;
+        let binary = package.join(current.trim()).join("bin").join("zsh");
+        binary.is_file().then(|| binary.display().to_string())
+    }
+
+    /// What the check reads of one part: its names and the snapshot it states.
+    type PartRead = (Vec<String>, Snapshot);
+
+    /// The first two parts of the answer to the line that types the exported names, the first
+    /// from a shell that holds `first` and the second from one that holds `second`, each as the
+    /// check reads them: the second part's reading says whether the two are one list.
+    fn two_parts_from_shells(
+        zsh: &str,
+        first: &[&str],
+        second: &[&str],
+    ) -> (PartRead, Result<PartRead, String>) {
+        let rows_of = |held: &[&str], skipped: usize, tag: usize| -> Vec<String> {
+            zsh_runs(
+                zsh,
+                &environment_of_two_parts(held),
+                "",
+                &Expected::exported_line(skipped, tag),
+                "",
+            )
+            .0
+            .lines()
+            .map(str::to_owned)
+            .collect()
+        };
+        let (names, snapshot) = read_exported(0, &[], None, &rows_of(first, 0, 0))
+            .expect("the first part of a whole answer");
+        assert_eq!(
+            names.len(),
+            PART_NAMES,
+            "the environment has more names than a part"
+        );
+        let next = read_exported(1, &names, Some(&snapshot), &rows_of(second, names.len(), 1));
+        ((names, snapshot), next)
+    }
+
+    /// A line whose answer came late ran without the capability that the shell integration gives
+    /// each line, and one whose answer came in time ran with it: a shell that exports the
+    /// capability at one typed line and not at the next is still one list of names, whichever
+    /// comes first, and the list does not hold the capability's name.
+    #[test]
+    fn a_shell_that_holds_the_line_capability_at_one_typed_line_and_not_at_the_next_is_one_list() {
+        let Some(zsh) = zsh_for_the_capability_cases() else {
+            eprintln!("skipping: no zsh, system or managed, for the capability cases");
+            return;
+        };
+        let zsh = zsh.as_str();
+        let (with, without) = ([LINE_CAPABILITY], []);
+        let ((names, first), next) = two_parts_from_shells(zsh, &with, &without);
+        assert!(
+            next.is_ok(),
+            "a shell that gained no name but the capability is one list: {next:?}"
+        );
+        let Ok((more, second)) = next else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(
+            first, second,
+            "the same total and digest, with or without the capability"
+        );
+        assert!(
+            !names
+                .iter()
+                .chain(&more)
+                .any(|name| name == LINE_CAPABILITY)
+        );
+        let ((_, third), next) = two_parts_from_shells(zsh, &without, &with);
+        assert!(next.is_ok(), "the same in the other order: {next:?}");
+        let Ok((more, fourth)) = next else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(third, fourth);
+        assert_eq!(first, third);
+        assert!(!more.iter().any(|name| name == LINE_CAPABILITY));
+    }
+
+    /// The control: a name other than the capability that one answer holds and the next does not
+    /// is a list that changed, and the reading says so, whichever name it is.
+    #[test]
+    fn a_shell_that_holds_another_name_at_one_typed_line_and_not_at_the_next_is_refused() {
+        let Some(zsh) = zsh_for_the_capability_cases() else {
+            eprintln!("skipping: no zsh, system or managed, for the capability cases");
+            return;
+        };
+        let zsh = zsh.as_str();
+        for other in ["KR_SESSION", "KR_DETACH_TOKEN_ALSO", "E2E_RUN_MARK"] {
+            let (_, next) = two_parts_from_shells(zsh, &[other], &[]);
+            let failure = next.expect_err("a list that gained or lost a name is refused");
+            assert!(
+                failure.starts_with(NOT_READ_WHOLE) && failure.contains("names and then"),
+                "{other}: {failure}"
+            );
+        }
     }
 
     #[test]
