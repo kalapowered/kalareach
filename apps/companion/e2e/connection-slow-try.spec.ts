@@ -8,16 +8,17 @@
  * moves when the sentence appears: it is a text swap, with no transition and no animation, with or
  * without reduced motion.
  *
- * iOS carries the person's text size to the page as `--text-scale`; both are set directly here, as
- * the text-size tests do. Android's web view scales the text and leaves a length in em where it
- * was, which a root font size of 200 percent does not: the Android renders here set the bar's text
- * smaller than a device does at that setting, and make no claim about what the device draws. That
- * the real web views give the page the size is held on a simulator and an emulator.
+ * iOS carries the person's text size to the page as `--text-scale`, which this file sets directly,
+ * as the text-size tests do. Android's web view scales the text and leaves a length in em where it
+ * was, which a root font size of 200 percent does not: the Android case here sets the root's font
+ * size to 200 percent instead, so it sets the bar's text smaller than a device does at that
+ * setting, and makes no claim about what the device draws. That the real web views give the page
+ * the size is held on a simulator and an emulator.
  *
- * At the two largest sizes the sentence needs two lines in the platform's own font, so a cut at
- * two lines and the whole wrap look alike there. The case that tells them apart widens the face
- * until the sentence needs three lines, and holds the whole of it, inside the bar, with the
- * content below the bar.
+ * In the font of the machine these cases were measured on, the sentence needs two lines at the two
+ * largest sizes, so a cut at two lines and the whole wrap look alike there; nothing is claimed for
+ * another platform's font. The case that tells them apart widens the face until the sentence needs
+ * three lines, and holds the whole of it, inside the bar, with the content below the bar.
  */
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
@@ -39,14 +40,18 @@ const WIDE_FACE = 0.4
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
 
-/** How a phone's web view gives the page the person's text size. */
+/**
+ * The text sizes the browser stands in with. The iOS size is `--text-scale`, which the page itself
+ * sets from the system's size on iOS; the Android size is a root font size of 200 percent, which
+ * only stands in for the Android web view and is not what it does (see the header).
+ */
 const SIZES = [
   { name: 'default', scale: 1, root: null, surface: 'ios' },
   { name: 'ios-largest', scale: LARGEST, root: null, surface: 'ios' },
   { name: 'android-2.0', scale: 1, root: 200, surface: 'android' }
 ] as const
 
-/** Sets the text size the way the web view does, before the page's first frame. */
+/** Sets the browser's stand-ins for a text size, before the page's first frame. */
 async function withTextSize(page: Page, scale: number, root: number | null): Promise<void> {
   await page.addInitScript(
     ({ ratio, percent }) => {
@@ -187,7 +192,7 @@ test.describe("the phone's line, while a slow try is still running", () => {
 
   // The sentence needs three lines here, which the cut at two lines would take from it. A face this
   // wide is set on the words, as the tab bar's cases do; the cases above hold the same at the
-  // two-line size that each platform's own font gives the sentence.
+  // two-line size that the measured machine's font gives the sentence.
   test('wraps a sentence that needs three lines in full, inside the bar and above the content', async ({ page }) => {
     await page.setViewportSize({ width: 320, height: 844 })
     await page.goto('/harness.html?surface=ios')
