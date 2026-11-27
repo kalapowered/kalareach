@@ -4,9 +4,10 @@
 //! a binding. That makes them the wrong evidence for a claim about what happens *while* a component
 //! is running: after a few hundred milliseconds there is no longer a component running at all.
 //!
-//! This one spends most of an `observe` deadline and then returns. A queue of observations against
-//! it is therefore a component that is continuously inside a call, for as long as the queue lasts,
-//! with no fault and no disabling -- which is what a test about the terminal path needs around it.
+//! This one does a fixed amount of work, sized against the fuel an `observe` is given, and then
+//! returns. A queue of observations against it is therefore a component that is continuously inside
+//! a call, for as long as the queue lasts, with no fault and no disabling on a host whose epoch no
+//! time advances -- which is what a test about the terminal path needs around it.
 //!
 //! The work is arithmetic on a volatile cell, so no optimiser can decide it does nothing. How much
 //! of it there is was chosen against the fuel a 10 ms observe is given rather than against a clock:
@@ -43,11 +44,12 @@ static WORK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(
 /// How many rounds one call spends.
 ///
 /// An observe is given 10 ms and a hundred million units of fuel per millisecond of it. This is
-/// enough rounds to spend a good part of that and few enough to leave room to return: a call that
-/// used its whole allowance would be a fault, and a fault is what this component exists not to be.
+/// enough rounds to spend a good part of that fuel and few enough to leave room to return: a call
+/// that used its whole allowance would be a fault, and a fault is what this component exists not
+/// to be. How many milliseconds the rounds take depends on the machine.
 const ROUNDS: u64 = 1_000_000;
 
-/// Spends most of a call, then returns.
+/// Does one call's fixed amount of work, then returns.
 fn spend() {
     let mut carried = WORK.load(core::sync::atomic::Ordering::Relaxed);
     for round in 0..ROUNDS {
