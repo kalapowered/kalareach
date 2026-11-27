@@ -1218,6 +1218,15 @@ mod windows {
         Policy(String),
     }
 
+    impl AccessListRefusal {
+        /// Says why the list was not accepted.
+        fn into_detail(self) -> String {
+            match self {
+                Self::Unreadable(detail) | Self::Policy(detail) => detail,
+            }
+        }
+    }
+
     /// Creates a directory whose access-control list names its owner and nothing else, and says
     /// whether it did.
     ///
@@ -1280,6 +1289,63 @@ mod windows {
             }
             Some(error) => Err(IpcError::io("create", path, error)),
         }
+    }
+
+    /// The descriptor of a file this host writes owner-only, as SDDL, for the account whose
+    /// identifier is written `user`.
+    ///
+    /// The account owns the file, and the list is protected, so nothing its directory passes down
+    /// reaches it, and names three accounts, each with every right: that account, the local system
+    /// and the administrators group. The reader trusts the last two, as it trusts the machine they
+    /// run, and an account that holds the machine is not one a file can be closed to.
+    fn owner_only_file_descriptor(user: &str) -> String {
+        format!("O:{user}D:P(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;BA)")
+    }
+
+    /// Creates the new file an owner-only writer fills, with its access list in the call that
+    /// creates it, and reads the list back before the caller writes the first byte.
+    ///
+    /// No handle to the file can exist before the list does, so no account that its directory
+    /// admits can hold one that outlives it. The read back is the reader's own check, with
+    /// protection demanded: where the volume keeps no lists, or the list is not the one that was
+    /// asked for, the file is removed and the write fails, and no file is ever written without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be created, or when the list it carries is not one
+    /// this host accepts.
+    pub(super) fn create_owner_only_file(path: &Path) -> Result<std::fs::File> {
+        use std::os::windows::io::AsHandle as _;
+
+        let refused = |detail: String| IpcError::io("create", path, std::io::Error::other(detail));
+        let user = TokenAccounts::read()
+            .and_then(|accounts| {
+                sid_text(accounts.user()).ok_or_else(|| {
+                    AccessListRefusal::Unreadable(
+                        "this process's own account could not be written out".to_owned(),
+                    )
+                })
+            })
+            .map_err(|refusal| refused(refusal.into_detail()))?;
+        #[cfg(test)]
+        let descriptor = super::tests::DESCRIPTOR
+            .with(|chosen| chosen.borrow().clone())
+            .unwrap_or_else(|| owner_only_file_descriptor(&user));
+        #[cfg(not(test))]
+        let descriptor = owner_only_file_descriptor(&user);
+        let file = create_file_with_descriptor(path, &descriptor)
+            .map_err(|error| IpcError::io("create", path, error))?;
+        if let Err(refusal) = check_access_list(file.as_handle(), &path.display().to_string(), true)
+        {
+            drop(file);
+            let _ = std::fs::remove_file(path);
+            return Err(refused(format!(
+                "the file was made with an access list this host does not accept, so nothing is \
+                 written to it: {}",
+                refusal.into_detail()
+            )));
+        }
+        Ok(file)
     }
 
     /// Checks the access-control list of an opened directory.
@@ -2264,11 +2330,16 @@ mod windows {
 
     /// Names one identifier for a refusal.
     fn describe(sid: PSID) -> String {
+        sid_text(sid).unwrap_or_else(|| "an account that could not be named".to_owned())
+    }
+
+    /// Writes one identifier the way Windows writes it, `S-1-5-18`, or says that it cannot.
+    fn sid_text(sid: PSID) -> Option<String> {
         let mut text: *mut u16 = std::ptr::null_mut();
         // SAFETY: `sid` is live and `text` is a live out parameter.
         let converted = unsafe { ConvertSidToStringSidW(sid, &raw mut text) };
         if converted == 0 || text.is_null() {
-            return "an account that could not be named".to_owned();
+            return None;
         }
         let mut length = 0_usize;
         // SAFETY: the buffer the conversion allocated is null-terminated, so the scan stops inside it.
@@ -2282,7 +2353,7 @@ mod windows {
         unsafe {
             LocalFree(text.cast());
         }
-        described
+        Some(described)
     }
 
     /// Encodes a path for the wide form of a Windows call.
@@ -2297,21 +2368,24 @@ mod windows {
         text.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Creates a file with one explicit security descriptor, written as SDDL.
+    /// Creates a new file with one explicit security descriptor, written as SDDL, in the call that
+    /// creates it, and returns it open for writing.
     ///
-    /// For this crate's tests of [`FileAccess`], which need files carrying lists, labels and
-    /// entries no ordinary creation gives them. The product writes no list.
+    /// The descriptor is the file's from its first moment, as [`create_directory_with_list`] makes a
+    /// directory's: no handle to the file can exist before it, and no list is set by path
+    /// afterwards. The handle can write and can read the list back, and shares reading, writing and
+    /// deletion as an ordinary open does, so a program the list lets in can still read the file.
     ///
     /// # Errors
     ///
     /// Returns the operating system's error when the descriptor cannot be built or the file cannot
-    /// be created with it.
-    #[cfg(test)]
+    /// be created with it, and when a file is already at the name.
     pub(crate) fn create_file_with_descriptor(
         path: &Path,
         descriptor: &str,
-    ) -> std::io::Result<()> {
-        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    ) -> std::io::Result<std::fs::File> {
+        use std::os::windows::io::FromRawHandle as _;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::{
             CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
         };
@@ -2328,8 +2402,8 @@ mod windows {
         let handle = unsafe {
             CreateFileW(
                 wide_path.as_ptr(),
-                GENERIC_WRITE,
-                0,
+                GENERIC_WRITE | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 &raw const attributes,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
@@ -2339,18 +2413,23 @@ mod windows {
         if handle == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: the handle came from the creation above and is closed exactly once.
-        unsafe {
-            CloseHandle(handle);
-        }
-        Ok(())
+        // SAFETY: the handle came from the creation above, is open, and is owned by nobody else:
+        // the file takes it and closes it.
+        let file = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
+        #[cfg(test)]
+        super::tests::AFTER_CREATING.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(path);
+            }
+        });
+        Ok(file)
     }
 
     /// Sets a directory's discretionary list, written as SDDL, without carrying it to anything the
     /// directory already holds: the older call used here changes the one object it names.
     ///
     /// For this crate's tests of a file that inherited its list before its directory's changed.
-    /// The product writes no list.
+    /// The owner-only writers make their files with the list in the creating call instead.
     ///
     /// # Errors
     ///
@@ -2375,10 +2454,8 @@ mod windows {
     }
 
     /// A security descriptor built from SDDL, freed when it goes out of scope.
-    #[cfg(test)]
     struct BuiltDescriptor(PSECURITY_DESCRIPTOR);
 
-    #[cfg(test)]
     impl BuiltDescriptor {
         fn parse(descriptor: &str) -> std::io::Result<Self> {
             let wide_descriptor = wide_str(descriptor);
@@ -2400,7 +2477,6 @@ mod windows {
         }
     }
 
-    #[cfg(test)]
     impl Drop for BuiltDescriptor {
         fn drop(&mut self) {
             // SAFETY: the descriptor was allocated by the conversion above and is freed once.
@@ -3221,14 +3297,21 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 /// Writes a file owner-only, replacing any previous contents atomically.
 ///
 /// The temporary file is created in the destination's own directory so the rename cannot cross a
-/// filesystem boundary, and it carries the final permissions before it holds any content. On
-/// Windows the rename is tried again while another program holds the file it replaces or the new
-/// one, as [`kr_flush::retry_while_held`] says; nothing about the destination is checked before
-/// it, so there is nothing to check again.
+/// filesystem boundary, and it carries the final access before it holds any content. On Unix that
+/// is the mode `0600`. On Windows it is an access list that the call creating the file sets, never
+/// the list the directory passes down: the account that writes owns the file, the list is
+/// protected, and it names that account, the local system and the administrators group. The list is
+/// read back from the new file before the first byte is written, and where it is not the one asked
+/// for, or the volume keeps no lists, the write fails and the file is removed. The rename keeps the
+/// list, so the published file does not depend on its directory. On Windows the rename is tried
+/// again while another program holds the file it replaces or the new one, as
+/// [`kr_flush::retry_while_held`] says; nothing about the destination is checked before it, so
+/// there is nothing to check again.
 ///
 /// # Errors
 ///
-/// Returns an error when the file cannot be written or renamed into place.
+/// Returns an error when the file cannot be written or renamed into place, and on Windows when the
+/// new file does not carry the list it was made with.
 pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     replace_through_temporary(path, contents, make_owner_only)
 }
@@ -3253,7 +3336,9 @@ pub fn write_file_in_directory_access(path: &Path, contents: &[u8]) -> Result<()
 /// How a new file is made: open for writing, at a name that is not there yet.
 type MakeFile = fn(&Path) -> Result<std::fs::File>;
 
-/// Makes a new file that nobody else can reach, and says why it did not.
+/// Makes a new file that no account but its owner and the machine's own can reach, and says why it
+/// could not: by its mode on Unix, and on Windows by an access list made with the file and read
+/// back before the first byte is written.
 fn make_owner_only(path: &Path) -> Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -3261,7 +3346,7 @@ fn make_owner_only(path: &Path) -> Result<std::fs::File> {
     }
     #[cfg(not(unix))]
     {
-        make_in_directory_access(path)
+        windows::create_owner_only_file(path)
     }
 }
 
@@ -3324,6 +3409,9 @@ fn replace_through_temporary(path: &Path, contents: &[u8], make: MakeFile) -> Re
 ///
 /// This is the publication a racing caller must lose rather than win. `rename` always replaces, so
 /// it cannot answer "who got there first"; a publication that never replaces can.
+///
+/// The file carries the access that [`write_owner_only_file`] gives its file, from the first moment
+/// it exists, on each system.
 ///
 /// The file is given its name by [`kr_flush::publish_without_replacing`], tried again while another
 /// program holds it, as [`kr_flush::retry_while_held`] says: a rename that does not replace on
@@ -3812,6 +3900,19 @@ mod tests {
         /// name it is published under, on the thread of the test that set it.
         pub(super) static BEFORE_PUBLISHING: std::cell::RefCell<Option<PublicationHook>> =
             std::cell::RefCell::new(None);
+
+        /// Called with a new file's name at the first moment the file exists, while the call that
+        /// made it has just returned, on the thread of the test that set it. Only Windows makes a
+        /// file with an access list of its own, and only there is the moment of any use.
+        #[cfg(windows)]
+        pub(super) static AFTER_CREATING: std::cell::RefCell<Option<PublicationHook>> =
+            std::cell::RefCell::new(None);
+
+        /// The descriptor an owner-only writer makes its new files with in place of its own, on the
+        /// thread of the test that set it.
+        #[cfg(windows)]
+        pub(super) static DESCRIPTOR: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
@@ -5057,6 +5158,171 @@ mod tests {
     fn access(path: &Path) -> FileAccess {
         FileAccess::of(path)
             .unwrap_or_else(|refusal| panic!("{} is read: {refusal:?}", path.display()))
+    }
+
+    /// The text of this account's identifier, as the system's own tool writes it, and so not read
+    /// from the code under test.
+    #[cfg(windows)]
+    fn this_account() -> String {
+        let printed = run(
+            "whoami.exe",
+            &[
+                "/user".as_ref(),
+                "/fo".as_ref(),
+                "csv".as_ref(),
+                "/nh".as_ref(),
+            ],
+        );
+        printed
+            .trim()
+            .rsplit(',')
+            .next()
+            .expect("a last column")
+            .trim_matches('"')
+            .to_owned()
+    }
+
+    /// The descriptor an owner-only file is meant to be made with, spelled out here for `user`: it
+    /// is owned by the account, and its protected list names the account, the local system and the
+    /// administrators group.
+    #[cfg(windows)]
+    fn the_owner_only_descriptor(user: &str) -> String {
+        format!("O:{user}D:P(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;BA)")
+    }
+
+    /// Gives the users' group a right that every file made in `directory` inherits, as a profile's
+    /// folder does for the accounts that a managed or imaged machine names there.
+    #[cfg(windows)]
+    fn pass_the_users_group_down(directory: &Inheriting) {
+        run(
+            "icacls.exe",
+            &[
+                directory.0.as_os_str(),
+                "/grant".as_ref(),
+                "*S-1-5-32-545:(OI)(CI)M".as_ref(),
+            ],
+        );
+    }
+
+    /// A file written in a folder that passes another account's entry down carries none of it, so
+    /// the reader that refuses such an entry accepts what both writers made.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_written_where_the_folder_passes_a_group_down_is_still_read() {
+        let directory = Inheriting::new("passes-down");
+        pass_the_users_group_down(&directory);
+        let replaced = directory.0.join("replaced");
+        write_owner_only_file(&replaced, b"kept").expect("the replacing writer writes here");
+        let created = directory.0.join("created");
+        create_new_owner_only_file(&created, b"kept").expect("the creating writer writes here");
+        for path in [&replaced, &created] {
+            assert_eq!(
+                read_owner_only_file(path, 64)
+                    .expect("the reader accepts the file")
+                    .expect("present"),
+                b"kept",
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// A file either writer makes carries the one list they are meant to give, whatever its folder
+    /// passes down: owned by the account that wrote it, protected, and naming that account, the
+    /// local system and the administrators group. A replacement carries it too.
+    #[cfg(windows)]
+    #[test]
+    fn a_written_file_carries_the_owner_only_list_and_nothing_its_folder_passes_down() {
+        let directory = Inheriting::new("exact-list");
+        pass_the_users_group_down(&directory);
+        let expected =
+            access(&directory.described("expected", &the_owner_only_descriptor(&this_account())));
+        let replaced = directory.0.join("replaced");
+        write_owner_only_file(&replaced, b"first").expect("writes");
+        assert_eq!(access(&replaced), expected, "after the first write");
+        write_owner_only_file(&replaced, b"second").expect("replaces");
+        assert_eq!(access(&replaced), expected, "after a replacement");
+        let created = directory.0.join("created");
+        create_new_owner_only_file(&created, b"first").expect("creates");
+        assert_eq!(access(&created), expected, "after a creation");
+    }
+
+    /// A new file has its list from the first moment it exists: its folder passes the users' group
+    /// down, and a program that looks at the file as soon as the call that made it returns finds
+    /// the owner-only list already there.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_file_has_its_list_from_the_first_moment_it_exists() {
+        let directory = Inheriting::new("first-moment");
+        pass_the_users_group_down(&directory);
+        let expected =
+            access(&directory.described("expected", &the_owner_only_descriptor(&this_account())));
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let looked = std::rc::Rc::clone(&seen);
+        AFTER_CREATING.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |new: &Path| {
+                looked
+                    .borrow_mut()
+                    .push(FileAccess::of(new).map_err(|refusal| format!("{refusal:?}")));
+            }));
+        });
+        let written = write_owner_only_file(&directory.0.join("file"), b"content");
+        AFTER_CREATING.with(|hook| *hook.borrow_mut() = None);
+        written.expect("writes");
+        let seen = seen.take();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the file was looked at once, when it was made"
+        );
+        assert_eq!(
+            seen[0].as_ref().expect("the new file is read"),
+            &expected,
+            "what the first look at the new file found"
+        );
+    }
+
+    /// A file made with a list this host does not accept is never written into, never published and
+    /// never left behind, for either writer, and a file already at the destination is as it was.
+    /// These are the lists a volume that keeps none, or a folder that overrides what a creation
+    /// asks for, would give: one that is not protected, one that names everyone, and none at all.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_made_with_a_list_that_is_refused_is_never_written_or_published() {
+        let directory = Inheriting::new("refused-list");
+        pass_the_users_group_down(&directory);
+        let target = directory.0.join("target");
+        write_owner_only_file(&target, b"kept").expect("a first write");
+        let user = this_account();
+        let refused = [
+            (
+                "a list that is not protected",
+                format!("O:{user}D:(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;BA)"),
+            ),
+            (
+                "a list that names everyone",
+                format!("O:{user}D:P(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"),
+            ),
+            ("no list at all", format!("O:{user}D:NO_ACCESS_CONTROL")),
+        ];
+        for (what, descriptor) in refused {
+            DESCRIPTOR.with(|chosen| *chosen.borrow_mut() = Some(descriptor));
+            let replaced = write_owner_only_file(&target, b"changed");
+            let created = create_new_owner_only_file(&directory.0.join("fresh"), b"changed");
+            DESCRIPTOR.with(|chosen| *chosen.borrow_mut() = None);
+            assert!(replaced.is_err(), "{what}: the replacing writer fails");
+            assert!(created.is_err(), "{what}: the creating writer fails");
+            assert_eq!(
+                std::fs::read(&target).expect("the destination reads"),
+                b"kept",
+                "{what}: the destination is as it was"
+            );
+            assert_eq!(
+                names_in(&directory.0),
+                vec!["target".to_owned()],
+                "{what}: nothing is left beside it"
+            );
+        }
     }
 
     /// Two files made in one directory have the same access, which records nothing set on either
