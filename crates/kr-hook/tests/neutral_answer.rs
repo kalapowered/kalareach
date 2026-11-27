@@ -727,7 +727,8 @@ fn a_process_a_test_started_is_ended_when_the_test_unwinds() {
     let held_open = process.stdin.take().expect("its input");
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _guarded = common::Ending::new(&mut process);
-        panic!("the test fails with its process running");
+        // An unwind as a failed assertion makes, without the message of a panic.
+        std::panic::resume_unwind(Box::new("the test fails with its process running"));
     }));
     assert!(unwound.is_err(), "the closure panics");
     let status = process.try_wait().expect("the process can be waited on");
