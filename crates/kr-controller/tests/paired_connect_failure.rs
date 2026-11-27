@@ -191,9 +191,10 @@ fn each_failure_of_the_transport_is_named_by_its_layer() {
 /// a dial from it offers that address beside the new one: the stranger's answer there carries a key
 /// that is not the host's, and ends the dial with a certificate that is not the one dialled, in
 /// about half the dials. So the case does not count dials. It shows that the device's own endpoint
-/// holds the address the host left (the case sets its own trap), that the endpoint the helper
-/// dials from holds no address of the host before it dials, that the dial then connects, and that
-/// the endpoint holds the host's new address and not the old one.
+/// and the endpoint of the device's earlier dial, which the case keeps across the restart, both
+/// hold the address the host left (the case sets its own traps), that the endpoint a second dial
+/// goes out from holds no address of the host before it dials, that the dial then connects, and
+/// that the endpoint holds the host's new address and not the old one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_address_it_left() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -206,6 +207,10 @@ async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_addr
         proposal(&[ActionRight::SessionView]),
     )
     .await;
+    // The device dials the host before it stops, and the case keeps that dial: its endpoint holds
+    // the host's address as it was.
+    let earlier = paired_dial(&host, &device, &record);
+    drop(earlier.dial().await);
     let [left] = host.network().bound_sockets()[..] else {
         panic!("the host is bound to one socket");
     };
@@ -230,13 +235,21 @@ async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_addr
     };
     assert_ne!(left, now, "the host came back on another port");
 
-    // The trap: the endpoint the device paired from still holds the address the host left. A case
-    // that cannot set it shows nothing about the dial.
+    // The traps: the endpoint the device paired from, and the one its earlier dial went out from,
+    // still hold the address the host left. A case that cannot set them shows nothing about the
+    // dial.
     let trap = device.addresses_held_for(&host).await;
     assert!(
         trap.contains(&left),
         "the case did not set its trap: the device's own endpoint holds {trap:?} for the host, \
          not the address {left} the host left, so a dial from it would not meet the stranger"
+    );
+    let earlier_trap = earlier.addresses_held_for_the_host().await;
+    assert!(
+        earlier_trap.contains(&left),
+        "the case did not set its second trap: the endpoint of the device's earlier dial holds \
+         {earlier_trap:?} for the host, not the address {left} the host left, so a dial from it \
+         would not meet the stranger"
     );
 
     let dial = paired_dial(&host, &device, &record);
@@ -245,7 +258,7 @@ async fn a_paired_device_reaches_its_host_while_another_host_answers_at_the_addr
         before.is_empty(),
         "the endpoint the dial goes out from holds {before:?} for the host before its first \
          dial, and carries an address of an earlier host (the device's own endpoint holds \
-         {trap:?})"
+         {trap:?}, the endpoint of its earlier dial {earlier_trap:?})"
     );
 
     // The host selects the paired record by the key the dial's endpoint proves, so a connection
