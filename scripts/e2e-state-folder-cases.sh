@@ -108,10 +108,15 @@ mode_sentence() {
   printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has mode %s; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w' "$1" "$2" "$3"
 }
 
-# The sentence for a folder or marker that could not be written, for the path $1.
+# The sentence for a folder or marker that could not be written, for the path $1; it ends with the
+# words $2 that say what is left, or says that nothing was kept.
 write_sentence() {
-  printf 'e2e: could not prepare KR_E2E_STATE %s: its folder, its mode or its owner marker could not be written; nothing that this check made was kept' "$1"
+  printf 'e2e: could not prepare KR_E2E_STATE %s: its folder, its mode or its owner marker could not be written; %s' "$1" "${2:-nothing that this check made was kept}"
 }
+# What a failure says is left where the check could not remove what it made.
+left_marker='the owner marker that the check wrote is still in the folder'
+left_folder='the empty folder that the check made is still there'
+left_both='the folder that the check made, with its owner marker, is still there'
 
 # What $1 holds at every depth: each entry's name, kind, mode, owner and link target, the folder's
 # own included, and a checksum of each file; or `absent`; or, for a link, where it points and what
@@ -554,9 +559,9 @@ for victim in mid state; do
 done
 
 echo "== each folder is listed from inside its parent, and the folder that is entered is the one listed"
-# A case defines `stand_cd`, `stand_ls` or `stand_uname`, which stand in for `cd`, `ls` and `uname`
-# inside the subshell that stand_check runs the check in (so that no other case sees them), and
-# removes them after the call.
+# A case defines `stand_cd`, `stand_ls`, `stand_uname`, `stand_rm` or `stand_chmod`, which stand in for
+# `cd`, `ls`, `uname`, `rm` and `chmod` inside the subshell that stand_check runs the check in (so that
+# no other case sees them), and removes them after the call.
 # stand_check <temporary directory> <state>: sets `out` (what the check said, or `accepted` with the
 # inode and the name it left) and `code`.
 stand_check() {
@@ -564,9 +569,12 @@ stand_check() {
   out="$(
     # shellcheck source=scripts/lib/e2e-state-folder.sh
 . "$root/scripts/lib/e2e-state-folder.sh"
-    if declare -F stand_cd > /dev/null; then cd() { stand_cd "$@"; }; fi
-    if declare -F stand_ls > /dev/null; then ls() { stand_ls "$@"; }; fi
-    if declare -F stand_uname > /dev/null; then uname() { stand_uname "$@"; }; fi
+    local fn
+    for fn in cd ls uname rm chmod; do
+      if declare -F "stand_$fn" > /dev/null; then
+        eval "$fn() { stand_$fn \"\$@\"; }"
+      fi
+    done
     export TMPDIR="$tmpdir"
     export KR_E2E_STATE="$state"
     export KR_E2E_STATE_OWNER="$owner"
@@ -739,6 +747,68 @@ acl_entry=. stand_check "$scratch/R1777-acl" "$scratch/R1777-acl/mid/state"
 said "a sticky temporary directory with an access list entry (the macOS listing)" accepted
 unset -f stand_uname stand_ls
 echo "  skipped: a folder with a real access list on a real macOS (macOS only: this script runs only on Linux, and nothing of it runs on a Mac)"
+
+echo "== a refusal changes nothing that existed, and a failure says what is left"
+# The walk's result is handed over BEFORE the mode of the folder changes. Here its standard output is
+# /dev/full, so the hand-over fails: the status is 3 (nothing left to say), the folder that was
+# there keeps its listing and its mode (755, not 700), and a folder that the walk made is gone.
+mk "$t/hand/exist/state" "$t/hand/new"
+before="$(snapshot "$t/hand/exist")"
+before_new="$(snapshot "$t/hand/new")"
+for hand_state in "$t/hand/exist/state" "$t/hand/new/state"; do
+  rc="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    export TMPDIR="$t"
+    (e2e_state_folder_walk "$hand_state" "$owner") > /dev/full 2> /dev/null
+    echo "$?"
+  )"
+  expect "a result that cannot be handed over fails the walk with status 3 and nothing left ($hand_state)" 3 "$rc"
+done
+expect "a folder that was there keeps its listing and its mode when the hand-over fails" "$before" "$(snapshot "$t/hand/exist")"
+expect "a folder that the walk made is removed when the hand-over fails" "$before_new" "$(snapshot "$t/hand/new")"
+
+# The mode change fails: the check says so, and where it removed all it made it says that nothing
+# was kept.
+mk "$t/chm/exist/state" "$t/chm/new"
+before="$(snapshot "$t/chm/exist")"
+before_new="$(snapshot "$t/chm/new")"
+stand_chmod() { return 1; }
+stand_check "$t" "$t/chm/exist/state"
+said "a mode change that fails on a folder that was there" "$(write_sentence "$t/chm/exist/state")"
+stand_check "$t" "$t/chm/new/state"
+said "a mode change that fails on a folder that the walk made" "$(write_sentence "$t/chm/new/state")"
+unset -f stand_chmod
+expect "the folder that was there is as it was" "$before" "$(snapshot "$t/chm/exist")"
+expect "the folder that the walk made is gone" "$before_new" "$(snapshot "$t/chm/new")"
+
+# The mode change fails and the removal fails too: the sentence says what is left, never that nothing
+# was kept.
+mk "$t/rmf/exist/state" "$t/rmf/new"
+stand_chmod() { return 1; }
+stand_rm() { return 1; }
+stand_check "$t" "$t/rmf/exist/state"
+said "a failed removal of the marker is said" "$(write_sentence "$t/rmf/exist/state" "$left_marker")"
+stand_check "$t" "$t/rmf/new/state"
+said "a failed removal of the marker and of the folder that was made is said" "$(write_sentence "$t/rmf/new/state" "$left_both")"
+unset -f stand_chmod stand_rm
+
+# The folder that the walk made is moved aside and another closed folder of the caller's takes its name
+# before the walk enters it: the cleanup does not remove what it did not make, and says that what it made
+# is still there.
+mk "$t/idc/mid"
+stand_cd() {
+  if [ "${3:-}" = ./state ]; then
+    mv -- "$t/idc/mid/state" "$t/idc/mid/state-aside"
+    mkdir -m 700 -- "$t/idc/mid/state"
+  fi
+  builtin cd "$@" || return
+}
+stand_check "$t" "$t/idc/mid/state"
+unset -f stand_cd
+said "a folder made by the walk and replaced before it is entered" "$(sentence "$t/idc/mid/state")$changed_clause; $left_folder"
+expect "the folder that took its name is not removed" yes "$([ -d "$t/idc/mid/state" ] && echo yes || echo no)"
+expect "the folder that the walk made is where it was moved" yes "$([ -d "$t/idc/mid/state-aside" ] && echo yes || echo no)"
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"
