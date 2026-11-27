@@ -337,7 +337,7 @@ WRAPPER
         make_reader_home || { say "no folder could be made for the text reader's recognition programs"; return 1; }
         check_the_reader_on_known_pictures
         verdict=$?
-        record_reader_programs
+        record_reader_programs "$verdict"
         [ "$verdict" -ne 0 ] || break
         discard_reader_home || {
             say "the folder of the text reader's recognition programs could not be thrown away; see $artefacts/reader-check.log"
@@ -347,8 +347,12 @@ WRAPPER
             say "the text reader failed on a known picture; see $artefacts/reader-check.log"
             return 1
         fi
+        if [ "$reader_listing_failed" -eq 1 ]; then
+            say "the text reader's text did not match a known picture, and the files under the folder made for the reader could not be listed, so whether the system wrote programs there is not known; no new folder is tried; see $artefacts/reader-check.log"
+            return 1
+        fi
         if [ "$reader_programs" -eq 0 ]; then
-            say "the text reader's text did not match a known picture, and the system wrote no program under the folder made for the reader, so a new folder cannot build them again; see $artefacts/reader-check.log"
+            say "the text reader's text did not match a known picture, and no recognition program was found under the folder made for the reader; no new folder is tried; see $artefacts/reader-check.log"
             return 1
         fi
         if [ "$build" -eq 4 ]; then
@@ -462,16 +466,27 @@ check_the_reader_fixtures() {
     return "$ok"
 }
 
-# Writes to the log the files the system compiled for the reader into the folder made for this build,
-# one line each with its SHA-1, and sets reader_programs to how many there are: none says that the
-# reader's home did not take effect, and a new folder cannot then build them again.
+# Writes to the log the files under the folder made for this build, one line each with its SHA-1, as
+# the system left them after the reading, and sets two results. reader_programs is how many of them
+# are recognition cache files, by the folder the system names them in on the Mac where the fault was
+# measured (com.apple.e5rt.e5bundlecache); other files, a preferences file for one, are not counted.
+# reader_listing_failed is 1 when the files could not be listed (the log then holds the exit status
+# and the error output of the listing), which says nothing about whether any file is there. The
+# verdict of the check is the first argument: a reading that passed with no recognition cache file
+# under the folder says so, since where the system keeps its programs is then not established.
 reader_programs=0
+reader_listing_failed=0
 record_reader_programs() {
-    local listing
+    local verdict=$1 listing status total=0
+    local errors="${artefacts:?}/reader-errors.log" log_file="$artefacts/reader-check.log"
+    reader_programs=0
+    reader_listing_failed=0
     listing="$(python3 -I -c '
 import hashlib, os, sys
+def fail(error):
+    raise error
 top = sys.argv[1]
-for base, folders, names in os.walk(top):
+for base, folders, names in os.walk(top, onerror=fail):
     folders.sort()
     for name in sorted(names):
         path = os.path.join(base, name)
@@ -479,14 +494,30 @@ for base, folders, names in os.walk(top):
             continue
         with open(path, "rb") as handle:
             print(hashlib.sha1(handle.read()).hexdigest(), os.path.relpath(path, top))
-' "${reader_home:?}")" || listing=""
-    if [ -z "$listing" ]; then
-        reader_programs=0
-    else
-        reader_programs="$(printf '%s\n' "$listing" | wc -l | tr -d ' ')"
+' "${reader_home:?}" 2>"$errors")"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        reader_listing_failed=1
+        {
+            printf 'the files under %s could not be listed (exit status %s)\n' "$reader_home" "$status"
+            if [ -s "$errors" ]; then
+                printf '  its error output:\n'
+                awk '{ print "    " $0 }' "$errors"
+            else
+                printf '  it wrote no error output\n'
+            fi
+        } >>"$log_file"
+        return 0
     fi
-    printf 'programs under %s: %s file(s)\n' "$reader_home" "$reader_programs" >>"$artefacts/reader-check.log"
-    [ -z "$listing" ] || printf '%s\n' "$listing" | awk '{ print "    " $0 }' >>"$artefacts/reader-check.log"
+    if [ -n "$listing" ]; then
+        total="$(printf '%s\n' "$listing" | wc -l | tr -d ' ')"
+        reader_programs="$(printf '%s\n' "$listing" | grep -cE '(^| |/)com\.apple\.e5rt\.e5bundlecache/')"
+    fi
+    printf 'programs under %s: %s recognition cache file(s) of %s file(s)\n' "$reader_home" "$reader_programs" "$total" >>"$log_file"
+    [ -z "$listing" ] || printf '%s\n' "$listing" | awk '{ print "    " $0 }' >>"$log_file"
+    if [ "$verdict" -eq 0 ] && [ "$reader_programs" -eq 0 ]; then
+        printf 'the place of the recognition cache was not established: the reading passed, and no recognition cache file stands under %s\n' "$reader_home" >>"$log_file"
+    fi
 }
 
 # The reader on the pictures kept for it in the companion's voice tests (reader-fixtures), each a

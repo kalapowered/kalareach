@@ -72,6 +72,33 @@ exit 1
 STANDIN
 chmod +x "$root/bin/node"
 
+# python3: the real one, except for the listing of the files under the reader's folder (the one call
+# that names hashlib). FAKE_LISTING=fails makes it fail with a line on its error output.
+# FAKE_LISTING=locked gives the folder a subfolder that cannot be opened while the real listing runs,
+# and opens it again after, so that the folder can be removed.
+cat >"$root/bin/python3" <<'STANDIN'
+#!/bin/bash
+case "$*" in
+    *hashlib*)
+        if [ "${FAKE_LISTING:-}" = fails ]; then
+            printf 'fake python3: cannot read a file\n' >&2
+            exit 3
+        fi
+        if [ "${FAKE_LISTING:-}" = locked ]; then
+            locked="${!#}/Library/locked"
+            mkdir -p "$locked" && chmod 000 "$locked"
+            "$REAL_PYTHON3" "$@"
+            status=$?
+            chmod 755 "$locked"
+            exit "$status"
+        fi
+        ;;
+esac
+exec "$REAL_PYTHON3" "$@"
+STANDIN
+chmod +x "$root/bin/python3"
+real_python3="$(command -v python3)" || exit 1
+
 # `rm`: records each call, and removes only inside the folder this run made.
 cat >"$root/bin/rm" <<'STANDIN'
 #!/bin/bash
@@ -95,15 +122,17 @@ chmod +x "$root/bin/rm"
 # the first line of every text, as a wrong build of the system's programs leaves rows out.
 # FAKE_DROP_LAST=1 leaves out the last line of every text instead. Like the
 # system, it writes a file of compiled programs into the home folder it was started with
-# (CFFIXED_USER_HOME) the first time it runs there, unless FAKE_COMPILES=0.
+# (CFFIXED_USER_HOME) the first time it runs there, unless FAKE_COMPILES=0, which writes none, or
+# FAKE_COMPILES=other, which writes a preferences file and no compiled program.
 cat >"$root/reader-standin.sh" <<'STANDIN'
 #!/bin/bash
 image=$1
 name=${image##*/}
 home=${KR_READER_HOME-unset}
 printf '%s home=%s cffixed=%s\n' "$name" "$home" "${CFFIXED_USER_HOME-unset}" >>"$FAKE_DIR/reads.log"
-if [ -n "${CFFIXED_USER_HOME-}" ] && [ "${FAKE_COMPILES:-1}" = 1 ]; then
+if [ -n "${CFFIXED_USER_HOME-}" ] && [ "${FAKE_COMPILES:-1}" != 0 ]; then
     programs="$CFFIXED_USER_HOME/Library/Caches/read-text-bin/com.apple.e5rt.e5bundlecache"
+    [ "${FAKE_COMPILES:-1}" != other ] || programs="$CFFIXED_USER_HOME/Library/Preferences"
     if [ ! -d "$programs" ]; then
         mkdir -p "$programs" && printf 'programs for %s\n' "$CFFIXED_USER_HOME" >"$programs/program"
     fi
@@ -161,7 +190,7 @@ run_script() {
     shift
     c="$root/$name"
     env -i PATH="$root/bin:$PATH" HOME="${HOME:-/}" TMPDIR="$c/tmp" KR_MOBILE_SCREENSHOT_DIR="$c/shots" \
-        FAKE_DIR="$c/fake" FAKE_ROOT="$root" READER_STANDIN="$root/reader-standin.sh" "$@" \
+        FAKE_DIR="$c/fake" FAKE_ROOT="$root" READER_STANDIN="$root/reader-standin.sh" REAL_PYTHON3="$real_python3" "$@" \
         bash "$c/tree/scripts/e2e-voice-device.sh" reader >"$c/out.log" 2>&1
     printf '%s\n' "$?" >"$c/rc"
 }
@@ -404,7 +433,8 @@ make_tree programs-recorded
 run_script programs-recorded FAKE_BAD_FIRST=2
 expect "programs: a line for each of three builds" test "$(grep -c '^programs under ' "$(check_log programs-recorded)")" = 3
 expect "programs: each build's folder is its own" test "$(grep '^programs under ' "$(check_log programs-recorded)" | sort -u | wc -l | tr -d ' ')" = 3
-expect "programs: each build wrote one file" test "$(grep -c ': 1 file(s)$' "$(check_log programs-recorded)")" = 3
+expect "programs: each build wrote one recognition cache file, and nothing else" test "$(grep -c ': 1 recognition cache file(s) of 1 file(s)$' "$(check_log programs-recorded)")" = 3
+expect "programs: a pass with files says nothing of an unestablished place" never_says "$(check_log programs-recorded)" "was not established"
 expect "programs: each file has a SHA-1" test "$(grep -cE '^    [0-9a-f]{40} Library/Caches/read-text-bin/' "$(check_log programs-recorded)")" = 3
 
 # A reader that wrote no program under its folder cannot be helped by a new folder: the run stops after
@@ -413,8 +443,57 @@ make_tree programs-missing
 run_script programs-missing FAKE_BAD_FIRST=9 FAKE_COMPILES=0
 expect "no programs: one check" test "$(checks programs-missing)" = 1
 expect "no programs: the folder is removed once" test "$(removals programs-missing)" = 1
-expect "no programs: the run says a new folder cannot build them again" says "$(out programs-missing)" "a new folder cannot build them again"
+expect "no programs: the run says that no recognition program was found" says "$(out programs-missing)" "no recognition program was found under the folder made for the reader"
+expect "no programs: the run does not say that a new folder cannot build them" never_says "$(out programs-missing)" "cannot build them again"
+expect "no programs: the log counts none" says "$(check_log programs-missing)" ": 0 recognition cache file(s) of 0 file(s)"
 expect "no programs: the run fails with exit 2" rc_is programs-missing 2
+
+# A file that is not a recognition cache file, a preferences file, is no program: the run stops after
+# the first mismatch as it does for no file, and the log counts the file apart.
+make_tree programs-other
+run_script programs-other FAKE_BAD_FIRST=9 FAKE_COMPILES=other
+expect "other files only: one check" test "$(checks programs-other)" = 1
+expect "other files only: the log counts no recognition cache file of one" says "$(check_log programs-other)" ": 0 recognition cache file(s) of 1 file(s)"
+expect "other files only: the run says that no recognition program was found" says "$(out programs-other)" "no recognition program was found under the folder made for the reader"
+
+# A reading that passes with no recognition cache file is no failure, and the log says that the place
+# of the cache was not established.
+make_tree programs-none-pass
+run_script programs-none-pass FAKE_COMPILES=0
+expect "a pass with no programs: the run goes on" says "$(out programs-none-pass)" "the text reader read the known pictures as drawn"
+expect "a pass with no programs: the log says the place was not established" says "$(check_log programs-none-pass)" "the place of the recognition cache was not established"
+
+# A listing that fails is not a listing of no file: the run stops after the first mismatch with words
+# of their own, and the log keeps the exit status and the error output of the listing.
+make_tree listing-fails
+run_script listing-fails FAKE_BAD_FIRST=9 FAKE_LISTING=fails
+expect "a failed listing: one check" test "$(checks listing-fails)" = 1
+expect "a failed listing: the run says the files could not be listed" says "$(out listing-fails)" "could not be listed"
+expect "a failed listing: the run does not say that no program was written" never_says "$(out listing-fails)" "no recognition program was found"
+expect "a failed listing: nor that the system wrote none" never_says "$(out listing-fails)" "the system wrote no program"
+expect "a failed listing: the log keeps its exit status" says "$(check_log listing-fails)" "could not be listed (exit status 3)"
+expect "a failed listing: the log keeps its error output" says "$(check_log listing-fails)" "    fake python3: cannot read a file"
+expect "a failed listing: the run fails with exit 2" rc_is listing-fails 2
+
+make_tree listing-fails-pass
+run_script listing-fails-pass FAKE_LISTING=fails
+expect "a failed listing after a pass: the run goes on" says "$(out listing-fails-pass)" "the text reader read the known pictures as drawn"
+expect "a failed listing after a pass: the log says the files could not be listed" says "$(check_log listing-fails-pass)" "could not be listed (exit status 3)"
+expect "a failed listing after a pass: the log counts no file" never_says "$(check_log listing-fails-pass)" "recognition cache file(s)"
+
+# A folder under the reader's folder that cannot be opened is a listing that failed, not a listing
+# without it. A user that can open any folder cannot show this, and the case is then left out.
+make_tree listing-locked
+mkdir "$root/listing-locked/probe" && chmod 000 "$root/listing-locked/probe"
+if [ -x "$root/listing-locked/probe" ]; then
+    printf 'skip a folder that cannot be opened: this user can open any folder\n'
+else
+    run_script listing-locked FAKE_LISTING=locked
+    expect "a folder that cannot be opened: the log says the files could not be listed" says "$(check_log listing-locked)" "could not be listed (exit status 1)"
+    expect "a folder that cannot be opened: the log keeps the system's words" says "$(check_log listing-locked)" "Permission denied"
+    expect "a folder that cannot be opened: the run still goes on after a pass" says "$(out listing-locked)" "the text reader read the known pictures as drawn"
+fi
+chmod 755 "$root/listing-locked/probe"
 
 # ---- What the mode reports -----------------------------------------------------------------------
 
