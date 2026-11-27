@@ -75,7 +75,7 @@ fast() {
   # release makes, and a host too old for a method.
   expect --at-least 20 cargo test --locked -p kr-protocol --test retained
   expect --at-least 10 cargo test --locked -p kr-protocol --test public_majors
-  expect --at-least 127 cargo test --locked -p kr-cli --test retained_surface
+  expect --at-least 128 cargo test --locked -p kr-cli --test retained_surface
   expect --at-least 6 cargo test --locked -p kr-client --test release_check
   expect cargo test --locked -p kr-client --test network_chunks -- --exact \
     a_host_of_an_earlier_build_is_told_to_update_before_anything_is_reserved
