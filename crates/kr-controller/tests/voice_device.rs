@@ -290,7 +290,19 @@ async fn read_figures(peer: &AudioPeer, since: Instant) -> serde_json::Value {
     }
 }
 
-/// Runs the host and the voice service for one phone, from its invitation to its end.
+/// KR-REQ-15.01: runs the host and the voice service for one phone, from its invitation to its end.
+///
+/// The script's `outage` and `delegating` modes show, on a simulator or an emulator, a call from the
+/// pairing to its end through the real daemon and the real native code: native code holds the
+/// capture and the playback, audio is carried in both directions (read from the connection's
+/// counters), and each leg of the gate that hands spoken requests to the host is answered against a
+/// stand-in for the voice service. A simulator has no microphone, so there the capture is a
+/// synthetic device or reads unavailable. That is the client delegation and the provider interface,
+/// with the provider replaced.
+///
+/// It does not show the provider's own answer, the live model, a production broker origin, or what
+/// a phone's audio session does to a call. The peer that answers the offer is the application's own,
+/// marked as the provider's. No test here makes a live provider call or holds a provider key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "started by scripts/e2e-voice-call-device.sh beside a simulator or an emulator"]
 async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {

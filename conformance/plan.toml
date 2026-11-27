@@ -2790,6 +2790,14 @@ file = 'scripts/e2e-push-device.sh'
 line = 'KR_HARNESS_DIR="$harness" KR_HARNESS_PEER="$1" KR_HARNESS_SECONDS=1500 KR_PUSH_ANDROID_STATES="$states" KR_PUSH_GATEWAY="$gateway_origin" KR_PUSH_FCM_PORT="$fcm_port" KR_PUSH_TOKEN="$token" host_start "$harness_exe" --ignored --exact a_phone_registers_with_a_gateway_and_is_delivered_to_through_it --nocapture >"$artefacts/harness.log" 2>&1 &'
 
 [[ignored_run]]
+package = 'kr-controller'
+target = '--test voice_device'
+cases = ['a_phone_is_paired_and_runs_a_call_against_a_real_host']
+[ignored_run.runs]
+kind = 'by_hand'
+why = 'scripts/e2e-voice-call-device.sh starts it, in its outage and delegating modes, beside the debug application on an iOS Simulator or an Android emulator inside the device lease of a Mac; a person runs that script and no step of this repository does'
+
+[[ignored_run]]
 package = 'kr-transport'
 target = '--test real_proxy'
 [ignored_run.runs]
