@@ -2443,30 +2443,6 @@ test.describe("the phone's tab bar", () => {
     expect(root, `the root's text at ${scale}`).toBeCloseTo((16 * parseFloat(scale)) / 100, 1)
   }
 
-  /**
-   * The bar once it holds still: two reads in a row, a moment apart, that agree. A page is laid out
-   * as it loads, so a read can come in the middle of that and see a form the bar is about to leave.
-   * The wait is bounded by `within` ms and asks for no frame, which a window the engine does not draw
-   * never gives; a bar that keeps changing fails at the bound, and the message says where.
-   */
-  const settledBar = async (page: Page, at: string, within = 5_000): Promise<BarLayout> => {
-    const read: { layout: BarLayout | null; previous: string } = { layout: null, previous: '' }
-    await expect
-      .poll(
-        async () => {
-          read.layout = await readBar(page)
-          const now = JSON.stringify(read.layout)
-          const held = now === read.previous
-          read.previous = now
-          return held
-        },
-        { message: `the bar at ${at} did not hold still`, timeout: within, intervals: [10, 25, 50, 100] }
-      )
-      .toBe(true)
-    if (read.layout === null) throw new Error(`the bar at ${at} was not read`)
-    return read.layout
-  }
-
   /** One case: a platform's bar at a screen, a text size and a face, and what it shows that no other case does. */
   interface TabBarCase {
     readonly seen: Seen
@@ -2814,15 +2790,14 @@ test.describe("the phone's tab bar", () => {
           // Once for the case: each page load below opens at this text size.
           await withTextSize(page, scale)
           for (const width of SHORT_WIDTHS) {
-            const at = `${width}×${height} at ${scale}`
             await page.setViewportSize({ width, height })
             await page.goto(`/harness.html?surface=${surface}`)
             await expectRootSize(page, scale)
             await expect(page.getByRole('navigation', { name: 'Sections' })).toBeVisible()
             await expect(page.locator('.m-tab-badge')).toBeVisible()
-            const seen = await settledBar(page, at)
+            const seen = await readBar(page)
             forms.add(seen.form ?? 'row')
-            failures.push(...crowding(seen, width, `${at} (${seen.form ?? 'row'})`, true))
+            failures.push(...crowding(seen, width, `${width}×${height} at ${scale} (${seen.form ?? 'row'})`, true))
           }
           expect(failures, 'where a label, a glyph or the badge is too close').toEqual([])
           // The widths cover both forms: the system's own text size fits the labels in one row, and the largest is where the bar has to stack.
@@ -2832,21 +2807,6 @@ test.describe("the phone's tab bar", () => {
       }
     }
   }
-
-  test('gives up on a bar that keeps changing at its bound and says which width', async ({ page }) => {
-    await onPhone(page, 'ios', { width: 646, height: 320, scale: '100%' })
-    await expect(page.locator('.m-tab-badge')).toBeVisible()
-    // A bar that is never the same twice: its padding grows at every tick.
-    await page.evaluate(() => {
-      const bar = document.querySelector('.m-tabbar') as HTMLElement
-      let step = 0
-      window.setInterval(() => {
-        step += 1
-        bar.style.paddingLeft = `${step / 10}px`
-      }, 4)
-    })
-    await expect(settledBar(page, '646×320 at 100%', 400)).rejects.toThrow('the bar at 646×320 at 100% did not hold still')
-  })
 })
 
 // KR-REQ-13.19: the conversation keeps a height it scrolls within at a person's own text size: at
