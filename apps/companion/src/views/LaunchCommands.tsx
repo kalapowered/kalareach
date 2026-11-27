@@ -21,6 +21,7 @@ import type { LaunchShell, NamedLaunch, ShellLaunchCommandsListResult } from '@k
 import { useHeldConnection } from '../app/rights'
 import { useSavedCommands } from '../app/launch-commands'
 import { useApp } from '../app/state'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Button } from '../components/ui'
 import { failureWords } from '../host/port'
 import {
@@ -241,7 +242,9 @@ export function LaunchCommands({
                   <div>
                     <h3>{command.label}</h3>
                     <p className="mono small">
-                      {[command.program, ...command.arguments].map((word) => `"${word}"`).join(' ')}
+                      <TechnicalWord
+                        text={[command.program, ...command.arguments].map((word) => `"${word}"`).join(' ')}
+                      />
                     </p>
                   </div>
                   {editable ? (
@@ -349,7 +352,9 @@ export function LaunchCommands({
             <p className="small faint">{WORDS.preview}</p>
             <ul className="mono small">
               {[draft.program, ...draft.arguments].map((word, index) => (
-                <li key={index}>{`"${word}"`}</li>
+                <li key={index}>
+                  <TechnicalWord text={`"${word}"`} />
+                </li>
               ))}
             </ul>
           </div>

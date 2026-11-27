@@ -39,6 +39,7 @@ import { useHeldConnection } from '../app/rights'
 import { useLaunchSurface, useSavedCommandsRead } from '../app/launch-surface'
 import { LaunchSurface } from './LaunchSurface'
 import { AttachmentPaths } from '../components/AttachmentPaths'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { AttachmentThumb } from '../components/AttachmentThumb'
 import {
   failureCode,
@@ -1324,7 +1325,9 @@ const NodeView = memo(function NodeView({
             const entry = file as { path?: string; added?: number; removed?: number }
             return (
               <div className="divided-row" key={`${node.id}-${index}`}>
-                <span className="mono spacer">{entry.path}</span>
+                <span className="mono spacer">
+                  <TechnicalWord text={entry.path ?? ''} />
+                </span>
                 <span className="success-text small">+{entry.added ?? 0}</span>
                 <span className="danger-text small">-{entry.removed ?? 0}</span>
               </div>
@@ -1698,7 +1701,9 @@ function Composer({
                   setShowCommands(false)
                 }}
               >
-                <code>/{command.name}</code>
+                <code>
+                  <TechnicalWord text={`/${command.name}`} />
+                </code>
                 <span className="faint">{command.summary}</span>
               </button>
             </li>

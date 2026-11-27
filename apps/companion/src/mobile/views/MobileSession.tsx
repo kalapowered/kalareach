@@ -65,6 +65,7 @@ import { claimWasLost, keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { StandingBanner } from '../../components/StandingBanner'
+import { TechnicalWord } from '../../components/TechnicalWord'
 import { isOver, rightsOf } from '../../model/openings'
 import {
   failureCode,
@@ -1855,7 +1856,9 @@ export function MobileSession({
                       document.getElementById(`composer-${sessionId}`)?.focus()
                     }}
                   >
-                    <code>/{command.name}</code>
+                    <code>
+                      <TechnicalWord text={`/${command.name}`} />
+                    </code>
                     <span className="m-slash-summary">{command.summary}</span>
                   </Button>
                 </li>

@@ -27,6 +27,7 @@
  */
 
 import {
+  Fragment,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -39,6 +40,7 @@ import {
 
 import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, Sheet, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type SetupIdentity, type SetupPlatform } from '../host/port'
@@ -190,11 +192,19 @@ function establishedAbout(record: CapabilityRecord): string | null {
   return opened ? 'the one file it was given' : null
 }
 
-/** What a record was established about, in one line, where it names something. */
-function aboutLine(record: CapabilityRecord): string | null {
-  const parts = [record.subject.application, record.subject.terminal, record.identity.binary]
-    .filter((part): part is string => typeof part === 'string' && part.length > 0)
-  return parts.length > 0 ? parts.join(' · ') : null
+/** What a record was established about, in one line, where it names something: each name a technical word. */
+function aboutLine(record: CapabilityRecord): ReactNode {
+  const names = [record.subject.application, record.subject.terminal, record.identity.binary].filter(
+    (name): name is string => typeof name === 'string' && name.length > 0
+  )
+  if (names.length === 0) return null
+  return names.map((name, index) => (
+    // The names are positions in one line, and never reorder.
+    <Fragment key={index}>
+      {index > 0 ? ' · ' : null}
+      <TechnicalWord text={name} />
+    </Fragment>
+  ))
 }
 
 /** The setup assistant. */
@@ -781,7 +791,9 @@ function IdentityStep({
     <>
       <Card data-testid="setup-identity">
         <header className="card-header">
-          <h2>{identity.application_id}</h2>
+          <h2>
+            <TechnicalWord text={identity.application_id} />
+          </h2>
           {filed ? (
             <Badge tone={identity.stable ? 'success' : 'warning'}>
               {identity.stable ? 'Stable identity' : 'Identity moves between launches'}
@@ -802,7 +814,9 @@ function IdentityStep({
             </div>
             <div>
               <dt>Running from</dt>
-              <dd className="mono small">{identity.executable ?? 'not known'}</dd>
+              <dd className="mono small">
+                {identity.executable === null ? 'not known' : <TechnicalWord text={identity.executable} />}
+              </dd>
             </div>
             {filed ? (
               <>
@@ -842,11 +856,15 @@ function IdentityStep({
           <dl className="detail-list">
             <div>
               <dt>Build</dt>
-              <dd className="mono small">{identity.helper_build ?? 'no host yet'}</dd>
+              <dd className="mono small">
+                {identity.helper_build === null ? 'no host yet' : <TechnicalWord text={identity.helper_build} />}
+              </dd>
             </div>
             <div>
               <dt>Environment</dt>
-              <dd className="mono small">{identity.helper_environment ?? '—'}</dd>
+              <dd className="mono small">
+                {identity.helper_environment === null ? '—' : <TechnicalWord text={identity.helper_environment} />}
+              </dd>
             </div>
           </dl>
         </div>
@@ -1148,7 +1166,9 @@ function CapabilitiesStep({
             </div>
             <div>
               <dt>Login session</dt>
-              <dd className="mono small">{desktop.desktop_session_id ?? 'no desktop'}</dd>
+              <dd className="mono small">
+                {desktop.desktop_session_id === null ? 'no desktop' : <TechnicalWord text={desktop.desktop_session_id} />}
+              </dd>
             </div>
           </dl>
           <p className="faint small">
@@ -1319,7 +1339,11 @@ function CapabilityCard({
                 <div>
                   <dt>About</dt>
                   <dd className="mono small">
-                    {establishedFor}
+                    {record.capability !== FILE_READ && record.identity.binary ? (
+                      <TechnicalWord text={record.identity.binary} />
+                    ) : (
+                      establishedFor
+                    )}
                     {record.identity.version ? ` · ${record.identity.version}` : ''}
                   </dd>
                 </div>
@@ -1396,7 +1420,10 @@ function HostStep({
               <p className="faint small">{item.installs}</p>
               {item.command ? (
                 <p className="faint small">
-                  Installed by <code className="mono">{item.command}</code>
+                  Installed by{' '}
+                  <code className="mono">
+                    <TechnicalWord text={item.command} />
+                  </code>
                 </p>
               ) : null}
               {answer ? (
@@ -1428,7 +1455,7 @@ function HostStep({
             {SLEEP_OFFERS.map((offer) => (
               <li key={offer.setting} data-testid={`setup-sleep-${offer.setting}`}>
                 <code className="mono small">
-                  {`${SLEEP_COMMAND} ${offer.setting}`}
+                  <TechnicalWord text={`${SLEEP_COMMAND} ${offer.setting}`} />
                   {power?.setting === offer.setting ? ' — set now' : ''}
                 </code>
                 <span>{offer.meaning}</span>
@@ -1740,7 +1767,9 @@ function ReadyStep({
                         <span>{item.name}</span>
                         <span className="faint small">
                           {item.command ? (
-                            <code className="mono">{item.command}</code>
+                            <code className="mono">
+                              <TechnicalWord text={item.command} />
+                            </code>
                           ) : (
                             'the installer, when you run it'
                           )}

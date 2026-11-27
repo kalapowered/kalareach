@@ -28,6 +28,7 @@ import type { LaunchShell, ShellLaunchResult } from '@kalareach/protocol'
 
 import { useApp } from '../app/state'
 import type { LaunchSurfaceReads } from '../app/launch-surface'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Button, CommitButton } from '../components/ui'
 import { failureCode, failureRetry, failureWords, type LaunchPress } from '../host/port'
 import { commandLine } from '../model/command-line'
@@ -185,11 +186,17 @@ export function LaunchSurface({
           <p className="small faint" data-testid="launch-instruction">
             {chosen !== null ? (
               <>
-                Type this at the prompt: <code>{typed(chosen, drawn.shell)}</code>
+                Type this at the prompt:{' '}
+                <code>
+                  <TechnicalWord text={typed(chosen, drawn.shell)} />
+                </code>
               </>
             ) : chosenSaved !== null ? (
               <>
-                Type this at the prompt: <code>{typedSaved(chosenSaved, drawn.shell)}</code>
+                Type this at the prompt:{' '}
+                <code>
+                  <TechnicalWord text={typedSaved(chosenSaved, drawn.shell)} />
+                </code>
               </>
             ) : (
               'This is a stock shell, so nothing is typed into it for you. Choose one to see what to type.'

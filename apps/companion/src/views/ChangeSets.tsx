@@ -20,6 +20,7 @@ import type {
   ReviewState
 } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureCode, failureMessage, watch, type HostPort, type Watch } from '../host/port'
@@ -320,7 +321,7 @@ export function ChangeSets(): ReactNode {
                   <p className="muted small">
                     Version {version.version} · against{' '}
                     <span className="mono">
-                      {version.base_reference ?? version.base_revision.slice(0, 12)}
+                      <TechnicalWord text={version.base_reference ?? version.base_revision.slice(0, 12)} />
                     </span>{' '}
                     · {Number(version.summary.total_paths).toLocaleString()} paths
                   </p>
@@ -344,7 +345,9 @@ export function ChangeSets(): ReactNode {
                 <h3>Changed</h3>
                 {version.changes.map((path) => (
                   <div className="divided-row" key={path.path} data-change={path.change}>
-                    <span className="mono spacer">{path.path}</span>
+                    <span className="mono spacer">
+                      <TechnicalWord text={path.path} />
+                    </span>
                     <span className="small muted">
                       {path.change === 'deleted'
                         ? 'Deleted'
@@ -364,7 +367,9 @@ export function ChangeSets(): ReactNode {
                     <h3>Left out</h3>
                     {version.exclusions.map((exclusion) => (
                       <div className="divided-row" key={exclusion.path}>
-                        <span className="mono spacer">{exclusion.path}</span>
+                        <span className="mono spacer">
+                          <TechnicalWord text={exclusion.path} />
+                        </span>
                         <span className="small muted">{EXCLUDED[exclusion.reason]}</span>
                       </div>
                     ))}

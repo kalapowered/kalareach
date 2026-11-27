@@ -13,6 +13,7 @@ import { useApp } from '../app/state'
 import type { SessionSubject } from '../host/port'
 import type { DraftAttachment } from '../model/drafts'
 import type { PathState } from '../model/manual-paths'
+import { TechnicalWord } from './TechnicalWord'
 import { Button } from './ui'
 
 /**
@@ -114,7 +115,7 @@ function FilePath({
       ) : (
         <>
           <code className="attachment-path-text" data-testid="attachment-path" tabIndex={0}>
-            {state.hostPath}
+            <TechnicalWord text={state.hostPath} />
           </code>
           <p className="small muted">
             This is where the file is on the host. Give the path to your agent yourself, in its

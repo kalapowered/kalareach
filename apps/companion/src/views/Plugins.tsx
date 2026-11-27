@@ -12,6 +12,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { CatalogueListResult, PluginListResult } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, Segmented } from '../components/ui'
 import { useApp } from '../app/state'
 import { failureMessage, watch, type Watch } from '../host/port'
@@ -244,7 +245,9 @@ export function Plugins(): ReactNode {
                 <ul className="capability-list">
                   {catalogue.ceiling.map((capability) => (
                     <li key={capability}>
-                      <code>{capability}</code>
+                      <code>
+                        <TechnicalWord text={capability} />
+                      </code>
                     </li>
                   ))}
                 </ul>

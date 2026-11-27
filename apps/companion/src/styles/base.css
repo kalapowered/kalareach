@@ -120,6 +120,21 @@ pre {
   margin: 0;
 }
 
+/* A technical word (TechnicalWord): one box that stays on a line while it fits there, so that it
+   moves to the next line whole rather than ending a line in the middle of a part. A box wider than
+   its line is as wide as the line, and breaks at its <wbr> places first and, inside a part, by the
+   rule that lets a word break anywhere, the last step. */
+.technical-word {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* A run of hyphens and the letter after it: the engine ends no line between them. */
+.technical-head {
+  white-space: nowrap;
+}
+
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 4px;

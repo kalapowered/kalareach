@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import type { LaunchShell, SessionReadResult } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp, useSession } from '../app/state'
 import {
@@ -459,7 +460,9 @@ function SessionSettings({
                     <p>The host has not reported this session’s shell yet.</p>
                   ) : session.shell_mode === 'native_compat' ? (
                     <>
-                      <p className="mono small">Stock shell, {session.shell_path}</p>
+                      <p className="mono small">
+                        Stock shell, <TechnicalWord text={session.shell_path} />
+                      </p>
                       <p>
                         Ctrl-D does what the shell does, and can close this session. Launch
                         buttons show the command for you to type, and the shell’s editor is not
@@ -468,7 +471,9 @@ function SessionSettings({
                     </>
                   ) : (
                     <>
-                      <p className="mono small">Managed shell, {session.shell_path}</p>
+                      <p className="mono small">
+                        Managed shell, <TechnicalWord text={session.shell_path} />
+                      </p>
                       <p>
                         Ctrl-D at an empty prompt detaches this view, and the session keeps
                         running. Launch buttons start the agent at the prompt for you.

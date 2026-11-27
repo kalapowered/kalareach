@@ -9,6 +9,8 @@
 
 import { Fragment, type ReactNode } from 'react'
 
+import { TechnicalWord } from './TechnicalWord'
+
 /**
  * An address as a person says it aloud: each dot is the word "dot", each colon of an IPv6 literal
  * is the word "colon", and a port is "port" and its number.
@@ -58,7 +60,9 @@ export function sayingAddresses(
     ) : (
       <Fragment key={at}>
         <span className="visually-hidden spoken-form">{spokenAddress(part)}</span>
-        <span aria-hidden="true">{part}</span>
+        <span aria-hidden="true">
+          <TechnicalWord text={part} />
+        </span>
       </Fragment>
     )
   )
@@ -76,7 +80,7 @@ export function ServiceAddress({
     <strong>
       <span className="visually-hidden spoken-form">{spokenAddress(host)}</span>
       <span aria-hidden="true" data-testid={testId}>
-        {host}
+        <TechnicalWord text={host} />
       </span>
     </strong>
   )
