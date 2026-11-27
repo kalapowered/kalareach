@@ -129,8 +129,11 @@ fn namespace_launcher() -> Launcher {
 }
 
 /// Why a filesystem was not attached: the call that failed, how it ended, and what the tool
-/// printed. The only paths it holds are inside the folders the case gave the attachment, and
-/// device names.
+/// printed. In the tool's text, an absolute path outside the folders the case gave the attachment
+/// and outside `/dev` is replaced by `<path>`, up to the next white space or quoting, bracketing or
+/// separating character. The rest of the text is kept as the tool wrote it, and the replacement
+/// does not cover a relative path, a path that starts with `~/`, the rest of a path after a space,
+/// or a `..` component in a path that starts inside those folders or under `/dev`.
 #[derive(Debug)]
 pub struct NotAttached(String);
 
@@ -341,9 +344,12 @@ fn call_failed(
     format!("{tool} ended with {}: {said}", output.status)
 }
 
-/// `text` with each absolute path in it that is neither inside one of `own` nor a device name
-/// replaced by `<path>`, so that what a tool says about the host's other folders, the person's
-/// home among them, does not reach a log.
+/// `text` with each absolute path in it that is neither inside one of `own` nor under `/dev`
+/// replaced by `<path>`. A path runs from its `/` to the next white space or quoting, bracketing or
+/// separating character, and a `/` that follows a letter, a digit or one of `_-.~` begins none.
+/// Everything else stays as the tool wrote it, so a log is not promised free of the host's other
+/// paths: a relative path, a path that starts with `~/`, the rest of a path after a space, and a
+/// `..` component in a path that starts inside `own` or under `/dev` all stay.
 fn without_foreign_paths(text: &str, own: &[PathBuf]) -> String {
     // A path ends at white space or at a character that quotes or separates it; a stop or a mark
     // after its last name belongs to the sentence.
@@ -1032,8 +1038,8 @@ mod tests {
         );
     }
 
-    /// What a tool printed keeps the paths inside the folders the case gave and the device names,
-    /// and not another path, whatever stands around it.
+    /// What a tool printed keeps the absolute paths inside the folders the case gave and under
+    /// `/dev`, and not another absolute path, whatever stands around it.
     #[test]
     fn a_path_outside_the_cases_folders_is_not_kept_in_what_a_tool_printed() {
         let own = [std::path::PathBuf::from("/case")];
