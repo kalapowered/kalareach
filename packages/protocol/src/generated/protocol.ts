@@ -8947,6 +8947,10 @@ export interface SessionSummary {
   attachment_count: string
   /**
    * The final record, once the session has closed.
+   *
+   * It is null in the summary of a close answer that carries the record in its own `closure`,
+   * since that answer holds the record once; a worker built before that answer sends it in both
+   * places. A read or a list of sessions carries it.
    */
   closure: ClosureRecord | null
   /**
@@ -16360,6 +16364,10 @@ export interface SessionSummary1 {
   attachment_count: string
   /**
    * The final record, once the session has closed.
+   *
+   * It is null in the summary of a close answer that carries the record in its own `closure`,
+   * since that answer holds the record once; a worker built before that answer sends it in both
+   * places. A read or a list of sessions carries it.
    */
   closure: ClosureRecord | null
   /**
@@ -29454,7 +29462,10 @@ export interface SessionCloseResult {
   durability: 'durable' | 'volatile'
   /**
    * The session as its worker described it in this answer: `closing` once the close is
-   * admitted, or `closed` with its record.
+   * admitted, or `closed`.
+   *
+   * When this answer's `closure` carries the record, the summary's own `closure` is null: the
+   * record travels once. A worker built before that sends it in both places.
    *
    * The daemon keeps it for a read that meets the worker on its way out. It is absent where
    * there is no worker's description to give: in the answer of a worker built before this
@@ -29496,6 +29507,10 @@ export interface SessionSummary2 {
   attachment_count: string
   /**
    * The final record, once the session has closed.
+   *
+   * It is null in the summary of a close answer that carries the record in its own `closure`,
+   * since that answer holds the record once; a worker built before that answer sends it in both
+   * places. A read or a list of sessions carries it.
    */
   closure: ClosureRecord | null
   /**
@@ -29666,6 +29681,10 @@ export interface SessionSummary3 {
   attachment_count: string
   /**
    * The final record, once the session has closed.
+   *
+   * It is null in the summary of a close answer that carries the record in its own `closure`,
+   * since that answer holds the record once; a worker built before that answer sends it in both
+   * places. A read or a list of sessions carries it.
    */
   closure: ClosureRecord | null
   /**
@@ -30294,6 +30313,10 @@ export interface SessionSummary4 {
   attachment_count: string
   /**
    * The final record, once the session has closed.
+   *
+   * It is null in the summary of a close answer that carries the record in its own `closure`,
+   * since that answer holds the record once; a worker built before that answer sends it in both
+   * places. A read or a list of sessions carries it.
    */
   closure: ClosureRecord | null
   /**

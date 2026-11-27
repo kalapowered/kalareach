@@ -37943,7 +37943,7 @@
               "type": "null"
             }
           ],
-          "description": "The session as its worker described it in this answer: `closing` once the close is\nadmitted, or `closed` with its record.\n\nThe daemon keeps it for a read that meets the worker on its way out. It is absent where\nthere is no worker's description to give: in the answer of a worker built before this\nmember, in a host's own answer from a recorded closure, and in an answer to a caller whose\nauthority does not reach the session's description. It is absent from the wire when it is\nabsent, so such an answer is byte for byte what a reader built before this member expects."
+          "description": "The session as its worker described it in this answer: `closing` once the close is\nadmitted, or `closed`.\n\nWhen this answer's `closure` carries the record, the summary's own `closure` is null: the\nrecord travels once. A worker built before that sends it in both places.\n\nThe daemon keeps it for a read that meets the worker on its way out. It is absent where\nthere is no worker's description to give: in the answer of a worker built before this\nmember, in a host's own answer from a recorded closure, and in an answer to a caller whose\nauthority does not reach the session's description. It is absent from the wire when it is\nabsent, so such an answer is byte for byte what a reader built before this member expects."
         },
         "session_id": {
           "$ref": "#/$defs/SessionId",
@@ -39033,7 +39033,7 @@
               "type": "null"
             }
           ],
-          "description": "The final record, once the session has closed."
+          "description": "The final record, once the session has closed.\n\nIt is null in the summary of a close answer that carries the record in its own `closure`,\nsince that answer holds the record once; a worker built before that answer sends it in both\nplaces. A read or a list of sessions carries it."
         },
         "created_at_ms": {
           "$ref": "#/$defs/TimestampMs",
