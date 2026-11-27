@@ -762,8 +762,9 @@ test.describe('motion', () => {
   // KR-REQ-13.06: with reduced motion a press keeps its feedback and loses its movement. Nine controls
   // of the four tinted classes (button, icon button, navigation item, session row) are each held down
   // by a real desktop pointer press, in the light and the dark theme, and so is a switch: the engine
-  // computes no transform and no transition for the control, and no transition or animation of a
-  // transform runs on it. The press shows as a tint of the label's own colour over the control's
+  // computes no transform for the control and no transition or animation of a transform runs on it,
+  // and the four classes and the switch's thumb compute no transition either; the switch's track
+  // keeps its colour transitions. The press shows as a tint of the label's own colour over the control's
   // surface: the pixel sampled inside the control moves toward the label's colour from the same pixel
   // with the pointer resting on the control, and, with the pointer slid off while the press is held
   // (what a touch press has, nothing hovering, though no touch input occurs here), from the pixel at
