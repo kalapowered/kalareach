@@ -20,8 +20,13 @@
 #     (${TMPDIR:-/tmp}, read through its links, with every character of its name kept), and the
 #     folder lies in a subfolder of that directory, with no symbolic link on the way down;
 #   * the temporary directory belongs to the caller or to root and is closed to writes by group and
-#     others (with no access list entry on macOS), or has the sticky bit, so that nobody else can
-#     rename or remove an entry that is not theirs;
+#     others (with no access list entry on macOS), or has the sticky bit and, on macOS, no access list
+#     entry that allows another account to write its security information (`writesecurity`: mode,
+#     owner and list), to change its owner (`chown`) or to delete from it (`delete_child`), and no
+#     line that cannot be read as an `allow` or a `deny` entry, so that nobody else can rename or
+#     remove an entry that is not theirs. A `deny` entry grants nothing and is accepted; an entry for
+#     `delete_child` is refused without a proof that it overrides the sticky bit, since refusing
+#     more is the safe side;
 #   * every folder from the first subfolder down to the state folder belongs to the caller, is
 #     closed to writes by group and others and, on macOS, has no access list entry, so that no other
 #     account can rename, replace or link away anything in the chain (on Linux the group bits of the
@@ -61,7 +66,8 @@
 # listing, or a name that ends in a line feed and was cut there), the refusal adds fixed words after
 # the rule's sentence. A refusal has no effect. The check makes the one folder and the one file it
 # names, and when it cannot finish it removes the marker and the folder that it made, and nothing
-# else; where it cannot remove one of them, the refusal says what is left.
+# else; where it cannot remove one of them, or cannot read the folder to tell whether it is gone, the
+# refusal says what is left or that the folder may be left, and never that nothing was kept.
 #
 # What the check does not stop. The started program inherits its working directory, and the product
 # turns that into a name and opens each file by that name, so the check holds only for as long as
@@ -71,9 +77,13 @@
 # is a change of the product and is not made here. The walk starts at the temporary directory: the
 # folders above it belong to the operating system and are not walked (a walk from the top of the
 # file system would refuse every run in a container, where the system's folders show as another
-# account's, and no supported host lets another account write them). Another account is stopped
-# only where it cannot write a folder of the chain, by its mode, its owner and, on macOS, its access
-# list; on Linux the group bits of the mode mask a list.
+# account's, and no supported host lets another account write them), so a temporary directory below
+# a folder that others can write is accepted: that protection is an assumption about the host, not
+# something this check establishes. Another account is stopped only where it cannot write a folder
+# of the chain, by its mode, its owner and, on macOS, its access list; on Linux the group bits of the
+# mode mask a list, and a list cannot give another account the right to change a folder's mode or
+# owner. The access list rule for a sticky temporary directory rests on the system manual's text for
+# each right: a real macOS folder with an access list entry is not exercised by the cases.
 
 # e2e_state_folder_list <entry>: reads <entry> (a name in the working directory, `.`, or a path) with
 # ONE listing that does not follow a link, and leaves what it shows in e2e_state_folder_ino (the

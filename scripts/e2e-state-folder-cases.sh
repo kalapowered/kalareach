@@ -1111,6 +1111,15 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
   fi
 done
 
+echo "== the folders above the temporary directory are not walked"
+# The walk starts at the temporary directory. One that lies below a folder that every account can write
+# (mode 777, not sticky, so that another account could rename the temporary directory itself) is
+# accepted: the folders above it are an assumption about the host, which the library's header says.
+mk "$scratch/above/T/mid/state"
+chmod 777 "$scratch/above"
+stand_check "$scratch/above/T" "$scratch/above/T/mid/state"
+said "a temporary directory below a folder that every account can write" accepted
+
 echo "== the library's header and the workflow's comment say what the check does not stop"
 cases=$((cases + 1))
 if ! grep -Fq "OWN account that moves a folder" "$root/scripts/lib/e2e-state-folder.sh"; then
