@@ -63,6 +63,15 @@ cp "$READER_STANDIN" "$out" && chmod +x "$out"
 STANDIN
 chmod +x "$root/bin/swiftc"
 
+# Node, which the script starts after the known pictures to draw its own: records the environment it was
+# started in, and stops.
+cat >"$root/bin/node" <<'STANDIN'
+#!/bin/bash
+printf 'CFFIXED_USER_HOME=%s\n' "${CFFIXED_USER_HOME-unset}" >>"$FAKE_DIR/node.log"
+exit 1
+STANDIN
+chmod +x "$root/bin/node"
+
 # `rm`: records each call, and removes only inside the folder this run made.
 cat >"$root/bin/rm" <<'STANDIN'
 #!/bin/bash
@@ -168,6 +177,36 @@ expect "a deleted pair: the reader reads nothing" no_reads fixture-pair-deleted
 expect "a deleted pair: the log names the picture" says "$(check_log fixture-pair-deleted)" "one-line.png is missing"
 expect "a deleted pair: the run fails with exit 2" rc_is fixture-pair-deleted 2
 
+# An empty picture shows nothing to read, and is not the picture of no-text either.
+make_tree fixture-picture-empty
+: >"$root/fixture-picture-empty/tree/apps/companion/test/voice/reader-fixtures/one-line.png"
+run_script fixture-picture-empty
+expect "an empty picture: the reader reads nothing" no_reads fixture-picture-empty
+expect "an empty picture: the log names the picture" says "$(check_log fixture-picture-empty)" "one-line.png is missing, empty or cannot be read"
+
+# A text file the reader of the check cannot open is a missing text, not an empty one. A user that can
+# read any file cannot show this, and the case is then left out.
+make_tree fixture-text-unreadable
+chmod 000 "$root/fixture-text-unreadable/tree/apps/companion/test/voice/reader-fixtures/line-tokens.txt"
+if [ -r "$root/fixture-text-unreadable/tree/apps/companion/test/voice/reader-fixtures/line-tokens.txt" ]; then
+    printf 'skip a text file that cannot be read: this user can read any file\n'
+else
+    run_script fixture-text-unreadable
+    expect "an unreadable text file: the reader reads nothing" no_reads fixture-text-unreadable
+    expect "an unreadable text file: the log names the file" says "$(check_log fixture-text-unreadable)" "line-tokens.txt is missing or cannot be read"
+fi
+
+# The same for a picture.
+make_tree fixture-picture-unreadable
+chmod 000 "$root/fixture-picture-unreadable/tree/apps/companion/test/voice/reader-fixtures/line-tokens.png"
+if [ -r "$root/fixture-picture-unreadable/tree/apps/companion/test/voice/reader-fixtures/line-tokens.png" ]; then
+    printf 'skip a picture that cannot be read: this user can read any file\n'
+else
+    run_script fixture-picture-unreadable
+    expect "an unreadable picture: the reader reads nothing" no_reads fixture-picture-unreadable
+    expect "an unreadable picture: the log names the picture" says "$(check_log fixture-picture-unreadable)" "line-tokens.png is missing, empty or cannot be read"
+fi
+
 # A picture without its text file would be held to no words at all.
 make_tree fixture-text-missing line-tokens.txt
 run_script fixture-text-missing
@@ -254,6 +293,7 @@ expect "launch: each read starts with CFFIXED_USER_HOME set to its folder" awk '
     { home = $2; sub("home=", "", home); started = $3; sub("cffixed=", "", started); if (home != started) bad = 1 }
     END { exit bad }' "$reads_file"
 expect "launch: the compiler starts without CFFIXED_USER_HOME" test "$(sort -u "$(fake launch-environment swiftc.log)")" = "CFFIXED_USER_HOME=unset"
+expect "launch: node, started after the reader's folder was made, starts without it" test "$(sort -u "$(fake launch-environment node.log)")" = "CFFIXED_USER_HOME=unset"
 
 # The TypeScript reads screenshots with the program it is given, started the way readImage starts it:
 # the reader it is given is the wrapper, which gives the home to the reader, and fails without a folder.
