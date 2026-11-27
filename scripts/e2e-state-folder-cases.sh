@@ -884,6 +884,9 @@ done
 mk "$sticky_acl/inherited/mid/state" "$sticky_acl/unreadable/mid/state" "$sticky_acl/deny/mid/state"
 acl_entry=. acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 inherited allow add_file,writesecurity' stand_check "$sticky_acl" "$sticky_acl/inherited/mid/state"
 said "a sticky temporary directory whose inherited access list entry allows writesecurity (the macOS listing)" "$(acl_sentence "$sticky_acl/inherited/mid/state" "$sticky_acl")"
+mk "$sticky_acl/inherited-ok/mid/state"
+acl_entry=. acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 inherited allow list,add_file' stand_check "$sticky_acl" "$sticky_acl/inherited-ok/mid/state"
+said "a sticky temporary directory whose inherited access list entry allows only list and add_file (the macOS listing)" accepted
 acl_entry=. acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 add_file' stand_check "$sticky_acl" "$sticky_acl/unreadable/mid/state"
 said "a sticky temporary directory with an access list line that is neither an allow nor a deny entry (the macOS listing)" "$(acl_sentence "$sticky_acl/unreadable/mid/state" "$sticky_acl")"
 acl_entry=. acl_line=$' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 deny writesecurity,chown,delete_child\n 1: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow list,add_file' stand_check "$sticky_acl" "$sticky_acl/deny/mid/state"
