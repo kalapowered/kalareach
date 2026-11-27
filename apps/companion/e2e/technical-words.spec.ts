@@ -252,6 +252,12 @@ interface Kind {
   /** Opens the page showing `word` at `selector`. */
   open(page: Page, word: string): Promise<void>
   readonly selector: string
+  /**
+   * The word as the case opens it: with a space at each end where the page keeps one (inside the quotes
+   * of an option), so that a copy that drops or adds a space shows. A host name comes from an address,
+   * which holds no space, so it is the word as it is.
+   */
+  sample(word: string): string
   /** The text of the element at `selector` when the word is drawn in it. */
   shown(word: string): string
   /** A word of this kind whose parts each fit a line, and the parts a line may end between. */
@@ -336,6 +342,7 @@ const KINDS: readonly Kind[] = [
     name: 'an application identifier',
     open: (page, word) => openSetup(page, { application_id: word }),
     selector: '[data-testid="setup-identity"] h2',
+    sample: (word) => ` ${word} `,
     shown: (word) => word,
     parts: IDENTIFIER,
     wide: ['com.', 'kalareach.', `${LONG_PART}${LONG_PART}`],
@@ -346,6 +353,7 @@ const KINDS: readonly Kind[] = [
     name: 'a path',
     open: (page, word) => openSetup(page, { executable: word }),
     selector: '[data-testid="setup-identity"] dd.mono',
+    sample: (word) => ` ${word} `,
     shown: (word) => word,
     parts: PATH,
     wide: ['/Users/', 'sam/', `${LONG_PART}${LONG_PART}/`, 'bin'],
@@ -357,6 +365,7 @@ const KINDS: readonly Kind[] = [
     // The row quotes each word, so the quotes of the word as drawn are not part of the argument.
     open: (page, word) => openLaunchCommands(page, 'Start', ['node', word.slice(1, -1)]),
     selector: '[data-testid="launch-commands-list"] p.mono',
+    sample: (word) => `" ${word.slice(1, -1)} "`,
     shown: (word) => `"node" ${word}`,
     parts: OPTION,
     wide: [`"--${LONG_PART}${LONG_PART}"`],
@@ -367,6 +376,7 @@ const KINDS: readonly Kind[] = [
     name: 'a host name',
     open: (page, word) => openSyncService(page, word),
     selector: '[data-testid="sync-service-changed"]',
+    sample: (word) => word,
     shown: (word) => word,
     parts: HOST,
     wide: ['sync.', `${LONG_PART}${LONG_PART}`, '.com'],
@@ -429,45 +439,103 @@ for (const kind of KINDS) {
   }
 }
 
+/** What a selection over an element's text holds: the range's own text, the selection's, and the clipboard's after a copy. */
+interface Taken {
+  readonly range: string
+  readonly selection: string
+  readonly breakPlaces: number
+  readonly clipboard?: string
+}
+
+/**
+ * Selects the whole text of the first element `selector` matches, or from its second character to the one
+ * before its last, and reads what the range and the selection hold. With `control`, the same is read from a
+ * copy of the element in which each technical word is plain text, placed after it.
+ */
+function selectText(page: Page, selector: string, control: boolean, inside: boolean): Promise<Taken> {
+  return page.evaluate(
+    ({ where, asControl, within }) => {
+      let root = document.querySelector<HTMLElement>(where)
+      if (root === null) throw new Error(`nothing matches ${where}`)
+      if (asControl) {
+        let plain = document.querySelector<HTMLElement>('[data-control]')
+        if (plain === null) {
+          plain = root.cloneNode(true) as HTMLElement
+          for (const word of Array.from(plain.querySelectorAll('.technical-word')))
+            word.replaceWith(document.createTextNode(word.textContent ?? ''))
+          plain.setAttribute('data-control', '')
+          root.after(plain)
+        }
+        root = plain
+      }
+      const texts: Text[] = []
+      const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      for (let current = walk.nextNode(); current !== null; current = walk.nextNode()) texts.push(current as Text)
+      const length = texts.reduce((total, text) => total + text.length, 0)
+      /** The text and the offset in it of the boundary before the character at `index` of the element's text. */
+      const place = (index: number): [Text, number] => {
+        let left = index
+        for (const text of texts) {
+          if (left <= text.length) return [text, left]
+          left -= text.length
+        }
+        throw new Error(`no text holds the character at ${index}`)
+      }
+      const range = document.createRange()
+      if (within) {
+        const [start, from] = place(1)
+        const [end, to] = place(length - 1)
+        range.setStart(start, from)
+        range.setEnd(end, to)
+      } else {
+        range.selectNodeContents(root)
+      }
+      const selection = window.getSelection()
+      if (selection === null) throw new Error('the page has no selection')
+      selection.removeAllRanges()
+      selection.addRange(range)
+      return { range: range.toString(), selection: selection.toString(), breakPlaces: root.querySelectorAll('wbr').length }
+    },
+    { where: selector, asControl: control, within: inside }
+  )
+}
+
 for (const kind of KINDS) {
   test.describe(`${kind.name}, copied and measured`, () => {
-    test('is copied as it is written, whole and from the middle of one part to the middle of another', async ({
-      page
+    test('is copied as it is written, spaces at both ends included, whole and from the middle of one part to the middle of another', async ({
+      page,
+      context,
+      browserName
     }) => {
-      const word = kind.parts.join('')
-      await kind.open(page, word)
-      const seen = await page.evaluate((where) => {
-        const root = document.querySelector(where)
-        if (root === null) throw new Error(`nothing matches ${where}`)
-        const selection = window.getSelection()
-        if (selection === null) throw new Error('the page has no selection')
-        const whole = document.createRange()
-        whole.selectNodeContents(root)
-        selection.removeAllRanges()
-        selection.addRange(whole)
-        const copiedWhole = selection.toString()
-        // From the second character of the first text to the one before the last of the last text.
-        const texts: Text[] = []
-        const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-        for (let current = walk.nextNode(); current !== null; current = walk.nextNode()) texts.push(current as Text)
-        const first = texts[0]
-        const last = texts[texts.length - 1]
-        if (first === undefined || last === undefined) throw new Error('the word has no text')
-        const inside = document.createRange()
-        inside.setStart(first, 1)
-        inside.setEnd(last, last.length - 1)
-        selection.removeAllRanges()
-        selection.addRange(inside)
-        return {
-          copiedWhole,
-          copiedInside: selection.toString(),
-          breakPlaces: root.querySelectorAll('wbr').length
-        }
-      }, kind.selector)
-      const shown = kind.shown(word)
-      expect(seen.breakPlaces, 'the word is drawn with places to end a line').toBeGreaterThan(0)
-      expect(seen.copiedWhole.trim()).toBe(shown)
-      expect(seen.copiedInside).toBe(shown.slice(1, -1))
+      // Chromium lets a case read the clipboard; WebKit under the driver grants no read of it, so there the
+      // text of the range and of the selection, which is what the engine copies, are what is compared.
+      const clipboard = browserName === 'chromium'
+      if (clipboard) await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+      const sample = kind.sample(kind.parts.join(''))
+      await kind.open(page, sample)
+      const shown = kind.shown(sample)
+      const taken = async (control: boolean, inside: boolean): Promise<Taken> => {
+        const selected = await selectText(page, kind.selector, control, inside)
+        if (!clipboard) return selected
+        await page.keyboard.press('ControlOrMeta+c')
+        return { ...selected, clipboard: await page.evaluate(() => navigator.clipboard.readText()) }
+      }
+      const whole = await taken(false, false)
+      const wholeControl = await taken(true, false)
+      const inside = await taken(false, true)
+      const insideControl = await taken(true, true)
+      expect(whole.breakPlaces, 'the word is drawn with places to end a line').toBeGreaterThan(0)
+      // The characters of the range are the source's, none added, none dropped, the spaces at the ends kept.
+      expect(whole.range).toBe(shown)
+      expect(inside.range).toBe(shown.slice(1, -1))
+      // What the engine copies from the drawn word is what it copies from the same text drawn as plain text.
+      expect(whole.selection).toBe(wholeControl.selection)
+      expect(inside.selection).toBe(insideControl.selection)
+      if (clipboard) {
+        expect(whole.clipboard?.replace(/\s/gu, ''), 'something was copied').toBe(shown.replace(/\s/gu, ''))
+        expect(whole.clipboard).toBe(wholeControl.clipboard)
+        expect(inside.clipboard).toBe(insideControl.clipboard)
+      }
     })
 
     for (const [size, ratio] of SIZES) {
