@@ -939,9 +939,7 @@ impl Registry {
             read_stall: crate::attention::Pause::default(),
         };
         // The version is read, and a version this build does not open is refused, before the first
-        // statement of ours that can write, which is the setting of the journal mode below. The
-        // connection's first read, before this, is the open's `PRAGMA user_version`: it writes
-        // nothing of ours.
+        // statement of ours that can write, which is the setting of the journal mode below.
         let recorded = registry.recorded_version()?;
         if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
             return Err(refused_version(version));

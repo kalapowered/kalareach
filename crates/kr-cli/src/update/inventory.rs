@@ -253,9 +253,10 @@ pub async fn described(environment: &EnvironmentPaths) -> Vec<Stated> {
 /// at the schema this release reads, or the next one it reads through, is not migrated, and one
 /// this cannot bring forward, because it records a schema past that or one below the oldest it
 /// brings forward, no schema or several, or is not a file, is left for [`classify`]'s reader to
-/// refuse in its own words. A registry that lost a table its records are read from is refused
-/// here, by the table's name. One at version 17 or 20, which no release wrote, is refused here by
-/// its version, after the lost-table check.
+/// refuse in its own words. Neither a registry whose immutable open or version read fails nor an
+/// absent one is carried; [`classify`] accepts an absent one with an empty result. A registry that
+/// lost a table its records are read from is refused here, by the table's name. One at version 17
+/// or 20, which no release wrote, is refused here by its version, after the lost-table check.
 ///
 /// # Errors
 ///

@@ -962,11 +962,6 @@ impl GrantDirectory {
     /// Gives this daemon's start to every grant that has no start point, and to every grant whose
     /// point is in a boot the host can no longer tell from another.
     ///
-    /// A grant has none when an earlier release wrote it, when a repair put the registry back, when
-    /// it was written while the boot was one the host could not tell apart, or when the counter read
-    /// zero at its decision: the text made for it before the first start that gives it a point is
-    /// never served.
-    ///
     /// `settled_ms` is the host's settled reading of UTC, taken **before** this call and outside
     /// any transaction: it takes the policy lock and may write through this store, and a
     /// transaction of this store cannot take either again. The counter is read here, after the
