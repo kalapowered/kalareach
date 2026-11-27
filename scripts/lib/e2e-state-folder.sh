@@ -611,11 +611,13 @@ e2e_state_folder_open() {
 
 # e2e_state_folder_listed <folder> [<left>]: says which folder of the chain has an access list entry
 # that the rule does not accept, and what to do about it, and ends the script. Only the macOS branch
-# reads an access list (see `list`), so the command that the sentence names is macOS's.
+# reads an access list (see `list`), so the command that the sentence names is macOS's. The sentence
+# names KR_E2E_STATE only where a wrapper set it (as `refuse` does).
 e2e_state_folder_listed() {
-  local left
+  local left below=''
   left="$(e2e_state_folder_left_words "${2:-0}")"
-  printf 'e2e: refusing %s: its folder %s has an access list entry that the rule does not accept. The rule refuses any entry that allows something, whoever it names, this account included; any line that is neither an allow nor a deny entry; and a deny entry, unless the folder is a temporary directory with the sticky bit. The owner of the folder can remove the list, for example with chmod -N. If this account does not own the temporary directory, set TMPDIR to a private folder of your own and put KR_E2E_STATE below it%s\n' "$e2e_state_folder_subject" "$1" "${left:+; $left}" >&2
+  [ "$e2e_state_folder_wrapped" != 1 ] || below=' and put KR_E2E_STATE below it'
+  printf 'e2e: refusing %s: its folder %s has an access list entry that the rule does not accept. The rule refuses any entry that allows something, whoever it names, this account included; any line that is neither an allow nor a deny entry; and a deny entry, unless the folder is a temporary directory with the sticky bit. The owner of the folder can remove the list, for example with chmod -N. If this account does not own the temporary directory, set TMPDIR to a private folder of your own%s%s\n' "$e2e_state_folder_subject" "$1" "$below" "${left:+; $left}" >&2
   exit 1
 }
 

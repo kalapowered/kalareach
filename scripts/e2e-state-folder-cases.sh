@@ -728,7 +728,15 @@ said() {
 }
 # The sentence for a folder of the chain that has an access list entry, for the path $1 and the folder $2.
 acl_sentence() {
-  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has an access list entry that the rule does not accept. The rule refuses any entry that allows something, whoever it names, this account included; any line that is neither an allow nor a deny entry; and a deny entry, unless the folder is a temporary directory with the sticky bit. The owner of the folder can remove the list, for example with chmod -N. If this account does not own the temporary directory, set TMPDIR to a private folder of your own and put KR_E2E_STATE below it' "$1" "$2"
+  acl_sentence_of "KR_E2E_STATE $1" "$2" ' and put KR_E2E_STATE below it'
+}
+# The same for a run that no wrapper gave a state folder: the subject $1 (the temporary directory and its path)
+# and the folder $2, and no word of KR_E2E_STATE.
+acl_sentence_plain() {
+  acl_sentence_of "$1" "$2" ''
+}
+acl_sentence_of() {
+  printf 'e2e: refusing %s: its folder %s has an access list entry that the rule does not accept. The rule refuses any entry that allows something, whoever it names, this account included; any line that is neither an allow nor a deny entry; and a deny entry, unless the folder is a temporary directory with the sticky bit. The owner of the folder can remove the list, for example with chmod -N. If this account does not own the temporary directory, set TMPDIR to a private folder of your own%s' "$1" "$2" "$3"
 }
 
 # Another closed folder of the caller's is put at the state folder's name after the listing and before
@@ -872,6 +880,10 @@ acl_entry=. stand_check "$t" "$t/acl-root/mid/state"
 said "a closed temporary directory with an access list entry (the macOS listing)" "$(acl_sentence "$t/acl-root/mid/state" "$t")"
 acl_entry=none stand_check "$t" "$t/acl-none/mid/state"
 said "a closed chain with no access list entry (the macOS listing)" accepted
+# A run that no wrapper gave a state folder (an empty KR_E2E_STATE) is refused for the temporary directory's
+# own entry, and the sentence does not name KR_E2E_STATE, which no wrapper set.
+acl_entry=. stand_check "$t" ""
+said "a closed temporary directory with an access list entry, in a run with no wrapper (the macOS listing)" "$(acl_sentence_plain "the temporary directory $t" "$t")"
 # A sticky temporary directory is read for its access list before it is accepted: an entry that allows
 # any right refuses it, whichever right it names, an inherited entry too, and so does a line that is
 # neither an allow nor a deny entry. An entry that only denies passes, and a deny entry does not hide an
