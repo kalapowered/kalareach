@@ -3220,8 +3220,9 @@ function distanceTo(x: number, y: number, rect: Rectangle): number {
  * of the label's text (the distance is Euclidean and the samples lie on a grid of 3 points). The test is a distance, not the press's
  * target: a line's target is a rectangle, so a point can lie farther than half the least size from a line and still be in a corner of
  * that line's target, and the case does not check the samples against the targets. The label's own inline box
- * spans the stand-in box's whole width on the last row (the box sits on one line of the label, at its baseline) and takes hits there,
- * and the engines send a tap near a link's element to it: the points keep the least size and a margin of 8 points from it.
+ * spans the stand-in box's whole width on the last row (the box sits on one line of the label, at its baseline) and takes hits there.
+ * A tap about 10 points above it, at (30, 366), gave a click on the link at (30, 376): seen once, in Chromium on iOS. The points keep
+ * the least size and a margin of 8 points from it.
  */
 async function blankPoints(page: Page, href: string, size: number, most: number): Promise<{ x: number; y: number }[]> {
   const lines = await textLinesOf(page, href)

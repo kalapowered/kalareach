@@ -357,7 +357,10 @@ function pressedLink(pane: HTMLElement, event: PointerEvent): { id: HTMLElement;
  *   rectangles held to every box that clips them, not the raw rectangles; the element's padded box takes
  *   no hit). The point is the press's first
  *   one for a touch or a pen, whose click comes from where it went down, and the pointer's current one
- *   for a mouse or a trackpad, whose click comes from where the button is released;
+ *   for a mouse or a trackpad, whose click comes from where the button is released. A box inside the label
+ *   can take a click outside the words (`pointer-events` is inherited from the label): `liesInView` is
+ *   false there, so this returns false for a mouse or a trackpad, and for a touch or a pen the hit test
+ *   below decides;
  * - the nearest-words rule at the press's first point, for a pointer that `opensByRule` (a touch or a
  *   pen) only: a mouse's click on plain text opens nothing. The page's hit test at that point says what
  *   the click names. Where it names that link's own element and the link still opens what it opened at
@@ -392,7 +395,9 @@ function releaseOpens(pane: HTMLElement, press: Recorded): boolean {
 /**
  * Whether `point` lies in the part of the words of `link` that every box clipping it leaves in view. The
  * words are what takes a tap: the button's own box is padded to the least size and takes none (see
- * `.m-node .md-link` in the stylesheet), so the point in that room is on plain text.
+ * `.m-node .md-link` in the stylesheet), so the point in that room is on plain text. A box inside the
+ * label can take a tap outside the words as well (`pointer-events` is inherited from the label): a point
+ * there that is in none of the words is false here.
  */
 function liesInView(pane: HTMLElement, link: HTMLElement, point: { x: number; y: number }): boolean {
   const view = viewOf(link, ancestorsOf(pane), screenOf())
