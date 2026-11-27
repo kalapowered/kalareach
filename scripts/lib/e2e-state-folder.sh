@@ -350,10 +350,14 @@ e2e_state_folder_check() {
 }
 
 # e2e_state_folder_enter [<own folder>]: changes into the state folder and looks again at what it is
-# in: the physical name, the owner and mode, the inode that the check saw, and the marker. It returns
-# 1 where any of them differs. The caller runs it in a subshell and does its work in the working
-# directory. Where no wrapper named a folder (the check left E2E_STATE_FOLDER empty), it changes into
-# the folder given as the argument, which is inside the run's own root.
+# in: the physical name that the system gives (`/bin/pwd -P`), the ORIGINAL inode (the one the walk
+# listed from inside the parent, before it entered the folder, which is what E2E_STATE_FOLDER_ID
+# holds), and the marker. It returns 1 where any of them differs. It reaches the folder by its name
+# and tests nothing of the parent: the inode and the name are what make the folder the one that was
+# checked, and only the account that owns a folder can change its mode or its owner, so the folder
+# gets no second owner and mode test. The caller runs it in a subshell and does its work in the
+# working directory. Where no wrapper named a folder (the check left E2E_STATE_FOLDER empty), it
+# changes into the folder given as the argument, which is inside the run's own root.
 e2e_state_folder_enter() {
   local line inode _
   if [ -z "${E2E_STATE_FOLDER:-}" ]; then
@@ -363,7 +367,6 @@ e2e_state_folder_enter() {
   fi
   CDPATH='' cd -P -- "$E2E_STATE_FOLDER" 2> /dev/null || return 1
   e2e_state_folder_here && [ "$e2e_state_folder_name" = "$E2E_STATE_FOLDER" ] || return 1
-  e2e_state_folder_look own . || return 1
   line="$(ls -di -- . 2> /dev/null)" || return 1
   read -r inode _ <<< "$line"
   [ "$inode" = "${E2E_STATE_FOLDER_ID:-}" ] || return 1

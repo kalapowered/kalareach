@@ -452,7 +452,7 @@ echo "== the folder is entered again from inside, and looked at there"
 # could write the parent (the folder moved away and a link, or another folder, put in its place), then
 # the entry, which must be refused, and must change nothing in what the link points at.
 mk "$t/enter"
-for variant in same link folder other-marker; do
+for variant in same opened link folder other-marker name; do
   cases=$((cases + 1))
   dir="$t/enter/$variant"
   mk "$dir" "$o/enter-target-$variant"
@@ -475,15 +475,31 @@ for variant in same link folder other-marker; do
         mkdir -m 700 "$dir/state"
         printf '%s\n' "$owner" > "$dir/state/.kr-e2e-owner"
         ;;
+      opened)
+        # Only the account that owns a folder can change its mode, so the entry does not test the mode
+        # again: the walk's one test of it, from the parent, is the only one.
+        chmod 775 "$dir/state"
+        ;;
       other-marker)
         printf '%s\n' "someone-else-1" > "$dir/state/.kr-e2e-owner"
+        ;;
+      name)
+        # The same folder, moved aside, with its old name a link to it, and the shell's record of
+        # its directory set to the old name: its inode and its marker are the checked ones, so only
+        # the system's physical name refuses it.
+        mv -- "$dir/state" "$dir/aside"
+        ln -s "$dir/aside" "$dir/state"
+        cd() {
+          builtin cd "$@" || return
+          PWD="$E2E_STATE_FOLDER"
+        }
         ;;
     esac
     e2e_state_folder_enter > /dev/null 2>&1
     echo "$?"
   )"
   case "$variant" in
-    same) wanted=0 ;;
+    same | opened) wanted=0 ;;
     *) wanted=1 ;;
   esac
   if [ "$rc" != "$wanted" ]; then
