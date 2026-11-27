@@ -671,6 +671,18 @@ impl ClosureRecord {
     ///
     /// `ownership_coverage` and every other member are unchanged: they are the worker's account of
     /// the whole lists, which this does not shorten in what it says.
+    ///
+    /// It takes whole lists, whose `surviving` does not already end in an entry that counts what is
+    /// not listed. Such an entry would be treated as an ordinary survivor and its counts would not
+    /// be added to the new entry's. A caller passes the lists it has just built.
+    ///
+    /// The bounds hold for [`CLOSURE_BUDGET_BYTES`], the budget the worker and the host use. At
+    /// that budget the record encodes within the codec's default limits, and as a paired device is
+    /// shown it, it is no more than 512 bytes (the entry) and 1,536 bytes (the members other than
+    /// the lists) over the budget. They do not hold for every budget. The first survivor is listed
+    /// whatever it costs, up to about 2,100 bytes, so a budget below that can be passed by that
+    /// entry alone. At a budget much larger than the production one, two lists at the member limit
+    /// can hold more items than the codec allows in one record.
     #[must_use]
     pub fn bounded(mut self, budget: usize) -> Self {
         if let Some(signal) = self.root_signal.0.as_mut() {
@@ -776,6 +788,9 @@ impl ClosureRecord {
 
     /// The bytes by which this record's entries grow in the form a paired device is given, headers
     /// included: for each entry, the encoding it has there less its own, where that is more.
+    ///
+    /// It is an allowance that errs high. It counts every entry in that form, and the door leaves
+    /// a detail that does not name the host as it is, so the record shown can grow by less.
     #[must_use]
     pub fn device_extra(&self) -> usize {
         self.surviving
