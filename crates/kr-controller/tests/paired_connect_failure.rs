@@ -319,10 +319,18 @@ async fn a_paired_dial_keeps_its_endpoint_only_once_it_connects() {
             "attempt {attempt}: the host connected a device it never paired"
         );
     }
+    // A refusal through `RawDevice::admitted` is made through the dial's report and not through
+    // `try_dial`, and it keeps no endpoint either.
+    assert!(
+        RawDevice::admitted(&host, &unpaired, &record)
+            .await
+            .is_err(),
+        "the host admitted a device it never paired, through the dial's report"
+    );
     assert_eq!(
         unpaired.dialers_kept(),
         0,
-        "three dials that the host refused left their endpoints with the device"
+        "dials that the host refused left their endpoints with the device"
     );
 
     let shut = paired_dial(&host, &device, &record);
