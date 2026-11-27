@@ -6,21 +6,31 @@
  * at. The engine breaks such a word wherever the line ends, in the middle of a part. The parts
  * below are the places it may end a line instead.
  *
- * A line may end at an internal dot that a letter or an underscore follows. Where the part after the
- * dot is short, four characters or fewer, the line ends before the dot, so that a familiar ending
- * stays whole (`KalaReach` and `.app`, `archive` and `.tar` and `.gz`). Where it is longer, the line
- * ends after the dot: a dot in front would only make the part wider, and a part wider than its line is
- * cut sooner (`com.` and `kalareach.` and `companion`). The dot follows the same rule after underscores,
- * whether they open the word or close a part (`_` and `.py`). A line may also end before an internal at
- * sign (`git` and `@host`, `"sam"` and `@example`) and before a run of hyphens, so that an option keeps
- * its hyphens: `--cache-dir` ends a line at `--cache` and never between `--` and `cache`. It may end
- * after a run of underscores, and after a run of slashes, backslashes, colons and equals signs: a run of
- * such separators is one place, after its last character. These never end a line: a separator that opens
- * a word (the slash of a path, the dot of `.local`, the underscores of `__init__`, the at sign of
- * `@types`), a dot that a digit follows (an address, a version or a file's number is not cut, and no
- * line starts with `.1`), a dot or an at sign that closes a word (the stop of a sentence, the root dot of
- * a host name), and a run of hyphens that opens a word or follows a quote. A word with a space in it
- * keeps its spaces as the places the engine breaks at already.
+ * A line may end at an internal dot: one that follows a letter, a digit or an underscore (any
+ * underscore, whether the run opens the word or closes a part: `_.py`, `main_.py`) and that a letter or
+ * an underscore follows. Where the part after the dot is short, four characters or fewer, the line ends
+ * before the dot, so that a familiar ending stays whole (`KalaReach` and `.app`, `archive` and `.tar`
+ * and `.gz`, `_` and `.py`). Where it is longer, the line ends after the dot: a dot in front would only
+ * make the part wider, and a part wider than its line is cut sooner (`com.` and `kalareach.` and
+ * `companion`).
+ *
+ * A line may end before an at sign that stands inside its word and that a letter or a digit follows
+ * (`git` and `@host`): after text or an underscore, after a quote that closes (`"sam"` and `@example`,
+ * `"a("` and `@example`), after a closing bracket or another sign (`(sam)` and `@example`, `sam!` and
+ * `@example`). Whether a quote closes or opens is read from the quotes of the word, followed from its
+ * start, and not from the character before it. A line may also end before a run of hyphens, so that an
+ * option keeps its hyphens: `--cache-dir` ends a line at `--cache` and never between `--` and `cache`.
+ * It may end after a run of underscores, and after a run of slashes, backslashes, colons and equals
+ * signs: a run of such separators is one place, after its last character.
+ *
+ * These never end a line: a separator that opens a word (the slash of a path, the dot of `.local`, the
+ * underscores of `__init__`, the at sign of `@types`, of `(@x)`, of `"@x"` and of `--file="@name"`, where
+ * the quote opens); a dot that a sign precedes, unless a run of slashes, backslashes, colons or equals
+ * signs does (`report!.txt`), or that a digit follows (an address, a version or a file's number is not
+ * cut, and no line starts with `.1`); a dot or
+ * an at sign that closes a word (the stop of a sentence, the root dot of a host name, `sam@`); an at sign
+ * after another at sign, a dot or a hyphen; and a run of hyphens that opens a word or follows a quote. A
+ * word with a space in it keeps its spaces as the places the engine breaks at already.
  */
 
 /** The longest part after a dot that keeps the dot in front of it. */
@@ -136,15 +146,40 @@ function dotLeavesLine(characters: readonly string[], dot: number): boolean {
 }
 
 /**
+ * Whether the quote at `index` opens a quoted text, as against closing one. The quotes of the word are
+ * followed from its start: a quote closes the quote of its own kind that is open; any other quote opens
+ * one, unless a letter or a digit stands before it (the apostrophe of `it's`, the stray quote of `sam"`),
+ * which makes it close what it follows. What stands before the quote says nothing by itself: the bracket
+ * of `"a("` is text inside a quote, the equals sign of `--file="` stands before a quote that opens.
+ */
+function quoteOpens(characters: readonly string[], index: number): boolean {
+  const open: string[] = []
+  let opens = false
+  for (let at = 0; at <= index; at += 1) {
+    const character = characters[at]
+    if (!QUOTES.has(character)) continue
+    if (open[open.length - 1] === character) {
+      open.pop()
+      opens = false
+    } else {
+      opens = !isWordCharacter(characters[at - 1])
+      if (opens) open.push(character)
+    }
+  }
+  return opens
+}
+
+/**
  * Whether the at sign at `at`, which no run of slashes or the like precedes, stands inside its word:
- * what stands before it is text, a quote that closes the text it follows (`"sam"@example.com`) or
- * a closing bracket, not the start of the word, an opening quote or bracket, another at sign, or a dot or
- * a hyphen (a run of those belongs to what follows).
+ * what stands before it is text, a quote that closes (`"sam"@example.com`, `"a("@example.com`) or a
+ * closing bracket or other sign (`(sam)@example.com`, `sam!@example.com`), and not the start of the
+ * word, a quote that opens (`"@x"`, `--file="@name"`), an opening bracket, another at sign, or a dot or a
+ * hyphen (a run of those belongs to what follows).
  */
 function atSignInside(characters: readonly string[], at: number): boolean {
   const before = characters[at - 1]
   if (endsStem(before)) return true
-  if (QUOTES.has(before)) return !opensWord(characters[at - 2])
+  if (QUOTES.has(before)) return !quoteOpens(characters, at - 1)
   return !(opensWord(before) || before === '@' || before === '.' || before === '-')
 }
 

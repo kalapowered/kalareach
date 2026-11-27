@@ -50,8 +50,9 @@ const ROWS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['_.config', ['_.', 'config']],
   ['main_.py', ['main_', '.py']],
   ['main_.config', ['main_.', 'config']],
-  // An internal at sign ends a line before it, whatever non-space character stands before it; one that
-  // opens its word or closes it does not.
+  // An internal at sign ends a line before it when text, a closing quote or bracket, or another sign
+  // stands before it; one that opens its word (after an opening quote or bracket, another at sign, a dot
+  // or a hyphen) or closes it does not.
   ['"sam"@example.com', ['"sam"', '@example', '.com']],
   ['(sam)@example.com', ['(sam)', '@example', '.com']],
   ['sam!@example.com', ['sam!', '@example', '.com']],
@@ -63,6 +64,16 @@ const ROWS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['sam@', ['sam@']],
   ['a.@b', ['a.@b']],
   ['a-@b', ['a-@b']],
+  // A quote closes or opens by the quotes of the word, followed from its start, and not by the character
+  // before it: a bracket inside a quote does not make the closing quote an opening one, and an equals
+  // sign before a quote does not make it a closing one.
+  ['"a("@example.com', ['"a("', '@example', '.com']],
+  ['--file="@name"', ['--file="@name"']],
+  // A quote after a letter or a digit closes what it follows; one that follows a closing quote opens the next.
+  ['sam"@example.com', ['sam"', '@example', '.com']],
+  ['"a""@x"', ['"a""@x"']],
+  // A quote of another kind inside a quote opens a quote of its own.
+  ['"\'@x\'"', ['"\'@x\'"']],
   // A run of separators of any kind is one place, after its last character.
   ['a//::==b', ['a//::==', 'b']],
   ['a..b', ['a..b']],
