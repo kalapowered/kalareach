@@ -20,6 +20,7 @@ import type {
 } from '@kalareach/protocol'
 import { base64UrlToBytes } from '@kalareach/protocol'
 
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Banner, Button, CommitButton } from '../components/ui'
 import { AGENT_READ_CADENCE_MS } from '../app/agent'
 import { readOnCadence } from '../app/cadence'
@@ -403,7 +404,8 @@ export function ApprovalRequests({
             <p className="eyebrow">Waiting for you</p>
             <h3>{decoding.projection.summary}</h3>
             <p className="small muted">
-              Read by {decoding.plugin_id} from {decoding.publisher_id} · asked{' '}
+              Read by <TechnicalWord text={decoding.plugin_id} /> from{' '}
+              <TechnicalWord text={decoding.publisher_id} /> · asked{' '}
               {describeElapsed(now - Number(resource.recorded_at))} ago
             </p>
             <details className="approval-source">
@@ -415,7 +417,8 @@ export function ApprovalRequests({
                 <p className="small faint">And {source.more} more characters.</p>
               ) : null}
               <p className="small faint">
-                {decoding.method} · request {decoding.upstream_request_id}. The summary above is
+                <TechnicalWord text={decoding.method} /> · request{' '}
+                <TechnicalWord text={decoding.upstream_request_id} />. The summary above is
                 what the decoder made of this; the host does not prove it read it correctly.
               </p>
             </details>

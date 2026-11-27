@@ -210,7 +210,10 @@ export function Plugins(): ReactNode {
                 {live.map((release) => (
                   <div className="divided-row" key={`${release.plugin_id}-${release.package_digest}`}>
                     <span className="spacer">
-                      <strong>{release.plugin_id}</strong> {release.version}
+                      <strong>
+                        <TechnicalWord text={release.plugin_id} />
+                      </strong>{' '}
+                      {release.version}
                       <span className="faint small mono"> {short(release.package_digest)}</span>
                     </span>
                     {release.ending ? <Badge tone="neutral">Ending</Badge> : null}

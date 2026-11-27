@@ -80,7 +80,9 @@ describe('the attention inbox', () => {
     expect(within(approval).getByTestId('approval-source').textContent).toContain(
       '"command":["scripts/release.sh","--publish"]'
     )
-    expect(within(approval).getByText(/Read by openai\.codex from openai/)).toBeInTheDocument()
+    const plugin = within(approval).getByText(technicalWordText('openai.codex'))
+    expect(plugin.parentElement).toHaveTextContent(/Read by openai\.codex from openai/)
+    expect(within(approval).getByText(technicalWordText('openai'))).toBeInTheDocument()
     expect(within(approval).getByTestId('approval-authority').textContent).toContain(
       'with its own permissions'
     )

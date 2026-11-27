@@ -355,7 +355,14 @@ export function Hosts(): ReactNode {
             <h2>{environments?.environments[0]?.label ?? 'This machine'}</h2>
             <p className="muted small">
               {reachable === null ? 'Reading this host…' : reachable ? 'Connected' : 'Not in contact'}
-              {info ? ` · build ${info.build_id}` : ''}
+              {info ? (
+                <>
+                  {' · build '}
+                  <TechnicalWord text={info.build_id} />
+                </>
+              ) : (
+                ''
+              )}
             </p>
           </div>
           {reachable === null ? null : (

@@ -770,7 +770,12 @@ function Pasted({
                     ? ` It expires in ${timeLeft(invitation.expires_at_ms, now).replace(' left', '')}.`
                     : ''
                 }`
-              : `Code for a host that uses ${invitation.origin_host ?? 'another service'}.`}
+              : (
+                  <>
+                    Code for a host that uses{' '}
+                    {invitation.origin_host === null ? 'another service' : <TechnicalWord text={invitation.origin_host} />}.
+                  </>
+                )}
           </p>
         </div>
         <div className="card-footer">
