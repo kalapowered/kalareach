@@ -85,7 +85,7 @@ pub mod profiles;
 pub mod reading;
 pub mod rebuild;
 pub mod semantic;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod server;
 mod splice;
 pub mod stream;

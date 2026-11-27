@@ -26,6 +26,10 @@ use tokio::io::AsyncWrite;
 mod unix;
 #[cfg(unix)]
 pub use unix::{InputPipe, Output, Server};
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{InputPipe, Output, Server};
 
 /// How long the server has to end after its input has closed, before it is asked to terminate.
 pub const INPUT_GRACE: Duration = Duration::from_millis(1500);

@@ -409,6 +409,13 @@ crates/kr-worker/src/broker/server/unix.rs | Server::show | tokio::task::spawn_b
 crates/kr-worker/src/broker/server/unix.rs | Server::spawn | tokio::spawn | async{.read} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/server/unix.rs | Server::spawn | tokio::task::spawn_blocking | closure{crate::broker::image::read_identity} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/broker/server/unix.rs | Server::start | Self::spawn | spec | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::members | tokio::task::spawn_blocking | closure{.process_ids} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::show | tokio::task::spawn_blocking | closure{show_image} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::spawn | tokio::spawn | async{.read} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/broker/server/windows.rs | Server::spawn | tokio::task::spawn_blocking | closure{kr_ipc::testing::created::note_words_here} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::spawn | tokio::task::spawn_blocking | closure{read_holding} | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::start | Self::spawn | spec | 1 | joined | - | awaited where it stands
+crates/kr-worker/src/broker/server/windows.rs | Server::terminate | tokio::task::spawn_blocking | closure{.terminate} | 1 | joined | - | awaited where it stands
 crates/kr-worker/src/broker/websocket.rs | TextLines::drop | .spawn | async{tokio::time::timeout_at} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/daemon_link.rs | Drafts::ensure_reporter | .spawn | deliver | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/description_facts.rs | DescriptionFacts::read_directory | .spawn | closure{.run_reads} | 1 | other_crate | - | worker program: linked; the worker runs it

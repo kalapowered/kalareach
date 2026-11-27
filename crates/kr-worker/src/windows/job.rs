@@ -166,6 +166,16 @@ impl SessionJob {
         self.job.kills_on_close()
     }
 
+    /// Returns the user-interface restrictions the job sets, as the kernel reads them back.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when they cannot be read.
+    #[cfg(feature = "testing")]
+    pub fn ui_restrictions(&self) -> std::io::Result<u32> {
+        self.job.ui_restrictions()
+    }
+
     /// Returns the identifiers of every process the job currently holds.
     ///
     /// This is the process tree. A descendant that changed its session, detached, or was started
@@ -324,6 +334,13 @@ impl AgentJob {
         self.job.holds(child.as_raw_handle().cast())
     }
 
+    /// Reads the process holding `pid` as a member of this job, or says it is not one, as
+    /// [`SessionJob::member`] does for a session's job.
+    #[must_use]
+    pub fn member(&self, pid: u32) -> MemberReading {
+        self.job.member(pid)
+    }
+
     /// Returns whether this job still permits a child to break away from it.
     ///
     /// # Errors
@@ -340,6 +357,17 @@ impl AgentJob {
     /// Returns the operating system's failure when the limits cannot be read.
     pub fn kills_on_close(&self) -> std::io::Result<bool> {
         self.job.kills_on_close()
+    }
+
+    /// Returns the user-interface restrictions the job sets, as the kernel reads them back: none
+    /// for a job that does not restrict the desktop its processes make.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when they cannot be read.
+    #[cfg(feature = "testing")]
+    pub fn ui_restrictions(&self) -> std::io::Result<u32> {
+        self.job.ui_restrictions()
     }
 
     /// Returns the identifiers of every process the job currently holds: the agent while it runs,
@@ -452,6 +480,33 @@ impl Job {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Reads the user-interface restrictions this job sets, for a test.
+    #[cfg(feature = "testing")]
+    fn ui_restrictions(&self) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_UI_RESTRICTIONS, JobObjectBasicUIRestrictions,
+        };
+
+        let mut restrictions = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: 0,
+        };
+        // SAFETY: the handle is this object's own and open for the call; the structure is a local
+        // this thread owns, filled by the call, and its declared size is its own.
+        let read = unsafe {
+            QueryInformationJobObject(
+                self.raw(),
+                JobObjectBasicUIRestrictions,
+                std::ptr::from_mut(&mut restrictions).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>()).unwrap_or(0),
+                std::ptr::null_mut(),
+            )
+        };
+        if read == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(restrictions.UIRestrictionsClass)
     }
 
     /// Returns whether this job still permits a child to break away from it, as the kernel reads
