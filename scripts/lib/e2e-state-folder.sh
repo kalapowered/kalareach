@@ -46,8 +46,11 @@
 # folder's name from the working directory it is in, never from KR_E2E_STATE.
 #
 # A refusal names a folder of the chain that its group or others can write with that folder's mode,
-# so that a person knows what to change. A refusal has no effect. The check makes the one folder and the one file it names, and when it
-# cannot finish it removes the marker and the folder that it made, and nothing else.
+# so that a person knows what to change. Where a folder on the way is not the one that its name
+# gives (a link or another folder put in its place after the look, or a name that ends in a line
+# feed and was cut there), the refusal adds fixed words after the rule's sentence. A refusal has no
+# effect. The check makes the one folder and the one file it names, and when it cannot finish it
+# removes the marker and the folder that it made, and nothing else.
 
 # e2e_state_folder_look <root|own>: looks at the working directory. A root is the temporary
 # directory: it belongs to the caller or to root, and is closed to writes by group and others or has
@@ -135,7 +138,9 @@ e2e_state_folder_fail() {
 
 # e2e_state_folder_walk <path> <owner>: the check proper, run in a subshell. It ends with status 0
 # and prints the inode and the physical name of the state folder, with a space between, or with
-# status 1 for a refusal by the rule and 3 where a write failed.
+# status 1 for a refusal by the rule, 3 where a write failed, 4 for a folder of the chain that
+# others can write and 5 where a folder on the way is not the one that its name gives. The check
+# gives its callers status 1 for every refusal.
 e2e_state_folder_walk() {
   local state="$1" owner="$2" tmp base prev rest component name listing line inode _
   e2e_state_folder_made=""
@@ -168,7 +173,7 @@ e2e_state_folder_walk() {
     rest="${rest#*/}"
     [ ! -L "./$component" ] || e2e_state_folder_fail 1
     CDPATH='' cd -P -- "./$component" 2> /dev/null || e2e_state_folder_fail 1
-    [ "$PWD" = "$prev/$component" ] || e2e_state_folder_fail 1
+    [ "$PWD" = "$prev/$component" ] || e2e_state_folder_fail 5
     prev="$PWD"
     e2e_state_folder_look own || e2e_state_folder_look_failed $?
   done
@@ -184,7 +189,7 @@ e2e_state_folder_walk() {
   [ -d "./$name" ] || e2e_state_folder_fail 1
   CDPATH='' cd -P -- "./$name" 2> /dev/null || e2e_state_folder_fail 1
   e2e_state_folder_inside=1
-  [ "$PWD" = "$prev/$name" ] || e2e_state_folder_fail 1
+  [ "$PWD" = "$prev/$name" ] || e2e_state_folder_fail 5
   e2e_state_folder_look own || e2e_state_folder_look_failed $?
 
   # Empty or marked. The listing keeps a line feed at its end: a name that is one line feed is an
@@ -240,6 +245,7 @@ e2e_state_folder_check() {
     0) ;;
     3) e2e_state_folder_write_failed "$state" ;;
     4) e2e_state_folder_open "$state" "${result%% *}" "${result#* }" ;;
+    5) e2e_state_folder_refuse "$state" "the path leads to a folder other than the one it names" ;;
     *) e2e_state_folder_refuse "$state" ;;
   esac
   E2E_STATE_FOLDER_ID="${result%% *}"
@@ -268,9 +274,11 @@ e2e_state_folder_enter() {
   e2e_state_folder_marker_ok "${E2E_STATE_FOLDER_OWNER:-}"
 }
 
-# e2e_state_folder_refuse <path>: says that the rule is not met and ends the script.
+# e2e_state_folder_refuse <path> [<words>]: says that the rule is not met and ends the script. Where
+# the check gives words, they follow the sentence after a semicolon; they are fixed words of the
+# check, never a name that arrived.
 e2e_state_folder_refuse() {
-  printf 'e2e: refusing KR_E2E_STATE %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name\n' "$1" >&2
+  printf 'e2e: refusing KR_E2E_STATE %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name%s\n' "$1" "${2:+; $2}" >&2
   exit 1
 }
 

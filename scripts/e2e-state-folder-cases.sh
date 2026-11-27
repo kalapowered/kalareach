@@ -97,6 +97,10 @@ sentence() {
   printf 'e2e: refusing KR_E2E_STATE %s: it must be a plain absolute path, with no symbolic link in it, to a folder inside a subfolder of the temporary directory; the temporary directory must belong to this account or to root and be closed to writes by others or sticky, and every folder below it, the state folder included, must belong to this account and be closed to writes by its group and others; KR_E2E_STATE_OWNER must name this run; and the folder must be new, empty, or marked with that name' "$1"
 }
 
+# The words that follow the rule's sentence where a folder on the way is not the one that its name
+# gives (the check's second refusal of that name).
+changed_clause='; the path leads to a folder other than the one it names'
+
 # The sentence for a folder of the chain that its group or others can write, for the path $1, the
 # folder $2 and its mode $3.
 mode_sentence() {
@@ -367,9 +371,11 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
   fi
 
   # A temporary directory whose name ends in a line end is compared whole: a run in /T<LF> is not
-  # a run in /T.
+  # a run in /T. A folder `run` stands in both, so that a name cut at the line end would reach the
+  # folder in /T<LF> and be refused by the equality of the names, which adds the clause; the sentence
+  # asserted here is the plain one, which only the whole name gives.
   tl="$scratch/TL-$script"$'\n'
-  mk "$tl" "$scratch/TL-$script/run"
+  mk "$tl" "$tl/run" "$scratch/TL-$script/run"
   run_tmp="$tl" expect_refused "a temporary directory whose name ends in a line end, and a folder in the one without it" "$script" "$scratch/TL-$script/run/state" "$owner" "$scratch/TL-$script/run"
 
   # A relative path to a folder that exists below the temporary directory, from a copy of the checkout
@@ -502,6 +508,49 @@ rc="$(
   echo "$?"
 )"
 expect "a run with no folder named by a wrapper and none given enters nothing" 1 "$rc"
+
+echo "== a folder on the way that is not the one its name gives"
+# A path that passes every look of the rule and then reaches another folder: another account that
+# could write the parent could put a link in place of a folder between the look at its name and the
+# change into it. A function that stands in for `cd` makes that change at the moment the walk
+# enters the folder `victim` (a folder on the way, or the state folder itself): the folder is moved
+# aside and a link to another folder takes its place. Only the equality of the names can refuse
+# this, and it says so in words of its own after the rule's sentence. Nothing is written where the
+# link points.
+for victim in mid state; do
+  mk "$t/swap-$victim/mid/state" "$o/swap-target-$victim"
+  chmod 755 "$o/swap-target-$victim"
+  swapped="$t/swap-$victim/mid"
+  [ "$victim" = mid ] || swapped="$swapped/state"
+  before="$(snapshot "$o/swap-target-$victim")"
+  cases=$((cases + 1))
+  out="$(
+    # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+    cd() {
+      if [ "${3:-}" = "./$victim" ]; then
+        mv -- "$swapped" "$swapped-aside"
+        ln -s "$o/swap-target-$victim" "$swapped"
+      fi
+      builtin cd "$@" || return
+    }
+    export TMPDIR="$t"
+    export KR_E2E_STATE="$t/swap-$victim/mid/state"
+    export KR_E2E_STATE_OWNER="$owner"
+    e2e_state_folder_check 2>&1
+  )"
+  code=$?
+  label="a folder on the way put in another folder's place ($victim)"
+  if [ "$code" -ne 1 ]; then
+    fail "$label: it ended with status $code, not 1"
+  elif [ "$out" != "$(sentence "$t/swap-$victim/mid/state")$changed_clause" ]; then
+    fail "$label: it said '$out', not the rule's sentence with the clause"
+  elif [ "$before" != "$(snapshot "$o/swap-target-$victim")" ]; then
+    fail "$label: it changed what the link points at"
+  else
+    ok "$label: refused with the clause, nothing written where the link points"
+  fi
+done
 
 echo "== a marker that is already there is not overwritten"
 mk "$t/mark/held" "$t/mark/dangling"
