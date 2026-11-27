@@ -29,6 +29,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
 import { DESKTOP_BUNDLE } from './served'
 
 /** Every stylesheet under `src`, the design tokens first so their variables are defined. */
@@ -344,6 +345,8 @@ interface Shown {
   readonly moving: string[]
   /** How many transitions of the transform started on the element since the record began. */
   readonly runs: number
+  /** The properties the element's computed `transition` names; `none` when it declares no transition. */
+  readonly transition: string
 }
 
 /** Runs in the page. Records every transition of a transform that starts, by the element it starts on. */
@@ -375,7 +378,8 @@ function shown(control: Locator): Promise<Shown> {
       transform: style.transform,
       scale: style.transform === 'none' ? 1 : new DOMMatrix(style.transform).a,
       moving,
-      runs: record.filter((target) => target === node).length
+      runs: record.filter((target) => target === node).length,
+      transition: style.transitionProperty
     }
   })
 }
@@ -477,6 +481,114 @@ function tintedToward(from: Rgb, to: Rgb, label: Rgb): boolean {
     Math.max(...moved.map(Math.abs)) >= 6 &&
     moved.every((delta, channel) => Math.abs(delta) <= 1 || delta * ((label[channel] ?? 0) - (from[channel] ?? 0)) > 0)
   )
+}
+
+/** A piece of text inside a control, with the colour the engine draws it in. */
+interface Ink {
+  readonly name: string
+  readonly colour: Rgb
+}
+
+/**
+ * Every piece of text that is drawn on the control's own surface, each in its own colour (a label, a
+ * second line, a note), or the control's own colour when it holds none, as a glyph does. A text that
+ * has a background of its own, such as a badge, is on that background and not on the control's.
+ */
+function inksOf(control: Locator): Promise<Ink[]> {
+  return control.evaluate((node) => {
+    const colourOf = (element: Element): [number, number, number] => {
+      const [r, g, b] = (getComputedStyle(element).color.match(/[\d.]+/g) ?? []).map(Number)
+      return [r ?? 0, g ?? 0, b ?? 0]
+    }
+    const holdsText = (element: Element): boolean =>
+      [...element.childNodes].some((child) => child.nodeType === Node.TEXT_NODE && (child.textContent ?? '').trim() !== '')
+    const onSurface = (element: Element): boolean => {
+      const [, , , alpha] = (getComputedStyle(element).backgroundColor.match(/[\d.]+/g) ?? []).map(Number)
+      return alpha === 0
+    }
+    const holders = [...node.querySelectorAll('*')].filter((element) => holdsText(element) && onSurface(element))
+    if (holdsText(node)) holders.unshift(node)
+    if (holders.length === 0) return [{ name: 'the glyph', colour: colourOf(node) }]
+    return holders.map((element) => ({
+      name: `"${(element.textContent ?? '').trim().slice(0, 24)}"`,
+      colour: colourOf(element)
+    }))
+  })
+}
+
+/**
+ * Holds a real press on `control` and reads what a person sees, with the pointer on it and then with
+ * the pointer slid off while the press is held, as on a touch screen where nothing hovers. The engine
+ * computes no transform and no transition for the pressed control; its surface is a tint of the
+ * label's colour over the surface it has with the pointer on it, and over its surface at rest; every
+ * text drawn on it keeps `floor` against both. `floor` is 4.5 for text and 3 for a glyph that has no
+ * text. `null` is a switch's track, which has no text and keeps its colour fade.
+ */
+async function pressAnswers(
+  page: Page,
+  probe: Page,
+  colorScheme: string,
+  kind: string,
+  control: Locator,
+  floor: number | null
+): Promise<void> {
+  const where = `${kind}, ${colorScheme} theme`
+  await control.scrollIntoViewIfNeeded()
+  // At rest: the pointer is off the control, and nothing on it is still fading from an earlier change.
+  await page.mouse.move(1, 1)
+  await twoFrames(page)
+  await expect
+    .poll(() => control.evaluate((node) => node.getAnimations().length), { message: `${where}: still fading` })
+    .toBe(0)
+  const box = await control.boundingBox()
+  if (!box) throw new Error(`${where}: no box to press`)
+  const rest = await surfaceOf(page, probe, control)
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await twoFrames(page)
+  const hovered = await surfaceOf(page, probe, control)
+  await held(page, control, async () => {
+    const pressed = await shown(control)
+    expect(pressed.transform, `${where}: the transform of the pressed control`).toBe('none')
+    expect(pressed.moving, `${where}: animations of a transform while it is pressed`).toEqual([])
+    expect(pressed.runs, `${where}: transitions of a transform that started on it`).toBe(0)
+    if (floor !== null) expect(pressed.transition, `${where}: the transition of the pressed control`).toBe('none')
+
+    // With the pointer on the control, the press is a tint over the hover's surface.
+    const surface = await surfaceOf(page, probe, control)
+    const label = await labelOf(control)
+    expect(
+      tintedToward(hovered, surface, label),
+      `${where}: pressed ${show(surface)} against hover ${show(hovered)}`
+    ).toBe(true)
+    if (floor !== null) {
+      for (const ink of await inksOf(control)) {
+        expect(
+          contrast(ink.colour, surface),
+          `${where}: ${ink.name} in ${show(ink.colour)} against the pressed surface ${show(surface)}`
+        ).toBeGreaterThanOrEqual(floor)
+      }
+    }
+
+    // With the pointer slid off and the press still held, it is a tint over the surface at rest, of
+    // the label's colour as it is now that nothing hovers.
+    await page.mouse.move(1, 1)
+    await twoFrames(page)
+    expect(await control.evaluate((node) => node.matches(':active')), `${where}: still pressed`).toBe(true)
+    const alone = await surfaceOf(page, probe, control)
+    const labelAlone = await labelOf(control)
+    expect(
+      tintedToward(rest, alone, labelAlone),
+      `${where}: pressed ${show(alone)} against rest ${show(rest)}`
+    ).toBe(true)
+    if (floor !== null) {
+      for (const ink of await inksOf(control)) {
+        expect(
+          contrast(ink.colour, alone),
+          `${where}: ${ink.name} in ${show(ink.colour)} against the pressed surface ${show(alone)}, no hover`
+        ).toBeGreaterThanOrEqual(floor)
+      }
+    }
+  })
 }
 
 test.describe('motion', () => {
@@ -647,17 +759,20 @@ test.describe('motion', () => {
     }
   })
 
-  // KR-REQ-13.20: with reduced motion a press keeps its feedback and loses its movement. A button,
-  // an icon button, a navigation item and a session row are each held down by a real pointer press,
-  // in the light and the dark theme: the engine computes no transform for the control, and no
-  // transition or animation of a transform runs on it. The press shows as a tint of the label's own
-  // colour over the control's surface: the pixel sampled inside the control moves toward the label's
-  // colour from the same pixel with the pointer resting on the control, and, with the pointer slid
-  // off while the press is held (as on a touch screen, where nothing hovers), from the pixel at
-  // rest; the label keeps its contrast against both. A switch's track takes the same tint while it is
-  // held, in both of its states and not when it cannot be changed, and its thumb stands in its new place
-  // at once. Without reduced motion the same press scales a button and tints nothing, so the case cannot pass on a
-  // page where nothing ever scales.
+  // KR-REQ-13.06: with reduced motion a press keeps its feedback and loses its movement. Nine controls
+  // of the four tinted classes (button, icon button, navigation item, session row) are each held down
+  // by a real desktop pointer press, in the light and the dark theme, and so is a switch: the engine
+  // computes no transform and no transition for the control, and no transition or animation of a
+  // transform runs on it. The press shows as a tint of the label's own colour over the control's
+  // surface: the pixel sampled inside the control moves toward the label's colour from the same pixel
+  // with the pointer resting on the control, and, with the pointer slid off while the press is held
+  // (what a touch press has, nothing hovering, though no touch input occurs here), from the pixel at
+  // rest; every text drawn on the control, read again once the pointer is off, keeps its contrast
+  // against both. A switch's track takes the same tint while it is held, in both of its states and not
+  // when it cannot be changed, and its thumb stands in its new place at once. Without reduced motion
+  // the same press scales a button and tints nothing, so the case cannot pass on a page where nothing
+  // ever scales. An engine without `color-mix` shows no tint, which is outside what a browser here
+  // can run.
   test('a held press moves no control with reduced motion and tints it, and scales a button without it', async ({
     page
   }) => {
@@ -668,55 +783,8 @@ test.describe('motion', () => {
       await page.goto('/harness.html')
       await page.evaluate(startTransformRecord)
 
-      // `floor` is the contrast the label needs against the pressed surface: 4.5 for text, 3 for a
-      // glyph that has no text, and none for a control that has no label, such as a switch.
-      const answers = async (kind: string, control: Locator, floor: number | null): Promise<void> => {
-        const where = `${kind}, ${colorScheme} theme`
-        await control.scrollIntoViewIfNeeded()
-        const box = await control.boundingBox()
-        if (!box) throw new Error(`${where}: no box to press`)
-        const rest = await surfaceOf(page, probe, control)
-        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
-        await twoFrames(page)
-        const hovered = await surfaceOf(page, probe, control)
-        await held(page, control, async () => {
-          const pressed = await shown(control)
-          expect(pressed.transform, `${where}: the transform of the pressed control`).toBe('none')
-          expect(pressed.moving, `${where}: animations of a transform while it is pressed`).toEqual([])
-          expect(pressed.runs, `${where}: transitions of a transform that started on it`).toBe(0)
-
-          // With the pointer on the control, the press is a tint over the hover's surface.
-          const surface = await surfaceOf(page, probe, control)
-          const label = await labelOf(control)
-          expect(
-            tintedToward(hovered, surface, label),
-            `${where}: pressed ${show(surface)} against hover ${show(hovered)}`
-          ).toBe(true)
-          if (floor !== null) {
-            expect(
-              contrast(label, surface),
-              `${where}: the label ${show(label)} against the pressed surface ${show(surface)}`
-            ).toBeGreaterThanOrEqual(floor)
-          }
-
-          // With the pointer slid off and the press still held, as on a touch screen where nothing
-          // hovers, it is a tint over the surface at rest.
-          await page.mouse.move(1, 1)
-          await twoFrames(page)
-          expect(await control.evaluate((node) => node.matches(':active')), `${where}: still pressed`).toBe(true)
-          const alone = await surfaceOf(page, probe, control)
-          expect(
-            tintedToward(rest, alone, label),
-            `${where}: pressed ${show(alone)} against rest ${show(rest)}`
-          ).toBe(true)
-          if (floor !== null) {
-            expect(
-              contrast(label, alone),
-              `${where}: the label ${show(label)} against the pressed surface ${show(alone)}, no hover`
-            ).toBeGreaterThanOrEqual(floor)
-          }
-        })
-      }
+      const answers = (kind: string, control: Locator, floor: number | null): Promise<void> =>
+        pressAnswers(page, probe, colorScheme, kind, control, floor)
 
       const sessions = page.getByRole('button', { name: 'Sessions', exact: true })
       await answers('navigation item', sessions, 4.5)
@@ -749,6 +817,7 @@ test.describe('motion', () => {
       expect(after.transform, 'the thumb has moved').not.toBe(before.transform)
       expect(after.moving, 'animations of the thumb').toEqual([])
       expect(after.runs, 'transitions of the thumb that started').toBe(0)
+      expect(after.transition, 'the transition of the thumb').toBe('none')
 
       // The track takes the tint in its other state too, and a switch that cannot be changed now takes
       // none: a press that does nothing must not look like one that does.
@@ -784,6 +853,56 @@ test.describe('motion', () => {
         'a pressed button without reduced motion has no tint'
       ).toBe('none')
     })
+    await probe.close()
+  })
+
+  // KR-REQ-13.06: two lines that the harness does not show at rest, drawn by the product's own
+  // components from made-up data, keep their contrast on the pressed surface: the second line of the
+  // Account item, which shows who is signed in, and the program line under a saved command's label.
+  // Both are in the faint colour, the faintest text inside a pressed control.
+  test('the fainter lines inside a held control keep their contrast with reduced motion', async ({ page }) => {
+    const probe = await page.context().newPage()
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ reducedMotion: 'reduce', colorScheme })
+      await page.goto('/harness.html')
+      await page.evaluate(startTransformRecord)
+      await page.evaluate(() => {
+        window.krTestHost?.account.set({
+          state: 'signed_in',
+          email: 'sam@example.com',
+          name: null,
+          usage_readable: false,
+          generation: 'aaaa',
+          mark: 'ab'.repeat(32),
+          outcome: null
+        })
+      })
+      const account = page.getByRole('button', { name: /^Account/ })
+      await expect(account.locator('.nav-item-detail')).toHaveText('sam@example.com')
+      await pressAnswers(page, probe, colorScheme, 'account item', account, 4.5)
+
+      await page.goto('/harness.html?stock_shell=bash')
+      await page.waitForSelector('.app-shell')
+      await page.evaluate(startTransformRecord)
+      await page.evaluate(() => {
+        window.krTestHost?.launchCommands.changeElsewhere([
+          { label: 'Claude Code', program: '/Users/rs/.local/bin/claude', arguments: ['--resume'] },
+          { label: 'Codex CLI', program: 'codex', arguments: [] }
+        ])
+      })
+      await page.getByRole('button', { name: 'Sessions' }).click()
+      await page.getByRole('button', { name: 'New session' }).click()
+      const sheet = page.getByTestId('sheet')
+      await expect(sheet).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
+      await sheet.getByRole('radio', { name: /Stock shell/ }).check()
+      await sheet.getByRole('textbox', { name: 'Directory' }).fill('/Users/rs/work/notes')
+      await sheet.getByRole('button', { name: 'Create session' }).click()
+      await expect(sheet).toBeHidden({ timeout: PRESENTATION_DEADLINE })
+      await page.getByRole('button', { name: 'Dismiss' }).click()
+      const saved = page.getByTestId('launch-saved').getByRole('button', { name: /Claude Code/ })
+      await expect(saved.locator('.launch-program')).toHaveText('/Users/rs/.local/bin/claude')
+      await pressAnswers(page, probe, colorScheme, 'saved command', saved, 4.5)
+    }
     await probe.close()
   })
 })
