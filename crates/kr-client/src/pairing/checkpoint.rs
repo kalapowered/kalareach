@@ -9,7 +9,8 @@
 //! * A checkpoint belongs to an archive at a service that one host produced, not to a pairing: the
 //!   entry names the host's endpoint and the key id of the stored-envelope key its record declared
 //!   (the producer), beside the service and the archive. It stays when a pairing is replaced or a
-//!   host is forgotten, and no write ever lowers one.
+//!   host is forgotten, and a write that the lock excludes from every other writer never lowers
+//!   one.
 //! * Whether a host still owes a checkpoint is derived, never written beforehand: an owner pairing
 //!   with no `told` entry owes one. The file says only that a read of that pairing completed, and
 //!   what it answered. Only an owner pairing is asked, so only an owner record settles an answer.
@@ -19,13 +20,26 @@
 //! * Every operation takes an operating-system lock on `checkpoints.lock` for its own file work and
 //!   never holds it across a wait on the network. The work is synchronous: a caller on a runtime
 //!   runs it on a blocking task.
-//! * The lock stays required. Just before a settle replaces the file, it reads the file again and
-//!   refuses with [`Unsettled::Changed`] when it differs from the snapshot its result was derived
-//!   from, so that it does not drop what another writer committed meanwhile. It never retries: the
-//!   caller asks again. That makes the gap smaller; it does not close it. The replacement is not
-//!   conditional, so two writers that both check before either renames still lose a write. A file
-//!   system whose lock does not exclude leaves the same gap, and so does a writer that does not
-//!   take the lock: it can lower a checkpoint alone, and no check in a settle can stop it.
+//! * The check does not replace the lock. A settle reads the file and `hosts.json` once, under the
+//!   lock, and derives its result from that snapshot. Just before it replaces the file it reads the
+//!   file again and refuses with [`Unsettled::Changed`] when the file differs from the snapshot, so
+//!   that it does not drop what another writer committed meanwhile. That look comes before the
+//!   temporary file is made, written and flushed, and on Windows the rename can try again for some
+//!   seconds after it, so a gap stays. The replacement is not conditional: a writer that commits in
+//!   that gap loses its checkpoints, its new entries and its `told` entries to the overwrite, a
+//!   checkpoint can go down, and that writer may already have returned `Settled`. A file system
+//!   whose lock does not exclude leaves the same gap, and so does a writer that does not take the
+//!   lock: no check in a settle can stop it. A lock file that is removed and made again while it is
+//!   held defeats the lock the same way, since two writers then hold two locks.
+//! * Only the file is compared. `hosts.json` is read in the snapshot and not compared, and it is
+//!   written under its own in-process mutex, not this lock. So `current` and the `told` entries
+//!   that a settle keeps or drops come from the hosts as they stood at the snapshot: the pairing
+//!   the answer came through can still be reported as the host's owner after it went meanwhile,
+//!   and the `told` entry of a pairing that went meanwhile is kept until a later settle. No
+//!   checkpoint is lowered or dropped by that.
+//! * A settle never retries, and nothing asks the host again. After [`Unsettled::Changed`] or
+//!   `Busy` the answer is not kept: its checkpoint reaches the file only when a later read of the
+//!   host is settled.
 //! * A file this release cannot read is a refusal, never an empty set.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -376,10 +390,10 @@ pub enum Unsettled {
     Unreadable(SnapshotCause),
     /// Something else holds the lock.
     Busy,
-    /// The file differed from the snapshot when it was read again just before the replacement:
-    /// another writer replaced it meanwhile. Nothing was written, and the file holds what that
-    /// writer wrote. The answer was derived from a file that no longer stands, so it is asked for
-    /// again.
+    /// The file read again, before the temporary file was made, differed from the snapshot: it was
+    /// changed, replaced or removed meanwhile, and an absent file reads as empty. Nothing was
+    /// written. The answer was derived from a file that no longer stands, and nothing asks the host
+    /// again: its checkpoint reaches the file only when a later read of the host is settled.
     Changed,
     /// The file could not be written. Either a second read showed the old file, or that read
     /// failed too; in the second case the replacement may have landed, since a failed read after a
@@ -524,7 +538,8 @@ impl PairedCheckpoints {
     }
 
     /// Settles what the host of the pairing `host` holds answered: at most one write, under the
-    /// lock, and never one that lowers or deletes a checkpoint.
+    /// lock, and, while the lock excludes every other writer, never one that lowers or deletes a
+    /// checkpoint.
     ///
     /// `host` is the record the answer was read through, and it alone says whose answer this is: the
     /// entry is kept under the endpoint of `host` and the producer its declared key names, never
@@ -612,8 +627,10 @@ impl PairedCheckpoints {
             (self.before_compare)(&path);
             // The last look before the replacement: the result was derived from the snapshot, so a
             // file that is no longer the snapshot belongs to another writer, whose checkpoints
-            // this result would drop. A refusal, never a retry: the caller asks again. A read that
-            // fails is a refusal too, and nothing is written.
+            // this result would drop. A refusal, never a retry, and nothing asks the host again.
+            // The look comes before the temporary file is made, written and flushed, and on
+            // Windows the rename can try again for some seconds after it: it narrows the gap and
+            // does not close it. A read that fails is a refusal too, and nothing is written.
             if self.read_file()? != file {
                 return Err(Unsettled::Changed);
             }
@@ -2909,7 +2926,8 @@ mod tests {
     const SETTLE_WITHIN: Duration = Duration::from_secs(120);
 
     /// Settles, and settles again after each Busy until [`SETTLE_WITHIN`] has passed. The store's
-    /// answer at Busy is legal and writes nothing; a caller that wants the answer kept asks again.
+    /// answer at Busy is legal and writes nothing; a caller that wants the answer kept has to settle
+    /// it again, as this does, and the production caller does not.
     fn settled_within(
         checkpoints: &PairedCheckpoints,
         host: &PairedHost,
