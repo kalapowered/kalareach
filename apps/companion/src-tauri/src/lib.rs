@@ -179,8 +179,8 @@ pub fn run() {
             }
             #[cfg(all(debug_assertions, mobile))]
             device_probe::start(app.handle());
-            // A device run of notifications leaves its own request, which names a gateway and a
-            // token in place of the managed service's and the platform's.
+            // A device run of notifications leaves its own request, which names a gateway in place
+            // of the managed service's and may name a token in place of the platform's.
             #[cfg(all(debug_assertions, mobile))]
             if let Some(request) = probe::notifications::take(app.handle()) {
                 probe::notifications::start(app.handle(), request);

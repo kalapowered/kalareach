@@ -3188,9 +3188,10 @@ impl HostLine for ConnectionLine {
     }
 }
 
-/// What a device run gives a debug build instead of a provider's token and the build's gateway
-/// origin: a file in the application's own data directory, `kr-probe/push-request.json`, as the other
-/// device checks have. A release build has none of it.
+/// What a device run gives a debug build in place of the build's gateway origin and, when the
+/// request holds one, of the platform's registration token: a file in the application's own data
+/// directory, `kr-probe/push-request.json`, as the other device checks have. A release build has
+/// none of it.
 #[cfg(debug_assertions)]
 mod probe {
     use std::path::Path;
