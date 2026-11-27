@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::Instant;
 
-use kr_cbor::{Limits, encoded_len, to_canonical_value, to_canonical_vec_within};
+use kr_cbor::{CanonicalValue, Limits, encoded_len, to_canonical_value, to_canonical_vec_within};
 use kr_protocol::envelope::{ControlFrame, Notification, Outcome, ParamsValue, Response};
 use kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN;
 use kr_protocol::ids::{
@@ -99,6 +99,10 @@ const AGENT_RESOURCE_ESTIMATE: usize = 2_200;
 const AGENT_RESOURCE_PAYLOAD: usize = 2_147;
 /// The complete frame of the widest agent resource event the type allows. An exact pin, as above.
 const AGENT_RESOURCE_FRAME: usize = 2_247;
+/// The payload of the smallest pending resource the types allow: the shortest kind, class, state and
+/// durability, one-byte identifiers and nothing optional. An exact pin: when a type gains a shorter
+/// variant and this moves, the counts of the subscribe case move with it, so change both.
+const SMALL_RESOURCE_PAYLOAD: usize = 270;
 /// What the design derives for the longest causal root: 20 digits, a colon and the longest upstream
 /// identifier. An exact pin: when the identifier's bound moves, change this with the design.
 const CAUSAL_ROOT_BOUND: usize = 1_559;
@@ -163,6 +167,14 @@ fn widest<T: Serialize>(candidates: Vec<T>) -> T {
     candidates
         .into_iter()
         .max_by_key(payload_len)
+        .expect("a candidate")
+}
+
+/// The candidate whose encoding is the shortest; the lists are the types' own where they have one.
+fn narrowest<T: Serialize>(candidates: Vec<T>) -> T {
+    candidates
+        .into_iter()
+        .min_by_key(payload_len)
         .expect("a candidate")
 }
 
@@ -337,43 +349,58 @@ fn live_instance(refusal: Option<String>) -> AgentInstanceSummary {
     one
 }
 
-/// The refusal text, of the 512 bytes the worker cuts it to, that the door shows longest. The door
-/// replaces a command in backticks by a fixed phrase and a text that names the host by a clause and
-/// a reason, so a text can be longer once shown; the candidates here are the plain text and texts of
-/// short quotations, and the door's own function picks the longest.
+/// The refusal of an agent instance, as the door shows it in the announcement that carries `text`.
+fn shown_refusal(text: &str) -> String {
+    let ControlFrame::Notification(notification) = shown(&notice(
+        AGENT_INSTANCE_EVENT,
+        &instance_event_of(instance_with(Some(text.to_owned()))),
+    )) else {
+        unreachable!("a notice is a notification");
+    };
+    let CanonicalValue::Map(event) = notification.payload.as_value() else {
+        panic!("an agent instance event is a map");
+    };
+    let Some(CanonicalValue::Map(instance)) = event.get("instance") else {
+        panic!("the event holds its instance");
+    };
+    instance
+        .get("refusal")
+        .and_then(CanonicalValue::as_text)
+        .expect("the instance holds its refusal as text")
+        .to_owned()
+}
+
+/// The refusal text, of the 512 bytes the worker cuts it to, that the door shows longest, which is
+/// the longest an error's message may be.
+///
+/// The door replaces each quotation in backticks that holds white space by the nine bytes of `a
+/// command`, with no space inserted beside it (the reading that inserts one only decides whether a
+/// name can be kept), and it holds a text to [`kr_protocol::error::MAX_ERROR_MESSAGE_LEN`]: a longer
+/// one is replaced by a fixed sentence. A quotation of one space is three bytes and gains six, so
+/// 512 bytes of them end at 1,022 bytes (85 of them) or over the limit (86); the 512 bytes reach
+/// exactly 1,024 only with one quotation of a different width, and a quotation of five spaces gains
+/// two. The search takes a count of one-space quotations, then one quotation of each width, then
+/// plain text, and the door's own rewrite picks the longest.
 fn longest_refusal_shown() -> String {
     const CUT: usize = 512;
-    let shown_len = |text: &str| {
-        frame_len(&shown(&notice(
-            AGENT_INSTANCE_EVENT,
-            &instance_event_of(instance_with(Some(text.to_owned()))),
-        )))
-    };
     let mut best = "r".repeat(CUT);
-    // A quotation with white space inside it is shown as "a command", which is longer than the
-    // shortest of them: a backtick, a space and a backtick (three bytes) become nine, and the door
-    // puts a space between those words and a neighbour that would run into them. A text that would
-    // be shown over the longest an error may be is replaced by a fixed sentence, so the search
-    // stops short of it by taking the best of the counts.
-    for quoted in [
-        "``",
-        "` `",
-        "r` `",
-        "` `r",
-        "r` `r",
-        "`x`",
-        "`ls`",
-        "`a b`",
-        "`a command`",
-    ] {
-        for count in 1..=CUT / quoted.len() {
+    let mut best_len = shown_refusal(&best).len();
+    for width in 0..=8 {
+        let other = if width == 0 {
+            String::new()
+        } else {
+            format!("`{}`", " ".repeat(width))
+        };
+        for count in 0..=(CUT - other.len()) / 3 {
             let text = format!(
-                "{}{}",
-                quoted.repeat(count),
-                "r".repeat(CUT - count * quoted.len())
+                "{}{other}{}",
+                "` `".repeat(count),
+                "r".repeat(CUT - count * 3 - other.len())
             );
-            if shown_len(&text) > shown_len(&best) {
+            let len = shown_refusal(&text).len();
+            if len > best_len {
                 best = text;
+                best_len = len;
             }
         }
     }
@@ -1733,8 +1760,16 @@ fn the_widest_agent_events() {
     };
     let resource = resource_event();
     let root = causal_root();
-    // The worker holds the refusal at its cut of 512 bytes; the door can show a longer one.
-    let instance_longest = instance_event_of(instance_with(Some(longest_refusal_shown())));
+    // The worker holds the refusal at its cut of 512 bytes; the door can show one up to the longest
+    // an error's message may be, and the search reaches it.
+    let longest_text = longest_refusal_shown();
+    assert_eq!(longest_text.len(), 512, "the worker's cut of a refusal");
+    assert_eq!(
+        shown_refusal(&longest_text).len(),
+        kr_protocol::error::MAX_ERROR_MESSAGE_LEN,
+        "the door shows a refusal of 512 bytes at the longest an error's message may be"
+    );
+    let instance_longest = instance_event_of(instance_with(Some(longest_text)));
     let mut table = String::from("MEASURE | the agent events\n");
     for (name, event) in [
         (
@@ -1968,17 +2003,27 @@ fn the_marker_and_the_reduced_record() {
     );
 }
 
-/// A pending resource at its smallest: a one-byte upstream identifier and method, and nothing set
-/// that is optional.
+/// A pending resource at its smallest: a one-byte upstream identifier and method, nothing set that
+/// is optional, and the shortest of the kinds, classes, states and durabilities the types allow.
 fn small_resource() -> kr_protocol::gateway::PendingResource {
-    use kr_protocol::gateway::DownstreamRequestId;
+    use kr_protocol::gateway::{
+        DownstreamRequestId, NativeClassification, NativeMethodClass, PendingKind, PendingState,
+    };
     let mut resource = pending_resource();
     resource.request = DownstreamRequestId::new(
         GatewayConnectionId::new(1),
         UpstreamRequestId::new("1".to_owned()).expect("an upstream identifier"),
     );
+    resource.kind = narrowest(PendingKind::ALL.to_vec());
     resource.method = UpstreamMethod::new("m".to_owned()).expect("a method");
+    resource.classification = NativeClassification {
+        class: narrowest(NativeMethodClass::ALL.to_vec()),
+        declared: true,
+    };
     resource.source_generation = SourceGeneration::new(1);
+    resource.state = narrowest(PendingState::ALL.to_vec());
+    // `Durability` has no list of its variants, so the candidates are written by hand.
+    resource.durability = narrowest(vec![Durability::Durable, Durability::Volatile]);
     resource.deadline_ms = Nullable::null();
     resource.recorded_at = TimestampMs::new(1);
     resource
@@ -2192,10 +2237,16 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
     let supply = kr_worker::broker::MAX_SNAPSHOT_RESOURCES + 44;
     let widest_resources = resources_of(&pending_resource(), supply);
     let smallest_resources = resources_of(&small_resource(), supply);
+    let longest_text = longest_refusal_shown();
+    assert_eq!(
+        shown_refusal(&longest_text).len(),
+        kr_protocol::error::MAX_ERROR_MESSAGE_LEN,
+        "the door shows the refusal of the cap at the longest an error's message may be"
+    );
     let forms = [
         (
             "refusal of the cap, as the door shows it longest",
-            Some(longest_refusal_shown()),
+            Some(longest_text),
         ),
         ("short refusal that names the host", Some("/".to_owned())),
         ("no refusal", None),
@@ -2237,13 +2288,19 @@ fn the_subscribe_and_agent_instances_answers_as_a_device_receives_them() {
     }
     let resource = pending_resource();
     let resource_payload = payload_len(&resource);
+    let small_payload = payload_len(&small_resource());
     writeln!(
         table,
-        "MEASURE | one pending resource at its widest {resource_payload} bytes; the worker's own bound {}",
+        "MEASURE | one pending resource at its widest {resource_payload} bytes, at its smallest {small_payload} bytes; the worker's own bound {}",
         kr_worker::recovery::MAX_RECOVERY_RESOURCE_BYTES
     )
     .expect("a string takes a write");
     println!("{table}");
+
+    assert_eq!(
+        small_payload, SMALL_RESOURCE_PAYLOAD,
+        "the smallest pending resource is {SMALL_RESOURCE_PAYLOAD} bytes of payload"
+    );
 
     assert!(
         resource_payload <= kr_worker::recovery::MAX_RECOVERY_RESOURCE_BYTES,
