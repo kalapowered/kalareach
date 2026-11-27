@@ -20,7 +20,7 @@ import {
 import type { ActionRight } from '@kalareach/protocol'
 
 import { AccountPanel, useAccount } from './components/AccountPanel'
-import { Brand, Button, Sheet, Toast, closeWithSheets, useModalSurface } from './components/ui'
+import { Brand, Button, INERT_SUPPORTED, Sheet, Toast, closeWithSheets, useModalSurface } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
 import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
@@ -221,6 +221,8 @@ export function App(): ReactNode {
   const [navigationOpen, setNavigationOpen] = useState(false)
   // Motion answers a person's own act. The drawer goes out by a transition only once a person has
   // opened it in this form; a window that changes form puts the sidebar in its place without one.
+  // Where the web view has no `inert`, the closed drawer is out of reach only by being hidden, and
+  // a drawer that is still going out is not: there it leaves at once, with no exit.
   const [navigationUsed, setNavigationUsed] = useState(false)
   // A window widened past the drawer's width while it was open leaves the sidebar where it stands,
   // and one narrowed again meets the drawer closed, and not yet used.
@@ -301,7 +303,7 @@ export function App(): ReactNode {
         aria-label="Workspace navigation"
         ref={sidebar}
         data-open={narrow ? String(open) : undefined}
-        data-used={narrow ? String(navigationUsed) : undefined}
+        data-used={narrow ? String(navigationUsed && INERT_SUPPORTED) : undefined}
         inert={narrow && !open}
       >
         {narrow ? (

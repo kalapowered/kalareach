@@ -1508,7 +1508,9 @@
 
   /* The drawer goes out by a transition once a person has opened it in this form. A window that
      changes form puts the sidebar in its closed place without moving it: a resize is not an act
-     that the drawer answers. Its visibility changes as the exit ends, on the exit's own time. */
+     that the drawer answers. Its visibility changes as the exit ends, on the exit's own time. The
+     shell leaves the mark off where the web view lacks `inert`: there the drawer is hidden at once,
+     for a drawer still going out would take focus and be read. */
   .sidebar[data-used='true'] {
     transition: transform var(--state) var(--ease-out), visibility var(--state);
   }

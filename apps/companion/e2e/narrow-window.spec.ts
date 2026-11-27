@@ -1068,6 +1068,77 @@ for (const [reduced, how] of [
   })
 }
 
+/**
+ * The drawer's exit lasts 160 ms, 120 ms with reduced motion. A read made straight after a close is
+ * inside it, whatever the machine's speed, once the exit is made to last for seconds: the cases that
+ * follow read the drawer in that time and wait for no hidden state. Where the web view has `inert`
+ * the drawer still goes out by its transition and is out of reach at once; where it has none it has
+ * no exit, and is hidden at once.
+ */
+for (const inert of [false, true]) {
+  for (const [reduced, how] of [
+    [false, 'with the ordinary motion'],
+    [true, 'with reduced motion asked for']
+  ] as const) {
+    test.describe(`straight after a press closed the drawer, ${inert ? 'with' : 'without'} the inert attribute, ${how}`, () => {
+      test.use({ reducedMotion: reduced ? 'reduce' : 'no-preference' })
+
+      for (const [width, ratio] of [
+        [600, 1],
+        [480, LARGEST]
+      ] as const) {
+        test(`${width} points: a Tab reaches no control of the drawer and no reader is told of them`, async ({ page }) => {
+          if (!inert) await withoutInert(page)
+          await openWindow(page, width, ratio)
+          // Only the exit is lost where there is no `inert`: the drawer still comes in by its travel.
+          await watchTravel(page)
+          await menuOf(page).click()
+          await expect(drawerOf(page)).toBeVisible()
+          if (reduced) await expectTravel(page, FADE_SECONDS, 'the drawer fades in', 'opacity')
+          else await expectTravel(page, OPEN_SECONDS, 'a pointer-driven open travels in')
+          await page.addStyleTag({ content: 'html:root { --state: 3s !important; --press: 3s !important; }' })
+          await closeOf(page).click()
+          await expect(menuOf(page), 'the focus is back on the control that opened it').toBeFocused()
+
+          // Nothing is awaited from here: the exit is running or, without `inert`, it never starts.
+          const drawer = await page.evaluate(() => {
+            const element = document.querySelector('aside.sidebar') as HTMLElement & { inert?: boolean }
+            const style = getComputedStyle(element)
+            return {
+              visibility: style.visibility,
+              pointerEvents: style.pointerEvents,
+              inert: element.inert === true,
+              reached: [4, 60, 120, 180, 234].flatMap((x) =>
+                [20, 100, 300, 500, 700].filter((y) => document.elementFromPoint(x, y)?.closest('aside.sidebar') != null)
+              )
+            }
+          })
+          expect(drawer.pointerEvents, 'it takes no press').toBe('none')
+          expect(drawer.reached, 'no point of the window reaches it').toEqual([])
+          if (inert) {
+            expect(drawer.inert, 'the web view makes it inert at once').toBe(true)
+            expect(drawer.visibility, 'its exit is still running, as it is where inert exists').toBe('visible')
+          } else {
+            expect(drawer.visibility, 'it has no exit: it is hidden at once').toBe('hidden')
+            expect(await page.getByRole('button', { name: 'Close menu' }).count(), 'its controls are not in the accessibility tree').toBe(0)
+            expect(await page.locator('body').ariaSnapshot(), 'a reader is not told of the drawer').not.toContain('Close menu')
+          }
+          expect(await tabStopsInDrawer(page, 8), 'a Tab from the start of the page never lands in the drawer').toBe(0)
+          await menuOf(page).focus()
+          await page.keyboard.press(tabKeys().forward)
+          expect(await focusInDrawer(page), 'a Tab from Menu does not enter the drawer').toBe(false)
+
+          // A first open and close leaves the end state that an engine with `inert` has.
+          await expectDrawerClosed(page)
+          await expect(menuOf(page)).toHaveAttribute('aria-expanded', 'false')
+          await expect(page.getByTestId('drawer-scrim')).toHaveAttribute('data-open', 'false')
+          expect(await tabStopsInDrawer(page, 8), 'at the end a Tab never lands in the drawer').toBe(0)
+        })
+      }
+    })
+  }
+}
+
 test.describe('under a right-to-left root', () => {
   test('the wide sidebar and the drawer both stand and travel at the end the page starts from', async ({ page }) => {
     await openWindow(page, 1280)

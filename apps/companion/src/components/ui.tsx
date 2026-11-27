@@ -839,7 +839,7 @@ export interface ModalSurfaceOptions {
 }
 
 /** Whether this web view has the `inert` attribute. Where it has not, the surface's own Tab cycle holds the keyboard. */
-const INERT_SUPPORTED = typeof HTMLElement !== 'undefined' && 'inert' in HTMLElement.prototype
+export const INERT_SUPPORTED = typeof HTMLElement !== 'undefined' && 'inert' in HTMLElement.prototype
 
 /**
  * What a surface that opens over the screen does for the keyboard while it is mounted.
