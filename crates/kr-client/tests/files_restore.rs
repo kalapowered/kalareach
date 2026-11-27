@@ -4119,9 +4119,12 @@ async fn an_entry_holds_only_the_archive_of_the_producer_it_names() {
     for offered in [&older, &newer] {
         let source = Arc::new(Scripted::serving(&world, bundle()).publishing(offered));
         let held = held_with(vec![elsewhere.clone()]);
-        let prepared = restore_held(&world, &source, None, &held)
-            .await
-            .expect("an entry of another producer holds nothing");
+        let result = restore_held(&world, &source, None, &held).await;
+        assert!(
+            result.is_ok(),
+            "an entry of another producer holds nothing: {result:?}"
+        );
+        let prepared = result.expect("restored, as asserted above");
         assert!(matches!(
             prepared.plan().standing.standing,
             GenerationStanding::NoCheckpoint
@@ -4176,9 +4179,9 @@ async fn a_publication_that_names_two_producers_or_none_is_held_by_no_entry() {
         let source =
             Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&two));
         let held = held_with(vec![entry(held_by)]);
-        let prepared = restore_held(&world, &source, None, &held)
-            .await
-            .expect("two producers are no producer");
+        let result = restore_held(&world, &source, None, &held).await;
+        assert!(result.is_ok(), "two producers are no producer: {result:?}");
+        let prepared = result.expect("restored, as asserted above");
         assert_eq!(prepared.plan().generation.get(), 3);
         assert_eq!(prepared.plan().pairing, PairingStanding::None);
     }
