@@ -907,6 +907,11 @@ acl_entry=. acl_line=$' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 deny writesecuri
 said "a sticky temporary directory whose access list denies one right and allows list (the macOS listing)" "$(acl_sentence "$sticky_acl/deny-allow/mid/state" "$sticky_acl")"
 unset -f stand_uname stand_ls
 echo "  skipped: a folder with a real access list on a real macOS (macOS only: this script runs only on Linux, and nothing of it runs on a Mac)"
+# On Linux the listing has no entry lines. A time format with a line feed (TIME_STYLE) breaks the entry's own
+# line in two, and the second line is not an access list entry: the chain is accepted.
+mk "$t/ts/mid/state"
+TIME_STYLE='+%Y%n%m' stand_check "$t" "$t/ts/mid/state"
+said "a listing whose time format breaks the entry's line is not read as an access list on Linux" accepted
 
 echo "== a refusal changes nothing that existed, and a failure says what is left"
 # The walk's result is handed over BEFORE the mode of the folder changes. Here its standard output is

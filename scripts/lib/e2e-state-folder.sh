@@ -90,7 +90,7 @@
 # e2e_state_folder_list <entry>: reads <entry> (a name in the working directory, `.`, or a path) with
 # ONE listing that does not follow a link, and leaves what it shows in e2e_state_folder_ino (the
 # inode), e2e_state_folder_mode (the kind and the mode, 10 characters), e2e_state_folder_uid (the
-# owner), e2e_state_folder_acl (1 where the listing has a line after the entry's own) and
+# owner), e2e_state_folder_acl (1 where, on macOS, the listing has a line after the entry's own) and
 # e2e_state_folder_acl_grants (1 where one of those lines is not a `deny` entry: an entry that allows
 # any right, or a line that cannot be read, may grant something; a `deny` entry grants nothing). On macOS the listing is asked for the access list
 # entries (`-e`, with `-n`, so that a principal prints as one word), each of which prints on a line of
@@ -100,15 +100,19 @@
 # can give another account the right to change a folder's mode or owner. It returns 1 where the entry
 # cannot be listed.
 e2e_state_folder_list() {
-  local flags=-ldin line entries entry word _
+  local flags=-ldin line entries entry word _ macos=0
   if [ "$(uname -s)" = Darwin ]; then
     flags=-ldine
+    macos=1
   fi
   line="$(LC_ALL=C ls "$flags" -- "$1" 2> /dev/null)" || return 1
   read -r e2e_state_folder_ino e2e_state_folder_mode _ e2e_state_folder_uid _ <<< "$line"
   e2e_state_folder_mode="${e2e_state_folder_mode:0:10}"
   e2e_state_folder_acl=0
   e2e_state_folder_acl_grants=0
+  # Only the macOS listing has entry lines. A line after the entry's own on Linux is the entry's own
+  # line broken by a time format (TIME_STYLE with a line feed), not an access list entry.
+  [ "$macos" = 1 ] || return 0
   case "$line" in
     *$'\n'*)
       e2e_state_folder_acl=1
