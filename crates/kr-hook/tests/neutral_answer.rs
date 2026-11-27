@@ -709,6 +709,35 @@ async fn kr_req_12_27_a_worker_that_closes_without_admitting_is_one_refusal_in_e
     }
 }
 
+/// A process that a test started is ended and collected through its own handle when the test
+/// unwinds before it has seen the process end, so a failed assertion or a failed wait leaves
+/// neither a hook nor a warm-up run behind.
+///
+/// `cat` ends only when its input closes, and the test holds that input open: only the guard can
+/// end it while the test still holds the input. The handle is the test's again once the guard is
+/// gone, and a process that was ended and collected has its status ready without a wait.
+#[cfg(unix)]
+#[test]
+fn a_process_a_test_started_is_ended_when_the_test_unwinds() {
+    let mut command = std::process::Command::new("cat");
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+    let mut process = command.spawn().expect("a process starts");
+    let held_open = process.stdin.take().expect("its input");
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guarded = common::Ending::new(&mut process);
+        panic!("the test fails with its process running");
+    }));
+    assert!(unwound.is_err(), "the closure panics");
+    let status = process.try_wait().expect("the process can be waited on");
+    assert!(
+        status.is_some_and(|status| !status.success()),
+        "the process was ended and collected: {status:?}"
+    );
+    drop(held_open);
+}
+
 /// KR-REQ-12.27: a standard error nobody reads cannot hold a hook. With standard error a pipe that
 /// is full before the hook starts, every hook still writes `{}` and exits 0: a hook held by the
 /// pipe would never exit, which is what the wait here is for. The most a hook waits for a

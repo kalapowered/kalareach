@@ -455,13 +455,72 @@ pub fn run_holding_input(command: Command, input: &[u8]) -> Ran {
     run(command, input, true, LIVENESS)
 }
 
+/// A process that a test started, ended and collected through its own handle when the test
+/// unwinds before it has seen the process end.
+///
+/// A panic that drops a [`std::process::Child`] leaves its process running, and a process that
+/// holds a pipe or a connection of the test can hold up whatever waits on the other end of it. The
+/// guard signals only the process it was given, by the handle that started it, and the handle is
+/// the test's again when the guard is gone.
+pub struct Ending<'a> {
+    child: &'a mut std::process::Child,
+    ended: bool,
+}
+
+impl<'a> Ending<'a> {
+    /// Holds `child` until it is seen to end.
+    #[must_use]
+    pub fn new(child: &'a mut std::process::Child) -> Self {
+        Self {
+            child,
+            ended: false,
+        }
+    }
+
+    /// The process's exit status where it has ended. A process seen to end is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the system's error when the process cannot be waited on, and the guard then ends it
+    /// when it is dropped.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        self.ended |= status.is_some();
+        Ok(status)
+    }
+}
+
+impl std::ops::Deref for Ending<'_> {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.child
+    }
+}
+
+impl std::ops::DerefMut for Ending<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.child
+    }
+}
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let started = Instant::now();
-    let mut child = command.spawn().expect("the forwarder starts");
+    let mut spawned = command.spawn().expect("the forwarder starts");
+    let mut child = Ending::new(&mut spawned);
     let mut stdin = child.stdin.take().expect("its input");
     let input = input.to_vec();
     let (release, released) = std::sync::mpsc::channel::<()>();
@@ -490,11 +549,10 @@ fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran 
         if let Some(status) = child.try_wait().expect("the forwarder can be waited on") {
             break status;
         }
-        if started.elapsed() > within {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("the forwarder did not end within {within:?}");
-        }
+        assert!(
+            started.elapsed() <= within,
+            "the forwarder did not end within {within:?}"
+        );
         std::thread::sleep(Duration::from_millis(5));
     };
     let took = started.elapsed();
