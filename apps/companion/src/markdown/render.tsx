@@ -201,7 +201,7 @@ function renderToken(token: Token, context: MarkdownContext, key: string): React
       // Nothing is fetched because an agent printed a URL. The person is shown what it is and can
       // ask for it.
       return (
-        <span key={key} className="md-image-placeholder">
+        <span key={key} className="md-image-placeholder" title={image.href}>
           <span className="faint">Image not loaded: {displayTarget(image.href)}</span>
           {openableScheme(image.href) ? (
             <button

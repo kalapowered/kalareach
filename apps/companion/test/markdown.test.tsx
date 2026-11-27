@@ -97,6 +97,15 @@ describe('the Markdown renderer', () => {
     expect(image).toHaveAttribute('src', 'blob:imported')
   })
 
+  it('shows an image that is not loaded by a shortened address and keeps the full target as its title', () => {
+    const target = `https://example.org/${'a'.repeat(100)}.png`
+    show(`![a screenshot](${target})`)
+    const placeholder = screen.getByTestId('out').querySelector('.md-image-placeholder')
+    expect(placeholder).toHaveAttribute('title', target)
+    expect(placeholder?.textContent).toContain('Image not loaded: https://example.org/')
+    expect(placeholder?.textContent).not.toContain(target)
+  })
+
   // KR-REQ-13.23: an image whose scheme the application does not open offers no import at all.
   it('offers no import for an image whose scheme is not one the application opens', () => {
     show('![x](data:image/png;base64,AAAA)')
