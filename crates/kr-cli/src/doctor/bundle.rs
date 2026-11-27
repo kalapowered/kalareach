@@ -18,8 +18,11 @@
 //! # The archive
 //!
 //! One uncompressed POSIX `ustar` archive, which `tar -tf` lists and every archiver opens. It is
-//! built in memory and written owner-only in one atomic replacement, because a bundle half-written
-//! into a path a person is about to attach to a message is worse than no bundle.
+//! built in memory and written in one atomic replacement, because a bundle half-written into a
+//! path a person is about to attach to a message is worse than no bundle. The file is private by
+//! its mode (`0600`) on Unix. On Windows it takes the access list of the folder the person named,
+//! which is theirs to choose, so a bundle written to a volume that keeps no lists is written as
+//! any other file is.
 //!
 //! [`write`]: fn@write
 
@@ -177,7 +180,7 @@ pub fn write(path: &Path, bundle: &ComposedBundle, content: Option<&Approved>) -
     for entry in content {
         archive.file(entry.entry, &entry.bytes)?;
     }
-    kr_ipc::paths::write_owner_only_file(path, &archive.finish()).map_err(CliError::Ipc)
+    kr_ipc::paths::write_file_in_directory_access(path, &archive.finish()).map_err(CliError::Ipc)
 }
 
 /// A POSIX `ustar` archive, built in memory.

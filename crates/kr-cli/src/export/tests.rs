@@ -1277,6 +1277,48 @@ async fn the_file_is_new_owner_only_and_whole() {
     assert_eq!(names, vec![std::ffi::OsString::from("session.json")]);
 }
 
+/// On Windows the file takes the access list of the folder the person named: the folder here passes
+/// the users' group down, and the export carries that entry as a file made beside it does. The
+/// writer sets no list on it, so a volume that keeps none holds it too.
+#[cfg(windows)]
+#[tokio::test]
+async fn the_file_takes_the_access_list_of_the_folder_it_is_written_to_on_windows() {
+    use kr_ipc::paths::FileAccess;
+
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 7, &[]),
+        page(0, b"abc"),
+        end(3),
+        privacy(false, 7, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    let directory = tempfile::tempdir().expect("a directory");
+    let granted = std::process::Command::new("icacls.exe")
+        .arg(directory.path())
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("icacls runs");
+    assert!(granted.success(), "the users' group is granted the folder");
+    let path = directory.path().join("session.json");
+    write(&path, &exported).expect("writes");
+    let beside = directory.path().join("beside");
+    std::fs::write(&beside, b"made as any program makes a file").expect("a file beside it");
+    let written = FileAccess::of(&path).expect("who can reach the export");
+    assert!(
+        format!("{written:?}").contains("S-1-5-32-545"),
+        "the export carries the entry its folder passes down: {written:?}"
+    );
+    assert_eq!(
+        written,
+        FileAccess::of(&beside).expect("who can reach the file beside it"),
+        "and nothing else was set on it"
+    );
+}
+
 /// An export never replaces a file and never writes through a link: a name that is taken, whether
 /// by a file or by a link to one, is refused before the output is read and again where the file is
 /// made, and what was there is untouched.

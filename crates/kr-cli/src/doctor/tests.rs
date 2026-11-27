@@ -1013,6 +1013,68 @@ fn an_entry_the_format_cannot_carry_is_refused() {
     );
 }
 
+/// A bundle with nothing in it, which is all the writes below need.
+fn an_empty_bundle() -> ComposedBundle {
+    ComposedBundle::new(
+        TimestampMs::new(1),
+        Vec::new(),
+        Vec::new(),
+        result(),
+        Vec::new(),
+    )
+}
+
+/// On Unix the bundle is private by its mode, as the person's own state is.
+#[cfg(unix)]
+#[test]
+fn a_bundle_is_private_by_its_mode_on_unix() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("support.tar");
+    bundle::write(&path, &an_empty_bundle(), None).expect("writes the bundle");
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+/// On Windows the bundle takes the access list of the folder the person named: the folder here
+/// passes the users' group down, and the bundle carries that entry as a file made beside it does.
+/// The writer sets no list on it, so a volume that keeps none holds it too.
+#[cfg(windows)]
+#[test]
+fn a_bundle_takes_the_access_list_of_the_folder_it_is_written_to_on_windows() {
+    use kr_ipc::paths::FileAccess;
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let granted = std::process::Command::new("icacls.exe")
+        .arg(directory.path())
+        .args(["/grant", "*S-1-5-32-545:(OI)(CI)M"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("icacls runs");
+    assert!(granted.success(), "the users' group is granted the folder");
+    let path = directory.path().join("support.tar");
+    bundle::write(&path, &an_empty_bundle(), None).expect("writes the bundle");
+    let beside = directory.path().join("beside");
+    std::fs::write(&beside, b"made as any program makes a file").expect("a file beside it");
+    let written = FileAccess::of(&path).expect("who can reach the bundle");
+    assert!(
+        format!("{written:?}").contains("S-1-5-32-545"),
+        "the bundle carries the entry its folder passes down: {written:?}"
+    );
+    assert_eq!(
+        written,
+        FileAccess::of(&beside).expect("who can reach the file beside it"),
+        "and nothing else was set on it"
+    );
+}
+
 /// KR-REQ-26.10: a document written at version 1 is read as it was, and the next
 /// edit writes it at the version this build writes with every choice it held.
 #[test]

@@ -383,16 +383,16 @@ pub fn write(path: &Path, exported: &Exported) -> Result<()> {
     // whole first: where the file goes is where the command was run.
     let whole = std::path::absolute(path)
         .map_err(|error| CliError::Ipc(kr_ipc::IpcError::io("resolve", path, error)))?;
-    kr_ipc::paths::create_new_owner_only_file(&whole, &exported.document).map_err(|error| {
-        match &error {
+    kr_ipc::paths::create_new_file_in_directory_access(&whole, &exported.document).map_err(
+        |error| match &error {
             kr_ipc::IpcError::Io { source, .. }
                 if source.kind() == std::io::ErrorKind::AlreadyExists =>
             {
                 taken(path)
             }
             _ => CliError::Ipc(error),
-        }
-    })
+        },
+    )
 }
 
 #[cfg(test)]

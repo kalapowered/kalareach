@@ -1622,7 +1622,8 @@ software versions, the capability evidence, the diagnostics, the effective confi
 of this host's errors, which `kr doctor` leaves empty, and `report.txt`, the same diagnostics as readable lines. Both are written from the
 bundle's own exported copy rather than from what the terminal showed: the report on your screen
 names your paths because you are at this machine, and the file you send somebody carries each of
-them as its class and its length.
+them as its class and its length. The file's mode is 0600 on Unix, and on Windows it takes the
+access list of the folder it is in, which is yours to choose.
 
 Every field in it is redacted by what it is rather than by what it looks like. Each exported field
 is listed once, with what its value is made of, and a field whose value came from outside this

@@ -3230,20 +3230,78 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 ///
 /// Returns an error when the file cannot be written or renamed into place.
 pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
+    replace_through_temporary(path, contents, make_owner_only)
+}
+
+/// Writes a file that is private by its mode where there are modes, and that takes its
+/// directory's access on Windows, replacing any previous contents atomically.
+///
+/// This is for a file that the person named a place for and hands to somebody: the place is theirs
+/// to choose, and what they choose decides who can reach the file, as it does for a file any other
+/// program makes there. The mode is `0600` on Unix. On Windows the file takes the access list of
+/// the directory it is made in, and no list is set on it or read back from it, so a volume that
+/// keeps no lists holds it as it holds any other file. The steps and the errors are those of
+/// [`write_owner_only_file`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written or renamed into place.
+pub fn write_file_in_directory_access(path: &Path, contents: &[u8]) -> Result<()> {
+    replace_through_temporary(path, contents, make_in_directory_access)
+}
+
+/// How a new file is made: open for writing, at a name that is not there yet.
+type MakeFile = fn(&Path) -> Result<std::fs::File>;
+
+/// Makes a new file that nobody else can reach, and says why it did not.
+fn make_owner_only(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        make_by_mode(path)
+    }
+    #[cfg(not(unix))]
+    {
+        make_in_directory_access(path)
+    }
+}
+
+/// Makes a new file that is private by its mode where there are modes, and takes the access of
+/// its directory on Windows.
+fn make_in_directory_access(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        make_by_mode(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| IpcError::io("create", path, error))
+    }
+}
+
+/// Makes a new file with the owner's mode from the first moment it exists.
+#[cfg(unix)]
+fn make_by_mode(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(OWNER_ONLY_FILE_MODE)
+        .open(path)
+        .map_err(|error| IpcError::io("create", path, error))
+}
+
+/// The replacement of a file by a new one made beside it, made by `make`.
+fn replace_through_temporary(path: &Path, contents: &[u8], make: MakeFile) -> Result<()> {
     use std::io::Write as _;
 
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = directory.join(format!(".{}.tmp", crate::new_uuid()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(OWNER_ONLY_FILE_MODE);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| IpcError::io("create", &temporary, error))?;
+    let mut file = make(&temporary)?;
     let written = file
         .write_all(contents)
         .and_then(|()| file.sync_all())
@@ -3279,6 +3337,28 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// Returns [`IpcError::Io`] with [`std::io::ErrorKind::AlreadyExists`] when the file is present,
 /// and any other failure of the write.
 pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
+    create_new_through_temporary(path, contents, make_owner_only)
+}
+
+/// Writes a file that is private by its mode where there are modes and takes its directory's access
+/// on Windows, failing when it already exists.
+///
+/// This is for a file that the person named a place for and hands to somebody, as
+/// [`write_file_in_directory_access`] says: the mode is `0600` on Unix, and on Windows the file
+/// takes the access list of the directory it is made in, with no list set on it or read back from
+/// it, so a volume that keeps no lists holds it as it holds any other file. The publication and the
+/// errors are those of [`create_new_owner_only_file`].
+///
+/// # Errors
+///
+/// Returns [`IpcError::Io`] with [`std::io::ErrorKind::AlreadyExists`] when the file is present,
+/// and any other failure of the write.
+pub fn create_new_file_in_directory_access(path: &Path, contents: &[u8]) -> Result<()> {
+    create_new_through_temporary(path, contents, make_in_directory_access)
+}
+
+/// The publication of a new file made beside its name by `make`, under a name that is not taken.
+fn create_new_through_temporary(path: &Path, contents: &[u8], make: MakeFile) -> Result<()> {
     use std::io::Write as _;
 
     // The contents are complete and on disk before the name exists. Creating the file at its final
@@ -3290,16 +3370,7 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     // well as making the publication atomic.
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = directory.join(format!(".{}.tmp", crate::new_uuid()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(OWNER_ONLY_FILE_MODE);
-    }
-    let mut file = options
-        .open(&temporary)
-        .map_err(|error| IpcError::io("create", &temporary, error))?;
+    let mut file = make(&temporary)?;
     let written = file
         .write_all(contents)
         .and_then(|()| file.sync_all())
