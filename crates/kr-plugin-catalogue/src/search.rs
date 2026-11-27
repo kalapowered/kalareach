@@ -117,6 +117,9 @@ impl<'a> MatchIndex<'a> {
                     "",
                     &observation.executable_path,
                     observation.distribution.as_ref(),
+                    // A lookup before an install has no executable to read a version from.
+                    None,
+                    &[],
                 )
             }));
         }

@@ -84,9 +84,14 @@ impl Admitted {
                 // The worker establishes no distribution for a program it finds running, so every
                 // rule recognises the program by its name and location as a guess. A publisher is
                 // vouched for by the enrolment of the repository the package came through.
-                if let Some(candidate) =
-                    rule.candidate(&plugin_id, &package.origin.enrolment_key, path, None)
-                {
+                if let Some(candidate) = rule.candidate(
+                    &plugin_id,
+                    &package.origin.enrolment_key,
+                    path,
+                    None,
+                    None,
+                    &[],
+                ) {
                     found.push((candidate, *digest));
                 }
             }

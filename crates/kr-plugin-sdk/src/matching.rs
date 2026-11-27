@@ -14,7 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{PluginId, PluginName};
-use crate::version::VersionRange;
+use crate::version::{PackageVersion, VersionRange};
 
 /// An operating system a package supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -299,6 +299,11 @@ impl MatchRule {
     /// `authority` names what vouches for the package's publisher: the enrolment of the repository
     /// the package came through, which has a root of its own. A publisher's name stands for one
     /// publisher only within one authority.
+    ///
+    /// `installed` is the version the host established for the program, where it did, and `ranges`
+    /// are the further ranges the package holds that version to besides the rule's own. A host
+    /// that established no version passes `None`, and every candidate then has the neutral
+    /// coverage.
     #[must_use]
     pub fn candidate(
         &self,
@@ -306,6 +311,8 @@ impl MatchRule {
         authority: &str,
         path: &str,
         observed: Option<&DistributionMatch>,
+        _installed: Option<&PackageVersion>,
+        _ranges: &[&VersionRange],
     ) -> Option<Candidate> {
         let executable_matched = self.executable.matches_path(path);
         let distribution_matched = match (self.distribution.0.as_ref(), observed) {
@@ -332,8 +339,24 @@ impl MatchRule {
             confidence,
             distribution_matched,
             located: executable_matched && !self.executable.path_suffix.is_empty(),
+            coverage: Coverage::Neutral,
         })
     }
+}
+
+/// How far the version a host established for a program fits the ranges a package declares.
+///
+/// The variants are in rank order: a package that covers the version ranks above one that says
+/// nothing about it, and that above one that refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Coverage {
+    /// The version is known and some range the package declares refuses it.
+    Excludes,
+    /// The package declares no range, or the host established no version: nothing is established
+    /// for or against the package.
+    Neutral,
+    /// The version is known and every range the package declares admits it.
+    Covers,
 }
 
 /// One package whose rules recognise what is running.
@@ -353,6 +376,8 @@ pub struct Candidate {
     /// Whether the rule recognised the program by an installation location it names, as well as
     /// by the executable's name.
     pub located: bool,
+    /// How far the program's version fits the ranges this rule and its package declare.
+    pub coverage: Coverage,
 }
 
 /// What matching decided.
@@ -457,6 +482,7 @@ mod tests {
             confidence,
             distribution_matched: false,
             located: false,
+            coverage: Coverage::Neutral,
         }
     }
 
@@ -565,18 +591,18 @@ mod tests {
         let path = "/usr/local/bin/sample";
         // The host established nothing about where the program came from: its name is a guess.
         let unknown = rule
-            .candidate(&package, "", path, None)
+            .candidate(&package, "", path, None, None, &[])
             .expect("recognised");
         assert_eq!(unknown.confidence, MatchConfidence::Inferred);
         assert!(!unknown.distribution_matched);
         // Established as another distribution: still recognised by name, and still a guess.
         let other = rule
-            .candidate(&package, "", path, Some(&npm("another")))
+            .candidate(&package, "", path, Some(&npm("another")), None, &[])
             .expect("recognised");
         assert_eq!(other.confidence, MatchConfidence::Inferred);
         // Established as the rule's own, in either case of the identifier: what the rule declares.
         let own = rule
-            .candidate(&package, "", path, Some(&npm("@Vendor/Sample")))
+            .candidate(&package, "", path, Some(&npm("@Vendor/Sample")), None, &[])
             .expect("recognised");
         assert_eq!(own.confidence, MatchConfidence::Exact);
         assert!(own.distribution_matched);
@@ -585,14 +611,14 @@ mod tests {
         let plain = named_rule("sample", &[], None, MatchConfidence::Exact);
         assert_eq!(
             plain
-                .candidate(&package, "", path, None)
+                .candidate(&package, "", path, None, None, &[])
                 .expect("recognised")
                 .confidence,
             MatchConfidence::Inferred
         );
         // And nothing is recognised that neither the name nor the distribution recognises.
         assert!(
-            rule.candidate(&package, "", "/usr/local/bin/other", None)
+            rule.candidate(&package, "", "/usr/local/bin/other", None, None, &[])
                 .is_none()
         );
     }
@@ -611,7 +637,7 @@ mod tests {
                 (&also_named, &by_name),
             ]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None, None, &[]))
             .collect::<Vec<_>>()
         };
         match resolve(candidates("/home/u/.tool/bin/tool"), None) {
@@ -636,7 +662,7 @@ mod tests {
         // The shipped package guesses by name, and the vendor's names a location: neither wins.
         let located = [(&shipped, &by_name), (&vendor, &at_home)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None, None, &[]))
             .collect::<Vec<_>>();
         assert!(matches!(resolve(located, None), Resolution::Conflict(_)));
         // The vendor's package declares its name exact, and it names no distribution to establish:
@@ -644,7 +670,7 @@ mod tests {
         let bold = named_rule("tool", &[], None, MatchConfidence::Exact);
         let exact = [(&shipped, &by_name), (&vendor, &bold)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None, None, &[]))
             .collect::<Vec<_>>();
         assert!(matches!(resolve(exact, None), Resolution::Conflict(_)));
         // The same publisher name from another repository is not the same publisher: the name is
@@ -656,7 +682,9 @@ mod tests {
                 (&helper, &at_home, authority),
             ]
             .into_iter()
-            .filter_map(|(plugin, rule, authority)| rule.candidate(plugin, authority, path, None))
+            .filter_map(|(plugin, rule, authority)| {
+                rule.candidate(plugin, authority, path, None, None, &[])
+            })
             .collect::<Vec<_>>()
         };
         match resolve(from("official"), None) {
@@ -670,12 +698,333 @@ mod tests {
         // And the person's own choice still decides.
         let chosen = [(&shipped, &by_name), (&vendor, &bold)]
             .into_iter()
-            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None))
+            .filter_map(|(plugin, rule)| rule.candidate(plugin, "", path, None, None, &[]))
             .collect::<Vec<_>>();
         match resolve(chosen, Some(&vendor)) {
             Resolution::Selected(candidate) => assert_eq!(candidate.plugin_id, vendor),
             other => panic!("the selection should win: {other:?}"),
         }
+    }
+
+    const TOOL: &str = "/home/u/.tool/bin/tool";
+
+    fn version(text: &str) -> PackageVersion {
+        PackageVersion::parse(text).expect("a version")
+    }
+
+    fn within(mut rule: MatchRule, range: &str) -> MatchRule {
+        rule.executable.version_range =
+            Nullable(Some(VersionRange::parse(range).expect("a version range")));
+        rule
+    }
+
+    /// The candidate `rule` makes of `plugin`, for a program of the version `installed` where one
+    /// is established, held to the further `ranges` as well.
+    fn recognised(
+        plugin: &str,
+        authority: &str,
+        rule: &MatchRule,
+        installed: Option<&str>,
+        ranges: &[&str],
+    ) -> Candidate {
+        let plugin = PluginId::new(plugin).expect("a plugin identifier");
+        let installed = installed.map(version);
+        let ranges: Vec<VersionRange> = ranges
+            .iter()
+            .map(|range| VersionRange::parse(range).expect("a version range"))
+            .collect();
+        let ranges: Vec<&VersionRange> = ranges.iter().collect();
+        rule.candidate(&plugin, authority, TOOL, None, installed.as_ref(), &ranges)
+            .expect("recognised")
+    }
+
+    fn covering(plugin: &str, confidence: MatchConfidence, coverage: Coverage) -> Candidate {
+        Candidate {
+            coverage,
+            ..candidate(plugin, confidence)
+        }
+    }
+
+    fn chosen(resolution: Resolution) -> String {
+        match resolution {
+            Resolution::Selected(chosen) => chosen.plugin_id.to_string(),
+            other => panic!("one package should be chosen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rule_covers_a_version_it_admits_excludes_one_it_refuses_and_is_neutral_otherwise() {
+        let open = named_rule("tool", &[], None, MatchConfidence::Inferred);
+        let bounded = within(open.clone(), ">=1.0.0, <2.0.0");
+        let coverage = |rule: &MatchRule, installed: Option<&str>, ranges: &[&str]| {
+            recognised("kalareach/sample", "", rule, installed, ranges).coverage
+        };
+        // A rule that declares no range says nothing about a version, known or not.
+        assert_eq!(coverage(&open, Some("1.4.0"), &[]), Coverage::Neutral);
+        assert_eq!(coverage(&open, None, &[]), Coverage::Neutral);
+        // A declared range is held against a known version.
+        assert_eq!(coverage(&bounded, Some("1.4.0"), &[]), Coverage::Covers);
+        assert_eq!(coverage(&bounded, Some("2.1.0"), &[]), Coverage::Excludes);
+        // A version nothing established never counts against the package.
+        assert_eq!(coverage(&bounded, None, &[]), Coverage::Neutral);
+        assert_eq!(coverage(&bounded, None, &["=1.4.0"]), Coverage::Neutral);
+        // A further range ranks a rule that declares none.
+        assert_eq!(
+            coverage(&open, Some("1.4.0"), &["=1.4.0"]),
+            Coverage::Covers
+        );
+        assert_eq!(
+            coverage(&open, Some("1.4.1"), &["=1.4.0"]),
+            Coverage::Excludes
+        );
+        // Every range must admit the version, so two ranges are held as their intersection.
+        assert_eq!(
+            coverage(&bounded, Some("1.4.0"), &["=1.4.0"]),
+            Coverage::Covers
+        );
+        assert_eq!(
+            coverage(&bounded, Some("1.5.0"), &["=1.4.0"]),
+            Coverage::Excludes
+        );
+        assert_eq!(
+            coverage(&bounded, Some("2.0.0"), &[">=1.0.0"]),
+            Coverage::Excludes
+        );
+        // A prerelease is outside a plain range, as the version grammar has it.
+        assert_eq!(
+            coverage(&bounded, Some("1.5.0-rc.1"), &[]),
+            Coverage::Excludes
+        );
+        assert_eq!(
+            coverage(&open, Some("1.5.0-rc.1"), &[">=1.5.0-rc.1"]),
+            Coverage::Covers
+        );
+    }
+
+    #[test]
+    fn a_covering_package_beats_a_neutral_one_and_a_neutral_one_beats_an_excluding_one() {
+        let by_name = named_rule("tool", &[], None, MatchConfidence::Inferred);
+        let from_one = within(by_name.clone(), ">=1.0.0, <2.0.0");
+        let from_two = within(by_name.clone(), ">=2.0.0");
+        let candidates = |installed: &str| {
+            vec![
+                recognised("kalareach/one", "", &from_one, Some(installed), &[]),
+                recognised("kalareach/two", "", &from_two, Some(installed), &[]),
+                recognised("kalareach/plain", "", &by_name, Some(installed), &[]),
+            ]
+        };
+        // At 1.4.0 the first covers, the second refuses and the third declares nothing.
+        assert_eq!(chosen(resolve(candidates("1.4.0"), None)), "kalareach/one");
+        let mut reversed = candidates("1.4.0");
+        reversed.reverse();
+        assert_eq!(chosen(resolve(reversed, None)), "kalareach/one");
+        // At 2.1.0 the second covers.
+        assert_eq!(chosen(resolve(candidates("2.1.0"), None)), "kalareach/two");
+        // Without the covering package, the one that says nothing beats the one that refuses.
+        let rest = candidates("1.4.0").split_off(1);
+        assert_eq!(chosen(resolve(rest, None)), "kalareach/plain");
+        // Equal coverage is still for the person to decide.
+        let alike = vec![
+            recognised("kalareach/one", "", &from_one, Some("1.4.0"), &[]),
+            recognised("kalareach/same", "", &from_one, Some("1.4.0"), &[]),
+        ];
+        assert!(matches!(resolve(alike, None), Resolution::Conflict(_)));
+        // And the person's own choice still decides, over a package that refuses the version.
+        let excluded = PluginId::new("kalareach/two").expect("a plugin identifier");
+        assert_eq!(
+            chosen(resolve(candidates("1.4.0"), Some(&excluded))),
+            "kalareach/two"
+        );
+    }
+
+    #[test]
+    fn coverage_ranks_before_an_exact_rule() {
+        let exact = |coverage| covering("kalareach/exact", MatchConfidence::Exact, coverage);
+        let guess = |coverage| covering("kalareach/guess", MatchConfidence::Inferred, coverage);
+        // A package whose exact rule refuses the version loses to a guess that admits it, and to a
+        // guess that says nothing.
+        assert_eq!(
+            chosen(resolve(
+                vec![exact(Coverage::Excludes), guess(Coverage::Covers)],
+                None
+            )),
+            "kalareach/guess"
+        );
+        assert_eq!(
+            chosen(resolve(
+                vec![exact(Coverage::Excludes), guess(Coverage::Neutral)],
+                None
+            )),
+            "kalareach/guess"
+        );
+        // An exact rule still beats a guess of the same coverage.
+        assert_eq!(
+            chosen(resolve(
+                vec![guess(Coverage::Covers), exact(Coverage::Covers)],
+                None
+            )),
+            "kalareach/exact"
+        );
+    }
+
+    #[test]
+    fn coverage_ranks_before_the_installation_location() {
+        let located = |coverage| Candidate {
+            located: true,
+            ..covering("kalareach/located", MatchConfidence::Inferred, coverage)
+        };
+        let named = |coverage| covering("kalareach/named", MatchConfidence::Inferred, coverage);
+        // The shape of two packages for one program, one of which names its install location: a
+        // package that refuses the version does not take the program by its location.
+        assert_eq!(
+            chosen(resolve(
+                vec![located(Coverage::Excludes), named(Coverage::Covers)],
+                None
+            )),
+            "kalareach/named"
+        );
+        // Among packages of one coverage, the location still decides.
+        assert_eq!(
+            chosen(resolve(
+                vec![named(Coverage::Covers), located(Coverage::Covers)],
+                None
+            )),
+            "kalareach/located"
+        );
+    }
+
+    #[test]
+    fn a_package_ranks_by_its_best_rule() {
+        // One package with two rules, one of which refuses the version and one of which admits it,
+        // against a package that says nothing: the first covers.
+        let both = |rule_id: &str, coverage| Candidate {
+            rule_id: rule_id.to_owned(),
+            ..covering("kalareach/both", MatchConfidence::Inferred, coverage)
+        };
+        let plain = covering(
+            "kalareach/plain",
+            MatchConfidence::Inferred,
+            Coverage::Neutral,
+        );
+        assert_eq!(
+            chosen(resolve(
+                vec![
+                    both("refuses", Coverage::Excludes),
+                    plain.clone(),
+                    both("admits", Coverage::Covers),
+                ],
+                None
+            )),
+            "kalareach/both"
+        );
+        // A package with a rule that says nothing and one that refuses it is neutral, so it beats
+        // a package whose only rule refuses.
+        let refusing = covering(
+            "kalareach/refusing",
+            MatchConfidence::Inferred,
+            Coverage::Excludes,
+        );
+        assert_eq!(
+            chosen(resolve(
+                vec![
+                    refusing,
+                    both("refuses", Coverage::Excludes),
+                    both("silent", Coverage::Neutral),
+                ],
+                None
+            )),
+            "kalareach/both"
+        );
+    }
+
+    #[test]
+    fn coverage_does_not_rank_packages_of_other_publishers_or_repositories() {
+        let shipped = |coverage| covering("kalareach/tool", MatchConfidence::Inferred, coverage);
+        let vendor =
+            |coverage| covering("example-vendor/tool", MatchConfidence::Inferred, coverage);
+        // A publisher's own record of a build is a claim only its repository vouches for, so a
+        // package of another publisher that names the program's version cannot take the program
+        // from the shipped package by it.
+        for (shipped_coverage, vendor_coverage) in [
+            (Coverage::Neutral, Coverage::Covers),
+            (Coverage::Excludes, Coverage::Covers),
+            (Coverage::Excludes, Coverage::Neutral),
+        ] {
+            let candidates = vec![shipped(shipped_coverage), vendor(vendor_coverage)];
+            assert_eq!(
+                resolve(candidates.clone(), None),
+                Resolution::Conflict(candidates),
+                "{shipped_coverage:?} against {vendor_coverage:?}"
+            );
+        }
+        // The same publisher's name from another repository is not the same publisher.
+        let from = |authority: &str, coverage| Candidate {
+            authority: authority.to_owned(),
+            ..covering("kalareach/tool", MatchConfidence::Inferred, coverage)
+        };
+        let elsewhere = Candidate {
+            plugin_id: PluginId::new("kalareach/tool-helper").expect("a plugin identifier"),
+            ..from("another root", Coverage::Covers)
+        };
+        let candidates = vec![from("official", Coverage::Neutral), elsewhere];
+        assert_eq!(
+            resolve(candidates.clone(), None),
+            Resolution::Conflict(candidates)
+        );
+        // Within one repository the same two coverages are ranked.
+        let candidates = vec![
+            from("official", Coverage::Neutral),
+            Candidate {
+                plugin_id: PluginId::new("kalareach/tool-helper").expect("a plugin identifier"),
+                ..from("official", Coverage::Covers)
+            },
+        ];
+        assert_eq!(chosen(resolve(candidates, None)), "kalareach/tool-helper");
+        // A third package of another publisher in the set keeps the whole set unranked.
+        let candidates = vec![
+            shipped(Coverage::Covers),
+            covering(
+                "kalareach/other",
+                MatchConfidence::Inferred,
+                Coverage::Neutral,
+            ),
+            vendor(Coverage::Neutral),
+        ];
+        assert_eq!(
+            resolve(candidates.clone(), None),
+            Resolution::Conflict(candidates)
+        );
+        // And the person's own choice still decides.
+        let selected = PluginId::new("example-vendor/tool").expect("a plugin identifier");
+        assert_eq!(
+            chosen(resolve(
+                vec![shipped(Coverage::Covers), vendor(Coverage::Excludes)],
+                Some(&selected)
+            )),
+            "example-vendor/tool"
+        );
+    }
+
+    #[test]
+    fn a_lone_excluding_package_stays_selected_and_all_excluding_packages_conflict() {
+        let one = covering(
+            "kalareach/one",
+            MatchConfidence::Inferred,
+            Coverage::Excludes,
+        );
+        let two = covering(
+            "kalareach/two",
+            MatchConfidence::Inferred,
+            Coverage::Excludes,
+        );
+        // A program only one package recognises is that package's, whatever its version: the
+        // package's own typed routes are refused later, not the binding.
+        assert_eq!(chosen(resolve(vec![one.clone()], None)), "kalareach/one");
+        // Packages that all refuse the version are alike, so nothing is preferred.
+        assert_eq!(
+            resolve(vec![one.clone(), two.clone()], None),
+            Resolution::Conflict(vec![one, two])
+        );
     }
 
     #[test]
