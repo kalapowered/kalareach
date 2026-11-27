@@ -923,12 +923,6 @@ impl Registry {
         environment_id: EnvironmentId,
         current_process: fn(&ProcessStartIdentity) -> CurrentProcess,
     ) -> Result<Self> {
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(ControllerError::registry)?;
-        connection
-            .pragma_update(None, "synchronous", "FULL")
-            .map_err(ControllerError::registry)?;
         let registry = Self {
             connection,
             environment_id,
@@ -936,7 +930,26 @@ impl Registry {
             #[cfg(feature = "testing")]
             read_stall: crate::attention::Pause::default(),
         };
-        registry.migrate()?;
+        // The version is read, and a version this build does not open is refused, before the first
+        // statement that can write. Setting the journal mode rewrites the file's header when the
+        // file is not in write-ahead mode, so a refused registry would not be left as it was by a
+        // refusal that came after it. What the connection did before this, its first read, writes
+        // nothing: a rollback journal that a stop left is rolled back by the database itself at
+        // that read, in every opener, and a write-ahead file's log and index, which that read
+        // makes where there are none, are removed again when the connection closes.
+        let recorded = registry.recorded_version()?;
+        if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
+            return Err(refused_version(version));
+        }
+        registry
+            .connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(ControllerError::registry)?;
+        registry
+            .connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(ControllerError::registry)?;
+        registry.migrate(recorded)?;
         registry.settle_whole_seconds()?;
         Ok(registry)
     }
@@ -962,14 +975,13 @@ impl Registry {
             .map_err(ControllerError::registry)
     }
 
-    fn migrate(&self) -> Result<()> {
-        // The version is read, and a version this build does not open is refused, before any
-        // statement writes: not even a table an ordinary writer makes is made in a file that is
-        // refused.
-        let recorded = self.recorded_version()?;
-        if let Some(version) = recorded.filter(|version| is_refused_version(*version)) {
-            return Err(refused_version(version));
-        }
+    /// Brings the file's own tables to this build's schema, from the version `recorded` that the
+    /// caller read and found this build opens: `None` for a file that records none.
+    ///
+    /// Nothing is written before this: the caller has read the version and refused the ones this
+    /// build does not open, ahead of the journal mode and every other statement that can write, so
+    /// not even a table an ordinary writer makes is made in a file that is refused.
+    fn migrate(&self, recorded: Option<i64>) -> Result<()> {
         self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);

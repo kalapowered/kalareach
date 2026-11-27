@@ -1201,6 +1201,311 @@ fn a_refused_registry_that_lacks_an_ordinary_table_is_left_byte_for_byte_as_it_w
     }
 }
 
+/// The journal mode a registry file is in before anything of the product looks at it.
+#[derive(Clone, Copy, Debug)]
+enum Journal {
+    /// The rollback journal: the mode of a file no daemon has put into write-ahead mode.
+    Rollback,
+    /// Write-ahead logging: the mode a daemon leaves a file in.
+    WriteAhead,
+}
+
+impl Journal {
+    fn pragma(self) -> &'static str {
+        match self {
+            Self::Rollback => "DELETE",
+            Self::WriteAhead => "WAL",
+        }
+    }
+
+    /// The two bytes of a database file's header, at offsets 18 and 19, that record the mode.
+    fn header(self) -> [u8; 2] {
+        match self {
+            Self::Rollback => [1, 1],
+            Self::WriteAhead => [2, 2],
+        }
+    }
+}
+
+/// Which of the registry's two ways of being opened for writing a case asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opener {
+    /// A daemon's start.
+    Open,
+    /// An update that brings a registry forward.
+    BringForward,
+}
+
+/// The names in `directory`, in a fixed order.
+fn listing(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)
+        .expect("the folder lists")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// The two header bytes of the file at `path` that record its journal mode.
+fn journal_header(path: &Path) -> [u8; 2] {
+    let bytes = std::fs::read(path).expect("the file reads");
+    [bytes[18], bytes[19]]
+}
+
+/// A registry file at `version`, in `journal` mode, that lacks the clock table an ordinary writer
+/// makes as it opens the file, with nothing beside it.
+///
+/// The product makes the tables of a new file once, and a connection of the case then drops the
+/// clock table, sets the version and puts the file into the mode, before the case takes the bytes
+/// it compares: the first look of the product at the file is the one under test. The file's header
+/// and the folder are checked here, so a case that is red is red for the opener, not for its
+/// fixture.
+fn registry_in_mode(path: &Path, version: i64, journal: Journal) {
+    drop(open_registry(path).expect("a registry"));
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    connection
+        .execute_batch(&format!(
+            "DROP TABLE clock_continuity; UPDATE schema_version SET version = {version};"
+        ))
+        .expect("the clock table goes and the version is put back");
+    connection
+        .pragma_update(None, "journal_mode", journal.pragma())
+        .expect("the journal mode is set");
+    drop(connection);
+    assert_eq!(
+        journal_header(path),
+        journal.header(),
+        "the file is in {journal:?} mode before anything of the product looks at it"
+    );
+    assert_eq!(
+        listing(path.parent().expect("a folder")),
+        [path.file_name().expect("a name").to_string_lossy()],
+        "nothing is beside the file"
+    );
+}
+
+/// KR-REQ-23.45: a registry file that this build refuses is left as it was in either journal mode:
+/// the file's bytes, which include the two header bytes that record the mode, and the folder's
+/// listing are the same after the refusal, so no table is made, no mode is set and no file is left
+/// beside it. A daemon's start refuses 17 and 20, which no release wrote, and 23, past what this
+/// build reads. An update that brings a registry forward refuses 17 and 20 the same way, and leaves
+/// 23 for the reader to refuse in its own words.
+#[test]
+fn a_refused_registry_is_left_as_it_was_in_either_journal_mode() {
+    let environment = kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([7; 16]));
+    let mut failures: Vec<String> = Vec::new();
+    for journal in [Journal::Rollback, Journal::WriteAhead] {
+        for version in [17_i64, 20, 23] {
+            for opener in [Opener::Open, Opener::BringForward] {
+                let temp = tempfile::tempdir().expect("a directory on the internal disk");
+                let path = temp.path().join("registry.db");
+                registry_in_mode(&path, version, journal);
+                let schema = schema_of(&path);
+                let bytes = std::fs::read(&path).expect("the file reads");
+                let names = listing(temp.path());
+                let outcome: Result<(), String> = match opener {
+                    Opener::Open => open_registry(&path).map(drop).map_err(|e| e.to_string()),
+                    Opener::BringForward => {
+                        kr_controller::registry::Registry::bring_forward(&path, environment)
+                            .map(|carried| assert!(carried.is_none(), "{carried:?}"))
+                            .map_err(|e| e.to_string())
+                    }
+                };
+                let what = format!("{opener:?} at {version} in {journal:?} mode");
+                match (opener == Opener::Open || version != 23, outcome) {
+                    (true, Err(refusal))
+                        if refusal.contains(&format!("schema version {version}")) => {}
+                    (false, Ok(())) => {}
+                    (_, other) => {
+                        failures.push(format!("{what}: not refused as it should be: {other:?}"))
+                    }
+                }
+                if std::fs::read(&path).expect("the file reads") != bytes {
+                    failures.push(format!("{what}: the file is not byte for byte as it was"));
+                }
+                if journal_header(&path) != journal.header() {
+                    failures.push(format!("{what}: the journal mode is not as it was"));
+                }
+                if listing(temp.path()) != names {
+                    failures.push(format!("{what}: the folder's listing changed"));
+                }
+                if schema_of(&path) != schema {
+                    failures.push(format!("{what}: a table was made"));
+                }
+                if recorded_version(&path) != version {
+                    failures.push(format!("{what}: the version was changed"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A file at a supported version opens as it always did: the mode is set to write-ahead, the
+/// tables a new file has are all there, and the version is as it was.
+#[test]
+fn a_registry_in_the_rollback_mode_at_a_supported_version_opens_and_is_put_in_write_ahead_mode() {
+    let other = tempfile::tempdir().expect("a directory on the internal disk");
+    let fresh = other.path().join("fresh.db");
+    drop(open_registry(&fresh).expect("a new registry"));
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.db");
+    registry_in_mode(
+        &path,
+        kr_controller::registry::SCHEMA_VERSION,
+        Journal::Rollback,
+    );
+    let opened = open_registry(&path);
+    assert!(
+        opened.is_ok(),
+        "a supported registry opens: {:?}",
+        opened.err()
+    );
+    drop(opened);
+    assert_eq!(
+        journal_header(&path),
+        Journal::WriteAhead.header(),
+        "the open put the file into write-ahead mode"
+    );
+    assert_eq!(
+        recorded_version(&path),
+        kr_controller::registry::SCHEMA_VERSION
+    );
+    assert_eq!(
+        schema_of(&path),
+        schema_of(&fresh),
+        "the clock table is made again: the file has the tables a new one has"
+    );
+}
+
+/// A registry as a newer daemon leaves it when it stops hard: its file, and beside it a
+/// write-ahead log that holds committed writes the file does not. Nothing else is beside them.
+///
+/// The case makes it with a connection of its own that keeps its log, and copies the file and the
+/// log while that connection is open and idle: the copy is what a stop leaves, a log and no
+/// shared-memory file. The writes the log holds are the version and the loss of the clock table.
+fn registry_with_a_log(directory: &Path, version: i64) -> std::path::PathBuf {
+    let made = directory.join("made.db");
+    drop(open_registry(&made).expect("a registry"));
+    let writer = rusqlite::Connection::open(&made).expect("a writer");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("no checkpoint");
+    writer
+        .execute_batch(&format!(
+            "DROP TABLE clock_continuity; UPDATE schema_version SET version = {version};"
+        ))
+        .expect("writes that only the log holds");
+    let left = directory.join("left.db");
+    std::fs::copy(&made, &left).expect("the file is copied");
+    std::fs::copy(directory.join("made.db-wal"), directory.join("left.db-wal"))
+        .expect("the log is copied");
+    drop(writer);
+    assert!(
+        std::fs::metadata(directory.join("left.db-wal"))
+            .expect("a log")
+            .len()
+            > 0,
+        "the log holds writes"
+    );
+    assert!(
+        !directory.join("left.db-shm").exists(),
+        "no shared-memory file, as after a stop"
+    );
+    left
+}
+
+/// The version, the schema's text and a digest over the rows of every table, as a read-only
+/// connection reads them through the log.
+fn what_a_reader_sees(path: &Path) -> (i64, Vec<(String, String, String)>, u64) {
+    use std::hash::{DefaultHasher, Hash as _, Hasher as _};
+
+    let connection = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .expect("a read-only connection opens");
+    let version = connection
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .expect("a version");
+    let schema: Vec<(String, String, String)> = connection
+        .prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name")
+        .expect("the schema")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row");
+    let mut digest = DefaultHasher::new();
+    for (_, table, _) in schema
+        .iter()
+        .filter(|(kind, name, _)| kind == "table" && !name.starts_with("sqlite_"))
+    {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{table}\""))
+            .expect("a table reads");
+        let columns = statement.column_count();
+        let mut rows: Vec<String> = statement
+            .query_map([], |row| {
+                let mut text = String::new();
+                for column in 0..columns {
+                    let value: rusqlite::types::Value = row.get(column)?;
+                    text.push_str(&format!("{value:?}|"));
+                }
+                Ok(text)
+            })
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("every row");
+        rows.sort();
+        (table, rows).hash(&mut digest);
+    }
+    (version, schema, digest.finish())
+}
+
+/// KR-REQ-23.45: a registry that a newer daemon left with a log that holds writes is refused, and
+/// the refusal adds nothing to what the database's own recovery does: the version, the schema's
+/// text and every table's rows, read through the log, are the same before and after. The log is the
+/// only place that holds the version here, so the file alone would read as a supported registry.
+#[test]
+fn a_refused_registry_with_a_log_that_holds_writes_reads_the_same_after_the_refusal() {
+    for version in [17_i64, 20, 23] {
+        let temp = tempfile::tempdir().expect("a directory on the internal disk");
+        let path = registry_with_a_log(temp.path(), version);
+        let alone = kr_controller::registry::open_immutable(&path)
+            .expect("the file alone reads")
+            .query_row("SELECT version FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("a version");
+        assert_eq!(
+            alone,
+            kr_controller::registry::SCHEMA_VERSION,
+            "the file alone records a supported version: the log holds the one under test"
+        );
+        let before = what_a_reader_sees(&path);
+        assert_eq!(before.0, version, "read through the log");
+        let refusal = match open_registry(&path) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("a registry at {version} is refused"),
+        };
+        assert!(
+            refusal.contains(&format!("schema version {version}")),
+            "{refusal}"
+        );
+        assert_eq!(
+            what_a_reader_sees(&path),
+            before,
+            "the refusal at {version} changed nothing a reader sees"
+        );
+    }
+}
+
 /// KR-REQ-23.45: a registry at 22 is the tables of 21 with the configuration document at its next
 /// version, and this build opens it as it finds it: nothing is brought forward, no table is made
 /// and no version is written.
