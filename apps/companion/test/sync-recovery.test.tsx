@@ -600,7 +600,7 @@ describe('recovery', () => {
     )
     expect(copies).toHaveTextContent('Archive 0a1b2c3d: the service holds no generation of it.')
     expect(copies).toHaveTextContent(
-      'Archive 0a1b2c3d: the recovery bundle holds two different backups for generation 8, so it is not offered.'
+      'Archive 0a1b2c3d: the recovery bundle holds two checkpoints that name different backups for generation 8, so it is not offered.'
     )
     expect(copies).toHaveTextContent(
       'Archive 0a1b2c3d: what the service holds for generation 9 is not the archive a host this device paired with named for it, so it is not offered.'

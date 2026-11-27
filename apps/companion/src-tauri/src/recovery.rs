@@ -1442,8 +1442,9 @@ const fn unreadable_recourse(cause: SnapshotCause) -> &'static str {
             "A newer version of this app wrote the file. Update the app."
         }
         SnapshotCause::Lock => {
-            "This file only guards the checkpoints and holds none, so removing it loses nothing. \
-             This device lists and exports no archive until that file can be used."
+            "Close every KalaReach program on this device first, then remove the lock file. It \
+             holds no checkpoint. This device lists and exports no archive until the file can be \
+             used."
         }
         SnapshotCause::Busy => {
             "Close any other KalaReach program on this device, or try again in a moment."

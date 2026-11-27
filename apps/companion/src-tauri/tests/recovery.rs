@@ -6943,8 +6943,8 @@ async fn the_words_for_checkpoints_that_cannot_be_used_name_the_file_at_fault_an
         words
     };
 
-    // A directory stands where the lock file goes: it cannot be opened. Removing the file loses
-    // nothing, since it holds no checkpoint.
+    // A directory stands where the lock file goes: it cannot be opened. The file holds no
+    // checkpoint, and it is removed only once every program has been closed.
     std::fs::create_dir(&lock).expect("a directory where the lock file goes");
     let words = listed();
     assert!(
@@ -6956,11 +6956,13 @@ async fn the_words_for_checkpoints_that_cannot_be_used_name_the_file_at_fault_an
     );
     assert!(
         words.ends_with(
-            "). This file only guards the checkpoints and holds none, so removing it loses \
-             nothing. This device lists and exports no archive until that file can be used."
+            "). Close every KalaReach program on this device first, then remove the lock file. \
+             It holds no checkpoint. This device lists and exports no archive until the file \
+             can be used."
         ),
         "{words}"
     );
+    assert!(!words.contains("loses nothing"), "{words}");
     std::fs::remove_dir(&lock).expect("the directory is removed");
 
     // Something else holds the lock: that is use, and the lock file is not offered for removal.
@@ -6982,7 +6984,7 @@ async fn the_words_for_checkpoints_that_cannot_be_used_name_the_file_at_fault_an
         ),
         "{words}"
     );
-    assert!(!words.to_lowercase().contains("removing"), "{words}");
+    assert!(!words.to_lowercase().contains("remov"), "{words}");
 
     // The checkpoints file is not one this release reads.
     std::fs::write(folder.join("checkpoints.json"), b"not a file").expect("a file that is not one");
@@ -7011,4 +7013,91 @@ async fn the_words_for_checkpoints_that_cannot_be_used_name_the_file_at_fault_an
         ),
         "{words}"
     );
+}
+
+/// KR-REQ-20.12: a lock file that cannot be opened is not a lock that is free. A program that
+/// already holds the lock keeps it on the file it opened, so the words for the unusable path tell a
+/// person to close every KalaReach program first and only then to remove the lock file, and they
+/// say of the file only that it holds no checkpoint.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unusable_lock_path_beside_a_handle_that_still_holds_the_lock_says_to_close_every_program_first()
+ {
+    let computer = Computer::new().await;
+    let page = computer.page().await;
+    page.call("recovery_turn_on", json!({})).expect("on");
+    let out = tempfile::tempdir().expect("a directory");
+    let (_, _kit) = page.kit(out.path());
+    let host = Arc::new(Host::new(&computer, computer.served.origin()));
+    host.sets_up();
+    page.cover_host(&host, false).expect("the host is covered");
+    let folder = computer
+        .data
+        .path()
+        .join(companion_tauri::device::HOSTS_DIRECTORY);
+    let checkpoints =
+        kr_client::pairing::checkpoint::PairedCheckpoints::open(&folder).expect("a directory");
+    let lock = folder.join("checkpoints.lock");
+
+    // An earlier program holds the lock on the file at this path.
+    let earlier = kr_ipc::paths::open_lock_file(&lock).expect("a lock file");
+    kr_flush::lock::exclusive(&earlier).expect("held");
+    // The path then becomes unusable: the file moves aside and a link stands where it was.
+    let aside = folder.join("checkpoints.lock.earlier");
+    std::fs::rename(&lock, &aside).expect("the file moves aside");
+    let elsewhere = folder.join("elsewhere");
+    std::fs::write(&elsewhere, b"").expect("a file");
+    std::os::unix::fs::symlink(&elsewhere, &lock).expect("a link where the lock file goes");
+    // The earlier handle still holds its lock, on the file it opened.
+    let again = kr_ipc::paths::open_lock_file(&aside).expect("the moved file opens");
+    assert!(
+        matches!(
+            kr_flush::lock::try_exclusive(&again),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "the earlier handle holds its lock beside the unusable path"
+    );
+
+    // The store does not read the path as free, empty or held: it cannot use it.
+    let held = checkpoints.held_checkpoints();
+    let kr_client::pairing::checkpoint::Held::Unreadable { cause, .. } = &held else {
+        panic!("an unusable lock path is not a free lock: {held:?}")
+    };
+    assert_eq!(
+        *cause,
+        kr_client::pairing::checkpoint::SnapshotCause::Lock,
+        "{held:?}"
+    );
+
+    // The person is told to close every program first, and what the file holds.
+    let refused = page
+        .call("recovery_archives", json!({}))
+        .expect_err("the list is refused while the lock file cannot be used");
+    assert_eq!(refused["code"], "PERMISSION_DENIED");
+    let words = refused["message"].as_str().expect("words").to_owned();
+    assert!(!words.contains('`'), "a file name is no code mark: {words}");
+    assert!(
+        words.starts_with(
+            "the lock file for the backup checkpoints this device kept when it paired cannot be \
+             used ("
+        ),
+        "{words}"
+    );
+    assert!(
+        words.ends_with(
+            "). Close every KalaReach program on this device first, then remove the lock file. \
+             It holds no checkpoint. This device lists and exports no archive until the file \
+             can be used."
+        ),
+        "{words}"
+    );
+    assert!(!words.contains("loses nothing"), "{words}");
+    let close = words
+        .find("Close every KalaReach program")
+        .expect("the advice to close");
+    let remove = words
+        .find("remove the lock file")
+        .expect("the advice to remove");
+    assert!(close < remove, "closing comes first: {words}");
+    kr_flush::lock::release(&earlier).expect("released");
 }

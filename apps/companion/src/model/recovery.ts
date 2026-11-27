@@ -222,7 +222,7 @@ export function describeArchive(archive: RecoveryArchive): string {
       return `${name}: the checkpoint this device kept when it paired and the recovery bundle name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
     }
     if (archive.withheld === 'bundle_disagree' && archive.checkpoint_generation !== null) {
-      return `${name}: the recovery bundle holds two different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
+      return `${name}: the recovery bundle holds two checkpoints that name different backups for generation ${archive.checkpoint_generation}, so it is not offered.`
     }
     if (archive.withheld === 'host_contradicts' && archive.checkpoint_generation !== null) {
       return `${name}: what the service holds for generation ${archive.checkpoint_generation} is not the archive a host this device paired with named for it, so it is not offered.`

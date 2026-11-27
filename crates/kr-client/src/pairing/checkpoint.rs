@@ -160,8 +160,9 @@ pub enum SnapshotCause {
     Unreadable,
     /// A newer release wrote the file.
     NewerVersion,
-    /// The lock file cannot be opened or locked. It holds no checkpoint, so removing it loses
-    /// nothing.
+    /// The lock file cannot be opened or locked. It holds no checkpoint. A program that holds the
+    /// lock keeps it on the file it opened, so the file is removed only with every program that
+    /// uses the store closed.
     Lock,
     /// Something else holds the lock, and did not let go in time: a use of the lock, not a change
     /// to the file.
