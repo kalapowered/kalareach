@@ -345,11 +345,12 @@ mod platform {
     use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    #[cfg(feature = "testing")]
+    use windows_sys::Win32::Foundation::DuplicateHandle;
     use windows_sys::Win32::Foundation::{
-        DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED,
-        ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+        STILL_ACTIVE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -372,9 +373,12 @@ mod platform {
         DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
         GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
         LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-        PROCESS_SYNCHRONIZE, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-        UpdateProcThreadAttribute, WaitForSingleObject,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    };
+    #[cfg(feature = "testing")]
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
 
     use super::{
