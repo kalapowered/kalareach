@@ -133,7 +133,7 @@ make_tree() {
     shift
     c="$root/$name"
     tree="$c/tree"
-    mkdir -p "$c/fake" "$c/art" "$c/shots" "$tree/scripts/lib"
+    mkdir -p "$c/fake" "$c/tmp" "$c/shots" "$tree/scripts/lib"
     cp "$here/scripts/e2e-voice-device.sh" "$tree/scripts/"
     cp "$here/scripts/lib/artifacts-dir.sh" "$here/scripts/lib/android-avd.sh" "$tree/scripts/lib/"
     [ "${1-}" != ALL ] || return 0
@@ -152,7 +152,7 @@ run_script() {
     local name=$1
     shift
     c="$root/$name"
-    env -u CFFIXED_USER_HOME PATH="$root/bin:$PATH" KR_TEST_ARTIFACTS_DIR="$c/art" KR_MOBILE_SCREENSHOT_DIR="$c/shots" \
+    env -i PATH="$root/bin:$PATH" HOME="${HOME:-/}" TMPDIR="$c/tmp" KR_MOBILE_SCREENSHOT_DIR="$c/shots" \
         FAKE_DIR="$c/fake" FAKE_ROOT="$root" READER_STANDIN="$root/reader-standin.sh" "$@" \
         bash "$c/tree/scripts/e2e-voice-device.sh" reader >"$c/out.log" 2>&1
     printf '%s\n' "$?" >"$c/rc"
@@ -160,7 +160,10 @@ run_script() {
 
 # What a case reads back.
 out() { printf '%s/%s/out.log' "$root" "$1"; }
-check_log() { printf '%s/%s/art/voice-device/reader-check.log' "$root" "$1"; }
+# The script makes its own evidence folder under the case's TMPDIR when none is given to it, and the
+# run starts from an empty environment, so nothing the driver's caller set reaches it.
+art_of() { local d; for d in "$root/$1"/tmp/*/voice-device; do printf '%s' "$d"; return; done; }
+check_log() { printf '%s/reader-check.log' "$(art_of "$1")"; }
 fake() { printf '%s/%s/fake/%s' "$root" "$1" "$2"; }
 rc_is() { [ "$(cat "$root/$1/rc")" = "$2" ]; }
 says() { grep -qF -- "$2" "$1"; }
@@ -299,7 +302,7 @@ expect "launch: node, started after the reader's folder was made, starts without
 
 # The TypeScript reads screenshots with the program it is given, started the way readImage starts it:
 # the reader it is given is the wrapper, which gives the home to the reader, and fails without a folder.
-wrapper="$root/launch-environment/art/voice-device/read-text"
+wrapper="$(art_of launch-environment)/read-text"
 picture="$root/launch-environment/tree/apps/companion/test/voice/reader-fixtures/one-line.png"
 typescript_start() {
     node --input-type=module -e '
@@ -315,7 +318,7 @@ expect "TypeScript launch: no folder, no reading" no_folder_no_reading
 
 # The wrapper is the only name the reader goes by: the compiler writes the reader elsewhere, the
 # script passes the wrapper to the TypeScript, and the TypeScript holds no other name.
-expect "one name: the compiler writes the reader to read-text-bin" grep -qx -- "$root/launch-environment/art/voice-device/read-text-bin" "$(fake launch-environment swiftc-out.log)"
+expect "one name: the compiler writes the reader to read-text-bin" grep -qx -- "$(art_of launch-environment)/read-text-bin" "$(fake launch-environment swiftc-out.log)"
 expect "one name: the script gives the TypeScript the wrapper" grep -qF -- '"http://localhost:$port" "$ocr" "$shots"' "$here/scripts/e2e-voice-device.sh"
 expect "one name: the TypeScript names no compiled reader" never_says "$here/apps/companion/test/voice/assert-voice-surface.ts" "read-text-bin"
 
