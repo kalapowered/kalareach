@@ -1149,13 +1149,24 @@ mod tests {
     }
 
     /// An environment of more names than one part lists, so that the exported names are read in
-    /// two parts, with `held` besides.
+    /// two parts, with `held` besides. The fillers sort after the capability's name, which
+    /// therefore falls in the first part.
     fn environment_of_two_parts(held: &[&str]) -> Vec<(String, String)> {
         let mut environment = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
         environment
-            .extend((0..PART_NAMES + 2).map(|n| (format!("FLAKE_NAME_{n:02}"), "1".to_owned())));
+            .extend((0..PART_NAMES + 2).map(|n| (format!("PADDING_{n:02}"), "1".to_owned())));
         environment.extend(held.iter().map(|name| ((*name).to_owned(), "1".to_owned())));
         environment
+    }
+
+    /// The names of `environment_of_two_parts` that none of `parts` lists: `PATH` and the fillers,
+    /// which both shells of a capability case hold whatever else either holds.
+    fn left_out_of(parts: &[&[String]]) -> Vec<String> {
+        environment_of_two_parts(&[])
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|held| !parts.iter().any(|part| part.contains(held)))
+            .collect()
     }
 
     /// A zsh the capability cases can run: the system's, or where the host has none (the build
@@ -1242,27 +1253,49 @@ mod tests {
                 .chain(&more)
                 .any(|name| name == LINE_CAPABILITY)
         );
-        let ((_, third), next) = two_parts_from_shells(zsh, &without, &with);
+        let left_out = left_out_of(&[&names, &more]);
+        assert!(
+            left_out.is_empty(),
+            "the list leaves out names that both shells hold: {left_out:?}"
+        );
+        let ((names, third), next) = two_parts_from_shells(zsh, &without, &with);
         assert!(next.is_ok(), "the same in the other order: {next:?}");
         let Ok((more, fourth)) = next else {
             unreachable!("asserted above")
         };
         assert_eq!(third, fourth);
         assert_eq!(first, third);
-        assert!(!more.iter().any(|name| name == LINE_CAPABILITY));
+        assert!(
+            !names
+                .iter()
+                .chain(&more)
+                .any(|name| name == LINE_CAPABILITY)
+        );
+        let left_out = left_out_of(&[&names, &more]);
+        assert!(
+            left_out.is_empty(),
+            "in the other order the list leaves out names that both shells hold: {left_out:?}"
+        );
     }
 
     /// The control: a name other than the capability that one answer holds and the next does not
-    /// is a list that changed, and the reading says so, whichever name it is.
+    /// is a list that changed, and the reading says so, whichever name it is: also one that begins
+    /// or ends as the capability's name does.
     #[test]
     fn a_shell_that_holds_another_name_at_one_typed_line_and_not_at_the_next_is_refused() {
         let Some(zsh) = zsh_for_the_capability_cases("control") else {
             return;
         };
         let zsh = zsh.as_str();
-        for other in ["KR_SESSION", "KR_DETACH_TOKEN_ALSO", "E2E_RUN_MARK"] {
+        for other in [
+            "KR_SESSION",
+            "KR_DETACH_TOKEN_ALSO",
+            "OLD_KR_DETACH_TOKEN",
+            "E2E_RUN_MARK",
+        ] {
             let (_, next) = two_parts_from_shells(zsh, &[other], &[]);
-            let failure = next.expect_err("a list that gained or lost a name is refused");
+            let failure =
+                next.expect_err(&format!("a list that gained or lost {other} is refused"));
             assert!(
                 failure.starts_with(NOT_READ_WHOLE) && failure.contains("names and then"),
                 "{other}: {failure}"
