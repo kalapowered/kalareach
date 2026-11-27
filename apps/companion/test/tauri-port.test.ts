@@ -471,6 +471,16 @@ describe('the desktop port and the connection state', () => {
     }
   })
 
+  it('takes a state that has no slow-try mark in as no mark', async () => {
+    // Native code that does not send the key at all: the page reads the state as having no mark.
+    const kept = Object.entries(lost('the relay closed this connection')).filter(([key]) => key !== 'still_reaching')
+    const sent = Object.fromEntries(kept) as unknown as ConnectionState
+    expect('still_reaching' in sent).toBe(false)
+    shell.answers.set('connection_state', sent)
+    expect(await tauriPort().connectionState()).toEqual(lost('the relay closed this connection'))
+    expect(await heard(sent)).toEqual([lost('the relay closed this connection')])
+  })
+
   it('asks native code for what the page missed above a revision, and takes in each state', async () => {
     shell.answers.set('connection_since', {
       revision: 3,
