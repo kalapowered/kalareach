@@ -12,8 +12,8 @@
 //! What the run shows is the product's own path from a phone to its host and back: the phone is
 //! paired, turns notifications on, answers the challenge the gateway sends it, and is a destination
 //! the host delivers to; a question the worker asks is delivered through the gateway to the phone.
-//! In this case no part of the provider is real, and no sender credential exists: what a real
-//! delivery would add is named in `docs/delivery/README.md`.
+//! In the stand-in case no part of the provider is real, and no sender credential exists: what a
+//! real delivery would add is named in `docs/delivery/README.md`.
 //!
 //! A second case, `a_phone_registers_through_the_real_provider`, is for a gateway whose sender
 //! account is a real one. It starts no stand-in and no worker, and reads only `KR_HARNESS_DIR`,
@@ -342,6 +342,54 @@ fn preview_key_id_of(push: &kr_delivery::destination::PushDestination) -> String
     .iter()
     .map(|byte| format!("{byte:02x}"))
     .collect()
+}
+
+/// Writes the report's fields for the phone's destination, all from the one record that ended the
+/// wait for it and the time the wait first saw it. With no such record the report holds no
+/// destination: a record that appears after the wait ended is not in it.
+fn destination_fields(
+    report: &mut serde_json::Map<String, Value>,
+    seen: Option<(&kr_delivery::destination::DestinationRecord, u64)>,
+) {
+    report.insert("destination_present".to_owned(), json!(seen.is_some()));
+    report.insert(
+        "destination_first_seen_ms".to_owned(),
+        json!(seen.map(|(_, first_seen_ms)| first_seen_ms)),
+    );
+    if let Some((record, _)) = seen {
+        report.insert(
+            "destination_configured_at_ms".to_owned(),
+            json!(record.configured_at_ms.get()),
+        );
+        report.insert("destination_enabled".to_owned(), json!(record.enabled));
+        report.insert(
+            "sender_record_id".to_owned(),
+            json!(sender_record_of(record)),
+        );
+        if let kr_delivery::destination::Destination::Push(push) = &record.destination {
+            report.insert("preview_key_id".to_owned(), json!(preview_key_id_of(push)));
+        }
+    }
+}
+
+/// Writes whether the phone's negative step ran, and when it did, the fields that the second read
+/// after it adds to the report. `after` is the count of destinations and the authorisation of the
+/// phone's destination, or none when the step did not end.
+fn negative_step_fields(
+    report: &mut serde_json::Map<String, Value>,
+    after: Option<(usize, Option<String>)>,
+) {
+    report.insert("negative_done".to_owned(), json!(after.is_some()));
+    if let Some((destinations, sender_record_id)) = after {
+        report.insert(
+            "destinations_after_negative".to_owned(),
+            json!(destinations),
+        );
+        report.insert(
+            "sender_record_id_after_negative".to_owned(),
+            json!(sender_record_id),
+        );
+    }
 }
 
 /// Issues the phone's direct invitation, writes it where the script reads it, waits until the phone
@@ -1506,21 +1554,31 @@ async fn a_phone_registers_with_a_gateway_and_is_delivered_to_through_it() {
 /// reads the host again after the phone has tried a registration with a token the provider does
 /// not know.
 ///
-/// For one delivery of the registration challenge through the provider's push service to a debug
-/// build on an Android emulator with Google Play services and no account, it shows that the
-/// gateway sent the challenge to the phone's own token, that the receiver answered it, that the
-/// gateway bound the token and then issued the sender authorisation, and that the host held the
-/// phone as a destination only after that. After the phone has tried a token the provider
-/// refuses, the host holds the same destination under the same authorisation. This case reads the
-/// host's side; the phone's, the gateway's and the provider's sides are read by whoever runs it.
+/// The run is one delivery of the registration challenge through the provider's push service to a
+/// debug build on an Android emulator with Google Play services and no account. This case reports
+/// only what the host held: the count of destinations at one sample after the owner's
+/// confirmation; the one destination record that ended the wait for it, with the time the wait
+/// first saw it and the time the record says it was configured, its authorisation and its state;
+/// and, when the script says the phone's negative step ended, the count of destinations and the
+/// record's authorisation again. The rest is shown by the run's other records, which whoever runs
+/// the case reads beside this report: the phone's records show that the receiver answered the
+/// challenge, and the gateway's that it sent the challenge to the phone's own token, bound the
+/// token and then issued the sender authorisation. The host's samples alone do not show that the
+/// host held no destination before that authorisation: the sample after the confirmation does not
+/// pause the phone, and the first-seen time is when the wait saw the record, not when it was
+/// written (the configured time is).
 ///
 /// It does not show a physical phone, its radio, its battery policy or a maker's limits on
 /// background work; a delivery to an application that is stopped or whose screen is off; an Apple
 /// device or Apple's push service; a release or store-signed build; the managed service's own
 /// gateway; or the refusals of a challenge that is not the pending one, which the other case
-/// shows. The host reaches no origin but the gateway's, on the loopback interface, and sends
-/// nothing to the provider: the gateway does, once for the challenge and once for the token it
-/// does not know. A person runs this case, and no step of this repository does.
+/// shows. The host reaches no origin that is not on loopback and sends nothing to the provider:
+/// the gateway does, and this case does not count its sends.
+///
+/// The case asserts only its set-up: the transport, the script's `go` and the phone's pairing. It
+/// ends successfully without a registration and without the negative step, so a report with
+/// `destination_present` false or `negative_done` false is incomplete evidence, which whoever
+/// judges the run must fail. A person runs this case, and no step of this repository does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "run by a person beside an emulator and a gateway that sends to the real provider"]
 async fn a_phone_registers_through_the_real_provider() {
@@ -1554,38 +1612,32 @@ async fn a_phone_registers_through_the_real_provider() {
 
     let device_id = pair_a_phone(&run, &host, &owner, &peer).await;
     report.insert("device_id".to_owned(), json!(device_id.to_string()));
-    // The phone is paired and has proved nothing yet: the host holds no destination for anyone.
+    // One sample right after the owner's confirmation; the phone is not paused, so it says how many
+    // destinations the host held then and nothing of what the phone does next.
     report.insert(
         "destinations_at_pairing".to_owned(),
         json!(destination_count(&host)),
     );
 
-    // The phone turned notifications on and proposed its own token; the gateway sent the
-    // challenge to the provider, the receiver answered it, and the gateway bound the token and
-    // issued the authorisation the phone handed the host.
+    // Waits for the host to hold the phone as a destination, which it does once the phone hands it
+    // the authorisation the gateway issued. What led to that is in the phone's and the gateway's
+    // records, not here.
     let id =
         kr_delivery::destination::DestinationId::new(device_id.to_string()).expect("an identifier");
-    let mut first_seen_ms = None;
-    let registered = until(REGISTRATION_WAIT.min(run.left()), || {
-        let held = destination_of(&host, &id).is_some();
-        if held {
-            first_seen_ms = Some(kr_ipc::now_ms().get());
-        }
-        held
+    // The record that ends the wait is kept, and the report is written from it alone. When the wait
+    // times out the last read found none, and the report holds no destination.
+    let mut seen = None;
+    until(REGISTRATION_WAIT.min(run.left()), || {
+        seen = destination_of(&host, &id).map(|record| (record, kr_ipc::now_ms().get()));
+        seen.is_some()
     })
     .await;
-    report.insert("destination_present".to_owned(), json!(registered));
-    report.insert("destination_first_seen_ms".to_owned(), json!(first_seen_ms));
-    if let Some(record) = destination_of(&host, &id) {
-        report.insert("destination_enabled".to_owned(), json!(record.enabled));
-        report.insert(
-            "sender_record_id".to_owned(),
-            json!(sender_record_of(&record)),
-        );
-        if let kr_delivery::destination::Destination::Push(push) = &record.destination {
-            report.insert("preview_key_id".to_owned(), json!(preview_key_id_of(push)));
-        }
-    }
+    let registered = seen.is_some();
+    destination_fields(
+        &mut report,
+        seen.as_ref()
+            .map(|(record, first_seen_ms)| (record, *first_seen_ms)),
+    );
     run.write(
         "registered.json",
         &Value::Object(report.clone()).to_string(),
@@ -1593,17 +1645,94 @@ async fn a_phone_registers_through_the_real_provider() {
 
     // The script has the phone try a registration with a token the provider does not know, and
     // says when it has ended. A run that registered nothing has no second step.
-    if registered && run.appears("negative-done", run.left()).await {
-        report.insert(
-            "destinations_after_negative".to_owned(),
-            json!(destination_count(&host)),
-        );
-        report.insert(
-            "sender_record_id_after_negative".to_owned(),
-            json!(destination_of(&host, &id).and_then(|record| sender_record_of(&record))),
-        );
-    }
+    let after_negative = if registered && run.appears("negative-done", run.left()).await {
+        Some((
+            destination_count(&host),
+            destination_of(&host, &id).and_then(|record| sender_record_of(&record)),
+        ))
+    } else {
+        None
+    };
+    negative_step_fields(&mut report, after_negative);
     run.write("report.json", &Value::Object(report).to_string());
     run.appears("finish", run.left()).await;
     host.stop().await;
+}
+
+/// The real-provider case writes its destination fields from the one record that ended its wait, so
+/// a report that says there was no destination holds none of a destination's fields, and says in
+/// plain fields whether the phone's negative step ran.
+#[test]
+fn the_real_provider_report_is_written_from_one_destination_record() {
+    use kr_delivery::destination::{
+        Destination, DestinationId, DestinationRecord, PreviewKeys, PushDestination,
+    };
+    use kr_protocol::ids::{InstallationId, PushSenderRecordId};
+    use kr_protocol::scalars::{NotificationPreviewKey, TimestampMs, Uuid};
+
+    let record = DestinationRecord {
+        id: DestinationId::new("a-phone").expect("an identifier"),
+        destination: Destination::Push(Box::new(PushDestination {
+            installation_id: InstallationId::new(Uuid::from_bytes([7; 16])),
+            sender_record_id: PushSenderRecordId::new(Uuid::from_bytes([9; 16])),
+            preview_keys: PreviewKeys::only(NotificationPreviewKey::from_bytes([3; 32]), 1),
+            previews_enabled: true,
+            mailbox_key: None,
+        })),
+        rule: None,
+        enabled: true,
+        configured_at_ms: TimestampMs::new(900),
+    };
+    let record_fields = [
+        "destination_configured_at_ms",
+        "destination_enabled",
+        "sender_record_id",
+        "preview_key_id",
+    ];
+
+    let mut held = serde_json::Map::new();
+    destination_fields(&mut held, Some((&record, 1_000)));
+    assert_eq!(held.get("destination_present"), Some(&json!(true)));
+    assert_eq!(held.get("destination_first_seen_ms"), Some(&json!(1_000)));
+    assert_eq!(held.get("destination_configured_at_ms"), Some(&json!(900)));
+    assert_eq!(held.get("destination_enabled"), Some(&json!(true)));
+    assert_eq!(
+        held.get("sender_record_id"),
+        Some(&json!(sender_record_of(&record)))
+    );
+    let Destination::Push(push) = &record.destination else {
+        panic!("the record is a push destination");
+    };
+    assert_eq!(
+        held.get("preview_key_id"),
+        Some(&json!(preview_key_id_of(push)))
+    );
+
+    // A wait that ended with no record, whether or not one appeared after it, reports no destination.
+    let mut none = serde_json::Map::new();
+    destination_fields(&mut none, None);
+    assert_eq!(none.get("destination_present"), Some(&json!(false)));
+    assert_eq!(none.get("destination_first_seen_ms"), Some(&Value::Null));
+    assert!(
+        record_fields.iter().all(|name| !none.contains_key(*name)),
+        "a report of no destination holds no field of a destination: {none:?}"
+    );
+
+    let mut after = serde_json::Map::new();
+    negative_step_fields(&mut after, Some((1, Some("a-sender".to_owned()))));
+    assert_eq!(after.get("negative_done"), Some(&json!(true)));
+    assert_eq!(after.get("destinations_after_negative"), Some(&json!(1)));
+    assert_eq!(
+        after.get("sender_record_id_after_negative"),
+        Some(&json!("a-sender"))
+    );
+
+    let mut never = serde_json::Map::new();
+    negative_step_fields(&mut never, None);
+    assert_eq!(never.get("negative_done"), Some(&json!(false)));
+    assert!(
+        !never.contains_key("destinations_after_negative")
+            && !never.contains_key("sender_record_id_after_negative"),
+        "a negative step that did not run reports nothing of what followed it: {never:?}"
+    );
 }
