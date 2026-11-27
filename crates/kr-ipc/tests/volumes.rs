@@ -16,12 +16,16 @@ use kr_ipc::testing::volumes::{self, Volume};
 /// never let go of and decides nothing else.
 const HUNG: Duration = Duration::from_secs(300);
 
-/// A volume attached in a directory of its own, and the directory it is attached from.
+/// A volume attached in a directory of its own, and the directory it is attached from. A volume
+/// that cannot be attached ends the case at the line that called this, not at one in here.
+#[track_caller]
 fn attached(scratch: &kr_ipc::testing::PrivateTempDir, tag: &str) -> (std::path::PathBuf, Volume) {
     let at = scratch.path().join(format!("volume-{tag}"));
     std::fs::create_dir(&at).expect("a mount point");
-    let volume =
-        Volume::attach(&at, scratch.path(), tag).unwrap_or_else(|why| volumes::not_attachable(why));
+    let volume = match Volume::attach(&at, scratch.path(), tag) {
+        Ok(volume) => volume,
+        Err(why) => volumes::not_attachable(why),
+    };
     (at, volume)
 }
 
