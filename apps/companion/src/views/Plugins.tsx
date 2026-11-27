@@ -157,9 +157,11 @@ export function Plugins(): ReactNode {
               <Card key={plugin.plugin_id} data-plugin={plugin.plugin_id}>
                 <div className="card-header">
                   <div className="spacer">
-                    <h2>{plugin.plugin_id}</h2>
+                    <h2>
+                      <TechnicalWord text={plugin.plugin_id} />
+                    </h2>
                     <p className="muted small">
-                      {plugin.version} · from {plugin.catalogue_id}
+                      {plugin.version} · from <TechnicalWord text={plugin.catalogue_id} />
                     </p>
                   </div>
                   <span className="row wrap">
@@ -227,7 +229,9 @@ export function Plugins(): ReactNode {
             <Card key={catalogue.catalogue_id} data-catalogue={catalogue.catalogue_id}>
               <div className="card-header">
                 <div className="spacer">
-                  <h2>{catalogue.catalogue_id}</h2>
+                  <h2>
+                    <TechnicalWord text={catalogue.catalogue_id} />
+                  </h2>
                   <p className="muted small">
                     {Number(catalogue.entries).toLocaleString()} packages in its index
                     {catalogue.generation === null ? '' : ` · generation ${catalogue.generation}`}
@@ -268,8 +272,12 @@ export function Plugins(): ReactNode {
             {enrolled.map((catalogue) => (
               <div className="divided-row" key={catalogue.catalogue_id}>
                 <div className="spacer">
-                  <strong>{catalogue.catalogue_id}</strong>
-                  <p className="muted small mono">{catalogue.metadata_url}</p>
+                  <strong>
+                    <TechnicalWord text={catalogue.catalogue_id} />
+                  </strong>
+                  <p className="muted small mono">
+                    <TechnicalWord text={catalogue.metadata_url} />
+                  </p>
                   <p className="muted small">
                     Trust root {short(catalogue.root_digest)} ·{' '}
                     {catalogue.synced_at_ms === null

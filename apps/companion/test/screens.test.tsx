@@ -15,6 +15,7 @@ import { fakeHost, type FakeHostControls } from '../src/host/fake'
 import type { HostPort } from '../src/host/port'
 import { receivedFailure } from '../src/host/tauri'
 import { CommitButton } from '../src/components/ui'
+import { technicalWordText } from './technical-word-text'
 
 function start(initialPlace: Place = { view: 'attention' }): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
@@ -970,14 +971,14 @@ describe('packages', () => {
 
     const search = screen.getByTestId('catalogue-search')
     await userEvent.type(search, 'tmux')
-    expect(within(installed).getByText('community.tmux-status')).toBeInTheDocument()
+    expect(within(installed).getByText(technicalWordText('community.tmux-status'))).toBeInTheDocument()
     expect(within(installed).queryByText('openai.codex')).toBeNull()
 
     await userEvent.click(screen.getByRole('tab', { name: 'Catalogue' }))
     await userEvent.clear(search)
     await userEvent.type(search, 'mirror')
     const catalogues = screen.getByTestId('catalogue-list')
-    expect(within(catalogues).getByText('community-mirror')).toBeInTheDocument()
+    expect(within(catalogues).getByText(technicalWordText('community-mirror'))).toBeInTheDocument()
     expect(within(catalogues).queryByText('official')).toBeNull()
   })
 
