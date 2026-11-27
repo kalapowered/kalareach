@@ -127,7 +127,7 @@ crates/kr-ipc/src/paths.rs | build_owner_only_directory | Io | 1 | own | own | -
 crates/kr-ipc/src/paths.rs | check_owner_only | DirectoryAccessRefused | 2 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | check_owner_only | DirectoryNotOwnerOnly | 1 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | check_owner_only | Io | 2 | own | own | - | agrees
-crates/kr-ipc/src/paths.rs | create_directory_with_list | Io | 2 | own | own | - | agrees
+crates/kr-ipc/src/paths.rs | create_directory_with_list | Io | 3 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | create_new_private_directory | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | create_new_through_temporary | Io | 2 | own | own | - | agrees
 crates/kr-ipc/src/paths.rs | create_owner_only_file | Io | 2 | own | own | - | agrees

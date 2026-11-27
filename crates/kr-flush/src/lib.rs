@@ -260,6 +260,75 @@ pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> 
     }
 }
 
+/// `path` as a native call reads a name: wide and NUL-terminated, the way the standard library
+/// gives a name to its own file calls.
+///
+/// A call that gives the system a name without the standard library's file calls takes it from
+/// here, so that a name is refused or given the same way whichever call reads it.
+///
+/// A name that holds a NUL is refused, because the call would read it only as far as the NUL,
+/// which can name another file. A name already verbatim (`\\?\` or `\??\`) goes as it is.
+/// Any other name is made absolute; one that reaches the old limit is then given the verbatim
+/// prefix that lifts it: `C:\` becomes `\\?\C:\`, `\\server\share` becomes
+/// `\\?\UNC\server\share`, and a device name `\\.\` becomes `\\?\`.
+///
+/// # Errors
+///
+/// Returns an error of kind [`std::io::ErrorKind::InvalidInput`] for a name that holds a NUL
+/// or is empty.
+#[cfg(windows)]
+pub fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    /// The length from which the standard library prefixes a name: some calls stop at 248
+    /// characters, short of the 260 of the old limit.
+    const LEGACY_MAX_PATH: usize = 248;
+    /// `\`, `?`, `.`, `:`, and the letters of `UNC`, as UTF-16.
+    const SEP: u16 = 0x5C;
+    const QUERY: u16 = 0x3F;
+    const DOT: u16 = 0x2E;
+    const COLON: u16 = 0x3A;
+    const UNC: [u16; 3] = [0x55, 0x4E, 0x43];
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} holds a NUL", path.display()),
+        ));
+    }
+    let verbatim = |name: &[u16]| {
+        name.starts_with(&[SEP, SEP, QUERY, SEP]) || name.starts_with(&[SEP, QUERY, QUERY, SEP])
+    };
+    let mut native = if verbatim(&wide) {
+        wide
+    } else {
+        let absolute: Vec<u16> = std::path::absolute(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        if absolute.len() + 1 < LEGACY_MAX_PATH || verbatim(&absolute) {
+            absolute
+        } else {
+            let prefix = [SEP, SEP, QUERY, SEP];
+            match absolute.as_slice() {
+                [_, COLON, SEP, ..] => prefix.iter().chain(&absolute).copied().collect(),
+                [SEP, SEP, DOT, SEP, rest @ ..] => prefix.iter().chain(rest).copied().collect(),
+                [SEP, SEP, rest @ ..] => prefix
+                    .iter()
+                    .chain(&UNC)
+                    .chain(&[SEP])
+                    .chain(rest)
+                    .copied()
+                    .collect(),
+                _ => absolute,
+            }
+        }
+    };
+    native.push(0);
+    Ok(native)
+}
+
 /// What the tests of a store that flushes through this crate use to reach what a test cannot reach
 /// from outside: a held rename, after an attempt was refused because another program holds what it
 /// needs and before the next, and a directory flush that fails after the name it follows has been
@@ -551,7 +620,7 @@ mod windows {
     ) -> std::io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-        let (from, to) = (native_name(from)?, native_name(to)?);
+        let (from, to) = (super::native_name(from)?, super::native_name(to)?);
         // SAFETY: both names are NUL-terminated wide strings with no NUL before their end, and they
         // live past the call, which reads them and keeps neither. With no flags the call moves a
         // name on one volume and never replaces one.
@@ -559,71 +628,6 @@ mod windows {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
-    }
-
-    /// `path` as a native call reads a name: wide and NUL-terminated, the way the standard library
-    /// gives a name to its own file calls.
-    ///
-    /// A name that holds a NUL is refused, because the call would read it only as far as the NUL,
-    /// which can name another file. A name already verbatim (`\\?\` or `\??\`) goes as it is.
-    /// Any other name is made absolute; one that reaches the old limit is then given the verbatim
-    /// prefix that lifts it: `C:\` becomes `\\?\C:\`, `\\server\share` becomes
-    /// `\\?\UNC\server\share`, and a device name `\\.\` becomes `\\?\`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error of kind [`std::io::ErrorKind::InvalidInput`] for a name that holds a NUL
-    /// or is empty.
-    pub(super) fn native_name(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        /// The length from which the standard library prefixes a name: some calls stop at 248
-        /// characters, short of the 260 of the old limit.
-        const LEGACY_MAX_PATH: usize = 248;
-        /// `\`, `?`, `.`, `:`, and the letters of `UNC`, as UTF-16.
-        const SEP: u16 = 0x5C;
-        const QUERY: u16 = 0x3F;
-        const DOT: u16 = 0x2E;
-        const COLON: u16 = 0x3A;
-        const UNC: [u16; 3] = [0x55, 0x4E, 0x43];
-
-        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if wide.contains(&0) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{} holds a NUL", path.display()),
-            ));
-        }
-        let verbatim = |name: &[u16]| {
-            name.starts_with(&[SEP, SEP, QUERY, SEP]) || name.starts_with(&[SEP, QUERY, QUERY, SEP])
-        };
-        let mut native = if verbatim(&wide) {
-            wide
-        } else {
-            let absolute: Vec<u16> = std::path::absolute(path)?
-                .as_os_str()
-                .encode_wide()
-                .collect();
-            if absolute.len() + 1 < LEGACY_MAX_PATH || verbatim(&absolute) {
-                absolute
-            } else {
-                let prefix = [SEP, SEP, QUERY, SEP];
-                match absolute.as_slice() {
-                    [_, COLON, SEP, ..] => prefix.iter().chain(&absolute).copied().collect(),
-                    [SEP, SEP, DOT, SEP, rest @ ..] => prefix.iter().chain(rest).copied().collect(),
-                    [SEP, SEP, rest @ ..] => prefix
-                        .iter()
-                        .chain(&UNC)
-                        .chain(&[SEP])
-                        .chain(rest)
-                        .copied()
-                        .collect(),
-                    _ => absolute,
-                }
-            }
-        };
-        native.push(0);
-        Ok(native)
     }
 }
 
@@ -923,7 +927,7 @@ mod tests {
     #[test]
     fn a_name_is_given_to_windows_as_the_standard_library_gives_it() {
         let native = |name: &str| {
-            let wide = self::windows::native_name(Path::new(name)).expect("a name");
+            let wide = native_name(Path::new(name)).expect("a name");
             assert_eq!(wide.last(), Some(&0), "{name}");
             String::from_utf16(&wide[..wide.len() - 1]).expect("the name")
         };
@@ -941,6 +945,12 @@ mod tests {
         for verbatim in [r"\\?\C:\x", r"\??\C:\x"] {
             assert_eq!(native(verbatim), verbatim);
         }
+        let refused = native_name(Path::new("C:\\a\0b\\c")).expect_err("a NUL in a name");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::InvalidInput,
+            "{refused}"
+        );
         // The prefix begins where the name and its NUL reach 248 characters.
         let under = format!(r"C:\{}", "a".repeat(243));
         assert_eq!(under.len(), 246);

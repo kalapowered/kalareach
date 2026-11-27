@@ -1247,7 +1247,8 @@ mod windows {
     ///
     /// Returns an error when the list cannot be built or the directory cannot be created.
     pub(crate) fn create_directory_with_list(path: &Path, descriptor: &str) -> Result<bool> {
-        let wide_path = wide(path.as_os_str());
+        let wide_path =
+            kr_flush::native_name(path).map_err(|error| IpcError::io("create", path, error))?;
         let wide_descriptor = wide_str(descriptor);
         let mut built: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: both pointers are null-terminated wide buffers this function owns for the whole
@@ -2406,13 +2407,6 @@ mod windows {
         Some(described)
     }
 
-    /// Encodes a path for the wide form of a Windows call.
-    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        text.encode_wide().chain(std::iter::once(0)).collect()
-    }
-
     /// Encodes a string for the wide form of a Windows call.
     fn wide_str(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -2429,7 +2423,9 @@ mod windows {
     /// # Errors
     ///
     /// Returns the operating system's error when the descriptor cannot be built or the file cannot
-    /// be created with it, and when a file is already at the name.
+    /// be created with it, and when a file is already at the name. A name that holds a NUL is
+    /// refused before any file is made, and a long name is given as `kr_flush::native_name` gives
+    /// it.
     pub(crate) fn create_file_with_descriptor(
         path: &Path,
         descriptor: &str,
@@ -2440,7 +2436,7 @@ mod windows {
             CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
         };
 
-        let wide_path = wide(path.as_os_str());
+        let wide_path = kr_flush::native_name(path)?;
         let built = BuiltDescriptor::parse(descriptor)?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
@@ -2491,7 +2487,7 @@ mod windows {
     ) -> std::io::Result<()> {
         use windows_sys::Win32::Security::SetFileSecurityW;
 
-        let wide_path = wide(path.as_os_str());
+        let wide_path = kr_flush::native_name(path)?;
         let built = BuiltDescriptor::parse(descriptor)?;
         // SAFETY: `wide_path` is a null-terminated wide buffer this function owns for the call, and
         // the descriptor lives until `built` is dropped, after the call.
