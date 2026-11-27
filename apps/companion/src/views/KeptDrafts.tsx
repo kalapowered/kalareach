@@ -23,6 +23,7 @@ import type { SessionListResult } from '@kalareach/protocol'
 import { useChannelMessages, useChannelShelf } from '../app/channel-messages'
 import { useBook, useDraftBook } from '../app/drafts'
 import { useApp, useSubmissions } from '../app/state'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Banner, Button, CommitButton, TwoPressButton } from '../components/ui'
 import {
   failureCode,
@@ -82,14 +83,23 @@ function sessionName(session: Session): string {
   return `Session ${session.display_number} · ${session.cwd}`
 }
 
+/** A session by its number and directory, the directory a technical word. */
+function SessionWords({ session }: { readonly session: Session }): ReactNode {
+  return (
+    <>
+      Session {session.display_number} · <TechnicalWord text={session.cwd} />
+    </>
+  )
+}
+
 /**
  * How a draft's session is named: by its number and directory, as not listed when the host named
  * the sessions it has and this was not one, and as unknown when the host could not be asked.
  */
-function homeLine(sessions: readonly Session[] | null, sessionId: string): string {
+function homeLine(sessions: readonly Session[] | null, sessionId: string): ReactNode {
   if (sessions === null) return 'Its session cannot be listed now'
   const home = sessions.find((session) => session.session_id === sessionId)
-  return home === undefined ? 'A session that is not listed' : sessionName(home)
+  return home === undefined ? 'A session that is not listed' : <SessionWords session={home} />
 }
 
 /** The kept drafts, and what a person can do with each. */
@@ -546,7 +556,7 @@ function whenWords(ms: string): string {
 }
 
 /** What a record of a send says it was: to a session by its name, or to one that cannot be named. */
-function holdWords(sessions: readonly Session[] | null, sessionsFailed: boolean, hold: StoredHold): string {
+function holdWords(sessions: readonly Session[] | null, sessionsFailed: boolean, hold: StoredHold): ReactNode {
   const at = whenWords(hold.sentAtMs)
   if (sessions === null) {
     // A read that has not answered yet says nothing about the host: only a failed one says it cannot be reached.
@@ -557,7 +567,11 @@ function holdWords(sessions: readonly Session[] | null, sessionsFailed: boolean,
   const home = sessions.find((session) => session.session_id === hold.sessionId)
   return home === undefined
     ? `A message to a session that ${hold.hostName} no longer lists, pressed at ${at}.`
-    : `A message to ${sessionName(home)} on ${hold.hostName}, pressed at ${at}.`
+    : (
+        <>
+          A message to <SessionWords session={home} /> on {hold.hostName}, pressed at {at}.
+        </>
+      )
 }
 
 /** The messages, the records of sends, and the ones that could not be read, below the drafts. */
