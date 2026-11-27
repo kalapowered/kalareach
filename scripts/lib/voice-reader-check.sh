@@ -89,7 +89,8 @@ STANDIN
 chmod +x "$root/bin/rm"
 
 # The reader. It prints the text kept beside the picture it is given. Every read is recorded with the
-# home it was started with. FAKE_READER=fails makes each read fail (exit 2). FAKE_BAD_FIRST=N makes
+# home it was started with. FAKE_READER=fails makes each read fail (exit 2), and FAKE_READER=aborts
+# makes each write a line to its error output and exit 134. FAKE_BAD_FIRST=N makes
 # the first N folders (by KR_READER_HOME, in the order they are first used) read wrong, leaving out
 # the first line of every text, as a wrong build of the system's programs leaves rows out.
 # FAKE_DROP_LAST=1 leaves out the last line of every text instead. Like the
@@ -108,6 +109,10 @@ if [ -n "${CFFIXED_USER_HOME-}" ] && [ "${FAKE_COMPILES:-1}" = 1 ]; then
     fi
 fi
 [ "${FAKE_READER:-good}" != fails ] || exit 2
+if [ "${FAKE_READER:-good}" = aborts ]; then
+    printf 'fake reader: aborted on purpose\n' >&2
+    exit 134
+fi
 if ! grep -qxF -- "$home" "$FAKE_DIR/homes.log" 2>/dev/null; then
     printf '%s\n' "$home" >>"$FAKE_DIR/homes.log"
 fi
@@ -317,16 +322,30 @@ make_tree reader-fails
 run_script reader-fails FAKE_READER=fails
 expect "a failing reader: one check, of twelve reads" test "$(checks reader-fails)" = 1 -a "$(reads reader-fails)" = 12
 expect "a failing reader: its folder is removed once" test "$(removals reader-fails)" = 1
-expect "a failing reader: the log shows the failed readings" says "$(check_log reader-fails)" "a failed reading (exit 2)"
+expect "a failing reader: the log shows the failed readings" says "$(check_log reader-fails)" "one-line: every line of its text: a failed reading; it must be passed"
+expect "a failing reader: the log shows the reader's own exit status" says "$(check_log reader-fails)" "the reader failed on one-line.png: exit status 2"
 expect "a failing reader: the run says it failed" says "$(out reader-fails)" "the text reader failed on a known picture"
 expect "a failing reader: the run claims no four checks" never_says "$(out reader-fails)" "four"
+expect "a failing reader: the run does not say that a new build changes nothing" never_says "$(out reader-fails)" "no new build"
+expect "a failing reader: the words of the code do not say it either" never_says "$here/scripts/e2e-voice-device.sh" "a new build would not change it"
 expect "a failing reader: the run fails with exit 2" rc_is reader-fails 2
+
+# A reader that aborts (exit 134) and writes a line to its error output: the log holds its own exit
+# status and its own words, not the status of the helper that judged the reading.
+make_tree reader-aborts
+run_script reader-aborts FAKE_READER=aborts
+expect "an aborting reader: one check, of twelve reads" test "$(checks reader-aborts)" = 1 -a "$(reads reader-aborts)" = 12
+expect "an aborting reader: the log shows its exit status 134" says "$(check_log reader-aborts)" "the reader failed on one-line.png: exit status 134"
+expect "an aborting reader: the log shows its error output" says "$(check_log reader-aborts)" "    fake reader: aborted on purpose"
+expect "an aborting reader: the log shows no other status for it" never_says "$(check_log reader-aborts)" "exit status 2"
+expect "an aborting reader: the run fails with exit 2" rc_is reader-aborts 2
 
 # Four mismatches, each with a folder of its own: four checks, no cause claimed.
 make_tree reader-mismatches
 run_script reader-mismatches FAKE_BAD_FIRST=9
 expect "four mismatches: four checks" test "$(checks reader-mismatches)" = 4
 expect "four mismatches: four folders are removed" test "$(removals reader-mismatches)" = 4
+expect "four mismatches: each picture is read once in a check, none a second time" test "$(reads reader-mismatches)" = 48
 expect "four mismatches: the run says four checks did not match" says "$(out reader-mismatches)" "did not match a known picture in four checks"
 expect "four mismatches: the run clears the page of nothing" never_says "$(out reader-mismatches)" "the page is not at fault"
 expect "four mismatches: the run names no builder of the wrong text" never_says "$(out reader-mismatches)" "gave wrong text"

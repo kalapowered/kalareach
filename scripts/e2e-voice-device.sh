@@ -329,8 +329,9 @@ WRAPPER
     # recognition programs the system built for the reader, which is the one cause tried here: the
     # folder they were built into, which this run made, is thrown away and they are built again, at
     # most three more times. Only a mismatch is tried again. A reading that failed, or could not be
-    # made, stops the run at once with its own words, since a new build would not change it. No claim
-    # about the page is read, or taken again, in the meantime.
+    # made, stops the run at once with its own words: this check does not decide whether a new build
+    # would change it, and the log holds the reader's own exit status and error output for each
+    # failed reading. No claim about the page is read, or taken again, in the meantime.
     local build verdict
     for build in 1 2 3 4; do
         make_reader_home || { say "no folder could be made for the text reader's recognition programs"; return 1; }
@@ -343,7 +344,7 @@ WRAPPER
             return 1
         }
         if [ "$verdict" -ne 1 ]; then
-            say "the text reader failed on a known picture, which no new build of its recognition programs changes; see $artefacts/reader-check.log"
+            say "the text reader failed on a known picture; see $artefacts/reader-check.log"
             return 1
         fi
         if [ "$reader_programs" -eq 0 ]; then
@@ -497,8 +498,9 @@ for base, folders, names in os.walk(top):
 # so the log shows each. The check is that each listed line is read, every word whole; the lists are
 # not a complete transcription (the pictures show more than they name), and the order of separate
 # lines is not checked. Answers 0 when every picture read as drawn, 1 when the text of one did not
-# match (the log then shows the text the reader gave), and 2 when a reading failed or could not be
-# made, which says nothing about the text and is never taken for a mismatch.
+# match (the log then shows the text of the read that did not match), and 2 when a reading failed or
+# could not be made (the log then shows the reader's exit status and error output), which says
+# nothing about the text and is never taken for a mismatch.
 check_the_reader_on_known_pictures() {
     local dir="$here/apps/companion/test/voice/reader-fixtures" picture name verdict mismatch=0 error=0
     printf 'known pictures, read with the programs kept in %s\n' "${reader_home:?}" >>"$artefacts/reader-check.log"
@@ -515,8 +517,8 @@ check_the_reader_on_known_pictures() {
             0) ;;
             1)
                 mismatch=1
-                printf 'what the reader gave for %s, read again:\n' "$name" >>"$artefacts/reader-check.log"
-                "$ocr" "$picture" 2>/dev/null | awk '{ print "    " $0 }' >>"$artefacts/reader-check.log"
+                printf 'what the reader gave for %s:\n' "$name" >>"$artefacts/reader-check.log"
+                printf '%s\n' "$reader_text" | awk '{ print "    " $0 }' >>"$artefacts/reader-check.log"
                 ;;
             *) error=1 ;;
         esac
@@ -525,17 +527,40 @@ check_the_reader_on_known_pictures() {
     return "$mismatch"
 }
 
+# Starts the reader on one picture: its text goes to reader_text, and the answer is the reader's own
+# exit status. When it fails, the log gets that status and its error output (kept in a file of the
+# run's folder that each read writes over), so that a failed reading shows its cause as the system
+# gave it: a crash, a signal (128 and over) or the reader's own words.
+reader_text=""
+read_picture() {
+    local status errors="${artefacts:?}/reader-errors.log"
+    reader_text="$("$ocr" "$1" 2>"$errors")"
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        {
+            printf 'the reader failed on %s: exit status %s\n' "${1##*/}" "$status"
+            if [ -s "$errors" ]; then
+                printf '  its error output:\n'
+                awk '{ print "    " $0 }' "$errors"
+            else
+                printf '  it wrote no error output\n'
+            fi
+        } >>"$artefacts/reader-check.log"
+    fi
+    return "$status"
+}
+
 # Whether the reader finds nothing at all in an image: 0 when it gives no character but spacing, 1
 # when it gives any, and 2 when the reader failed, which says nothing about the image.
 image_reads_nothing() {
-    local text
-    text="$("$ocr" "$1" 2>/dev/null)" || return 2
-    [ -z "${text//[[:space:]]/}" ]
+    read_picture "$1" || return 2
+    [ -z "${reader_text//[[:space:]]/}" ]
 }
 
 # Runs one picture check, writes what it did beside what it had to do, and answers 0 when they agree
 # and 1 when they do not. A reader or conversion that failed is neither a pass nor a refusal, so it
-# agrees with nothing, and the answer is 2 so that it is never taken for a disagreement.
+# agrees with nothing, and the answer is 2 so that it is never taken for a disagreement. The reader's
+# own exit status and error output are in the log, written by the read.
 reader_verdict() {
     local want=$1 what=$2 got rc
     shift 2
@@ -544,7 +569,7 @@ reader_verdict() {
     case "$rc" in
         0) got=passed ;;
         1) got=refused ;;
-        *) got="a failed reading (exit $rc)" ;;
+        *) got="a failed reading" ;;
     esac
     printf '%s: %s; it must be %s\n' "$what" "$got" "$want" >>"$artefacts/reader-check.log"
     [ "$got" != "$want" ] || return 0
@@ -577,7 +602,8 @@ image_shows() {
     local image=$1 text words phrase wanted
     shift
     [ "$#" -gt 0 ] || return 1
-    text="$("$ocr" "$image" 2>/dev/null)" || return 2
+    read_picture "$image" || return 2
+    text=$reader_text
     words="$(words_of "$text")" || return 2
     for phrase in "$@"; do
         wanted="$(words_of "$phrase")" || return 2
@@ -599,7 +625,8 @@ letters_of() {
 image_lacks() {
     local image=$1 text letters phrase wanted
     shift
-    text="$("$ocr" "$image" 2>/dev/null)" || return 2
+    read_picture "$image" || return 2
+    text=$reader_text
     letters="$(letters_of "$text")" || return 2
     for phrase in "$@"; do
         wanted="$(letters_of "$phrase")" || return 2
