@@ -1661,7 +1661,10 @@ async fn a_stored_capture_node_that_crosses_its_grant_is_refused_at_its_next_run
 }
 
 /// A first leg that copies a version, and a stored review workflow that starts on the event the
-/// copy produces, both under one grant that carries every right and selects every session.
+/// copy produces, both under one grant that carries every right and selects every session. A
+/// platform without a POSIX shell refuses a review node when it is installed, so the cases that
+/// use this do not run there.
+#[cfg(not(windows))]
 struct StoredReview {
     service: AutomationService,
     table: Arc<GrantTable>,
@@ -1670,6 +1673,7 @@ struct StoredReview {
     review: WorkflowDefinition,
 }
 
+#[cfg(not(windows))]
 impl StoredReview {
     /// The review is installed under the broad grant, as every definition is today, or stored
     /// with a shared working tree, as one installed before the refusal of that was.
