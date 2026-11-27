@@ -1,0 +1,1 @@
+This host sends at most 8,000 tokens of it, and cuts what is selected to fit.

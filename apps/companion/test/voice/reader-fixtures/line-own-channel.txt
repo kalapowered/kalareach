@@ -1,0 +1,1 @@
+This service's own channel to the provider still receives transcripts and copies of the audio. They

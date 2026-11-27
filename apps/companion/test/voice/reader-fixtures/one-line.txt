@@ -1,0 +1,1 @@
+Audio travels directly between this device and the provider, not through this service.

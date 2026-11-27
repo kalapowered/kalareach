@@ -1,0 +1,1 @@
+Selected context and host results are sent as bounded requests. What the host selected can

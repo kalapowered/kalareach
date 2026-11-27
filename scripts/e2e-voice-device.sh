@@ -42,6 +42,7 @@
 #   scripts/e2e-voice-device.sh ios
 #   scripts/e2e-voice-device.sh android
 #   scripts/e2e-voice-device.sh desktop
+#   scripts/e2e-voice-device.sh reader    # only the text reader, on the pictures kept for it
 #
 # Exit codes: 0 every requested platform ran, 2 bad usage or a failed assertion, 3 a requested
 # platform is not available on this machine.
@@ -58,7 +59,7 @@ port="${KR_VOICE_TEST_PORT:-4188}"
 want="${1:-all}"
 
 case "$want" in
-    ios | android | desktop | all) ;;
+    ios | android | desktop | reader | all) ;;
     *) printf 'unknown target: %s\n' "$want" >&2; exit 2 ;;
 esac
 
@@ -81,6 +82,35 @@ failures=0
 proved() { proved_lines+=("$*"); }
 unproved() { unproved_lines+=("$*"); }
 fail() { failures=$((failures + 1)); say "FAILED: $*"; }
+
+# The text reader's own folder of the programs the system compiles for it, for this run. The system
+# builds them at the reader's first run and keeps them under the home folder, named for the reader;
+# a bad build is kept, and every later run of the reader reads wrong from it (see the reader's
+# source). So the reader is told, by KR_READER_HOME, to keep them in a folder made here, which this
+# run can check and, if it reads wrong, throw away.
+reader_home=""
+
+make_reader_home() {
+    reader_home="$(mktemp -d "${artefacts:?}/reader-home.XXXXXX")" || { reader_home=""; return 1; }
+    export KR_READER_HOME="$reader_home"
+}
+
+# Removes the folder make_reader_home made, and nothing else: the recorded path must be a real
+# folder, not a link, directly inside this run's artefacts folder and named as make_reader_home
+# names it, or nothing is removed.
+discard_reader_home() {
+    local home=$reader_home
+    reader_home=""
+    unset KR_READER_HOME
+    [ -n "$home" ] || return 0
+    [ "$(dirname -- "$home")" = "${artefacts:?}" ] || return 1
+    case "$(basename -- "$home")" in
+        reader-home.??????) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$home" ] && [ ! -L "$home" ] || return 1
+    rm -rf -- "$home"
+}
 
 # ---- The harness the surfaces are driven in ----------------------------------------------------
 
@@ -120,8 +150,12 @@ cleanup() {
         kill "$android_pid" 2>/dev/null || true
         wait "$android_pid" 2>/dev/null || true
     fi
+    discard_reader_home || true
 }
 trap cleanup EXIT
+
+# The reader check needs no page, so it builds and serves none.
+if [ "$want" != reader ]; then
 
 say "building the harness bundle"
 if ! ( cd "$companion" && pnpm build:harness ) >"$artefacts/build.log" 2>&1; then
@@ -190,6 +224,8 @@ if [ "$ready" != 1 ]; then
     exit 2
 fi
 
+fi # [ "$want" != reader ]
+
 # ---- What a screenshot shows --------------------------------------------------------------------
 #
 # A screenshot is evidence of what it shows, and a file that exists shows nothing by being there: a
@@ -216,6 +252,17 @@ import Vision
 
 // Prints the text the system recognises in one image: a line of the image per line, from the top
 // down and, along a line, from the left.
+
+// The system compiles the programs it recognises text with when a reader first runs, and keeps them
+// in a folder named for the reader under the home folder. Some builds come out wrong, and then every
+// later run of the reader reads wrong from them: no text for a picture of one line, rows left out of
+// a page, whatever the margin and the recognition options. The script gives the reader a folder of
+// its own for the run, so that a wrong build can be thrown away. Without KR_READER_HOME the reader
+// keeps the system's default folder.
+if let home = ProcessInfo.processInfo.environment["KR_READER_HOME"], !home.isEmpty {
+    setenv("CFFIXED_USER_HOME", home, 1)
+}
+
 guard CommandLine.arguments.count == 2,
       let image = NSImage(contentsOfFile: CommandLine.arguments[1]),
       let picture = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { exit(2) }
@@ -269,6 +316,27 @@ SWIFT
         return 1
     }
     ocr="$artefacts/read-text"
+    : >"$artefacts/reader-check.log"
+    # The reader is first held to pictures it must read as drawn. This is a check of the instrument,
+    # not a retry of any assertion or wait: a wrong reading of a known picture says that the system
+    # built the reader's recognition programs wrongly, so the folder they were built into, which this
+    # run made, is thrown away and they are built again, at most three more times, before the run
+    # gives up. No claim about the page is read, or taken again, in the meantime.
+    local build
+    for build in 1 2 3 4; do
+        make_reader_home || { say "no folder could be made for the text reader's recognition programs"; return 1; }
+        check_the_reader_on_known_pictures && break
+        discard_reader_home || {
+            say "the folder of the text reader's recognition programs could not be thrown away; see $artefacts/reader-check.log"
+            return 1
+        }
+        if [ "$build" -eq 4 ]; then
+            say "this system's text recognition gave wrong text for a known picture in four builds of its programs; the page is not at fault; see $artefacts/reader-check.log"
+            return 1
+        fi
+        say "the text reader read a known picture wrong; building its recognition programs again"
+    done
+    say "the text reader read the known pictures as drawn, and read none in a picture without text"
     check_the_readers || {
         say "the picture checks passed a picture made to fail them, or failed one made to pass; see $artefacts/reader-check.log"
         return 1
@@ -295,7 +363,7 @@ check_the_readers() {
       await draw('$shows', '<p>Unmute microphone</p><p>Session 1b</p><p>\$00.1 a second</p>');
       await draw('$lacks', '<p>Start Voice Sessions</p>');
       await browser.close();
-    " ) >"$artefacts/reader-check.log" 2>&1 || return 1
+    " ) >>"$artefacts/reader-check.log" 2>&1 || return 1
     reader_verdict passed "every phrase drawn in it" image_shows "$shows" "Unmute microphone" "Session 1b" '$00.1 a second' &&
         reader_verdict refused '"Mute microphone" in a picture of "Unmute microphone"' image_shows "$shows" "Mute microphone" &&
         reader_verdict refused '"Session 1" in a picture of "Session 1b"' image_shows "$shows" "Session 1" &&
@@ -303,6 +371,40 @@ check_the_readers() {
         reader_verdict refused "nothing asked" image_shows "$shows" &&
         reader_verdict passed '"End session" absent from a picture without it' image_lacks "$lacks" "End session" &&
         reader_verdict refused '"Start voice session" absent from a picture of "Start Voice Sessions"' image_lacks "$lacks" "Start voice session"
+}
+
+# The reader on the pictures kept for it in the companion's voice tests (reader-fixtures), each a
+# picture of the product's own page with the text it shows beside it, one line of the text per line
+# of the file: lines of one card's text cut tight to one line each, as the picture of one element is
+# (these are the pictures a wrongly built reader gives no text for, the long ones above all); the
+# whole page of the provider choice; and a picture without any text, whose file is empty, which must
+# read as empty so that the reader can still refuse. Every picture is read whatever the others give,
+# so the log shows each.
+check_the_reader_on_known_pictures() {
+    local dir="$here/apps/companion/test/voice/reader-fixtures" picture name rows row ok=0
+    printf 'known pictures, read with the programs kept in %s\n' "${reader_home:?}" >>"$artefacts/reader-check.log"
+    for picture in "$dir"/*.png; do
+        name="${picture##*/}"
+        name="${name%.png}"
+        rows=()
+        while IFS= read -r row; do
+            [ -z "$row" ] || rows+=("$row")
+        done <"$dir/$name.txt"
+        if [ "${#rows[@]}" -eq 0 ]; then
+            reader_verdict passed "$name: no text in a picture without any" image_reads_nothing "$picture" || ok=1
+        else
+            reader_verdict passed "$name: every line of its text" image_shows "$picture" "${rows[@]}" || ok=1
+        fi
+    done
+    return "$ok"
+}
+
+# Whether the reader finds nothing at all in an image: 0 when it gives no character but spacing, 1
+# when it gives any, and 2 when the reader failed, which says nothing about the image.
+image_reads_nothing() {
+    local text
+    text="$("$ocr" "$1" 2>/dev/null)" || return 2
+    [ -z "${text//[[:space:]]/}" ]
 }
 
 # Runs one picture check, writes what it did beside what it had to do, and answers whether they
@@ -976,7 +1078,12 @@ run_desktop() {
 
 # ---- Execution ---------------------------------------------------------------------------------
 
-run_assertions
+if [ "$want" = reader ]; then
+    say "checking the text reader on the pictures kept for it"
+    ocr_ready || fail "the text reader did not pass its own checks"
+else
+    run_assertions
+fi
 
 platform_missing=0
 case "$want" in

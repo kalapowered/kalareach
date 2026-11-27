@@ -1,0 +1,1 @@
+are discarded before telemetry and never stored, which reduces what is kept rather than making it

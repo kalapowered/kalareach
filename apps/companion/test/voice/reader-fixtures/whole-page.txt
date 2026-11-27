@@ -1,0 +1,37 @@
+Start a voice session
+Voice model gpt-live-1
+https://reach.kala.to
+What this gives access to
+Audio travels directly between this device and the provider, not through this service.
+The provider and this service can process the speech and the context the host selects.
+This service's own channel to the provider still receives transcripts and copies of the audio. They
+are discarded before telemetry and never stored, which reduces what is kept rather than making it
+unreadable.
+Selected context and host results are sent as bounded requests. What the host selected can
+include project text, and this service and the provider both see it.
+A statement from the model that you confirmed something is not a confirmation. Actions that need
+one ask for it on the unlocked screen of this device.
+Sessions this call can reach
+Session 1
+What will be sent
+the session
+its description, working directory, active application, decisions waiting on you and the last 20
+messages
+This host sends at most 8,000 tokens of it, and cuts what is selected to fit.
+Not sent
+environment variables
+not selected
+raw terminal scrollback
+not selected
+What speaking will be allowed to do
+Hear a briefing built from the selected context.
+Compose a prompt without submitting it.
+Move between the sessions this grant covers.
+Read what a session is doing.
+The host refuses anything not listed here.
+Not done: this version does not act on spoken requests.
+What it costs
+$0.01 a second ($0.60 a minute)
+Every call is charged for at least 15 seconds. This call can last up to 30 minutes, so it can cost at
+most $18.00.
+Start voice session
