@@ -314,7 +314,7 @@ FEATURE_ROWS = [
     ('tests-1', 'rustix', 'pipe stdio',
      OTHER),
     ('tests-1', 'rustix', 'thread',
-     "turned on by kr-shell-integration's own tests, which are tests-2's; it adds the items of rustix's thread module, and the one case that calls them is built only for Linux, so no code of tests-1 on macOS calls them"),
+     "turned on by kr-shell-integration's own tests (a `cfg(unix)` dev-dependency), which are tests-2's; the workspace has two callers of rustix's thread module, the shell recovery case of kr-shell-integration's shellpkg suite and a case of kr-cli's probe suite (tests/probe.rs), and both are built only for Linux, so no code of tests-1 on macOS calls them; on macOS rustix uses its libc backend, where the feature only gates the `thread` module and the backend module under it (and some private modules that tests-1 builds already, since kr-ipc asks for fs, process and time), and changes no existing item; the raw system-call feature it also turns on (`linux-raw-sys/prctl`) applies to Linux only"),
     ('tests-1', 'serde_json', 'float_roundtrip',
      'only jsonschema asks for it, and only kr-codex-stand-in, a tests-2 package, pulls that in; without it tests-1 parses floats with the faster parser, which can differ from the exact one in the last place for some long inputs, and tests-1 parses only short decimals (0.0 and 2.5 in session_export.rs, two-decimal elapsed times in the Go report), which both read exactly'),
     ('tests-1', 'serde_json', 'unbounded_depth',
