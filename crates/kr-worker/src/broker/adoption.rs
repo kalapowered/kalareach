@@ -1446,4 +1446,83 @@ mod tests {
             );
         }
     }
+
+    /// KR-REQ-12.19: a tie says what each package makes of the version. A package with no version
+    /// that the decision can compare is told so in words that are true of all three reasons for it:
+    /// the decision was made with no digest, no record of the package names the digest, or a record
+    /// names it at text that is no version.
+    #[test]
+    fn a_tie_says_what_each_package_makes_of_the_version() {
+        let package =
+            |name: &str, ranges: &[&str], version: Option<&str>, coverage: Coverage| TiedPackage {
+                plugin_id: PluginId::new(name).expect("an identifier"),
+                protocol: None,
+                ranges: ranges.iter().map(|range| (*range).to_owned()).collect(),
+                version: version.map(str::to_owned),
+                coverage,
+            };
+        let said = |packages: Vec<TiedPackage>| {
+            tie_refusal(&Tie {
+                packages,
+                one_publisher: true,
+            })
+        };
+        let sentence = |clauses: &str| {
+            format!(
+                "it was not launched through the integration, and {clauses}, so no package was \
+                 chosen for it and none of its bridges is admitted"
+            )
+        };
+
+        assert_eq!(
+            said(vec![
+                package("kalareach/a", &[], None, Coverage::Neutral),
+                package("kalareach/b", &[], None, Coverage::Neutral),
+            ]),
+            sentence(
+                "kalareach/a and kalareach/b each have no version that this decision can compare"
+            ),
+            "packages that a decision made with no digest read no version for"
+        );
+        assert_eq!(
+            said(vec![
+                package("kalareach/a", &[], Some("1.4.0"), Coverage::Neutral),
+                package("kalareach/b", &[], Some("1.4.0"), Coverage::Neutral),
+            ]),
+            sentence("kalareach/a and kalareach/b each declare no range for version 1.4.0"),
+            "packages that declare no range for the version"
+        );
+        assert_eq!(
+            said(vec![
+                package(
+                    "kalareach/a",
+                    &[">=1.0.0, <2.0.0"],
+                    Some("1.4.0"),
+                    Coverage::Covers
+                ),
+                package(
+                    "kalareach/b",
+                    &[">=2.0.0"],
+                    Some("1.4.0"),
+                    Coverage::Excludes
+                ),
+            ]),
+            sentence(
+                "kalareach/a (>=1.0.0, <2.0.0) covers version 1.4.0 and kalareach/b (>=2.0.0) \
+                 refuses version 1.4.0"
+            ),
+            "one package covers the version and the other refuses it"
+        );
+        assert_eq!(
+            said(vec![
+                package("kalareach/a", &[], Some("1.4.0"), Coverage::Neutral),
+                package("kalareach/b", &[], None, Coverage::Neutral),
+            ]),
+            sentence(
+                "kalareach/a declares no range for version 1.4.0 and kalareach/b has no version \
+                 that this decision can compare"
+            ),
+            "packages of one publisher whose clauses differ get one clause each"
+        );
+    }
 }

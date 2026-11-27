@@ -16,7 +16,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_plugin_sdk::matching::MatchConfidence;
+use kr_plugin_sdk::matching::{Coverage, MatchConfidence};
 use kr_protocol::broker::IntegrationMode;
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{ApplicationInstanceId, BrokerBindingId, SessionId};
@@ -1519,7 +1519,9 @@ fn kr_req_12_19_a_package_that_names_the_digest_beats_one_whose_range_admits_the
 /// KR-REQ-12.19: a signed record whose version for the program's build is no package version names
 /// no version. The package that holds it neither covers the program nor refuses it, so it ranks
 /// with a package that knows nothing of the build: its range is not applied to text that is no
-/// version, and a tie names no version for it. The same record naming a version binds the package.
+/// version, and a tie names no version for it and says that it has none that the decision can
+/// compare, as it says of a package whose records do not name the build and of a decision made with
+/// no digest. The same record naming a version binds the package.
 #[test]
 fn kr_req_12_19_a_build_record_whose_version_is_no_package_version_names_no_version() {
     let claims = |version: &'static str| {
@@ -1555,12 +1557,42 @@ fn kr_req_12_19_a_build_record_whose_version_is_no_package_version_names_no_vers
         vec![None, None],
         "the tie names no version for either package"
     );
+    let told = found(&setup);
+    assert!(told.plugin_id.as_ref().is_none(), "bound to none: {told:?}");
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal(
+                "kalareach/one (>=1.0.0, <2.0.0) and kalareach/two each have no version that \
+                 this decision can compare"
+            )
+            .as_str()
+        ),
+        "the words are true of a record that names text that is no version, and of a package \
+         whose records do not name the build"
+    );
 
     let setup = claims("1.4.0");
     assert_eq!(
         selected(&decision(&setup)).as_deref(),
         Some("kalareach/one"),
         "the same record naming a version that the range admits binds the package"
+    );
+    let blind = setup
+        .broker
+        .recognise(&setup.program.display().to_string(), None);
+    let read: Vec<(Option<String>, Coverage)> = match &blind {
+        Recognition::Tied(tie) => tie
+            .packages
+            .iter()
+            .map(|package| (package.version.clone(), package.coverage))
+            .collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(
+        read,
+        vec![(None, Coverage::Neutral), (None, Coverage::Neutral)],
+        "a decision made with no digest ties the packages and reads no version for either"
     );
 }
 
@@ -1726,8 +1758,9 @@ fn kr_req_12_19_the_rank_and_the_sentence_agree_on_what_one_publisher_is() {
         told.refusal.as_ref().map(String::as_str),
         Some(
             refusal_across(
-                "example-vendor/two has no signed record of this build, kalareach/one (>=1.0.0) \
-                 covers version 1.4.0 and other-vendor/three has no signed record of this build",
+                "example-vendor/two has no version that this decision can compare, kalareach/one \
+                 (>=1.0.0) covers version 1.4.0 and other-vendor/three has no version that this \
+                 decision can compare",
                 "none"
             )
             .as_str()
@@ -1810,7 +1843,7 @@ fn kr_req_12_19_a_later_admission_that_names_the_build_resolves_a_tie_and_the_sw
         Some(
             refusal(
                 "kalareach/one (>=1.0.0, <2.0.0) and kalareach/two (>=2.0.0, <3.0.0) each have \
-                 no signed record of this build"
+                 no version that this decision can compare"
             )
             .as_str()
         ),
