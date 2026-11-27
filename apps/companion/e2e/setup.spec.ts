@@ -1630,6 +1630,31 @@ test.describe('the first-start assistant', () => {
   }
 
   /**
+   * The controls of the step that a keyboard can reach, by what the page holds: every enabled control
+   * in the main region that is shown and not taken out of the tab order, except the bar's own. Read
+   * from the page and not from a list here, so that a walk that stops early or skips a control
+   * differs from it.
+   */
+  function reachableInMain(page: Page): Promise<string[]> {
+    return page.evaluate(() => {
+      const main = document.getElementById('main')
+      const bar = document.querySelector('.setup-controls')
+      if (!main || !bar) throw new Error('the setup view is not on the page')
+      return Array.from(
+        main.querySelectorAll<HTMLElement>('a[href], button, input, select, textarea, summary, [tabindex]')
+      )
+        .filter(
+          (each) =>
+            !bar.contains(each) &&
+            !each.matches(':disabled') &&
+            each.getAttribute('tabindex') !== '-1' &&
+            each.checkVisibility({ visibilityProperty: true })
+        )
+        .map((each) => (each.getAttribute('data-testid') ?? each.textContent ?? each.tagName).trim().slice(0, 40))
+    })
+  }
+
+  /**
    * Moves focus through the whole step with the keyboard and reads every stop: forward from the top
    * of the page to the bar's last control, or back from the bar to the top of the page.
    */
@@ -1660,8 +1685,40 @@ test.describe('the first-start assistant', () => {
     throw new Error(`focus did not ${back ? 'leave the page' : "reach the bar's last control"} in 80 moves`)
   }
 
+  /**
+   * The controls whose box with its ring is taller than the room above the soft edge today, by window
+   * width and text size, with what each must still show after the keyboard moves to it. No scroll can
+   * show one of these whole. All are buttons of the step rail, whose steps grow taller than the room at
+   * the largest text on a narrow window.
+   *
+   * - `ring`: the box's top edge and the ring's top lie in the room, so that a person sees where the
+   *   control starts and scrolls on.
+   * - `box`: the box's top edge lies in the window and in the room, and the ring's top may lie above
+   *   the window by no more than the ring's own width. This is the rail's first step at 320 points with
+   *   the largest text going forward, where the step's box with its margin (578.7 px) is taller than
+   *   the window (568 px), so that an engine keeps one end of it only.
+   *
+   * The list is exact, per control and per direction, both ways: a control that does not fit and is
+   * not here fails the case, one here that now fits fails it, a `box` entry that begins to meet `ring`
+   * fails it, and a `ring` entry that falls to `box` fails it. The list shrinks when the rail is cured.
+   */
+  type StartRule = 'ring' | 'box'
+  const TALLER_THAN_THE_ROOM: Readonly<
+    Record<string, Readonly<Record<string, Readonly<Record<'forward' | 'back', StartRule>>>>>
+  > = {
+    '320 largest': {
+      'setup-step-identity': { forward: 'box', back: 'ring' },
+      'setup-step-host': { forward: 'ring', back: 'ring' },
+      'setup-step-capabilities': { forward: 'ring', back: 'ring' }
+    },
+    '1280 largest': {
+      'setup-step-capabilities': { forward: 'ring', back: 'ring' }
+    }
+  }
+
   for (const [width, height] of BAR_WINDOWS) {
     for (const [size, ratio] of BAR_SIZES) {
+      const tallerThanTheRoom = TALLER_THAN_THE_ROOM[`${String(width)} ${size}`] ?? {}
       for (const name of ['identity', 'permissions', 'capabilities', 'host', 'ready'] as const) {
         test(`shows a control that takes focus whole above the setup bar on the ${name} step at the ${size} text size, ${width} wide`, async ({
           page,
@@ -1670,11 +1727,16 @@ test.describe('the first-start assistant', () => {
           const option = browserName === 'webkit' && platform() === 'darwin'
           await openForBar(page, name, width, height, ratio)
           const found: string[] = []
-          for (const back of [false, true]) {
-            const stops = (await walkFocus(page, back, option)).filter((each) => each.inMain && !each.inBar)
-            expect(stops.length, `the controls that focus reached ${back ? 'going back' : 'going forward'}`).toBeGreaterThan(2)
+          const expected = (await reachableInMain(page)).sort()
+          expect(expected.length, 'the controls of the step that the page holds').toBeGreaterThan(2)
+          for (const direction of ['forward', 'back'] as const) {
+            const stops = (await walkFocus(page, direction === 'back', option)).filter((each) => each.inMain && !each.inBar)
+            expect(
+              stops.map((each) => each.label).sort(),
+              `the controls that focus reached going ${direction}, against the enabled controls of the step`
+            ).toEqual(expected)
             for (const stop of stops) {
-              const where = `${back ? 'back' : 'forward'}, ${stop.label}, scroll ${String(Math.round(stop.scrollY))}`
+              const where = `${direction}, ${stop.label}, scroll ${String(Math.round(stop.scrollY))}`
               if (stop.left < -0.5 || stop.right > stop.width + 0.5) {
                 const reach = `${stop.left.toFixed(1)} to ${stop.right.toFixed(1)} of ${String(stop.width)}`
                 if (stop.inRail) {
@@ -1689,43 +1751,45 @@ test.describe('the first-start assistant', () => {
                   found.push(`${where}: outside the window sideways (${reach})`)
                 }
               }
-              // Three kinds of control, by size against the room above the soft edge. (a) The box and its
-              // ring fit: both lie in the room. (b) The box fits and the box with its ring does not:
-              // the whole box lies in the room and the ring may be cut at the window's edge. (c) The
-              // box is taller than the room: its top edge lies in the room, so that a person sees
-              // where it starts and scrolls on. Kinds (b) and (c) are named, with their sizes, in the
-              // run's report.
+              // A control whose box with its ring fits the room above the soft edge is shown whole: the
+              // box and the ring both lie in it. One that does not fit cannot be shown whole by any
+              // scroll, and is exempt only where it is measured to be taller than the room and is on
+              // `TALLER_THAN_THE_ROOM` for this direction, with the start rule that the list gives it.
               const withRing = stop.bottom - stop.top
               const boxTop = stop.top + stop.ring
               const boxBottom = stop.bottom - stop.ring
               const sizes = `box ${(boxBottom - boxTop).toFixed(1)} px, with its ring ${withRing.toFixed(1)} px, room ${stop.fadeTop.toFixed(1)} px; box ${boxTop.toFixed(1)} to ${boxBottom.toFixed(1)}`
+              const rule = tallerThanTheRoom[stop.label]?.[direction]
               if (withRing <= stop.fadeTop + 0.5) {
+                if (rule !== undefined) found.push(`${where}: now fits the room, so it is off the list of controls that cannot (${sizes})`)
                 if (stop.top < -0.5) found.push(`${where}: its ring starts ${(-stop.top).toFixed(1)} above the window (${sizes})`)
                 if (stop.bottom > stop.fadeTop + 0.5) {
                   found.push(`${where}: ends ${(stop.bottom - stop.fadeTop).toFixed(1)} under the soft edge or the bar (${sizes})`)
                 }
-              } else if (boxBottom - boxTop <= stop.fadeTop + 0.5) {
-                // The two ends of the margin that the page asks for cannot both be kept for a box this
-                // close to the room's size: the engine keeps one, so the box's end may lie in the top
-                // of the soft edge, where it is nearly clear, and never under the bar itself.
-                const into = Math.max(0, boxBottom - stop.fadeTop)
-                test.info().annotations.push({
-                  type: 'box fits the room, its ring does not',
-                  description: `${where}: ${sizes}${into > 0.5 ? `; the box ends ${into.toFixed(1)} px into the soft edge` : ''}`
-                })
-                if (boxTop < -0.5) found.push(`${where}: its box starts ${(-boxTop).toFixed(1)} above the window (${sizes})`)
-                if (boxBottom > stop.barTop + 0.5) {
-                  found.push(`${where}: its box ends ${(boxBottom - stop.barTop).toFixed(1)} under the bar (${sizes})`)
-                } else if (into > stop.ring + 0.5) {
-                  found.push(`${where}: its box ends ${into.toFixed(1)} px into the soft edge, more than the ring's ${String(stop.ring)} px (${sizes})`)
-                }
               } else {
-                test.info().annotations.push({ type: 'box taller than the room', description: `${where}: ${sizes}` })
-                if (boxTop < -0.5 || boxTop >= stop.fadeTop - 0.5) {
+                test.info().annotations.push({ type: 'taller than the room, with its ring', description: `${where}: ${sizes}` })
+                const topInRoom = boxTop < stop.fadeTop - 0.5
+                const ringTopInWindow = stop.top >= -0.5
+                // How far the ring's top lies above the window, against the ring's own width (outline
+                // width plus offset, read from the computed style).
+                const ringTopCut = Math.max(0, -stop.top)
+                const cutWithinTheRing = ringTopCut <= stop.ring + 0.5
+                if (rule === undefined) {
+                  found.push(`${where}: does not fit the room and is not on the list of controls that cannot (${sizes})`)
+                } else if (!topInRoom) {
                   found.push(`${where}: its top edge is not in the room above the soft edge (${sizes})`)
+                } else if (rule === 'ring' && !ringTopInWindow) {
+                  found.push(`${where}: the top of its ring is ${ringTopCut.toFixed(1)} above the window, and the list says the ring's top is in it (${sizes})`)
+                } else if (rule === 'box' && !cutWithinTheRing) {
+                  found.push(`${where}: its box starts ${(-boxTop).toFixed(1)} above the window, more than the ring's ${stop.ring.toFixed(1)} px allows (${sizes})`)
+                } else if (rule === 'box' && ringTopInWindow) {
+                  found.push(`${where}: the top of its ring is in the window now, so the list must say so (${sizes})`)
                 }
               }
             }
+          }
+          for (const label of Object.keys(tallerThanTheRoom)) {
+            expect(expected, `${label}, on the list of controls that cannot fit, is a control of the step`).toContain(label)
           }
           expect(found, 'where a control that took focus is not whole above the bar').toEqual([])
         })
