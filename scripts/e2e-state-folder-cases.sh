@@ -840,16 +840,19 @@ fi
 
 # The macOS form of the listing, shown on Linux with a stand-in `uname` and a stand-in `ls` that answers
 # the listing's `-ldine` the way macOS does: the entry's own line, then one line for each access list
-# entry. The folder with such a line is refused, a closed folder with none is accepted, a sticky
-# temporary directory passes whatever it carries. A folder with a real access list on a real macOS is not
-# made here: this script runs only on Linux, and nothing of it runs on a Mac.
+# entry. The folder with such a line is refused, a closed folder with none is accepted, and a sticky
+# temporary directory is refused only for an entry that grants the right to write its security
+# information, to change its owner or to delete from it (or for a line that is neither an allow nor a
+# deny entry). A folder with a real access list on a real macOS is not made here: this script runs only
+# on Linux, and nothing of it runs on a Mac.
 acl_entry=none
+acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow add_file'
 stand_uname() { printf 'Darwin\n'; }
 stand_ls() {
   if [ "${1:-}" = -ldine ]; then
     command ls -ldin "${@:2}" || return
     if [ "${3:-}" = "$acl_entry" ]; then
-      printf ' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow add_file\n'
+      printf '%s\n' "$acl_line"
     fi
   else
     command ls "$@"
@@ -866,7 +869,24 @@ said "a closed temporary directory with an access list entry (the macOS listing)
 acl_entry=none stand_check "$t" "$t/acl-none/mid/state"
 said "a closed chain with no access list entry (the macOS listing)" accepted
 acl_entry=. stand_check "$scratch/R1777-acl" "$scratch/R1777-acl/mid/state"
-said "a sticky temporary directory with an access list entry (the macOS listing)" accepted
+said "a sticky temporary directory with an access list entry that grants no such right (the macOS listing)" accepted
+# A sticky temporary directory is read for its access list before it is accepted: an entry that lets
+# another account write its security information, change its owner or delete from it is refused, one
+# that is inherited too, and so is a line that is neither an allow nor a deny entry. A deny entry
+# grants nothing.
+sticky_acl="$scratch/R1777-acl"
+for acl_right in writesecurity chown delete_child; do
+  mk "$sticky_acl/grant-$acl_right/mid/state"
+  acl_entry=. acl_line=" 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow add_file,$acl_right" stand_check "$sticky_acl" "$sticky_acl/grant-$acl_right/mid/state"
+  said "a sticky temporary directory whose access list allows $acl_right (the macOS listing)" "$(acl_sentence "$sticky_acl/grant-$acl_right/mid/state" "$sticky_acl")"
+done
+mk "$sticky_acl/inherited/mid/state" "$sticky_acl/unreadable/mid/state" "$sticky_acl/deny/mid/state"
+acl_entry=. acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 inherited allow add_file,writesecurity' stand_check "$sticky_acl" "$sticky_acl/inherited/mid/state"
+said "a sticky temporary directory whose inherited access list entry allows writesecurity (the macOS listing)" "$(acl_sentence "$sticky_acl/inherited/mid/state" "$sticky_acl")"
+acl_entry=. acl_line=' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 add_file' stand_check "$sticky_acl" "$sticky_acl/unreadable/mid/state"
+said "a sticky temporary directory with an access list line that is neither an allow nor a deny entry (the macOS listing)" "$(acl_sentence "$sticky_acl/unreadable/mid/state" "$sticky_acl")"
+acl_entry=. acl_line=$' 0: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 deny writesecurity,chown,delete_child\n 1: FFFFEEEE-DDDD-CCCC-BBBB-AAAA00000001 allow list,add_file' stand_check "$sticky_acl" "$sticky_acl/deny/mid/state"
+said "a sticky temporary directory whose access list only denies those rights and allows others (the macOS listing)" accepted
 unset -f stand_uname stand_ls
 echo "  skipped: a folder with a real access list on a real macOS (macOS only: this script runs only on Linux, and nothing of it runs on a Mac)"
 

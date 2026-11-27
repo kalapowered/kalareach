@@ -78,13 +78,19 @@
 # e2e_state_folder_list <entry>: reads <entry> (a name in the working directory, `.`, or a path) with
 # ONE listing that does not follow a link, and leaves what it shows in e2e_state_folder_ino (the
 # inode), e2e_state_folder_mode (the kind and the mode, 10 characters), e2e_state_folder_uid (the
-# owner) and e2e_state_folder_acl (1 where the listing has a line after the entry's own). On macOS
-# the listing is asked for the access list entries (`-e`), each of which prints on a line of its own:
-# the `@` mark that an extended attribute puts after the mode hides the `+` mark of a list, so the
-# mark cannot show a list there. Linux has no such flag and its group bits mask a list. It returns 1
-# where the entry cannot be listed.
+# owner), e2e_state_folder_acl (1 where the listing has a line after the entry's own) and
+# e2e_state_folder_acl_grants (1 where one of those lines is an `allow` entry that grants the right to
+# write the folder's security information (mode, owner and list: `writesecurity`), to change its owner
+# (`chown`) or to delete or rename what it holds (`delete_child`), or is not readable as an `allow` or
+# a `deny` entry; a `deny` entry grants nothing). On macOS the listing is asked for the access list
+# entries (`-e`, with `-n`, so that a principal prints as one word), each of which prints on a line of
+# its own as ` <number>: <principal> [inherited ]allow|deny <right>,<right>...`: the `@` mark that an
+# extended attribute puts after the mode hides the `+` mark of a list, so the mark cannot show a list
+# there. Linux has no such flag, so nothing is read there: its group bits mask a list, and no list
+# can give another account the right to change a folder's mode or owner. It returns 1 where the entry
+# cannot be listed.
 e2e_state_folder_list() {
-  local flags=-ldin line _
+  local flags=-ldin line entries entry word rights _
   if [ "$(uname -s)" = Darwin ]; then
     flags=-ldine
   fi
@@ -92,18 +98,38 @@ e2e_state_folder_list() {
   read -r e2e_state_folder_ino e2e_state_folder_mode _ e2e_state_folder_uid _ <<< "$line"
   e2e_state_folder_mode="${e2e_state_folder_mode:0:10}"
   e2e_state_folder_acl=0
+  e2e_state_folder_acl_grants=0
   case "$line" in
-    *$'\n'*) e2e_state_folder_acl=1 ;;
+    *$'\n'*)
+      e2e_state_folder_acl=1
+      entries="${line#*$'\n'}"
+      while IFS= read -r entry; do
+        read -r _ _ word rights <<< "$entry"
+        if [ "$word" = inherited ]; then
+          read -r _ _ _ word rights <<< "$entry"
+        fi
+        case "$word" in
+          deny) ;;
+          allow)
+            case ",$rights," in
+              *,writesecurity,* | *,chown,* | *,delete_child,*) e2e_state_folder_acl_grants=1 ;;
+            esac
+            ;;
+          *) e2e_state_folder_acl_grants=1 ;;
+        esac
+      done <<< "$entries"
+      ;;
   esac
 }
 
 # e2e_state_folder_look <root|own> <entry>: lists <entry> (see above) and judges it, with the one
 # owner and mode test of that folder. A root is the temporary directory: it belongs to the caller or
 # to root, and is closed to writes by group and others (with no access list entry) or has the sticky
-# bit. Any other folder belongs to the caller, is closed to writes by group and others and has no
-# access list entry. It returns 0 for a folder that passes, 4 for one whose owner is right and whose
-# mode is too open (the mode is left in e2e_state_folder_seen), 6 for one with an access list entry,
-# and 1 for anything else, a link and a file included.
+# bit (with no access list entry that grants a right named at `list` above). Any other folder belongs
+# to the caller, is closed to writes by group and others and has no access list entry. It returns 0
+# for a folder that passes, 4 for one whose owner is right and whose mode is too open (the mode is
+# left in e2e_state_folder_seen), 6 for one with an access list entry that the rule refuses, and 1
+# for anything else, a link and a file included.
 e2e_state_folder_look() {
   e2e_state_folder_list "$2" || return 1
   e2e_state_folder_judge "$1"
@@ -120,8 +146,14 @@ e2e_state_folder_judge() {
   esac
   if [ "$kind" = root ]; then
     [ "$uid" = "$(id -u)" ] || [ "$uid" = 0 ] || return 1
+    # A sticky root that anyone can write is accepted only once its access list is read: an entry that
+    # lets another account write the folder's security information or change its owner can take the
+    # sticky bit away, and one that lets it delete from the folder can rename what is below it.
     case "${perms:9:1}" in
-      t | T) return 0 ;;
+      t | T)
+        [ "$e2e_state_folder_acl_grants" = 0 ] || return 6
+        return 0
+        ;;
     esac
   else
     [ "$uid" = "$(id -u)" ] || return 1
