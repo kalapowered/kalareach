@@ -15,6 +15,8 @@ import { useBook } from '../../app/drafts'
 import { useHeldConnection } from '../../app/rights'
 import { keptEntry } from '../../model/draft-book'
 import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
+import { ShownTitle } from '../../components/ShownTitle'
+import { TechnicalWord } from '../../components/TechnicalWord'
 import { Banner } from '../../components/ui'
 import { PairingFlow } from '../../pairing/PairingFlow'
 import { accountName } from '../../views/account-name'
@@ -23,7 +25,6 @@ import {
   applicationName,
   directoryName,
   freshnessNote,
-  shownTitle,
   sourceLabel,
   useDescriptions,
   useOnScreen
@@ -235,7 +236,7 @@ export function MobileSessions({
                 >
                   <span className="m-row-title">{row.title}</span>
                   <span className="m-row-description" data-testid="description-title">
-                    {shownTitle(row.directory ?? row.title, described)}
+                    <ShownTitle directoryName={row.directory ?? row.title} described={described} />
                     {label ? (
                       <span className="m-row-label" data-testid="description-source">
                         {' '}
@@ -254,7 +255,9 @@ export function MobileSessions({
                       ) : null}
                     </span>
                   ) : null}
-                  <span className="m-row-where">{row.where}</span>
+                  <span className="m-row-where">
+                    <TechnicalWord text={row.where} />
+                  </span>
                   <span className="m-row-detail">{row.detail}</span>
                 </button>
               </li>

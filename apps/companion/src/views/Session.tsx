@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState, type ReactNode } from 'react'
 
 import type { LaunchShell, SessionReadResult } from '@kalareach/protocol'
 
+import { ShownTitle } from '../components/ShownTitle'
 import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card, CommitButton, Segmented, Sheet, Switch, ThemeChooser } from '../components/ui'
 import { useApp, useSession } from '../app/state'
@@ -30,7 +31,7 @@ import { RetainedOutput } from './Output'
 import { Sharing } from './Sharing'
 import { RawTerminal } from '../terminal/RawTerminal'
 import { ask } from '../mobile/model/call'
-import { shownTitle, sourceLabel, useDescriptions } from '../model/describe'
+import { sourceLabel, useDescriptions } from '../model/describe'
 import { describeApplicationState, sessionDescription } from './Sessions'
 
 /** What the view has read of one session. */
@@ -160,7 +161,7 @@ export function Session({
             {state ? ` · ${state.label}` : ''}
           </p>
           <h1>
-            {summary ? shownTitle(sessionDescription(summary), described) : 'Session'}
+            {summary ? <ShownTitle directoryName={sessionDescription(summary)} described={described} /> : 'Session'}
             {summary && label ? (
               <>
                 {' '}
@@ -170,7 +171,9 @@ export function Session({
               </>
             ) : null}
           </h1>
-          <p className="session-meta mono">{summary?.cwd ?? ''}</p>
+          <p className="session-meta mono">
+            <TechnicalWord text={summary?.cwd ?? ''} />
+          </p>
           {summary?.shell_mode === 'native_compat' ? (
             // A stock shell is labelled wherever the session is shown, with what that means here.
             <p className="session-shell" data-testid="shell-mode">

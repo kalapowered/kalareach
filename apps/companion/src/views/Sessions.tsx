@@ -12,6 +12,8 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { EnvironmentListResult, HostInfoResult, SessionListResult } from '@kalareach/protocol'
 
+import { ShownTitle } from '../components/ShownTitle'
+import { TechnicalWord } from '../components/TechnicalWord'
 import { Badge, Banner, Button, Card } from '../components/ui'
 import { useApp, useWaitingHolds } from '../app/state'
 import { useChannelMessages } from '../app/channel-messages'
@@ -235,7 +237,7 @@ export function Sessions(): ReactNode {
                 <span className="session-number mono">{session.display_number}</span>
                 <span>
                   <h3>
-                    {shownTitle(sessionDescription(session), described)}
+                    <ShownTitle directoryName={sessionDescription(session)} described={described} />
                     {label ? (
                       <>
                         {' '}
@@ -256,7 +258,9 @@ export function Sessions(): ReactNode {
                       ) : null}
                     </p>
                   ) : null}
-                  <p className="faint mono">{session.shell_path}</p>
+                  <p className="faint mono">
+                    <TechnicalWord text={session.shell_path} />
+                  </p>
                   {session.shell_mode === 'native_compat' ? (
                     <Badge tone="neutral">Stock shell</Badge>
                   ) : null}
