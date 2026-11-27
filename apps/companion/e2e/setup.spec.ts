@@ -1772,6 +1772,9 @@ test.describe('the first-start assistant', () => {
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
       }
       document.getElementById('main')?.focus()
+      // A write that the focus made is queued: a frame later it has been delivered or is still held.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      count += watching.takeRecords().length
       watching.disconnect()
       return count
     })
@@ -1798,6 +1801,55 @@ test.describe('the first-start assistant', () => {
     expect(left.holders, 'elements that still hold the room').toBe(0)
     expect(left.padding, 'the scroll padding after the view is left').toBe('auto')
     expect(left.margin, 'the scroll margin after the view is left').toBe('0px')
+  })
+
+  test('measures the room under the setup bar again after a small change of the text size that leaves the bar content box as it was', async ({
+    page
+  }) => {
+    // The room is the bar's whole box and the gap above it, and a small change of the text size moves
+    // the bar's padding and the gap while both controls stay at their least height: the bar's content
+    // box, which the page's observer would report, is the same before and after.
+    await openForBar(page, 'capabilities', 390, 844, 1)
+    const read = (): Promise<{ held: number; bar: number; content: number; gap: number }> =>
+      page.evaluate(() => {
+        const bar = document.querySelector('.setup-controls')
+        const setup = document.querySelector('.setup')
+        if (!bar || !setup) throw new Error('the setup view is not on the page')
+        const style = getComputedStyle(bar)
+        const inside = ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth'].reduce(
+          (sum, name) => sum + parseFloat(style[name as 'paddingTop']),
+          0
+        )
+        const bounds = bar.getBoundingClientRect().height
+        return {
+          held: parseFloat(getComputedStyle(setup).getPropertyValue('--setup-bar-room')),
+          bar: bounds,
+          content: bounds - inside,
+          gap: parseFloat(getComputedStyle(setup).rowGap)
+        }
+      })
+    const wait = async (ratio: number): Promise<void> => {
+      await page.evaluate((value) => {
+        document.documentElement.style.setProperty('--text-scale', String(value))
+      }, ratio)
+      await settled(page)
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    }
+    const before = await read()
+    expect(before.held, 'the room at the ordinary size').toBeCloseTo(before.bar + before.gap, 0)
+    for (const ratio of [1.05, 1]) {
+      await wait(ratio)
+      const after = await read()
+      if (ratio === 1) {
+        expect(after.held, 'the room back at the ordinary size').toBeCloseTo(before.bar + before.gap, 0)
+        continue
+      }
+      expect(after.content, `the bar's content box at ${String(ratio)} times the text size`).toBeCloseTo(before.content, 1)
+      expect(after.bar + after.gap, `the bar and the gap at ${String(ratio)} times the text size`).toBeGreaterThan(
+        before.bar + before.gap + 0.5
+      )
+      expect(after.held, `the room at ${String(ratio)} times the text size`).toBeCloseTo(after.bar + after.gap, 0)
+    }
   })
 
   test('draws in both colour modes from the same tokens', async ({ page }) => {

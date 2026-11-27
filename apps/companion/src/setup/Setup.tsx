@@ -716,7 +716,8 @@ function useRoomUnderBar(bar: RefObject<HTMLElement | null>, shown: boolean): vo
     }
     measure()
     const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
-    watching?.observe(element)
+    // The measure takes the bar's whole box (its padding too), so that is the box that is watched.
+    watching?.observe(element, { box: 'border-box' })
     return () => {
       watching?.disconnect()
       view.style.removeProperty('--setup-bar-room')
