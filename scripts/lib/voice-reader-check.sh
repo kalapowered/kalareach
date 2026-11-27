@@ -295,6 +295,15 @@ expect "no programs: the folder is removed once" test "$(removals programs-missi
 expect "no programs: the run says a new folder cannot build them again" says "$(out programs-missing)" "a new folder cannot build them again"
 expect "no programs: the run fails with exit 2" rc_is programs-missing 2
 
+# ---- What the mode reports -----------------------------------------------------------------------
+
+# The mode checks the reader and qualifies nothing, and says so instead of a qualification summary.
+make_tree summary
+run_script summary
+expect "summary: the run says it checked the reader only" says "$(out summary)" "text reader check only: no platform was qualified"
+expect "summary: no qualification heading" never_says "$(out summary)" "Voice client qualification"
+expect "summary: no list of what was not proved" never_says "$(out summary)" "NOT PROVED"
+
 if [ "$failures" -ne 0 ]; then
     printf '%s case assertion(s) failed\n' "$failures"
     exit 1

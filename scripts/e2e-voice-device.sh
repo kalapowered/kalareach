@@ -42,7 +42,7 @@
 #   scripts/e2e-voice-device.sh ios
 #   scripts/e2e-voice-device.sh android
 #   scripts/e2e-voice-device.sh desktop
-#   scripts/e2e-voice-device.sh reader    # only the text reader, on the pictures kept for it
+#   scripts/e2e-voice-device.sh reader    # only the text reader on its known pictures; no platform is qualified
 #
 # Exit codes: 0 every requested platform ran, 2 bad usage or a failed assertion, 3 a requested
 # platform is not available on this machine.
@@ -237,9 +237,11 @@ fi # [ "$want" != reader ]
 
 ocr=""
 ocr_state=unknown
-# Builds the text reader, then holds the picture checks to pictures made to fail them. True only
-# when both hold: a reader that is missing, or checks that pass what they must refuse, are used for
-# no claim at all.
+# Builds the text reader, holds it to the known pictures kept for it, then holds the picture checks to
+# pictures made to fail them. True only when all hold: a reader that is missing or that does not read
+# the known pictures, or checks that pass what they must refuse, are used for no claim at all. That
+# the reader read twelve known pictures says nothing of its reading of any other picture, a phone's
+# screenshot for one.
 ocr_ready() {
     case "$ocr_state" in
         ready) return 0 ;;
@@ -476,7 +478,9 @@ for base, folders, names in os.walk(top):
 # (these are the pictures a wrongly built reader gives no text for, the long ones above all); the
 # whole page of the provider choice; and a picture without any text, whose file is empty, which must
 # read as empty so that the reader can still refuse. Every picture is read whatever the others give,
-# so the log shows each. Answers 0 when every picture read as drawn, 1 when the text of one did not
+# so the log shows each. The check is that each listed line is read, every word whole; the lists are
+# not a complete transcription (the pictures show more than they name), and the order of separate
+# lines is not checked. Answers 0 when every picture read as drawn, 1 when the text of one did not
 # match (the log then shows the text the reader gave), and 2 when a reading failed or could not be
 # made, which says nothing about the text and is never taken for a mismatch.
 check_the_reader_on_known_pictures() {
@@ -1217,6 +1221,9 @@ case "$want" in
         ;;
 esac
 
+if [ "$want" = reader ]; then
+    say "text reader check only: no platform was qualified and no row was tried"
+else
 {
     printf '\n'
     printf '================================================================================\n'
@@ -1241,6 +1248,7 @@ esac
     printf '\nScreenshots: %s\nArtefacts:   %s\n' "$shots" "$artefacts"
     printf '================================================================================\n'
 } | tee -a "${log:?}"
+fi # [ "$want" = reader ]
 
 if [ "$failures" -ne 0 ]; then
     say "$failures check(s) failed"
