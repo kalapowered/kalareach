@@ -1318,11 +1318,12 @@ fn kr_req_12_19_selection_by_version() {
     );
 }
 
-/// KR-REQ-12.19: a package's protocol pin, its name and the range it is qualified for, read against
-/// the version the signed records name, ranks a package like a range of its rule does. Two packages
-/// whose rules declare no range differ only by their pins, and the program is bound to the one
-/// whose pin admits its version; a version that neither admits ties them, and the announcement
-/// names each protocol and range.
+/// KR-REQ-12.19: the range a package's protocol pin is qualified for, read against the version the
+/// signed records name, ranks a package like a range of its rule does. Only that range takes part
+/// in the rank: the pin's protocol name goes into the announcement and is compared with nothing,
+/// and no installed schema is read. Two packages whose rules declare no range differ only by their
+/// pins, and the program is bound to the one whose pin admits its version; a version that neither
+/// admits ties them, and the announcement names each protocol and range.
 #[test]
 fn kr_req_12_19_selection_by_the_protocol_pin() {
     let mut setup = Setup::with(fixture::COMMAND, |store, bin| {

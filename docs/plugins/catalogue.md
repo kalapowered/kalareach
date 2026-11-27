@@ -383,12 +383,19 @@ executable's name, when one publisher published all the packages left through on
 equal rules are a conflict the person settles, not one the host settles for them. A rule is exact only for a program whose distribution the host has
 established as the one it names, which the worker does not for a program it finds running, so there
 every rule counts as inferred. A worker applies the same rule to the packages left after it has
-refused any two that integrate one command. A package covers a version when the range of its rule
-and the range its connector table is qualified for both admit it, refuses it when one of them does
-not, and says nothing about it when it declares neither or when no signed record of its own names the
-program: the version is the one a package's own signed builds name for the digest of the program's
-bytes, so the worker decides by the program's path alone to see whether the program is worth reading
-and decides again with the digest once it has read it. A package that is alone is bound whatever it
+refused any two that integrate one command. Coverage is read for each rule that recognises the
+program. A rule covers a version when every range it is held to admits it: the range of the rule,
+where it has one, and the range the package's connector table is qualified for, where the package
+has a table, so a rule held to one range is held to that range. It refuses the version when one of
+those ranges does not admit it. It says nothing about the version when it is held to no range, and
+when the host has no version to compare: no digest reached the decision, no signed record of the
+package names the digest, or a record names it at text that is no package version. A package ranks
+by the best of its rules that recognise the program, so a package one of whose rules covers the
+version covers it even where another of its rules refuses it. The version is the one a package's own
+signed builds name for the digest of the program's bytes, so the worker decides by the program's
+path alone to see whether the program is worth reading and decides again with the digest once it
+has read it. The catalogue's lookup supplies no version, so it ranks no package by one. A package
+that is alone is bound whatever it
 says of the version, and its connector table is refused for a version it is not qualified for, as
 before. The signed records of a package of another publisher, or of the same publisher name through
 another repository, rank nothing against the packages of another: they are that package's own claim

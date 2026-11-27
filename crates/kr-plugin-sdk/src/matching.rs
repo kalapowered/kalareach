@@ -437,20 +437,20 @@ pub enum Resolution {
 /// does: a package's claim about the version of a program is its own, and the host cannot check
 /// it, so a package of another publisher that claims a version does not take a program from
 /// another this way. A package ranks by its best rule, and a package that is alone is chosen
-/// whatever its coverage. A rule whose range refuses the version gives its package neither its
-/// installation location nor its exact confidence where another candidate ranks above it: each
-/// rule is one claim, and only the highest tier goes on to the steps below. Then an exact rule
-/// beats an inferred one. Of the rules left, one
-/// that matched an installation location its package names beats one that matched the executable's
-/// name alone, when one publisher published every package left, through one repository: the
-/// location says which product is installed there, and the name is shared by products that are
-/// not. A publisher's name is vouched for by the root of the repository that lists it, and two
-/// roots can list one name, so a package of another publisher, or of the same name from another
-/// repository, that names a location does not take a program from a package this way: packages of
-/// different publishers, or of one name from different repositories, that recognise a program
-/// equally well conflict, and the person settles it. The catalogue's search and the worker's binder both decide with this and read their
-/// rules with [`MatchRule::candidate`], so there is one rule wherever a running application meets
-/// the packages that recognise it.
+/// whatever its coverage. A rule that refuses the version gives its package neither its
+/// installation location nor its exact confidence where another candidate ranks above it: each rule
+/// is one claim, and only the highest tier goes on to the steps below. Then an exact rule beats an
+/// inferred one. Of the rules left, one that matched an installation location its package names
+/// beats one that matched the executable's name alone, when one publisher published every package
+/// left, through one repository: the location says which product is installed there, and the name
+/// is shared by products that are not. A publisher's name is vouched for by the root of the
+/// repository that lists it, and two roots can list one name, so a package of another publisher, or
+/// of the same name from another repository, that names a location does not take a program from a
+/// package this way: packages of different publishers, or of one name from different repositories,
+/// that recognise a program equally well conflict, and the person settles it. The catalogue's
+/// search and the worker's binder both decide with this and read their rules with
+/// [`MatchRule::candidate`], so there is one rule wherever a running application meets the packages
+/// that recognise it.
 #[must_use]
 pub fn resolve(candidates: Vec<Candidate>, selected: Option<&PluginId>) -> Resolution {
     if candidates.is_empty() {
