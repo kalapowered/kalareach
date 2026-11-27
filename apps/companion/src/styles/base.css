@@ -248,7 +248,7 @@ html[data-input='keyboard'] *::after {
 
 /*
  * Reduced motion keeps the feedback and removes the travel: a surface fades instead of arriving,
- * and a press stops scaling. It is not "no feedback".
+ * and a press stops scaling. It is not "no feedback", except on the two engines named below.
  *
  * The declarations for the pressed controls are important: the component and view styles load after
  * this file and state the press with rules of equal weight, which would win over these.
@@ -256,12 +256,20 @@ html[data-input='keyboard'] *::after {
  * The press shows as a state layer instead: while the pointer is down, the control's own surface
  * takes a tint of its label's colour, one flat colour over whatever background the control has. A
  * dark label darkens a light surface and a light label lightens a dark one, in every tone and both
- * themes, and a focus ring is not touched. The tint leaves each label at least 4.5:1 (3:1 for a
- * glyph) against the pressed surface; the motion spec samples it.
+ * themes, and a focus ring is not touched. The tint is 9%, the highest whole percent at which every
+ * text drawn on a pressed control keeps at least 4.55:1 against the pressed surface, with the pointer
+ * on the control and with it off. Measured on the pixels of both engines the lowest is 4.59:1, in
+ * the light theme, for the faint second line of the Account item and the program line of a saved
+ * command, and 4.74:1 in the dark theme; at 10% those two lines fall to 4.49:1. The motion spec
+ * samples the pressed surface and every text on it.
+ *
+ * Two engines show no press at all, with no scale either: one that cannot mix `currentColor` into a
+ * colour (before Chrome and Android WebView 111, Safari and iOS 16.2, Firefox 113), and one in forced
+ * colours, which draws no background image.
  */
 @media (prefers-reduced-motion: reduce) {
   :root {
-    --press-tint: 10%;
+    --press-tint: 9%;
   }
 
   *,
