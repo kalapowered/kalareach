@@ -411,6 +411,84 @@ fn held_by(server: &Server) -> Vec<ProcessStartIdentity> {
     held
 }
 
+/// How long a process the ending ended is given to read as ended. The system takes a process out of
+/// its job's count while its last thread still ends, so the job can read empty a short time before
+/// a member's process reads ended.
+const ENDS_BY: Duration = Duration::from_secs(10);
+
+/// The image name of a running process, as the system's task list names it.
+fn image_name(pid: u64) -> String {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| {
+            text.split(',')
+                .next()
+                .map(|name| name.trim().trim_matches('"').to_owned())
+        })
+        .filter(|name| name.ends_with(".exe"))
+        .unwrap_or_else(|| "unnamed".to_owned())
+}
+
+/// The members of `held`, each with its image name, read while they run.
+fn named(held: &[ProcessStartIdentity]) -> Vec<(String, ProcessStartIdentity)> {
+    held.iter()
+        .map(|identity| (image_name(identity.pid.get()), identity.clone()))
+        .collect()
+}
+
+/// How a member read once the ending was over: its name, its process number, how long after the
+/// first read it read as it did, and the state it last read.
+#[derive(Debug)]
+struct Lag {
+    name: String,
+    pid: u64,
+    took: Duration,
+    state: ProcessState,
+}
+
+/// Reads each of `members` every 20 ms until each reads ended or `bound` has passed (each is read
+/// once at least), prints one line per member, and returns what each last read. A member that did
+/// not read ended is the case's to fail on, by name.
+async fn read_ended(members: &[(String, ProcessStartIdentity)], bound: Duration) -> Vec<Lag> {
+    let started = Instant::now();
+    let mut lags: Vec<Option<Lag>> = members.iter().map(|_| None).collect();
+    loop {
+        for ((name, identity), lag) in members.iter().zip(lags.iter_mut()) {
+            if lag
+                .as_ref()
+                .is_some_and(|lag| lag.state == ProcessState::Ended)
+            {
+                continue;
+            }
+            *lag = Some(Lag {
+                name: name.clone(),
+                pid: identity.pid.get(),
+                took: started.elapsed(),
+                state: process_state(identity),
+            });
+        }
+        let done = lags
+            .iter()
+            .flatten()
+            .all(|lag| lag.state == ProcessState::Ended);
+        if done || started.elapsed() >= bound {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let lags: Vec<Lag> = lags.into_iter().flatten().collect();
+    for lag in &lags {
+        eprintln!(
+            "after the ending: {} (pid {}) read {:?} after {:?}",
+            lag.name, lag.pid, lag.state, lag.took
+        );
+    }
+    lags
+}
+
 /// What the ending forced, in the order `held_by` reads.
 fn forced_in_order(
     retirement: &kr_worker::broker::server::Retirement,
@@ -436,6 +514,7 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
     let left = held_by(&server);
     assert!(left.contains(&command), "{left:?}");
     assert!(!left.contains(server.identity()), "{left:?}");
+    let members = named(&left);
 
     let record = Record::default();
     let begun = Instant::now();
@@ -445,7 +524,11 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
     assert_eq!(forced_in_order(&retirement), left, "{retirement:?}");
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
-    assert!(left.iter().all(gone), "{left:?}");
+    let lags = read_ended(&members, ENDS_BY).await;
+    assert!(
+        lags.iter().all(|lag| lag.state == ProcessState::Ended),
+        "a member did not read ended within {ENDS_BY:?}: {lags:?}"
+    );
     // KR-REQ-07.53: it was waited for until the five seconds were over, and no longer.
     let went = watching.await.expect("the watch is joined")[0];
     assert!(
@@ -484,6 +567,7 @@ async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_
     let left = held_by(&server);
     assert!(left.contains(&command), "{left:?}");
     assert!(!left.contains(server.identity()), "{left:?}");
+    let members = named(&left);
 
     let retirement = server
         .retire(&Record::default(), Instant::now().into())
@@ -492,7 +576,11 @@ async fn kr_req_07_64_a_command_in_a_job_of_its_own_nests_under_the_servers_and_
     assert_eq!(forced_in_order(&retirement), left, "{retirement:?}");
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
-    assert!(left.iter().all(gone), "{left:?}");
+    let lags = read_ended(&members, ENDS_BY).await;
+    assert!(
+        lags.iter().all(|lag| lag.state == ProcessState::Ended),
+        "a member did not read ended within {ENDS_BY:?}: {lags:?}"
+    );
 }
 
 /// A server is started with the presented environment less the two variables of the launch and
