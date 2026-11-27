@@ -128,8 +128,8 @@ impl Exchange {
     /// before the hello is built, and the worker may accept it, find nothing it can admit and close
     /// it in between. A hello that finds the connection closed by the other end is
     /// [`ExchangeError::Refused`], the same answer as a read of the admission that finds it closed.
-    /// What counts as closed by the other end is the one rule of [`kr_ipc::error::peer_has_gone`],
-    /// the rule every other write, read and shutdown of a local stream follows: a broken pipe, a
+    /// What counts as closed by the other end is [`kr_ipc::error::peer_has_gone`], the IPC crate's
+    /// one rule for a failed write, read or shutdown of a connected local stream: a broken pipe, a
     /// reset, and "not connected", which a write that races the close gets on macOS. That claims
     /// that the connection closed and that no admission came. It does not claim why: a worker that
     /// died after it accepted the connection leaves the same error behind as one that refused the
@@ -137,14 +137,16 @@ impl Exchange {
     /// system's words.
     ///
     /// The rule reads the error's kind, so it reaches only the errors that the standard library
-    /// gives a kind. On Windows, the standard library of the toolchain this repository pins reads
-    /// a named pipe's broken-pipe (109) and no-data (232) errors as a broken pipe, which the rule
-    /// recognises. It gives the "pipe is not connected" error (233) the kind `Uncategorized`, which
-    /// the rule does not recognise. That is the error a client's write gets after the server
-    /// forcibly disconnects the pipe, as the example for disconnecting a pipe in the Tokio
-    /// documentation shows. A hello write that fails with it is [`ExchangeError::Broken`] with the
-    /// system's words, not a refusal. Which of these errors a hello write gets when the server
-    /// end of the pipe is simply closed has not been measured.
+    /// gives one of the rule's three kinds. On Windows, the standard library of the toolchain this
+    /// repository pins reads a named pipe's broken-pipe (109) and no-data (232) errors as a broken
+    /// pipe, which the rule recognises. It gives the "pipe is not connected" error (233) the kind
+    /// `Uncategorized`, which the rule does not recognise. That is the error a client's write gets
+    /// after the server forcibly disconnects the pipe, as the example for disconnecting a pipe in
+    /// the Tokio documentation shows. A hello write that fails with it is
+    /// [`ExchangeError::Broken`] with the system's words, not a refusal. The standard library does
+    /// not promise this mapping, and says of an error that is `Uncategorized` now that it may move
+    /// to a different or a new kind in the future. What a hello write gets when the server end of
+    /// the pipe is simply closed has not been measured.
     ///
     /// # Errors
     ///
