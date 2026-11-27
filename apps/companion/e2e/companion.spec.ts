@@ -1299,6 +1299,7 @@ test.describe('the raw terminal', () => {
     expect((await reported())?.columns).toBe(before.columns)
   })
 
+  // KR-REQ-13.18: in control mode the wheel goes to the program at the cell under the pointer.
   test("gives the wheel to the program at the session's cell under the pointer once the person takes control", async ({
     page
   }) => {
