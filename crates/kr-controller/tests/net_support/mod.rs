@@ -1740,6 +1740,9 @@ pub struct Device {
     keys: DeviceKeys,
     endpoint: Endpoint,
     identity: Arc<LocalIdentity>,
+    /// The endpoints its paired dials went out from, held for as long as the device is, so that a
+    /// connection made over one stays up ([`PairedDial`]).
+    dialers: Arc<std::sync::Mutex<Vec<Endpoint>>>,
 }
 
 impl Device {
@@ -1782,6 +1785,7 @@ impl Device {
             keys,
             endpoint,
             identity,
+            dialers: Arc::default(),
         }
     }
 
@@ -1995,14 +1999,54 @@ pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Ses
 /// What a paired device needs to dial the host it was paired with, again and again, with nothing of
 /// the host or the device held: for a suite that puts something of its own between the device's
 /// session and the host.
+///
+/// A dial goes out from an endpoint of its own that has the device's identity and has dialled
+/// nothing before, because an endpoint that dialled the host remembers the addresses it had before
+/// a restart, and on a machine that starts hundreds of hosts another host answers at one of them
+/// with its own key. The cases therefore do not exercise a reconnect from an endpoint that
+/// remembers a host's old addresses.
 #[derive(Clone)]
 pub struct PairedDial {
-    endpoint: Endpoint,
+    from: DialFrom,
     addr: EndpointAddr,
     identity: Arc<LocalIdentity>,
     host_record: PairedPeer,
     /// When the host's start returned, for the report of a connect that fails.
     host_started: std::time::Instant,
+}
+
+/// The endpoint a paired dial goes out from.
+#[derive(Clone)]
+enum DialFrom {
+    /// The device's own endpoint, for a dial through a relay, which the endpoint is bound to.
+    Kept(Endpoint),
+    /// An endpoint bound at the first dial, over loopback, with the device's identity.
+    Fresh {
+        keys: kr_crypto::keys::TransportIdentityKeyPair,
+        bound: Arc<tokio::sync::OnceCell<Endpoint>>,
+        /// The device's list, which holds the endpoint for as long as the device lives.
+        kept: Arc<std::sync::Mutex<Vec<Endpoint>>>,
+    },
+}
+
+impl DialFrom {
+    async fn endpoint(&self) -> Endpoint {
+        match self {
+            Self::Kept(endpoint) => endpoint.clone(),
+            Self::Fresh { keys, bound, kept } => bound
+                .get_or_init(|| async {
+                    let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), keys)
+                        .await
+                        .expect("a dialling endpoint");
+                    kept.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(endpoint.clone());
+                    endpoint
+                })
+                .await
+                .clone(),
+        }
+    }
 }
 
 impl PairedDial {
@@ -2015,12 +2059,18 @@ impl PairedDial {
     /// Returns the client's error when the host refuses the connection or it cannot be made.
     pub async fn try_dial(&self) -> std::result::Result<NetworkTransport, kr_client::ClientError> {
         pairing::connect_until_answered(
-            &self.endpoint,
+            &self.from.endpoint().await,
             self.addr.clone(),
             &self.identity,
             &self.host_record,
         )
         .await
+    }
+
+    /// Shuts the endpoint this dial goes out from, so that every connect of it fails at once: for
+    /// a case that shows what a connect that cannot be made says.
+    pub async fn shut_its_endpoint(&self) {
+        self.from.endpoint().await.close().await;
     }
 
     /// One connection of the device's to the host, authorised as the device. When it cannot be
@@ -2041,10 +2091,11 @@ impl PairedDial {
         iroh::endpoint::Connection,
         kr_transport::handshake::AuthorisedConnection,
     ) {
+        let endpoint = self.from.endpoint().await;
         let connection = pairing::until_answered(
             || {
                 kr_transport::endpoint::connect(
-                    &self.endpoint,
+                    &endpoint,
                     self.addr.clone(),
                     kr_protocol::hello::ALPN,
                 )
@@ -2162,7 +2213,8 @@ pub fn paired_dial_receiving(
 }
 
 /// How `device`, paired as `record`, dials `host` through the relay at `relay` and by no other
-/// route: the host's address names that relay and no socket.
+/// route: the host's address names that relay and no socket. The dial goes out from the device's
+/// own endpoint, which is the one bound to the relay.
 pub fn paired_dial_through(
     host: &Host,
     device: &Device,
@@ -2170,6 +2222,7 @@ pub fn paired_dial_through(
     relay: &iroh::RelayUrl,
 ) -> PairedDial {
     let mut dial = paired_dial_by(host, device, record);
+    dial.from = DialFrom::Kept(device.endpoint.clone());
     dial.addr = dial.addr.with_relay_url(relay.clone());
     dial
 }
@@ -2187,7 +2240,11 @@ fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> Paired
             .expect("a usable endpoint identity"),
     );
     PairedDial {
-        endpoint: device.endpoint.clone(),
+        from: DialFrom::Fresh {
+            keys: device.keys.transport.clone(),
+            bound: Arc::default(),
+            kept: Arc::clone(&device.dialers),
+        },
         addr,
         identity: device.paired_identity(record.device_id),
         host_record,

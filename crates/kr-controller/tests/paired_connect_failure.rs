@@ -1,6 +1,6 @@
 //! What the test helper's connect of a paired device says when it fails for good: the layer that
 //! failed, the error's chain, how long the host and the dial had been up, every attempt with what
-//! the dial offered and what the device's endpoint knew of the host, and the lines the process
+//! the dial offered and what the dialling endpoint knew of the host, and the lines the process
 //! logged.
 
 mod net_support;
@@ -66,7 +66,7 @@ async fn a_connect_that_fails_for_good_names_its_layer_its_chain_and_its_attempt
     .await;
     let dial = paired_dial(&host, &device, &record);
     tracing::debug!(target: "kr_transport::listener", "a planted line of the host");
-    device.endpoint().close().await;
+    dial.shut_its_endpoint().await;
 
     let failed = tokio::spawn(async move { dial.dial().await }).await;
     let message = match failed {
@@ -88,8 +88,8 @@ async fn a_connect_that_fails_for_good_names_its_layer_its_chain_and_its_attempt
         ("the attempt's own line", "attempt 1 at +"),
         ("what the dial offered", offered.as_str()),
         (
-            "what the device's endpoint knew of the host",
-            "the device's endpoint is closed",
+            "what the dialling endpoint knew of the host",
+            "the dialling endpoint is closed",
         ),
         ("a line of the process", "a planted line of the host"),
         (

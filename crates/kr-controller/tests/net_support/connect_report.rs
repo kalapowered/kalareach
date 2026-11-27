@@ -3,7 +3,7 @@
 //! The client reduces a transport failure to one line that is safe to show, so a case that fails
 //! to connect keeps nothing else of it. This keeps what is needed to tell which layer failed:
 //! the variant and the text of the transport's error, each attempt with the time it ended, the
-//! addresses the dial offered and the ones the device's own endpoint knew for the host when the
+//! addresses the dial offered and the ones the endpoint it dialled from knew for the host when the
 //! attempt failed, and the lines the process logged. It prints error texts only: no key, no seed
 //! and no pairing secret is an input of any of them.
 
@@ -205,14 +205,14 @@ fn offered(dial: &PairedDial) -> String {
     text
 }
 
-/// What the device's own endpoint holds for the host now: the addresses it learned from earlier
-/// connections, which a host that came back on another port does not answer on.
+/// What the endpoint the dial goes out from holds for the host now: the addresses it learned from
+/// earlier connections, which a host that came back on another port does not answer on.
 async fn known(endpoint: &Endpoint, peer: iroh::EndpointId) -> String {
     if endpoint.is_closed() {
-        return "the device's endpoint is closed".to_owned();
+        return "the dialling endpoint is closed".to_owned();
     }
     match endpoint.remote_info(peer).await {
-        None => "the device's endpoint knows for the host: nothing".to_owned(),
+        None => "the dialling endpoint knows for the host: nothing".to_owned(),
         Some(info) => {
             let mut addresses = info
                 .addrs()
@@ -220,7 +220,7 @@ async fn known(endpoint: &Endpoint, peer: iroh::EndpointId) -> String {
                 .collect::<Vec<_>>();
             addresses.sort();
             format!(
-                "the device's endpoint knows for the host: [{}]",
+                "the dialling endpoint knows for the host: [{}]",
                 addresses.join(", ")
             )
         }
@@ -300,10 +300,11 @@ pub(super) async fn dial(dial: &PairedDial) -> Result<NetworkTransport, DialFail
     let first = Instant::now();
     let notes = Mutex::new(Vec::new());
     let kept = &notes;
+    let endpoint = &dial.from.endpoint().await;
     let outcome = pairing::until_answered(
         move || async move {
             let outcome = NetworkTransport::connect(
-                &dial.endpoint,
+                endpoint,
                 dial.addr.clone(),
                 &dial.identity,
                 &dial.host_record,
@@ -316,7 +317,7 @@ pub(super) async fn dial(dial: &PairedDial) -> Result<NetworkTransport, DialFail
                     layer: layer_of(error),
                     chain: chain_of(error),
                     offered: offered(dial),
-                    known: known(&dial.endpoint, dial.addr.id).await,
+                    known: known(endpoint, dial.addr.id).await,
                 };
                 kept.lock()
                     .unwrap_or_else(PoisonError::into_inner)
