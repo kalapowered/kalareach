@@ -4184,7 +4184,13 @@ async fn kr_req_11_39_an_observation_and_a_call_on_one_connection_are_both_answe
     let Some(wasm) = components::component("slow-observe") else {
         return;
     };
-    let served = Served::start().await;
+    // A host whose epoch no time advances. The component's observations are sized against fuel and
+    // not against a clock, so on a machine that keeps their thread off the processor for a few
+    // milliseconds a running epoch stops one at its ten-millisecond deadline, and three of the
+    // sixty-four stopped within a minute disable the binding: the call below would then come back
+    // as an error this case does not allow. This case reads what comes back and is not about a
+    // deadline.
+    let served = Served::start_held().await;
     let client = Arc::new(served.client().await);
     let (path, digest, bytes) = served.install("slow-observe", &wasm);
     let request = components::request("slow-observe", 7);
