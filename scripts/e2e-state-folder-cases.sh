@@ -761,6 +761,38 @@ rc="$(
 )"
 expect "a marker that is a dangling link makes the marking fail" 3 "$rc"
 expect "a dangling link is not followed to make a file" absent "$(snapshot "$o/mark-target")"
+# A name that exists as a link to a device: no-clobber alone would open it, so only the existence test
+# refuses it, and the marking then records that it made nothing.
+mk "$t/mark/devnull"
+ln -s /dev/null "$t/mark/devnull/.kr-e2e-owner"
+rc="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  e2e_state_folder_marked=0
+  cd "$t/mark/devnull" && e2e_state_folder_mark "$owner" > /dev/null 2>&1
+  echo "$? $e2e_state_folder_marked"
+)"
+expect "a marker name that is a link to a device makes the marking fail and nothing is recorded as made" "3 0" "$rc"
+expect "the link to the device is as it was" "link to /dev/null" "$(snapshot "$t/mark/devnull/.kr-e2e-owner")"
+# The marker's name is exchanged for a link to another file at the moment the owner word is written: the
+# word goes through the descriptor of the one open, so the file at the link's target is not changed and
+# the word is in the file that was made. A hook that runs before each command (set -T and a DEBUG trap)
+# makes the exchange, since a stand-in for the write would run after its own redirection.
+mk "$t/mark/exchange"
+printf 'keep-me-9876\n' > "$o/exchange-target"
+before="$(snapshot "$o/exchange-target")"
+rc="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  cd "$t/mark/exchange" || exit 1
+  set -T
+  trap 'case "$BASH_COMMAND" in printf*) if [ ! -e "$t/mark/exchange-done" ]; then : > "$t/mark/exchange-done"; mv -- .kr-e2e-owner .kr-e2e-aside; ln -s "$o/exchange-target" .kr-e2e-owner; fi ;; esac' DEBUG
+  e2e_state_folder_mark "$owner" > /dev/null 2>&1
+  echo "$?"
+)"
+expect "a marker whose name is exchanged for a link while it is written makes the marking fail" 3 "$rc"
+expect "the file that the link points at is as it was" "$before" "$(snapshot "$o/exchange-target")"
+expect "the owner word went into the file that was made" "$owner" "$(cat -- "$t/mark/exchange/.kr-e2e-aside" 2> /dev/null)"
 
 echo "== scripts/e2e-update.sh: both scripts get both variables"
 update="$root/scripts/e2e-update.sh"

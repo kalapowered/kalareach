@@ -169,17 +169,26 @@ e2e_state_folder_marker_ok() {
 }
 
 # e2e_state_folder_mark <owner>: writes the owner word into the marker of the working directory, which
-# the check has found empty. Nothing is overwritten and no link is followed: the marker is made with
-# no-clobber, which fails for anything that is already at that name, a dangling link included. A
-# marker that cannot be made or written ends it with status 3.
+# the check has found empty. Nothing is overwritten and no link is followed. A name that exists in any
+# form is refused: no-clobber alone stops a regular file and a dangling link, and the existence test
+# stops a link to a device or a pipe and any other thing that no-clobber would open. The marker is
+# then made and written through ONE open of that name (descriptor 3), so that a name that is
+# exchanged for a link after the open cannot redirect the write. The creation is recorded before the
+# content is written, so that a cleanup knows a partial marker. A marker that cannot be made,
+# written or closed ends it with status 3; one that was refused or not made leaves nothing to remove.
 e2e_state_folder_mark() {
-  local owner="$1"
-  (
-    set -C
-    : > .kr-e2e-owner
-  ) 2> /dev/null || return 3
+  local owner="$1" opened written
+  [ ! -e .kr-e2e-owner ] || return 3
+  set -C
+  { exec 3> .kr-e2e-owner; } 2> /dev/null
+  opened=$?
+  set +C
+  [ "$opened" = 0 ] || return 3
   e2e_state_folder_marked=1
-  { printf '%s\n' "$owner" > .kr-e2e-owner; } 2> /dev/null || return 3
+  { printf '%s\n' "$owner" >&3; } 2> /dev/null
+  written=$?
+  exec 3>&- || return 3
+  [ "$written" = 0 ] || return 3
   e2e_state_folder_marker_ok "$owner" || return 3
 }
 
