@@ -1102,20 +1102,18 @@ mod tests {
         let root = directory("acl");
         let environment_id = environment();
         let boot = BootEpoch::new(13);
-        // `WD` is the Everyone group; `OICI` makes every file created inside inherit the entry.
-        let wide = root.join("wide");
-        crate::paths::create_directory_with_list(&wide, "D:P(A;OICI;GA;;;OW)(A;OICI;GA;;;WD)")
-            .expect("a directory whose files everyone may write");
-        let refused = SharedFloor::create(&wide.join("utc-floor"), environment_id, boot, 0)
-            .expect_err("a floor everyone may write");
-        assert!(
-            refused.to_string().contains("grants access to"),
-            "{refused}"
-        );
-        // The control: the same file in an owner-only directory is a floor.
-        let floor = SharedFloor::create(&root.join("utc-floor"), environment_id, boot, 0)
-            .expect("an owner-only floor");
+        let path = root.join("utc-floor");
+        // The control: a floor as the product writes it opens.
+        let floor = SharedFloor::create(&path, environment_id, boot, 0).expect("a floor");
         drop(floor);
+        drop(SharedFloor::open(&path, environment_id, boot).expect("the floor opens"));
+        // The test, not the product's writer, gives the file a list that names the Everyone group
+        // (`WD`): the writer's own files never carry it.
+        crate::paths::set_list_without_propagation(&path, "D:P(A;;GA;;;OW)(A;;GA;;;WD)")
+            .expect("a list that everyone may write by");
+        let refused =
+            SharedFloor::open(&path, environment_id, boot).expect_err("a floor everyone may write");
+        assert!(refused.reason.contains("grants access to"), "{refused}");
         std::fs::remove_dir_all(&root).expect("removed");
     }
 
