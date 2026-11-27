@@ -1,11 +1,11 @@
 //! What the network door writes to a paired device, measured as the device receives it.
 //!
-//! Each case builds the widest instance of a frame the door can carry from the types' own bounds
-//! and the worker's own builders, passes it through the rewrite the door applies to every frame
-//! ([`frame_for_a_device`]) and records three figures for it, separately: the size of its payload,
-//! the size of the complete frame a device receives, and what the worker's send queue charges for
-//! it. A case prints one table; read it with `--nocapture`. The assertions hold a figure to the
-//! bound the limits design states for it, and they do not look at a clock.
+//! Each case builds an instance of a frame the door can carry from the types' own bounds and the
+//! worker's own builders (a sample where a figure below says so), passes it through the rewrite the
+//! door applies to every frame ([`frame_for_a_device`]) and records three figures for it,
+//! separately: the size of its payload, the size of the complete frame a device receives, and what
+//! the worker's send queue charges for it. A case prints one table; read it with `--nocapture`. The
+//! assertions hold a figure to the bound the limits design states for it and look at no clock.
 //!
 //! The closure, the reduced record and the notification that replaces a frame are built here by
 //! hand, because the constructors that will build them are not in the tree yet; they are models of
@@ -389,9 +389,9 @@ fn shown_refusal(text: &str) -> String {
 /// name can be kept), and it holds a text to [`kr_protocol::error::MAX_ERROR_MESSAGE_LEN`]: a longer
 /// one is replaced by a fixed sentence. A quotation of one space is three bytes and gains six, so
 /// 512 bytes of them end at 1,022 bytes (85 of them) or over the limit (86); the 512 bytes reach
-/// exactly 1,024 only with one quotation of a different width, and a quotation of five spaces gains
-/// two. The search takes a count of one-space quotations, then one quotation of each width, then
-/// plain text, and the door's own rewrite picks the longest.
+/// exactly 1,024 with a mix of widths (85 one-space quotations and one of five spaces, which gains
+/// two, is one). The search takes a count of one-space quotations, then one quotation of each
+/// width, then plain text, and the door's own rewrite picks the longest.
 fn longest_refusal_shown() -> String {
     const CUT: usize = 512;
     let mut best = "r".repeat(CUT);
@@ -1886,11 +1886,12 @@ fn the_widest_agent_events() {
     );
 }
 
-/// The widest close answer of a closed session, and the closure notice, as a device receives them.
-///
-/// The record is built at the design's budget for the closure's lists, with each survivor's detail
-/// one byte that names the host, which the door lengthens. The worker builds the answer today with
-/// the record twice; the design builds it once.
+/// The widest close answer of a closed session that this model builds, and the closure notice, as a
+/// device receives them, at the design's budget for the closure's lists. The sizes are those of the
+/// model, with the two paths at [`PATH_ASSUMED`] and the summary's optional members left out; they
+/// are not a maximum close answer. Each survivor's detail is one byte that names the host, which
+/// the door lengthens. The worker builds the answer today with the record twice; the design builds
+/// it once.
 #[test]
 fn the_widest_close_answer_of_a_closed_session() {
     // The size one survivor takes in the form a device is shown, from a record with and without it.
@@ -2116,8 +2117,8 @@ fn cut_page(
 /// none to the worker's refusal is tried.
 struct Fit {
     /// The count before the first at which the door's frame is over the bound: every count to it
-    /// fits, and it is not the greatest count that fits. A page is cut to whole resources, so a
-    /// larger count can fit again by the room a cut leaves.
+    /// fits, and it need not be the greatest count that fits. A page is cut to whole resources, so
+    /// a larger count can fit again by the room a cut leaves.
     fit: usize,
     /// The most instances for which the worker still answers: one more and it refuses the peer
     /// because its frame cannot hold the answer and one resource.
