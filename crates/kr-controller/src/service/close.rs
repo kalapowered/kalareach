@@ -11,7 +11,8 @@ use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{SessionEpoch, SessionId};
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64};
 use kr_protocol::session::{
-    ClosureReason, ClosureRecord, Durability, SessionCloseParams, SessionCloseResult, SessionState,
+    CLOSURE_BUDGET_BYTES, ClosureReason, ClosureRecord, Durability, SessionCloseParams,
+    SessionCloseResult, SessionState,
 };
 use kr_protocol::worker::ReservationId;
 use kr_transport::window::AcceptedDeadline;
@@ -1245,8 +1246,13 @@ impl Controller {
         // A worker this host saw end is terminated; one it did not is not, whatever else is true
         // of the session. Saying otherwise in the record would be the record claiming the one
         // thing this host could not establish.
+        //
+        // The worker that was not confirmed ended comes first in `surviving`, ahead of whatever the
+        // fence found: the record is held to a budget below, and a budget keeps the first entry
+        // whatever it is, so the entry that keeps the session's registration open is never the one
+        // that is left out.
         let mut terminated = Vec::new();
-        let mut surviving = fenced.surviving.clone();
+        let mut surviving = Vec::with_capacity(fenced.surviving.len() + 1);
         if death_validated {
             terminated.push(kr_protocol::session::TerminatedProcess {
                 identity: identity.clone(),
@@ -1262,6 +1268,7 @@ impl Controller {
                 ),
             });
         }
+        surviving.extend(fenced.surviving.iter().cloned());
         // Whatever the fence saw end, recorded where a later reader is served it rather than only
         // where this daemon can see it.
         terminated.extend(fenced.ended.iter().map(|ended| {
@@ -1298,7 +1305,10 @@ impl Controller {
             // reported by the archive, which reads the store rather than this record.
             durability: kr_protocol::session::Durability::Durable,
             closed_at_ms: kr_ipc::now_ms(),
-        };
+        }
+        // The same bound as the worker's own record, so a fence that found thousands of processes
+        // writes a record that a connection can carry. The coverage above stands as it is.
+        .bounded(CLOSURE_BUDGET_BYTES);
         self.write_closure(&record, Whose::Daemon).await?;
         Ok(record)
     }
@@ -1416,21 +1426,26 @@ impl Controller {
     /// forgets it: this host has no way to follow that process. A closure that could not confirm
     /// its worker ended keeps it until the kernel says the worker's process has ended and the
     /// worker's own journal shows nothing it left running.
-    fn end_session_hold(
+    ///
+    /// A record that is held to a budget may count entries it does not list. Ended processes that
+    /// it does not list left nothing running, so they change nothing here; survivors that it does
+    /// not list may be anything, so they keep the registration as a listed survivor would.
+    pub(super) fn end_session_hold(
         &self,
         record: &ClosureRecord,
         launched: Option<kr_protocol::identity::ProcessStartIdentity>,
     ) {
         let holds = Arc::clone(self.project().service().holds());
         let session_id = record.session_id;
-        if record.surviving.is_empty() {
+        if !record.left_something() {
             holds.end_session(session_id);
             return;
         }
         if record
-            .surviving
+            .survivors()
             .iter()
             .any(|resource| resource.kind != UNACCOUNTED_WORKER)
+            || record.omitted().is_some_and(|omitted| omitted.other > 0)
         {
             return;
         }
@@ -1880,13 +1895,14 @@ async fn places_within(
 }
 
 /// Whether a worker that has ended shows that its session left nothing running: no claim took its
-/// launch, so it started no session, or its journal holds a closure that lists no survivor. A
-/// worker that was claimed and kept no journal (it starts its shell even when it cannot open
-/// one), a journal with no closure in it, and one that cannot be looked for or read show nothing.
+/// launch, so it started no session, or its journal holds a closure that lists and counts no
+/// survivor. A worker that was claimed and kept no journal (it starts its shell even when it
+/// cannot open one), a journal with no closure in it, and one that cannot be looked for or read
+/// show nothing.
 ///
 /// A journal an earlier release wrote is brought forward first, which the archive does only once
 /// the kernel has said that the worker which owned it ended.
-fn worker_left_nothing(
+pub(super) fn worker_left_nothing(
     archive: &crate::archive::ArchiveService,
     session_id: SessionId,
     never_claimed: bool,
@@ -1902,7 +1918,7 @@ fn worker_left_nothing(
     kr_worker::journal::Journal::open_read_only(&journal)
         .ok()
         .and_then(|journal| journal.read_closure(session_id).ok().flatten())
-        .is_some_and(|closure| closure.surviving.is_empty())
+        .is_some_and(|closure| !closure.left_something())
 }
 
 /// Removes a worker's job on a thread that may block, since the platform is asked with commands

@@ -2058,6 +2058,12 @@ mod the_end_of_a_write_is_told_under_its_authority;
 #[cfg(test)]
 mod a_close_that_meets_a_fence_after_the_route_answers;
 
+/// The closure record the daemon writes when it has no worker's own, held to the budget of a
+/// worker's, and what the session's registration as a writer does with a record that counts what
+/// it does not list.
+#[cfg(test)]
+mod a_closure_the_daemon_writes_beyond_its_budget;
+
 /// What the local door tells of a copy when a barrier restamps the registration after the
 /// route's own check.
 #[cfg(test)]
