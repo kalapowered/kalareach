@@ -453,8 +453,8 @@ pub struct WorkflowDefinitionSummary {
     pub grant_reference: GrantId,
     /// Whether enabled.
     pub enabled: bool,
-    /// Whether paused, by `workflow.pause`, because one of its own limits was breached or because its
-    /// definition was refused at admission.
+    /// Whether paused, by `workflow.pause`, because one of its own limits was breached or because
+    /// its definition was refused at admission.
     pub paused: bool,
     /// When installed.
     pub installed_at_ms: TimestampMs,

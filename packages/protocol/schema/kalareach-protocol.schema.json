@@ -43970,7 +43970,7 @@
           "type": "string"
         },
         "paused": {
-          "description": "Whether paused, by `workflow.pause`, because one of its own limits was breached or because its\ndefinition was refused at admission.",
+          "description": "Whether paused, by `workflow.pause`, because one of its own limits was breached or because\nits definition was refused at admission.",
           "type": "boolean"
         },
         "revision": {

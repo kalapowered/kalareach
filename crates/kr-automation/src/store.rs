@@ -933,9 +933,9 @@ impl<'c> Journal<'c> {
     /// Pauses a workflow revision and records the attention item the pause owes, together.
     ///
     /// Section 17 ¶8 asks for both when one of a workflow's own limits is breached, and the same
-    /// is done when a derived trigger meets a stored definition that no longer passes admission. A revision
-    /// that is already paused records nothing further, so a workflow being hammered produces one
-    /// item rather than one per refusal.
+    /// is done when a derived trigger meets a stored definition that no longer passes admission.
+    /// A revision that is already paused records nothing further, so a workflow being hammered
+    /// produces one item rather than one per refusal.
     ///
     /// # Errors
     ///

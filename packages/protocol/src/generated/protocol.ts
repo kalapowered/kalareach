@@ -33760,8 +33760,8 @@ export interface WorkflowDefinitionSummary {
    */
   name: string
   /**
-   * Whether paused, by `workflow.pause`, because one of its own limits was breached or because its
-   * definition was refused at admission.
+   * Whether paused, by `workflow.pause`, because one of its own limits was breached or because
+   * its definition was refused at admission.
    */
   paused: boolean
   /**

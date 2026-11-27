@@ -670,9 +670,9 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
     };
     let mut lines = vec![line(sentence)];
     // Only an automation pause carries its summary out: it is the host's own record of why it
-    // paused, a limit or a refusal of its definition. Any other rule's summary is made of words its event carried, such as a command
-    // line, a turn, an adapter's report or a notice's body, which a person or a program wrote, and
-    // stays with the host.
+    // paused, a limit or a refusal of its definition. Any other rule's summary is made of words
+    // its event carried, such as a command line, a turn, an adapter's report or a notice's body,
+    // which a person or a program wrote, and stays with the host.
     if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
         lines.push(line(notice.summary.clone()));
     }
