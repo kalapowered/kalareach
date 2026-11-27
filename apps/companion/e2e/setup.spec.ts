@@ -1771,7 +1771,11 @@ test.describe('the first-start assistant', () => {
         window.scrollTo({ top, behavior: 'instant' })
         await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
       }
-      document.getElementById('main')?.focus()
+      // Focus on a control of the view itself (the page's main region holds the view, so focus on it
+      // would not reach a listener on the view), the control that the page scrolls to.
+      const control = setup.querySelector<HTMLElement>('.setup-step')
+      if (!control) throw new Error('the setup view holds no step to focus')
+      control.focus()
       // A write that the focus made is queued: a frame later it has been delivered or is still held.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
       count += watching.takeRecords().length
