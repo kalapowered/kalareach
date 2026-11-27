@@ -7573,4 +7573,96 @@ mod a_boot_the_host_can_no_longer_tell_apart {
             "the text stamped at 100,000 is served: the limit of the high test"
         );
     }
+
+    /// The marker that makes the case below run its own body: the first run starts this test
+    /// program again with it set, to read what the body wrote to the host's log.
+    const THE_BODY_RUNS: &str = "KR_TEST_HOST_THE_SPOIL_IS_REPORTED_AFTER_THE_COMMIT";
+
+    /// A spoil is reported only once the transaction that stored its flag has committed. A boot
+    /// that spoils in a transaction that commits is reported. A boot whose transaction fails at the
+    /// commit, here by a deferred foreign key that the spoil's own update breaks, stores no flag and
+    /// has no line in the log, though the update that would have stored it ran.
+    #[test]
+    fn a_spoil_is_reported_only_after_the_transaction_that_stored_it_has_committed() {
+        let (healthy, failing) = (61_u64, 62_u64);
+        if std::env::var_os(THE_BODY_RUNS).is_none() {
+            let case = module_path!()
+                .split_once("::")
+                .map_or(String::new(), |(_, path)| path.to_owned())
+                + "::a_spoil_is_reported_only_after_the_transaction_that_stored_it_has_committed";
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("this test program"))
+                    .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+                    .env(THE_BODY_RUNS, "1")
+                    .output()
+                    .expect("this test program runs again");
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{log}"
+            );
+            assert!(
+                log.contains(&format!("boot {healthy}, from another boot")),
+                "the spoil that committed is in the log: {log}"
+            );
+            assert!(
+                !log.contains(&format!("boot {failing}, from another boot")),
+                "a spoil whose transaction did not commit is in the log: {log}"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().expect("a directory");
+        let path = temp.path().join("registry.db");
+        let store = GrantDirectory::open(&path).expect("the store");
+        let clock = SetClock::at(1_000);
+        store
+            .observe_boot(&boot_in(&clock, healthy))
+            .expect("the first boot is recorded");
+        clock.set(500);
+        let spoiled = store
+            .observe_boot(&boot_in(&clock, healthy))
+            .expect("a spoil in a transaction that commits");
+        assert!(spoiled.newly_spoiled.is_some(), "the control spoils");
+
+        store
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE a_parent (id INTEGER PRIMARY KEY);
+                 CREATE TABLE a_child (
+                     parent_id INTEGER REFERENCES a_parent (id) DEFERRABLE INITIALLY DEFERRED
+                 );
+                 CREATE TRIGGER the_spoil_breaks_the_commit AFTER UPDATE OF spoiled ON boots
+                 WHEN NEW.spoiled = 1
+                 BEGIN
+                     INSERT INTO a_child (parent_id) VALUES (1);
+                 END;",
+            )
+            .expect("the update of a flag is made to fail at the commit");
+        clock.set(1_000);
+        store
+            .observe_boot(&boot_in(&clock, failing))
+            .expect("the second boot is recorded");
+        clock.set(400);
+        let error = store
+            .observe_boot(&boot_in(&clock, failing))
+            .expect_err("the commit fails");
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+        let (high, flag): (i64, i64) = Connection::open(&path)
+            .expect("the registry opens")
+            .query_row(
+                "SELECT high_ms, spoiled FROM boots WHERE boot_epoch = ?1",
+                rusqlite::params![failing.to_be_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the row");
+        assert_eq!(
+            (high, flag),
+            (1_000, 0),
+            "the failed transaction stored nothing"
+        );
+    }
 }
