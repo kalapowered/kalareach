@@ -722,11 +722,21 @@ reading = 'cargo'
 command = ['cargo', 'test', '--locked', '-p', 'kr-boundary-windows']
 
 [[step]]
+id = 'rust-the-codex-stand-in-the-forwarder-s-suite-finds'
+group = 'rust'
+what = '''the Codex stand-in the forwarder's suite finds'''
+platforms = ['windows']
+reading = 'exit'
+setup = true
+command = ['cargo', 'build', '--locked', '-p', 'kr-codex-stand-in']
+
+[[step]]
 id = 'rust-the-forwarder'
 group = 'rust'
 what = 'the forwarder'
 platforms = ['windows']
 reading = 'cargo'
+after = ['rust-the-codex-stand-in-the-forwarder-s-suite-finds']
 command = ['cargo', 'test', '--locked', '-p', 'kr-hook']
 
 [[step]]
