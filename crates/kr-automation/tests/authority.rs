@@ -1377,8 +1377,8 @@ async fn a_command_that_declares_another_environment_installs_nowhere() {
     assert!(refusal.contains("its own environment"), "{refusal}");
 }
 
-/// The rights a review node needs: it asks the rights of a program start in a session that it
-/// creates and closes, in a copy of the version that it makes, and prompts it and reads it back.
+/// The rights a review node asks for: terminal input, creating and closing a session, managing a
+/// workspace, prompting the agent and viewing a session.
 const REVIEW_RIGHTS: [ActionRight; 6] = [
     ActionRight::TerminalInput,
     ActionRight::SessionCreate,

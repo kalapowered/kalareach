@@ -1192,8 +1192,8 @@ async fn a_revoked_grant_runs_no_workflow() {
     host.clients.abort();
 }
 
-/// The rights a review node needs: it asks the rights of a program start in a session of its own,
-/// and prompts it.
+/// The rights a review node asks for: terminal input, creating and closing a session, managing a
+/// workspace, prompting the agent and viewing a session.
 const REVIEW_RIGHTS: [ActionRight; 6] = [
     ActionRight::TerminalInput,
     ActionRight::SessionCreate,

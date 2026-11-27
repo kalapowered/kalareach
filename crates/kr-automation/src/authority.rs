@@ -85,10 +85,9 @@ pub const fn node_rights(action_kind: WorkflowActionKind) -> &'static [ActionRig
             ActionRight::SessionClose,
             ActionRight::WorkspaceManage,
         ],
-        // A review node asks the rights of a program start, as a node that runs a command does:
-        // the rights of that and of the copy of the version it reviews. It then asks the agent to
-        // do something, which is `agent.prompt`, and reads it back through the session it ran in,
-        // which is `session.view`.
+        // A review node asks the rights of a program start, as a node that runs a command does,
+        // and the rights of the copy of the version it reviews. It also asks to prompt the agent,
+        // which is `agent.prompt`, and to read the session back, which is `session.view`.
         WorkflowActionKind::RequestReview => &[
             ActionRight::TerminalInput,
             ActionRight::SessionCreate,
