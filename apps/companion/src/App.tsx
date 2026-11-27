@@ -13,7 +13,8 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-  type ReactNode
+  type ReactNode,
+  type RefObject
 } from 'react'
 
 import type { ActionRight } from '@kalareach/protocol'
@@ -55,6 +56,34 @@ const NARROW = '(max-width: 720px)'
 
 function isNarrow(): boolean {
   return window.matchMedia(NARROW).matches
+}
+
+/**
+ * Whether the words in `ref` run past their box (one that bounds their height), and whether more of
+ * them lie below what is shown. Both are read again when the box changes size, when the words
+ * scroll and when `text` changes.
+ */
+function useClipped(ref: RefObject<HTMLElement | null>, text: string | null): { clipped: boolean; more: boolean } {
+  const [state, setState] = useState({ clipped: false, more: false })
+  useLayoutEffect(() => {
+    const element = ref.current
+    if (element === null) return
+    const read = (): void => {
+      const clipped = element.scrollHeight > element.clientHeight + 1
+      const more = clipped && element.scrollTop + element.clientHeight < element.scrollHeight - 1
+      setState((was) => (was.clipped === clipped && was.more === more ? was : { clipped, more }))
+    }
+    read()
+    element.addEventListener('scroll', read, { passive: true })
+    // Every web view the application runs in has the observer; the unit tests' document has not.
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(read)
+    observer?.observe(element)
+    return () => {
+      element.removeEventListener('scroll', read)
+      observer?.disconnect()
+    }
+  }, [ref, text])
+  return state
 }
 
 /**
@@ -184,6 +213,8 @@ export function App(): ReactNode {
   // open the page behind takes no focus and no scroll, and the drawer closes by Escape, by a press
   // outside it, by its own control or by a choice. Where the focus goes then is decided by how it
   // closed: back to the control that opened it, or onto the page that was chosen.
+  const words = useRef<HTMLSpanElement | null>(null)
+  const { clipped, more } = useClipped(words, connection === null ? null : connection.connected ? 'connected' : (connection.reason ?? ''))
   const heldAtChange = useRef<Element | null>(null)
   const narrow = useNarrow(heldAtChange)
   const [wasNarrow, setWasNarrow] = useState(narrow)
@@ -370,7 +401,12 @@ export function App(): ReactNode {
                 Menu
               </Button>
             ) : null}
-            <span className="connection">
+            <span
+              className="connection"
+              ref={words}
+              data-more={clipped ? String(more) : undefined}
+              {...(clipped ? { tabIndex: 0, role: 'group', 'aria-label': 'Connection status' } : {})}
+            >
               {connection === null ? (
                 'Checking the connection…'
               ) : (

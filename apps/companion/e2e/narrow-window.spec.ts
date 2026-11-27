@@ -25,6 +25,8 @@ const SIZES = [
   ['the largest text size', LARGEST]
 ] as const
 const HEIGHT = 800
+/** The most of the window's height that the top bar, which stays in place, may take with the long reason. */
+const BAR_SHARE = 0.27
 
 const SIGNED_IN = {
   state: 'signed_in',
@@ -507,9 +509,117 @@ for (const width of WIDTHS) {
         expect(drawer.x, 'the drawer starts at the window edge').toBe(0)
         expect(drawer.width, 'the drawer leaves a strip of the page to press on').toBeLessThanOrEqual(width - 47)
       })
+
+      test('the top bar that stays in place leaves the window to the page, and the control is not covered', async ({ page }) => {
+        await openWindow(page, width, ratio)
+        await page.evaluate((reason) => {
+          window.krTestHost?.setConnected(false, reason)
+        }, LONG_REASON)
+        const menu = menuOf(page)
+        await expect(page.locator('.topbar .connection')).toContainText('refused the connection')
+        const bar = await rectangleOf(page.locator('.topbar'))
+        expect(bar.height, `the bar is at most ${BAR_SHARE * 100} % of the window, or ${BAR_SHARE * HEIGHT} points`).toBeLessThanOrEqual(
+          BAR_SHARE * HEIGHT
+        )
+        const control = await rectangleOf(menu)
+        expect(control.x, 'the control is inside the window').toBeGreaterThanOrEqual(0)
+        expect(control.y).toBeGreaterThanOrEqual(0)
+        expect(control.x + control.width).toBeLessThanOrEqual(width)
+        expect(control.y + control.height).toBeLessThanOrEqual(HEIGHT)
+        expect(
+          await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.closest('button')?.textContent, [
+            control.x + control.width / 2,
+            control.y + control.height / 2
+          ]),
+          'nothing covers the control'
+        ).toBe('Menu')
+      })
     })
   }
 }
+
+test.describe('the words in the top bar', () => {
+  const wordsOf = (page: Page): Locator => page.locator('.topbar .connection')
+  const shown = (page: Page): Promise<{ more: string | null; mask: string; line: string; scrolled: number }> =>
+    page.evaluate(() => {
+      const element = document.querySelector('.topbar .connection') as HTMLElement
+      const style = getComputedStyle(element)
+      return {
+        more: element.getAttribute('data-more'),
+        mask: style.maskImage || style.webkitMaskImage || 'none',
+        line: style.boxShadow,
+        scrolled: element.scrollTop
+      }
+    })
+
+  test('words that run past their box are one Tab stop with a name, scroll by the arrow keys, and fade while more follows', async ({
+    page
+  }) => {
+    await openWindow(page, 480, LARGEST)
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, LONG_REASON)
+    const words = wordsOf(page)
+    await expect(words).toContainText('refused the connection')
+    await expect(words, 'the words that are cut are a region with a name').toHaveAttribute('aria-label', 'Connection status')
+    await expect(words).toHaveAttribute('role', 'group')
+    await expect(words).toHaveAttribute('tabindex', '0')
+    const first = await shown(page)
+    expect(first.more, 'more follows').toBe('true')
+    expect(first.mask, 'the lower edge fades while more follows').not.toBe('none')
+
+    // One Tab stop: the next one after the control, and the one after that is not another of the bar.
+    await menuOf(page).focus()
+    await page.keyboard.press(tabKeys().forward)
+    await expect(words, 'the Tab after the control reaches the words').toBeFocused()
+    // An engine may take a key press for the start of a smooth scroll, so the key is pressed again
+    // at each read until the words have moved.
+    await expect
+      .poll(async () => {
+        await page.keyboard.press('ArrowDown')
+        return (await shown(page)).scrolled
+      }, 'an arrow key scrolls the words')
+      .toBeGreaterThan(0)
+    await expect
+      .poll(async () => {
+        await page.keyboard.press('End')
+        return (await shown(page)).more
+      }, 'at the end nothing follows')
+      .toBe('false')
+    const end = await shown(page)
+    expect(end.mask, 'at the end there is no fade').toBe('none')
+    expect(await page.evaluate(() => document.activeElement?.closest('.topbar') != null), 'the focus stays on the words').toBe(true)
+  })
+
+  test('words that fit have no Tab stop, no role and no fade', async ({ page }) => {
+    await openWindow(page, 600)
+    await expect(wordsOf(page)).toContainText('Connected to this machine')
+    await expect(wordsOf(page)).not.toHaveAttribute('tabindex', /.*/)
+    await expect(wordsOf(page)).not.toHaveAttribute('role', /.*/)
+    await expect(wordsOf(page)).not.toHaveAttribute('aria-label', /.*/)
+    const state = await shown(page)
+    expect(state.more).toBeNull()
+    expect(state.mask).toBe('none')
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, LONG_REASON)
+    await expect(wordsOf(page)).toContainText('refused the connection')
+    await expect(wordsOf(page), 'the long reason fits at the ordinary size in 600 points').not.toHaveAttribute('tabindex', /.*/)
+    expect((await shown(page)).mask).toBe('none')
+  })
+
+  test('with more contrast asked for, a plain line says that more follows, in place of the fade', async ({ page }) => {
+    await page.emulateMedia({ contrast: 'more' })
+    await openWindow(page, 480, LARGEST)
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, LONG_REASON)
+    await expect(wordsOf(page)).toHaveAttribute('data-more', 'true')
+    const state = await shown(page)
+    expect(state.mask, 'no fade').toBe('none')
+    expect(state.line, 'a plain line at the lower edge').not.toBe('none')
+  })
+})
 
 test.describe('the connection line', () => {
   for (const [size, ratio] of SIZES) {
@@ -940,6 +1050,13 @@ test.describe('the pictures', () => {
           await expect(drawerOf(page)).toBeVisible()
           await expect.poll(() => sidebarLeft(page)).toBe(0)
           await page.screenshot({ path: shot(`${name}-open`) })
+          await page.keyboard.press('Escape')
+          await expect(drawerOf(page)).toBeHidden()
+          await page.evaluate((reason) => {
+            window.krTestHost?.setConnected(false, reason)
+          }, LONG_REASON)
+          await expect(page.locator('.topbar .connection')).toContainText('refused the connection')
+          await page.screenshot({ path: shot(`${name}-closed-long-reason`) })
         })
       }
     }

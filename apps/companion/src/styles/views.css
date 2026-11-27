@@ -1582,6 +1582,18 @@
     /* Level with the control when it is one line, from the top of the row when it is more; the dot
        stays in the line of the words, on the first. */
     align-self: center;
+    /* The bar stays in place, so what it holds is bounded: at the largest text size a long reason
+       would otherwise fill the window and stay over the page. The words scroll inside their box. */
+    max-block-size: 12vh;
+    overflow: hidden auto;
+    overscroll-behavior: contain;
+  }
+
+  /* While more of the words lie below what is shown, their lower edge fades out; at the end, or
+     when nothing is cut, there is no fade. A plain line says it where the fade is not wanted. */
+  .topbar .connection[data-more='true'] {
+    -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 1.5em), transparent);
   }
 
   main {
@@ -1594,6 +1606,14 @@
 
   .theme-preview {
     height: 72px;
+  }
+}
+
+@media (max-width: 720px) and ((prefers-contrast: more) or (prefers-reduced-transparency: reduce)) {
+  .topbar .connection[data-more='true'] {
+    -webkit-mask-image: none;
+    mask-image: none;
+    box-shadow: inset 0 -2px 0 var(--control-line);
   }
 }
 
