@@ -74,10 +74,25 @@ const ROWS: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['"a""@x"', ['"a""@x"']],
   // A quote of another kind inside a quote opens a quote of its own.
   ['"\'@x\'"', ['"\'@x\'"']],
+  // A digit before a quote is text before it, as a letter is: the quote closes what it follows.
+  ['1"@x', ['1"', '@x']],
+  // A backtick is a quote like the other two: one that opens keeps the at sign after it, one that closes
+  // lets the line end before the at sign.
+  ['`@x`', ['`@x`']],
+  ['`a(`@example.com', ['`a(`', '@example', '.com']],
+  // A second quote right after a quote that closed opens a quote; it does not close the first one again.
+  ['a""@x', ['a""@x']],
   // A run of separators of any kind is one place, after its last character.
   ['a//::==b', ['a//::==', 'b']],
   ['a..b', ['a..b']],
   ['a---b', ['a', '---b']],
+  // After a run of slashes, colons or equals signs a dot, an at sign or a hyphen starts a part only when a
+  // letter or a digit stands further on in the word, past the signs that follow it: no mark is left alone
+  // at the end of a line. A path that goes up keeps its places.
+  ['--input=-', ['--input=-']],
+  ['a/@', ['a/@']],
+  ['a/.', ['a/.']],
+  ['../../x', ['../', '../', 'x']],
   // A dot that opens or closes a word, or that a digit follows, never starts or ends a part of its own.
   ['.local', ['.local']],
   ['name.', ['name.']],
@@ -101,4 +116,25 @@ describe('breakParts', () => {
       expect(breakParts(word).join('')).toBe(word)
     })
   }
+})
+
+// A word of any length is read in one pass, so a long one needs no bound. Each case is a plain run with
+// its exact parts; it holds no time limit.
+describe('breakParts on a long word', () => {
+  const REPEATS = 20_000
+
+  it('a quote and an at sign, repeated: the first quote opens, every later one closes', () => {
+    const word = '"@a'.repeat(REPEATS)
+    const parts = breakParts(word)
+    expect(parts).toEqual(['"@a"', ...Array.from({ length: REPEATS - 2 }, () => '@a"'), '@a'])
+    expect(parts.join('')).toBe(word)
+  })
+
+  it('a long run of underscores: one part, then the part after the run', () => {
+    const run = '_'.repeat(REPEATS)
+    const word = `a${run}b`
+    const parts = breakParts(word)
+    expect(parts).toEqual([`a${run}`, 'b'])
+    expect(parts.join('')).toBe(word)
+  })
 })
