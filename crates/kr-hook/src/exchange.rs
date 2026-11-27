@@ -123,12 +123,15 @@ impl Exchange {
     ///
     /// The worker's close can also come before the hello itself is written: the connection is made
     /// before the hello is built, and the worker may accept it, find nothing it can admit and close
-    /// it in between. A hello that finds the connection closed by the other end (a broken pipe, a
-    /// reset or an aborted connection) is [`ExchangeError::Refused`], the same answer as a read of
-    /// the admission that finds it closed. That claims that the connection closed and that no
-    /// admission came. It does not claim why: a worker that died after it accepted the connection
-    /// leaves the same error behind as one that refused the bridge. A write that fails for any other
-    /// reason stays [`ExchangeError::Broken`] with the system's words.
+    /// it in between. A hello that finds the connection closed by the other end is
+    /// [`ExchangeError::Refused`], the same answer as a read of the admission that finds it closed.
+    /// What counts as closed by the other end is the one rule of [`kr_ipc::error::peer_has_gone`],
+    /// the rule every other write, read and shutdown of a local stream follows: a broken pipe, a
+    /// reset, and "not connected", which a write that races the close gets on macOS. That claims
+    /// that the connection closed and that no admission came. It does not claim why: a worker that
+    /// died after it accepted the connection leaves the same error behind as one that refused the
+    /// bridge. A write that fails for any other reason stays [`ExchangeError::Broken`] with the
+    /// system's words.
     ///
     /// # Errors
     ///
@@ -156,17 +159,15 @@ impl Exchange {
     /// Writes the hello, and says a connection the other end had already closed is a refusal.
     async fn introduce(&mut self, hello: &[u8]) -> Result<(), ExchangeError> {
         check_line(hello)?;
-        self.outgoing
-            .put(hello)
-            .await
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => ExchangeError::Refused,
-                _ => ExchangeError::Broken {
+        self.outgoing.put(hello).await.map_err(|error| {
+            if kr_ipc::error::peer_has_gone(&error) {
+                ExchangeError::Refused
+            } else {
+                ExchangeError::Broken {
                     detail: error.to_string(),
-                },
-            })
+                }
+            }
+        })
     }
 
     /// Waits for the worker to say it admitted this bridge.
@@ -700,14 +701,15 @@ mod tests {
             .expect_err("the write fails")
     }
 
-    /// The three kinds of a failed write that say the other end closed the connection are each the
-    /// refusal, whatever the system's words for them are.
+    /// Each kind that the IPC crate's one rule reads as a peer that has gone is the refusal when it
+    /// is what the write of the hello answers, whatever the system's words for it are: a broken
+    /// pipe, a reset, and "not connected", which a write that races the close gets on macOS.
     #[tokio::test]
     async fn each_kind_of_a_closed_connection_is_a_refusal_when_the_hello_is_written() {
         for kind in [
             std::io::ErrorKind::BrokenPipe,
             std::io::ErrorKind::ConnectionReset,
-            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::NotConnected,
         ] {
             let error = introduction_failing_with(kind, 8).await;
             assert!(
@@ -726,6 +728,8 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::WriteZero,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::ConnectionRefused,
             std::io::ErrorKind::Other,
         ] {
             let error = introduction_failing_with(kind, 8).await;
