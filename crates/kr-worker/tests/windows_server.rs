@@ -376,19 +376,12 @@ async fn kr_req_07_66_a_server_that_ignores_its_input_is_forced_when_the_window_
     }
 }
 
-/// A server that dies with its command running leaves a command no parent names, and the ending
-/// ends it with the job that held it.
-#[tokio::test]
-async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_its_job() {
-    let stand_in = stand_in();
-    let session = session();
-    let server = start(&stand_in, &session, "die-first", PLAIN).await;
-    let mut conversation = to_the_approval(&server).await;
-    let command = command_of(&server).await;
-    // The approval is answered and the server dies.
+/// Answers the approval the server asked for, on which a server that dies first exits with its
+/// command running, and waits until the server is gone.
+async fn dies_with_its_command_running(server: &Server, conversation: &mut Conversation) {
     let id = conversation.approval["id"].clone();
     write(
-        &mut conversation,
+        conversation,
         &serde_json::json!({"id": id, "result": {"decision": "accept"}}),
     )
     .await;
@@ -397,6 +390,20 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_i
         assert!(started.elapsed() < LIVENESS, "the server died");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A server that dies with its command running leaves a command no parent names, and the ending
+/// ends it with the job that held it. The command is in no job of its own: a job of its own that
+/// ends its processes when its last handle closes would end the command as the server dies, and
+/// nothing would be left for the ending to end.
+#[tokio::test]
+async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_with_its_job() {
+    let stand_in = stand_in();
+    let session = session();
+    let server = start(&stand_in, &session, "die-first,command-shares-group", PLAIN).await;
+    let mut conversation = to_the_approval(&server).await;
+    let command = command_of(&server).await;
+    dies_with_its_command_running(&server, &mut conversation).await;
     assert!(!gone(&command), "the command outlived the server");
 
     let record = Record::default();
