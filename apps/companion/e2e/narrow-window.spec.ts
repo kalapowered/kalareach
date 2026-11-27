@@ -957,6 +957,62 @@ test.describe('a message that asks for confirmation while the drawer is open', (
   }
 })
 
+/**
+ * A web view without `inert` leaves the page behind the open drawer in the tab order. The hook sends
+ * the focus that lands there into the drawer, and leaves a message's own controls where they are: a
+ * press on a message's action that ends over its plain words does not use the action and leaves the
+ * focus on the message, and no Tab or Shift+Tab from there ends on the page behind.
+ */
+test.describe('the open drawer on a web view without the inert attribute: the keyboard from a message', () => {
+  for (const [width, ratio] of [
+    [600, 1],
+    [480, LARGEST]
+  ] as const) {
+    test(`${width} points: after a press on a message's action that ended over its words, no key reaches the page behind`, async ({
+      page
+    }) => {
+      await withoutInert(page)
+      await openWindow(page, width, ratio)
+      await menuOf(page).click()
+      await expect(drawerOf(page)).toBeVisible()
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, REQUEST)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('needs your confirmation')
+      const review = toast.getByRole('button', { name: 'Review' })
+      const action = await rectangleOf(review)
+      const words = await rectangleOf(toast.locator('.toast-text'))
+      await page.mouse.move(action.x + action.width / 2, action.y + action.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(words.x + words.width / 2, words.y + words.height / 2, { steps: 4 })
+      await page.mouse.up()
+      await expect(drawerOf(page), 'the press did not use the action: the drawer is still open').toBeVisible()
+      // An engine that does not give a button the focus on a press has it on the page's body here.
+      if (!(await review.evaluate((element) => element === document.activeElement))) await review.focus()
+      await expect(review, 'the focus is on the message').toBeFocused()
+
+      const place = (): Promise<'drawer' | 'message' | 'behind' | 'elsewhere'> =>
+        page.evaluate(() => {
+          const active = document.activeElement
+          if (active?.closest('aside.sidebar') != null) return 'drawer'
+          if (active?.closest('.toast') != null) return 'message'
+          if (active?.closest('.workspace, .skip-link') != null) return 'behind'
+          return 'elsewhere'
+        })
+      for (const key of [tabKeys().back, tabKeys().forward, tabKeys().back, tabKeys().back, tabKeys().forward, tabKeys().forward]) {
+        await page.keyboard.press(key)
+        expect(await place(), `${key} ends inside the drawer, on the message or on nothing of the page`).not.toBe('behind')
+      }
+      // Shift+Tab from the message used to walk into the page behind; it ends in the drawer now.
+      await review.focus()
+      await page.keyboard.press(tabKeys().back)
+      expect(await place(), 'Shift+Tab from the message ends inside the drawer').toBe('drawer')
+      await expect(closeOf(page), 'the drawer\'s own first control has it').toBeFocused()
+    })
+  }
+})
+
 test.describe('the drawer on a page that scrolls', () => {
   for (const [width, ratio] of [
     [600, 1],

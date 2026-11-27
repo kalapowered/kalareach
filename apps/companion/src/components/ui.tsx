@@ -874,9 +874,8 @@ export function useModalSurface(
     restoreFocus.current = document.activeElement as HTMLElement | null
     const focusable = () => stopsOf(element)
     ;(asked.firstStop?.() ?? focusable()[0])?.focus()
-    const behind = INERT_SUPPORTED
-      ? (asked.inactive ?? []).flatMap((part) => (part.current === null ? [] : [part.current]))
-      : []
+    const excluded = (asked.inactive ?? []).flatMap((part) => (part.current === null ? [] : [part.current]))
+    const behind = INERT_SUPPORTED ? excluded : []
     for (const part of behind) part.inert = true
 
     // A wheel or a touch moves the surface's own scroll, and nothing else: where the surface has no
@@ -914,7 +913,19 @@ export function useModalSurface(
       }
     }
     document.addEventListener('keydown', onKey)
+
+    // Where the web view has no `inert`, the parts behind the surface stay in the tab order, and the
+    // Tab cycle above holds the keyboard only from the surface's own edges: a press that began on a
+    // message's action and ended elsewhere leaves the focus outside the surface, and a Shift+Tab from
+    // there lands behind it. The focus that lands in a part that the surface excludes goes to the
+    // surface's first control. A message's own controls are in none of those parts and stay reachable.
+    const onFocus = (event: FocusEvent): void => {
+      const target = event.target
+      if (target instanceof Node && excluded.some((part) => part.contains(target))) focusable()[0]?.focus()
+    }
+    if (excluded.length > 0) document.addEventListener('focusin', onFocus)
     return () => {
+      document.removeEventListener('focusin', onFocus)
       document.removeEventListener('keydown', onKey)
       document.removeEventListener('wheel', hold, { capture: true })
       document.removeEventListener('touchmove', hold, { capture: true })
