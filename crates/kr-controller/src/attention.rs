@@ -28,7 +28,8 @@
 //! # The workflow journal's alerts
 //!
 //! The environment's own source is the workflow journal's attention records: a workflow revision or
-//! a causal chain that one of its own limits paused, and a revision enabled again. The store reads
+//! a causal chain that one of its own limits paused, a revision paused by one of its own limits or
+//! by a refusal of its definition at admission, and a revision enabled again. The store reads
 //! them as the journal's registered attention consumer. Each pass registers, reads the records past
 //! the store's own cursor, commits what they raise or end, and only then tells the journal how far
 //! the store has read, so a daemon that stops between the two neither loses a record nor counts one

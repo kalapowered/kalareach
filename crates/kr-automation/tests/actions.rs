@@ -671,4 +671,25 @@ async fn a_pass_that_stops_part_way_keeps_the_runs_it_committed() {
     let again = service.admit_triggers(3_000);
     assert!(again.stopped.is_some(), "still unreadable");
     assert!(again.started.is_empty());
+
+    // A grant that cannot be read says nothing about the definition, so it is not paused and no
+    // alert is owed for it: a retry can still decide it.
+    assert!(
+        !service
+            .store()
+            .is_paused(after_review.workflow_id, 1)
+            .expect("the journal"),
+        "an unreadable grant pauses nothing"
+    );
+    let read = service
+        .read(
+            &kr_protocol::automation::WorkflowReadParams {
+                workflow_id: Nullable::some(after_review.workflow_id),
+                ..kr_protocol::automation::WorkflowReadParams::default()
+            },
+            None,
+            3_000,
+        )
+        .expect("a read");
+    assert!(read.alerts.is_empty(), "{:?}", read.alerts);
 }

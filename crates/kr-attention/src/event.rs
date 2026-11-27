@@ -338,7 +338,8 @@ pub enum EventKind {
         /// The notice.
         notice: ApplicationNotice,
     },
-    /// A workflow revision or a causal chain was paused by one of its own limits.
+    /// A workflow revision or a causal chain was paused, by one of its own limits or, for a
+    /// revision, by a refusal of its definition at admission.
     AutomationPaused {
         /// What was paused.
         subject: AttentionAutomationSubject,

@@ -138,7 +138,8 @@ pub struct StoredRunRecord {
 
 /// The event type of the attention record an exhausted causal chain leaves in the outbox.
 pub const ATTENTION_CAUSAL_LIMIT: &str = "attention.causal_limit";
-/// The event type of the attention record a workflow paused by its own limits leaves.
+/// The event type of the attention record a workflow paused by one of its own limits or by a
+/// refusal of its definition at admission leaves.
 pub const ATTENTION_WORKFLOW_PAUSED: &str = "attention.workflow_paused";
 /// The event type that ends the condition [`ATTENTION_WORKFLOW_PAUSED`] raised.
 pub const ATTENTION_WORKFLOW_RESUMED: &str = "attention.workflow_resumed";
@@ -216,17 +217,17 @@ pub enum JournalEventKind {
         /// Which ceiling was reached.
         reason: String,
     },
-    /// A workflow revision was paused because one of its own limits was breached. It owes one
-    /// attention item.
+    /// A workflow revision was paused, because one of its own limits was breached or because its
+    /// definition was refused at admission. It owes one attention item.
     WorkflowPaused {
         /// The workflow.
         workflow_id: WorkflowId,
         /// The revision that was paused.
         revision: u64,
-        /// Which limit was breached.
+        /// Which limit was breached, or the refusal, in its own words.
         reason: String,
     },
-    /// The pause a breached limit caused was cleared, which ends that item's condition.
+    /// The pause a limit or a refusal caused was cleared, which ends that item's condition.
     WorkflowResumed {
         /// The workflow.
         workflow_id: WorkflowId,
@@ -452,7 +453,8 @@ fn awaiting_review(
 pub enum AttentionSubject {
     /// A causal chain whose budget ran out.
     CausalRoot(CausalRootId),
-    /// A workflow revision paused because one of its own limits was breached.
+    /// A workflow revision paused because one of its own limits was breached or because its
+    /// definition was refused at admission.
     ///
     /// The revision is part of the identity: two revisions of one workflow can be paused for
     /// different reasons, and enabling one must not clear the other's item.
@@ -483,7 +485,8 @@ pub struct InstalledDefinition {
     pub definition: WorkflowDefinition,
     /// Whether the revision has been enabled.
     pub enabled: bool,
-    /// Whether the revision has been paused, by request or by a breached limit.
+    /// Whether the revision has been paused, by request, by a breached limit or by a refusal of
+    /// its definition at admission.
     pub paused: bool,
     /// The grant the caller who installed it was held to, when a paired device installed it.
     ///
@@ -926,7 +929,8 @@ impl<'c> Journal<'c> {
 
     /// Pauses a workflow revision and records the attention item the pause owes, together.
     ///
-    /// Section 17 ¶8 asks for both when one of a workflow's own limits is breached. A revision
+    /// Section 17 ¶8 asks for both when one of a workflow's own limits is breached, and the same
+    /// is done when a derived trigger meets a stored definition that no longer passes admission. A revision
     /// that is already paused records nothing further, so a workflow being hammered produces one
     /// item rather than one per refusal.
     ///

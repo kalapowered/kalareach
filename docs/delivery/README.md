@@ -861,8 +861,8 @@ takes an announcement for delivery it writes, with the notice and before the sou
 moves, the lines the message will carry: one sentence per rule ("A question is waiting in session
 ...", "An approval is waiting in session ...", "A command failed in session ...") that names the
 session by its identifier and dated by when the condition was first seen. A notice about an
-automation paused by a limit adds the host's own summary of it, which names the workflow or the
-causal chain by identifier and the limit as the workflow journal records it (a limit on a node's
+automation pause adds the host's own summary of it, which names the workflow or the
+causal chain by identifier and the limit or the refusal as the workflow journal records it (a limit on a node's
 wait names the node by the identifier its author gave it); no other rule carries a summary out.
 Nothing a session said is in the lines, and a worker's words cannot be: the attention store keeps
 none. The lines are checked when the message is composed, against the grant of the rule that sends

@@ -123,7 +123,7 @@ const RULE_WORDS: Readonly<Record<AttentionItem['rule'], string>> = {
   'attention.review_ready': 'Finished work is ready to review',
   'attention.host_contact_lost': 'This host is out of contact',
   'attention.application_notice': 'An application asked for your attention',
-  'attention.automation_paused': 'An automation stopped at one of its own limits',
+  'attention.automation_paused': 'An automation was paused',
   'attention.authority_feed_removed': 'This host no longer learns revocations from its feed',
   'attention.receipt_uncertain': 'An action’s result is unknown',
   'attention.receipts_gap': 'Some action results cannot be read'

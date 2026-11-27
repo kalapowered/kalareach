@@ -630,7 +630,7 @@ impl Fate {
 /// The lines an external message carries for one announcement, in the host's own words.
 ///
 /// What a message names is what the host itself knows of the condition: which rule raised it, the
-/// session it belongs to and, for an automation paused by a limit, the host's own summary of it. A
+/// session it belongs to and, for an automation pause, the host's own summary of it. A
 /// session's own words never enter: the attention store keeps none of them, and a message built
 /// here could not carry them if it tried. The lines are committed with the notice, so a recovery
 /// that produces from the event again composes from the same lines.
@@ -658,7 +658,7 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         AttentionRule::ApplicationNotice => {
             format!("A program{place} asked the terminal for a notification.")
         }
-        AttentionRule::AutomationPaused => "Automation was paused by a limit.".to_owned(),
+        AttentionRule::AutomationPaused => "Automation was paused.".to_owned(),
         AttentionRule::AuthorityFeedRemoved => "This host's authority feed was removed.".to_owned(),
         AttentionRule::ReceiptUncertain => format!("An action's result is unknown{place}."),
         AttentionRule::ReceiptsGap => format!("Some action results cannot be read{place}."),
@@ -669,8 +669,8 @@ fn host_lines(rule: AttentionRule, notice: &Notice) -> Vec<ContentLine> {
         text,
     };
     let mut lines = vec![line(sentence)];
-    // Only an automation paused by a limit carries its summary out: it is the host's own record
-    // of the limit. Any other rule's summary is made of words its event carried, such as a command
+    // Only an automation pause carries its summary out: it is the host's own record of why it
+    // paused, a limit or a refusal of its definition. Any other rule's summary is made of words its event carried, such as a command
     // line, a turn, an adapter's report or a notice's body, which a person or a program wrote, and
     // stays with the host.
     if rule == AttentionRule::AutomationPaused && !notice.summary.is_empty() {
@@ -3274,7 +3274,7 @@ mod tests {
     /// it, does not call a chain a workflow, and says nothing was left out, because a line that
     /// names no session is not history.
     #[test]
-    fn an_automation_paused_by_a_limit_is_told_to_a_grant_that_sees_no_session() {
+    fn a_causal_chain_pause_is_told_to_a_grant_that_sees_no_session() {
         use kr_protocol::attention::AttentionAutomationSubject;
 
         let mut attention = store();

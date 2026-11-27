@@ -184,7 +184,7 @@ wire_enum! {
         ApplicationNotice => "attention.application_notice",
             "An application asked for a notification. Untrusted, and never an approval.";
         AutomationPaused => "attention.automation_paused",
-            "A workflow revision or a causal chain was paused by one of its own limits.";
+            "A workflow revision or a causal chain was paused, by one of its own limits or, for a revision, by a refusal of its definition at admission.";
         AuthorityFeedRemoved => "attention.authority_feed_removed",
             "The authority feed this host reads removed it, so it learns no revocation from it.";
         ReceiptUncertain => "attention.receipt_uncertain",
@@ -447,7 +447,8 @@ pub struct AttentionGap {
 )]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AttentionAutomationSubject {
-    /// A workflow revision paused by one of its own limits.
+    /// A workflow revision paused by one of its own limits or by a refusal of its definition at
+    /// admission.
     Workflow {
         /// The workflow.
         workflow_id: WorkflowId,

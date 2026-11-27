@@ -242,7 +242,8 @@ impl Subject {
             .done()
     }
 
-    /// A workflow revision paused by its own limits.
+    /// A workflow revision paused by one of its own limits or by a refusal of its definition at
+    /// admission.
     #[must_use]
     pub fn workflow(workflow_id: WorkflowId, revision: u64) -> Self {
         Builder::of(Form::Workflow)

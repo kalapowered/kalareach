@@ -611,8 +611,23 @@ impl AutomationService {
         now_ms: u64,
     ) -> Result<Admitted> {
         let grant = self.authority.grant(definition.grant_reference, now_ms)?;
-        validate_definition(definition, &grant)?;
-        authority::check_definition(&grant, definition, self.environment_id)?;
+        if let Err(refusal) = validate_definition(definition, &grant)
+            .and_then(|()| authority::check_definition(&grant, definition, self.environment_id))
+        {
+            // A caller who submitted the trigger is told the refusal. A trigger the host derived
+            // from a node has no caller, so a stored definition that no longer passes would stay
+            // enabled and start nothing, with nobody told. It is paused with the refusal as the
+            // reason, which owes the attention item, until it is enabled again.
+            if event_id.starts_with(DERIVED_TRIGGER_PREFIX) && refusal.is_decided() {
+                journal.pause_workflow_on_breach(
+                    definition.workflow_id,
+                    definition.revision.get(),
+                    &refusal.to_string(),
+                    now_ms,
+                )?;
+            }
+            return Err(refusal);
+        }
 
         if journal.trigger_is_recorded(
             definition.workflow_id,

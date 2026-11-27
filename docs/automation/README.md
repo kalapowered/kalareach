@@ -343,6 +343,16 @@ Install-time validation enforces:
 Instructions are plain text: `{{`, `}}`, `${`, `$(`, `<%`, `%>`, `eval(`, `exec(` and a backtick are
 refused when the workflow is offered.
 
+A `request_review` node names the isolated workspace: a node that names a shared working tree is
+refused when the workflow is offered, with the words "node {id} reviews in a shared working tree,
+which a review node does not do in this release: choose the isolated workspace". A definition
+stored before that refusal existed is refused with the same words at its next new admission, the
+words an explicit `workflow.run` is given. When a trigger that a node's success produced meets
+that refusal, or the refusal of a grant that no longer covers the definition, the host pauses the
+revision with the refusal as the reason and raises one attention item for it, so the owner reads it
+in the revision's alerts; enabling the revision again clears the pause, and the next trigger
+refuses it again unless a new revision or a wider grant has replaced what was refused.
+
 * **No template evaluation.** Parameter values are inspected after JSON decoding, so a marker such
   as `{{ ... }}`, `${ ... }` or `$( ... )` is rejected however it was written. Nothing in a
   definition is evaluated.
@@ -541,7 +551,7 @@ the daemon's registry, because a causal budget has to survive a reboot as well a
 The journal commits a small event with every transition a consumer outside it has to know about, in
 the same transaction as the transition: an accepted trigger and the run it started, a node's settled
 outcome, a run's stop (completed, failed, paused or cancelled), an exhausted chain, and a workflow
-paused by one of its own limits or enabled again. Every event carries an envelope: the subsystem it
+paused by one of its own limits or by a refusal of its definition at admission, or enabled again. Every event carries an envelope: the subsystem it
 comes from (`automation`), the verified actor whose action caused it or `host` for the host's own
 transitions, and its content class (`identifiers`). Inside, it carries the identifiers a consumer
 needs, the run's causal root, generation, depth and parent, and nothing a node produced: no output,

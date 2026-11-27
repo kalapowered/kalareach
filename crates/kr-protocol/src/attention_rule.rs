@@ -2,7 +2,8 @@
 //!
 //! Section 25 names eight rules, gives them stable identifiers and fixes the de-duplication window
 //! at sixty seconds; its automation paragraph, with section 17's workflow limits, adds a ninth for
-//! a workflow or a causal chain its own limits paused, a tenth tells the owner that the
+//! a workflow or a causal chain paused by its own limits or, for a workflow, by a refusal of its
+//! definition at admission, a tenth tells the owner that the
 //! authority feed a host reads removed it, an eleventh is for an action whose upstream result
 //! is unknown, and a twelfth for action results the host cannot read. [`RULES`] is that
 //! table, one entry per
@@ -156,7 +157,8 @@ pub static RULES: &[Rule] = &[
         trusted: false,
         droppable: true,
     },
-    // A workflow or a causal chain stopped by one of its own limits. Something the person has to
+    // A workflow or a causal chain paused by one of its own limits or, for a workflow, by a
+    // refusal of its definition at admission. Something the person has to
     // decide - enable the revision again, or re-arm the chain - so it is notable, and it is the
     // host's own record of its own journal, so it is trusted. It does not climb: a paused workflow
     // is not getting worse by waiting. And it is not the bound's to let go of, because it stands

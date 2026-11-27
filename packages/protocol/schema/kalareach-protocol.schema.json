@@ -3516,7 +3516,7 @@
       "oneOf": [
         {
           "additionalProperties": false,
-          "description": "A workflow revision paused by one of its own limits.",
+          "description": "A workflow revision paused by one of its own limits or by a refusal of its definition at\nadmission.",
           "properties": {
             "workflow": {
               "additionalProperties": false,
@@ -4272,7 +4272,7 @@
         },
         {
           "const": "attention.automation_paused",
-          "description": "A workflow revision or a causal chain was paused by one of its own limits.",
+          "description": "A workflow revision or a causal chain was paused, by one of its own limits or, for a revision, by a refusal of its definition at admission.",
           "type": "string"
         },
         {
@@ -43827,12 +43827,12 @@
         },
         {
           "const": "workflow_paused",
-          "description": "A workflow revision was paused by one of its own limits.",
+          "description": "A workflow revision was paused by one of its own limits or by a refusal of its definition at admission.",
           "type": "string"
         },
         {
           "const": "workflow_resumed",
-          "description": "The pause a limit caused was cleared by enabling the revision.",
+          "description": "The pause a limit or a refusal caused was cleared by enabling the revision.",
           "type": "string"
         }
       ]
@@ -43970,7 +43970,7 @@
           "type": "string"
         },
         "paused": {
-          "description": "Whether paused, by `workflow.pause` or because one of its own limits was breached.",
+          "description": "Whether paused, by `workflow.pause`, because one of its own limits was breached or because its\ndefinition was refused at admission.",
           "type": "boolean"
         },
         "revision": {

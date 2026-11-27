@@ -136,7 +136,7 @@ apart:
 | Kind | What it means |
 | --- | --- |
 | Waiting for you | A decision the person can take here |
-| Did not finish | A command that ended with a failure, an integration that stopped working, or an automation that stopped at one of its own limits |
+| Did not finish | A command that ended with a failure, an integration that stopped working, or an automation that was paused, by one of its own limits or by a refusal of its definition |
 | Result unknown | An action whose result is unknown, so nothing says whether it took effect; it is neither a failure nor a decision |
 | Results not read | The host cannot read some of a session's action results, so it cannot tell whether any of them is unknown; it does not mean that none is |
 | Ready to review | Finished work waiting to be looked at |

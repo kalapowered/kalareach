@@ -1393,8 +1393,8 @@ impl Engine {
                     AttentionRule::AutomationPaused,
                     keyed,
                     None,
-                    // The workflow journal's own record: identifiers and the name of a limit,
-                    // never anything a node, a terminal or a model produced.
+                    // The workflow journal's own record: identifiers and the name of a limit or
+                    // a refusal, never anything a node, a terminal or a model produced.
                     Text::Host(clip_summary(&format!("{named} paused: {reason}"))),
                     AttentionRouting::OwnerPolicy,
                 );

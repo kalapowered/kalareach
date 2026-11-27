@@ -126,8 +126,8 @@ wire_enum! {
     /// What a workflow alert is about.
     WorkflowAlertKind {
         CausalLimit => "causal_limit", "A causal chain ran out of budget and was paused.";
-        WorkflowPaused => "workflow_paused", "A workflow revision was paused by one of its own limits.";
-        WorkflowResumed => "workflow_resumed", "The pause a limit caused was cleared by enabling the revision.";
+        WorkflowPaused => "workflow_paused", "A workflow revision was paused by one of its own limits or by a refusal of its definition at admission.";
+        WorkflowResumed => "workflow_resumed", "The pause a limit or a refusal caused was cleared by enabling the revision.";
     }
 }
 
@@ -453,7 +453,8 @@ pub struct WorkflowDefinitionSummary {
     pub grant_reference: GrantId,
     /// Whether enabled.
     pub enabled: bool,
-    /// Whether paused, by `workflow.pause` or because one of its own limits was breached.
+    /// Whether paused, by `workflow.pause`, because one of its own limits was breached or because its
+    /// definition was refused at admission.
     pub paused: bool,
     /// When installed.
     pub installed_at_ms: TimestampMs,

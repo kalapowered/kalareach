@@ -1659,3 +1659,220 @@ async fn a_stored_capture_node_that_crosses_its_grant_is_refused_at_its_next_run
         "a refused admission leaves no run behind"
     );
 }
+
+/// A first leg that copies a version, and a stored review workflow that starts on the event the
+/// copy produces, both under one grant that carries every right and selects every session.
+struct StoredReview {
+    service: AutomationService,
+    table: Arc<GrantTable>,
+    grant_id: GrantId,
+    copy: WorkflowDefinition,
+    review: WorkflowDefinition,
+}
+
+impl StoredReview {
+    /// The review is installed under the broad grant, as every definition is today, or stored
+    /// with a shared working tree, as one installed before the refusal of that was.
+    fn new(number: u8, shared_tree: bool) -> Self {
+        use kr_protocol::project::WorkspaceKind;
+
+        let grant_id = test_grant_id(number);
+        let table = common::every_right(&[grant_id]);
+        let service = service(Arc::new(MockActionRunner::new()), Arc::clone(&table));
+        let copy = create_workflow_definition(
+            test_wf_id(number),
+            1,
+            "copy",
+            grant_id,
+            vec![node("copy", WorkflowActionKind::MaterializeChangeset)],
+            vec![],
+        );
+        let mut review = create_workflow_definition(
+            test_wf_id(number + 1),
+            1,
+            "review",
+            grant_id,
+            vec![node("review", WorkflowActionKind::RequestReview)],
+            vec![],
+        );
+        review.trigger.event_type = "changeset.materialized".to_owned();
+        let enable = |definition: &WorkflowDefinition| {
+            service
+                .submit_enable(
+                    &WorkflowEnableParams {
+                        workflow_id: definition.workflow_id,
+                        revision: definition.revision,
+                    },
+                    1_000,
+                )
+                .expect("the revision enables");
+        };
+        service
+            .submit_install(&install_params(&copy), 1_000)
+            .expect("the copy installs");
+        enable(&copy);
+        if shared_tree {
+            let mut params: serde_json::Value =
+                serde_json::from_str(&review.nodes[0].action_params).expect("the parameters");
+            params["workspace"] =
+                serde_json::to_value(WorkspaceKind::SharedExisting).expect("a kind");
+            review.nodes[0].action_params = params.to_string();
+            service
+                .store()
+                .save_definition(&review, 1_000)
+                .expect("stored");
+            service
+                .store()
+                .set_enabled(review.workflow_id, 1, true)
+                .expect("enabled");
+        } else {
+            service
+                .submit_install(&install_params(&review), 1_000)
+                .expect("the review installs under the broad grant");
+            enable(&review);
+        }
+        Self {
+            service,
+            table,
+            grant_id,
+            copy,
+            review,
+        }
+    }
+
+    /// The first leg runs, and the one pass that follows decides what its event triggered.
+    async fn trigger_once(&self, now_ms: u64) -> kr_automation::TriggerDecision {
+        self.service
+            .submit_run(&run_params(&self.copy, "evt-1"), now_ms)
+            .await
+            .expect("the first leg runs");
+        let mut decisions = self
+            .service
+            .dispatch_triggers(now_ms)
+            .await
+            .expect("a pass");
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        decisions.remove(0)
+    }
+
+    /// What the owner reads of the review: whether it is paused and enabled, and its alerts.
+    fn owner_reads(&self, now_ms: u64) -> kr_protocol::automation::WorkflowReadResult {
+        self.service
+            .read(
+                &kr_protocol::automation::WorkflowReadParams {
+                    workflow_id: Nullable::some(self.review.workflow_id),
+                    ..kr_protocol::automation::WorkflowReadParams::default()
+                },
+                None,
+                now_ms,
+            )
+            .expect("a read")
+    }
+}
+
+/// A stored review definition whose grant was issued again for fewer sessions is refused at its
+/// next derived trigger, and the owner is told: the revision is paused with the refusal as the
+/// reason, one attention item is owed, and enabling it again, once the grant covers it, clears the
+/// pause.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_derived_trigger_that_a_narrowed_grant_refuses_pauses_the_stored_review() {
+    use kr_automation::AuthoritySource;
+    use kr_protocol::grant::SessionSelector;
+    use kr_protocol::ids::SessionId;
+
+    let stored = StoredReview::new(60, false);
+    let mut narrowed = stored
+        .table
+        .grant(stored.grant_id, 1_000)
+        .expect("the grant");
+    narrowed.session_selector = SessionSelector::These {
+        session_ids: [SessionId::new(Uuid::from_bytes([61; 16]))]
+            .into_iter()
+            .collect(),
+    };
+    let broad = stored
+        .table
+        .grant(stored.grant_id, 1_000)
+        .expect("the grant");
+    stored.table.insert(narrowed);
+
+    let decision = stored.trigger_once(2_000).await;
+    let refusal = decision
+        .outcome
+        .expect_err("the narrowed grant no longer covers the review");
+    assert!(
+        refusal
+            .to_string()
+            .contains("asks for a session that does not exist yet"),
+        "{refusal}"
+    );
+    let read = stored.owner_reads(2_100);
+    assert!(read.definitions[0].enabled, "the definition stays enabled");
+    assert!(read.definitions[0].paused, "and is paused");
+    assert_eq!(read.alerts.len(), 1, "{:?}", read.alerts);
+    assert_eq!(
+        read.alerts[0].kind,
+        kr_protocol::automation::WorkflowAlertKind::WorkflowPaused
+    );
+    assert_eq!(read.alerts[0].reason, refusal.to_string());
+    assert!(
+        stored
+            .service
+            .store()
+            .list_runs(Some(stored.review.workflow_id))
+            .expect("the journal")
+            .is_empty(),
+        "a refused trigger starts no run"
+    );
+
+    stored.table.insert(broad);
+    stored
+        .service
+        .submit_enable(
+            &WorkflowEnableParams {
+                workflow_id: stored.review.workflow_id,
+                revision: stored.review.revision,
+            },
+            3_000,
+        )
+        .expect("the owner enables the revision again");
+    assert!(!stored.owner_reads(3_100).definitions[0].paused);
+}
+
+/// A review definition stored before a shared working tree was refused is refused at its next
+/// derived trigger with the words an explicit caller sees, and the owner is told the same way.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_derived_trigger_that_a_stored_shared_tree_review_meets_pauses_it() {
+    let stored = StoredReview::new(62, true);
+
+    let decision = stored.trigger_once(2_000).await;
+    let refusal = decision
+        .outcome
+        .expect_err("a review in a shared working tree is refused");
+    assert!(
+        refusal
+            .to_string()
+            .contains("reviews in a shared working tree"),
+        "{refusal}"
+    );
+    let read = stored.owner_reads(2_100);
+    assert!(read.definitions[0].enabled, "the definition stays enabled");
+    assert!(read.definitions[0].paused, "and is paused");
+    assert_eq!(read.alerts.len(), 1, "{:?}", read.alerts);
+    assert_eq!(
+        read.alerts[0].kind,
+        kr_protocol::automation::WorkflowAlertKind::WorkflowPaused
+    );
+    assert_eq!(read.alerts[0].reason, refusal.to_string());
+    assert!(
+        stored
+            .service
+            .store()
+            .list_runs(Some(stored.review.workflow_id))
+            .expect("the journal")
+            .is_empty(),
+        "a refused trigger starts no run"
+    );
+}

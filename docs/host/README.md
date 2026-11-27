@@ -6924,8 +6924,8 @@ here where it does not. Its timers wait for the first page each session answers 
 ### The workflow journal's alerts
 
 The environment has a source of its own beside the sessions': the workflow journal (see *The
-automation service*). When one of a workflow revision's own limits is breached, or a causal chain
-runs out of budget, the journal commits one attention record with the pause, and when a paused
+automation service*). When one of a workflow revision's own limits is breached, a derived trigger is
+refused by the revision's own definition at admission, or a causal chain runs out of budget, the journal commits one attention record with the pause, and when a paused
 revision is enabled again it commits one that ends the pause's item. The daemon reads these records
 as the journal's registered attention consumer, at its start and every two seconds after. It
 registers again before every pass, which also tells it how far the journal records it as having
@@ -7004,7 +7004,7 @@ raised, and a client of this release shows them.
 | `attention.adapter_failed` | An adapter failed | notable | urgent after five minutes, then every five |
 | `attention.host_contact_lost` | A host-contact-lost event, which the daemon does not send | notable | urgent after a minute, then every five |
 | `attention.application_notice` | An `OSC 9`, `OSC 99` or `OSC 777` sequence | informational | announced once |
-| `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain | notable | announced once |
+| `attention.automation_paused` | One of its own limits paused a workflow revision or a causal chain, or a refusal of its definition at admission paused a revision | notable | announced once |
 | `attention.authority_feed_removed` | The authority feed this host reads answered that it was removed from it | urgent | announced once; stands until the host reads another feed or none |
 | `attention.receipt_uncertain` | An action's upstream result is unknown, so the host cannot say whether it took effect; nothing raises it in this release | notable | announced once |
 | `attention.receipts_gap` | The host cannot read some of a session's action results, so it cannot say whether any of them is unknown; nothing raises it in this release | notable | announced once |
