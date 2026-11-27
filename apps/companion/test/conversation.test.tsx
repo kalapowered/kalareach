@@ -582,7 +582,7 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
     const { port } = fakeHost()
     // What the host writes in the refusal of an agent that two packages recognise equally well.
     const tie =
-      'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+      'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
     openConversation({
       ...port,
       sessionAgents: async (...args) => {
@@ -611,7 +611,7 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
   it('says the tie before the empty draft’s own words (KR-REQ-12.23)', async () => {
     const { port } = fakeHost()
     const tie =
-      'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+      'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
     openConversation({
       ...port,
       sessionAgents: async (...args) => {

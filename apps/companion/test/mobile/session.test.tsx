@@ -351,7 +351,7 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
 
   // What the host writes in the refusal of an agent that two packages recognise equally well.
   const TIE =
-    'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
 
   it("says why no package takes a prompt, in the host's own words, as the desktop does (KR-REQ-12.23)", async () => {
     const person = userEvent.setup()
