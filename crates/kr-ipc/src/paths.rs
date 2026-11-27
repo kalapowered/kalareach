@@ -5431,6 +5431,131 @@ mod tests {
         );
     }
 
+    /// A destination whose parent holds a NUL, in the two spellings a name can reach the system
+    /// in: as it is, which the standard library's own conversion refuses, and verbatim, which goes
+    /// to the system as it is. The folder's name is `a`, a NUL and `b`.
+    #[cfg(windows)]
+    fn destinations_with_a_nul_in_a_parent(directory: &Path) -> [(&'static str, PathBuf); 2] {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        let name = std::ffi::OsString::from_wide(&[u16::from(b'a'), 0, u16::from(b'b')]);
+        let plain = directory.join(name).join("file");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", plain.display()));
+        [("plain", plain), ("verbatim", verbatim)]
+    }
+
+    /// A write to a destination whose parent holds a NUL is refused and makes nothing in the
+    /// folder it was meant for. The system reads a name only as far as its first NUL, so a name
+    /// that is not refused makes the part before it: here a file `a`.
+    #[cfg(windows)]
+    fn assert_a_nul_in_a_parent_makes_nothing(write: fn(&Path, &[u8]) -> Result<()>) {
+        let directory = Inheriting::new("nul-in-a-parent");
+        for (spelling, destination) in destinations_with_a_nul_in_a_parent(&directory.0) {
+            let written = write(&destination, b"content");
+            assert!(
+                written.is_err(),
+                "a {spelling} name with a NUL in a parent is refused: {written:?}"
+            );
+            assert_eq!(
+                names_in(&directory.0),
+                Vec::<String>::new(),
+                "{spelling}: nothing is made in the folder, not even the part of the name before the NUL"
+            );
+        }
+    }
+
+    /// The replacing writer refuses a destination whose parent holds a NUL and makes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_replacing_writer_refuses_a_nul_in_a_parent_and_makes_nothing() {
+        assert_a_nul_in_a_parent_makes_nothing(write_owner_only_file);
+    }
+
+    /// The creating writer refuses a destination whose parent holds a NUL and makes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_creating_writer_refuses_a_nul_in_a_parent_and_makes_nothing() {
+        assert_a_nul_in_a_parent_makes_nothing(create_new_owner_only_file);
+    }
+
+    /// The directory writer refuses a destination whose parent holds a NUL and makes nothing.
+    #[cfg(windows)]
+    #[test]
+    fn the_directory_writer_refuses_a_nul_in_a_parent_and_makes_nothing() {
+        let directory = Inheriting::new("nul-in-a-parent-directory");
+        for (spelling, destination) in destinations_with_a_nul_in_a_parent(&directory.0) {
+            let made = windows::create_directory_with_list(&destination, "D:P(A;;GA;;;OW)");
+            assert_eq!(
+                names_in(&directory.0),
+                Vec::<String>::new(),
+                "{spelling}: nothing is made in the folder, not even the part of the name before the NUL"
+            );
+            assert!(
+                made.is_err(),
+                "a {spelling} name with a NUL in a parent is refused: {made:?}"
+            );
+        }
+    }
+
+    /// The length of the folder in the two cases that follow. The destination in it is 245
+    /// characters long, below the limit that a call without the verbatim prefix keeps. The
+    /// temporary name a writer makes beside it is 37 characters or more, so it is past the limit.
+    #[cfg(windows)]
+    const LONG_FOLDER_LENGTH: usize = 240;
+
+    /// A write to a destination below the short path limit, whose temporary name is past it, is
+    /// written whole and published, and nothing else is left in the folder.
+    #[cfg(windows)]
+    fn assert_a_temporary_name_past_the_limit_is_written(write: fn(&Path, &[u8]) -> Result<()>) {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let directory = Inheriting::new("long-temporary-name");
+        let used = directory.0.as_os_str().encode_wide().count() + 1;
+        let name = "d".repeat(
+            LONG_FOLDER_LENGTH
+                .checked_sub(used)
+                .filter(|length| (1..=255).contains(length))
+                .expect("the temporary folder leaves room for a name that gives the length"),
+        );
+        let folder = directory.0.join(name);
+        std::fs::create_dir(&folder).expect("the long folder");
+        let destination = folder.join("file");
+        assert_eq!(
+            destination.as_os_str().encode_wide().count(),
+            LONG_FOLDER_LENGTH + 5,
+            "the destination is the length the case is made for"
+        );
+        let written = write(&destination, b"whole");
+        assert!(
+            written.is_ok(),
+            "the write is made where its temporary name is past the limit and the destination is not: {written:?}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("the destination reads"),
+            b"whole",
+            "the destination holds what was written"
+        );
+        assert_eq!(
+            names_in(&folder),
+            vec!["file".to_owned()],
+            "nothing is left beside the destination"
+        );
+    }
+
+    /// The replacing writer writes whole where only its temporary name is past the short limit.
+    #[cfg(windows)]
+    #[test]
+    fn the_replacing_writer_publishes_where_only_its_temporary_name_is_past_the_limit() {
+        assert_a_temporary_name_past_the_limit_is_written(write_owner_only_file);
+    }
+
+    /// The creating writer writes whole where only its temporary name is past the short limit.
+    #[cfg(windows)]
+    #[test]
+    fn the_creating_writer_publishes_where_only_its_temporary_name_is_past_the_limit() {
+        assert_a_temporary_name_past_the_limit_is_written(create_new_owner_only_file);
+    }
+
     /// The variable that names the folder in which the two cases below meet.
     #[cfg(windows)]
     const TWO_TOKENS_FOLDER: &str = "KR_TWO_TOKENS_FOLDER";
