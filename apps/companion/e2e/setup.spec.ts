@@ -8,6 +8,8 @@
  * Every screenshot goes under the test artefact directory and is named for the requirement row it evidences.
  */
 
+import { platform } from 'node:os'
+
 import { expect, test, type Locator, type Page } from '@playwright/test'
 
 import { PRESENTATION_DEADLINE } from './bounds'
@@ -1064,7 +1066,11 @@ test.describe('the first-start assistant', () => {
   // Back or Continue, at any window and any text size. The soft edge belongs where the content
   // meets the bar, above the controls.
 
-  /** The windows the bar is held in: the narrowest phone's, a phone's and a desktop's. */
+  /**
+   * The windows the bar is held in. A desktop window is not made narrower than 480 points, so 320
+   * and 390 are the harness's own sizes: the narrowest and a common phone's width, where the two
+   * controls stack and where the page is longest. 1280 is a desktop's.
+   */
   const BAR_WINDOWS = [
     [320, 568],
     [390, 844],
@@ -1181,8 +1187,8 @@ test.describe('the first-start assistant', () => {
    * Where the page shows through behind a box of the bar. The box is drawn twice, over the content
    * and with the content hidden; a solid ground reads the same both ways, to the byte. It is read at
    * four places in the page so that text lies under the bar somewhere, and a read of the same box
-   * with the bar hidden proves that some did: a comparison that never had content beneath it would
-   * pass for the wrong reason.
+   * with the bar hidden proves that some did, for each box on its own: a comparison that never had
+   * content beneath a box would pass for the wrong reason.
    */
   async function showingThrough(
     page: Page,
@@ -1190,7 +1196,7 @@ test.describe('the first-start assistant', () => {
     targets: [string, () => Locator][]
   ): Promise<string[]> {
     const found: string[] = []
-    let contentBeneath = false
+    const beneathSome = new Set<string>()
     for (const share of [0.05, 0.25, 0.5, 0.75]) {
       const scrolled = await scrollShare(page, share)
       for (const [label, target] of targets) {
@@ -1208,13 +1214,17 @@ test.describe('the first-start assistant', () => {
         await hideForProbe(page, { content: true, bar: true })
         const nothing = await pictureOf(page, box)
         await hideForProbe(page, { content: false, bar: false })
-        if (!sameBytes(beneath, nothing)) contentBeneath = true
+        if (!sameBytes(beneath, nothing)) beneathSome.add(label)
         if (!sameBytes(shown, hidden)) {
           found.push(`${where}: the page shows through behind ${label}, at scroll ${scrolled}`)
         }
       }
     }
-    if (!contentBeneath) found.push(`${where}: no content lay under the bar at any place, so the read proved nothing`)
+    for (const [label] of targets) {
+      if (!beneathSome.has(label)) {
+        found.push(`${where}: no content lay under ${label} at any place, so the read proved nothing`)
+      }
+    }
     return found
   }
 
@@ -1232,6 +1242,9 @@ test.describe('the first-start assistant', () => {
       test(`keeps a solid ground behind every control of the setup bar at the ${size} text size, ${width} wide`, async ({
         page
       }) => {
+        // Two steps, two colour modes, four places and two controls, each read as four pictures: on
+        // a loaded machine this ran for up to 14 s of the 30 that a case is given.
+        test.slow()
         const found: string[] = []
         for (const name of BAR_STEPS) {
           await openForBar(page, name, width, height, ratio)
@@ -1287,45 +1300,51 @@ test.describe('the first-start assistant', () => {
   function barMaterial(page: Page): Promise<{
     ownImage: string
     ownAlpha: number
+    ownColor: string
     top: string
+    lineColor: string
     edgeShown: boolean
     edgeImage: string
     edgeHeight: number
     edgeBottom: number
     edgeEvents: string
+    edgePoint: string
     barHeight: number
-    unit: number
+    gap: number
   }> {
     return page.evaluate(() => {
       const bar = document.querySelector('.setup-controls')
-      if (!bar) throw new Error('the setup bar is not on the page')
+      if (!bar?.parentElement) throw new Error('the setup bar is not on the page')
       const own = getComputedStyle(bar)
       const edge = getComputedStyle(bar, '::before')
-      // The spacing unit the soft edge is sized in, read from the token as the page resolves it.
-      const probe = document.createElement('div')
-      probe.style.cssText = 'position:absolute;visibility:hidden;height:var(--gap-3)'
-      document.body.append(probe)
-      const unit = probe.getBoundingClientRect().height
-      probe.remove()
+      const box = bar.getBoundingClientRect()
+      // What a press in the middle of the soft edge reaches: the content beneath it, never the bar.
+      const hit = document.elementFromPoint(box.left + box.width / 2, box.top - parseFloat(edge.height) / 2)
+      const edgePoint = hit === null ? 'nothing' : bar.contains(hit) ? 'the bar' : hit.closest('#main') ? 'the content' : 'something else'
       const color = /rgba?\(([^)]*)\)/.exec(own.backgroundColor)?.[1]?.split(',') ?? []
       return {
         ownImage: own.backgroundImage,
         ownAlpha: color.length === 4 ? Number(color[3]) : color.length === 3 ? 1 : 0,
+        ownColor: own.backgroundColor,
         top: `${own.borderTopWidth} ${own.borderTopStyle}`,
+        lineColor: own.borderTopColor,
         edgeShown: edge.content !== 'none' && edge.display !== 'none',
         edgeImage: edge.backgroundImage,
         edgeHeight: parseFloat(edge.height),
         edgeBottom: parseFloat(edge.bottom),
         edgeEvents: edge.pointerEvents,
-        barHeight: bar.getBoundingClientRect().height,
-        unit
+        edgePoint,
+        barHeight: box.height,
+        // The gap that ends the page's content, which is the room the soft edge lies over.
+        gap: parseFloat(getComputedStyle(bar.parentElement).rowGap)
       }
     })
   }
 
   // The soft edge lies wholly above the bar's box: the box itself is a flat, opaque material, and a
-  // gradient that takes no pointer events ends where the box begins. Its height is two spacing
-  // units, so it does not grow with the bar when the two controls stack.
+  // gradient that takes no pointer events ends where the box begins. It is as tall as the gap that
+  // ends the content (one property sets both), so the content's last line stands clear of it, and
+  // it does not grow with the bar when the two controls stack.
   for (const [width, height, size, ratio] of [
     [320, 568, 'largest', LARGEST],
     [1280, 720, 'default', 1]
@@ -1340,10 +1359,9 @@ test.describe('the first-start assistant', () => {
       expect(material.edgeShown, 'the bar has a soft edge').toBe(true)
       expect(material.edgeImage, 'the soft edge is a gradient').toContain('linear-gradient')
       expect(material.edgeEvents, 'the soft edge takes no pointer events').toBe('none')
-      expect(material.edgeHeight, 'the soft edge is two spacing units tall').toBeCloseTo(material.unit * 2, 0)
-      expect(material.edgeBottom, 'the soft edge ends where the bar begins').toBeGreaterThanOrEqual(
-        material.barHeight - 0.5
-      )
+      expect(material.edgePoint, 'a press in the middle of the soft edge reaches').toBe('the content')
+      expect(material.edgeHeight, 'the soft edge is as tall as the gap that ends the content').toBeCloseTo(material.gap, 1)
+      expect(material.edgeBottom, 'the soft edge ends where the bar begins').toBeCloseTo(material.barHeight, 0)
     })
   }
 
@@ -1394,6 +1412,9 @@ test.describe('the first-start assistant', () => {
     expect(material.ownAlpha, `${form}: the bar's own box is opaque`).toBe(1)
     expect(material.edgeShown, `${form}: no soft edge`).toBe(false)
     expect(material.top, `${form}: the bar keeps its top line`).toBe('1px solid')
+    expect(material.lineColor, `${form}: the line is drawn in a colour that the ground is not`).not.toBe(
+      material.ownColor
+    )
   }
 
   // In reduced transparency the bar is solid, with a line along its top, and there is no soft edge:
@@ -1432,6 +1453,29 @@ test.describe('the first-start assistant', () => {
       await solidWithALine(page, 'forced colours')
       expect(
         await showingThrough(page, 'forced colours', [
+          ['the bar', () => page.locator('.setup-controls')],
+          ...barControls(page)
+        ]),
+        'where the page shows through'
+      ).toEqual([])
+    })
+
+    // More contrast: a fade over content is a transparency effect, and a person who asks for more
+    // contrast gets a hard edge, a line, in its place. Both engines take this preference from the test
+    // tool, so the media query itself matches in each.
+    test(`keeps the setup bar solid when more contrast is asked for at the ${size} text size, ${width} wide`, async ({
+      page
+    }) => {
+      await openForBar(page, 'capabilities', width, height, ratio)
+      await page.emulateMedia({ contrast: 'more' })
+      expect(
+        await page.evaluate(() => window.matchMedia('(prefers-contrast: more)').matches),
+        'the window asks for more contrast'
+      ).toBe(true)
+      await settled(page)
+      await solidWithALine(page, 'more contrast')
+      expect(
+        await showingThrough(page, 'more contrast', [
           ['the bar', () => page.locator('.setup-controls')],
           ...barControls(page)
         ]),
@@ -1485,16 +1529,26 @@ test.describe('the first-start assistant', () => {
             }
           }
           const edge = parseFloat(getComputedStyle(bar, '::before').height)
+          // The step's whole box, which holds what a line of text does not: a card's border and a
+          // control that lies lower than its label.
+          const content = scope.querySelector('.setup-body')
           return {
             bottom: bottom + window.scrollY,
             words,
+            contentBottom: (content?.getBoundingClientRect().bottom ?? Number.NEGATIVE_INFINITY) + window.scrollY,
             barTop: bar.getBoundingClientRect().top + window.scrollY,
             edge: Number.isFinite(edge) ? edge : 0
           }
         })
-        if (!Number.isFinite(end.bottom)) {
+        if (!Number.isFinite(end.bottom) || !Number.isFinite(end.contentBottom)) {
           found.push(`the ${name} step has no last line to read`)
           continue
+        }
+        const roomUnderBox = end.barTop - end.contentBottom
+        if (roomUnderBox < end.edge - 0.5) {
+          found.push(
+            `the ${name} step's box ends ${roomUnderBox.toFixed(1)} above the bar, under a soft edge ${end.edge.toFixed(1)} tall`
+          )
         }
         const room = end.barTop - end.bottom
         if (room < end.edge - 0.5) {
@@ -1506,6 +1560,245 @@ test.describe('the first-start assistant', () => {
       expect(found, 'last lines that the soft edge or the bar covers').toEqual([])
     })
   }
+
+  // ---- Keyboard focus and the bar -----------------------------------------------------------------
+  //
+  // A control that takes focus from the keyboard is shown whole: its box and its ring lie above the
+  // bar's soft edge and inside the window. An engine brings a focused control into view without
+  // knowing that the bar lies over the page, so the page gives that scroll its room: the bar's own
+  // height and its soft edge (`--setup-bar-room` on the setup view, measured from the bar) and the
+  // ring, which what takes focus there keeps below itself as a scroll margin.
+
+  /** Where the focused control lies, with its ring, in the window's coordinates. */
+  interface FocusedBox {
+    label: string
+    inBar: boolean
+    inMain: boolean
+    inRail: boolean
+    last: boolean
+    left: number
+    right: number
+    top: number
+    bottom: number
+    fadeTop: number
+    barTop: number
+    ring: number
+    width: number
+    scrollY: number
+  }
+
+  function focusedBox(page: Page): Promise<FocusedBox | null> {
+    return page.evaluate(() => {
+      const bar = document.querySelector('.setup-controls')
+      const main = document.getElementById('main')
+      const active = document.activeElement
+      if (!bar || !main || !active || active === document.body) return null
+      const box = active.getBoundingClientRect()
+      const style = getComputedStyle(active)
+      // The ring is drawn outside the box, by its offset and its width, where the page draws one.
+      const ring =
+        style.outlineStyle === 'none' ? 0 : parseFloat(style.outlineOffset) + parseFloat(style.outlineWidth)
+      const edge = getComputedStyle(bar, '::before')
+      const fade = edge.content !== 'none' && edge.display !== 'none' ? parseFloat(edge.height) : 0
+      const enabled = Array.from(bar.querySelectorAll('button')).filter((each) => !each.disabled)
+      return {
+        label: (active.getAttribute('data-testid') ?? active.textContent ?? active.tagName).trim().slice(0, 40),
+        inBar: bar.contains(active),
+        inMain: main.contains(active),
+        inRail: active.closest('.setup-rail') !== null,
+        last: enabled.at(-1) === active,
+        left: box.left - ring,
+        right: box.right + ring,
+        top: box.top - ring,
+        bottom: box.bottom + ring,
+        fadeTop: bar.getBoundingClientRect().top - fade,
+        barTop: bar.getBoundingClientRect().top,
+        ring,
+        width: window.innerWidth,
+        scrollY: window.scrollY
+      }
+    })
+  }
+
+  /**
+   * One move of the keyboard through the page's controls, forward or back. WebKit on a Mac moves
+   * through buttons only with Option held, as Safari does; no other engine or platform does, and
+   * there Option and Tab together move nothing.
+   */
+  async function moveFocus(page: Page, back: boolean, option: boolean): Promise<void> {
+    await page.keyboard.press(`${option ? 'Alt+' : ''}${back ? 'Shift+Tab' : 'Tab'}`)
+  }
+
+  /**
+   * Moves focus through the whole step with the keyboard and reads every stop: forward from the top
+   * of the page to the bar's last control, or back from the bar to the top of the page.
+   */
+  async function walkFocus(page: Page, back: boolean, option: boolean): Promise<FocusedBox[]> {
+    await page.evaluate((towardsTheEnd) => {
+      window.scrollTo({ top: towardsTheEnd ? document.documentElement.scrollHeight : 0, behavior: 'instant' })
+      if (towardsTheEnd) {
+        const enabled = Array.from(document.querySelectorAll<HTMLButtonElement>('.setup-controls button')).filter(
+          (each) => !each.disabled
+        )
+        enabled.at(-1)?.focus({ preventScroll: true })
+      } else {
+        // Forward from the page's first control: WebKit moves on from the step that was clicked to
+        // open this one, whatever else a script gives focus to, and would skip the steps before it.
+        document.querySelector<HTMLElement>('.skip-link')?.focus({ preventScroll: true })
+      }
+    }, back)
+    const stops: FocusedBox[] = []
+    for (let move = 0; move < 80; move += 1) {
+      await moveFocus(page, back, option)
+      const stop = await focusedBox(page)
+      // Going back, the first control of the page is passed and focus leaves the page.
+      if (stop === null && back) return stops
+      if (stop === null) throw new Error('focus was lost from the page')
+      stops.push(stop)
+      if (back ? !stop.inMain : stop.last) return stops
+    }
+    throw new Error(`focus did not ${back ? 'leave the page' : "reach the bar's last control"} in 80 moves`)
+  }
+
+  for (const [width, height] of BAR_WINDOWS) {
+    for (const [size, ratio] of BAR_SIZES) {
+      for (const name of ['identity', 'permissions', 'capabilities', 'host', 'ready'] as const) {
+        test(`shows a control that takes focus whole above the setup bar on the ${name} step at the ${size} text size, ${width} wide`, async ({
+          page,
+          browserName
+        }) => {
+          const option = browserName === 'webkit' && platform() === 'darwin'
+          await openForBar(page, name, width, height, ratio)
+          const found: string[] = []
+          for (const back of [false, true]) {
+            const stops = (await walkFocus(page, back, option)).filter((each) => each.inMain && !each.inBar)
+            expect(stops.length, `the controls that focus reached ${back ? 'going back' : 'going forward'}`).toBeGreaterThan(2)
+            for (const stop of stops) {
+              const where = `${back ? 'back' : 'forward'}, ${stop.label}, scroll ${String(Math.round(stop.scrollY))}`
+              if (stop.left < -0.5 || stop.right > stop.width + 0.5) {
+                const reach = `${stop.left.toFixed(1)} to ${stop.right.toFixed(1)} of ${String(stop.width)}`
+                if (stop.inRail) {
+                  // The rail of steps scrolls sideways inside itself, and a step is as wide as its
+                  // text asks, so the engine's own scroll of the rail decides how much of one shows.
+                  // That is the rail's and not the bar's: it is named in the run's report.
+                  test.info().annotations.push({
+                    type: 'a step of the rail, partly out sideways',
+                    description: `${where}: ${reach}, ${(stop.right - stop.left).toFixed(1)} px wide with its ring`
+                  })
+                } else {
+                  found.push(`${where}: outside the window sideways (${reach})`)
+                }
+              }
+              // Three kinds of control, by size against the room above the soft edge. (a) The box and its
+              // ring fit: both lie in the room. (b) The box fits and the box with its ring does not:
+              // the whole box lies in the room and the ring may be cut at the window's edge. (c) The
+              // box is taller than the room: its top edge lies in the room, so that a person sees
+              // where it starts and scrolls on. Kinds (b) and (c) are named, with their sizes, in the
+              // run's report.
+              const withRing = stop.bottom - stop.top
+              const boxTop = stop.top + stop.ring
+              const boxBottom = stop.bottom - stop.ring
+              const sizes = `box ${(boxBottom - boxTop).toFixed(1)} px, with its ring ${withRing.toFixed(1)} px, room ${stop.fadeTop.toFixed(1)} px; box ${boxTop.toFixed(1)} to ${boxBottom.toFixed(1)}`
+              if (withRing <= stop.fadeTop + 0.5) {
+                if (stop.top < -0.5) found.push(`${where}: its ring starts ${(-stop.top).toFixed(1)} above the window (${sizes})`)
+                if (stop.bottom > stop.fadeTop + 0.5) {
+                  found.push(`${where}: ends ${(stop.bottom - stop.fadeTop).toFixed(1)} under the soft edge or the bar (${sizes})`)
+                }
+              } else if (boxBottom - boxTop <= stop.fadeTop + 0.5) {
+                // The two ends of the margin that the page asks for cannot both be kept for a box this
+                // close to the room's size: the engine keeps one, so the box's end may lie in the top
+                // of the soft edge, where it is nearly clear, and never under the bar itself.
+                const into = Math.max(0, boxBottom - stop.fadeTop)
+                test.info().annotations.push({
+                  type: 'box fits the room, its ring does not',
+                  description: `${where}: ${sizes}${into > 0.5 ? `; the box ends ${into.toFixed(1)} px into the soft edge` : ''}`
+                })
+                if (boxTop < -0.5) found.push(`${where}: its box starts ${(-boxTop).toFixed(1)} above the window (${sizes})`)
+                if (boxBottom > stop.barTop + 0.5) {
+                  found.push(`${where}: its box ends ${(boxBottom - stop.barTop).toFixed(1)} under the bar (${sizes})`)
+                } else if (into > stop.ring + 0.5) {
+                  found.push(`${where}: its box ends ${into.toFixed(1)} px into the soft edge, more than the ring's ${String(stop.ring)} px (${sizes})`)
+                }
+              } else {
+                test.info().annotations.push({ type: 'box taller than the room', description: `${where}: ${sizes}` })
+                if (boxTop < -0.5 || boxTop >= stop.fadeTop - 0.5) {
+                  found.push(`${where}: its top edge is not in the room above the soft edge (${sizes})`)
+                }
+              }
+            }
+          }
+          expect(found, 'where a control that took focus is not whole above the bar').toEqual([])
+        })
+      }
+    }
+  }
+
+  test('measures the room under the setup bar, writes it only when the bar changes and removes it with the view', async ({
+    page
+  }) => {
+    await openForBar(page, 'capabilities', 390, 844, 1)
+    const room = (): Promise<{ held: number; bar: number; gap: number }> =>
+      page.evaluate(() => {
+        const bar = document.querySelector('.setup-controls')
+        const setup = document.querySelector('.setup')
+        if (!bar || !setup) throw new Error('the setup view is not on the page')
+        return {
+          held: parseFloat(getComputedStyle(setup).getPropertyValue('--setup-bar-room')),
+          bar: bar.getBoundingClientRect().height,
+          gap: parseFloat(getComputedStyle(setup).rowGap)
+        }
+      })
+    // The room is the bar's height and the gap above it, which the soft edge covers, at each text size.
+    for (const ratio of [1, LARGEST, 1]) {
+      await page.evaluate((value) => {
+        document.documentElement.style.setProperty('--text-scale', String(value))
+      }, ratio)
+      await settled(page)
+      await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+      const read = await room()
+      expect(read.held, `the room at ${String(ratio)}`).toBeCloseTo(read.bar + read.gap, 0)
+    }
+    // Scrolling and moving focus change nothing about the bar, so nothing is written.
+    const writes = await page.evaluate(async () => {
+      const setup = document.querySelector('.setup')
+      if (!setup) throw new Error('the setup view is not on the page')
+      let count = 0
+      const watching = new MutationObserver((records) => {
+        count += records.length
+      })
+      watching.observe(setup, { attributes: true, attributeFilter: ['style'] })
+      for (const top of [300, 900, 0]) {
+        window.scrollTo({ top, behavior: 'instant' })
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      }
+      document.getElementById('main')?.focus()
+      watching.disconnect()
+      return count
+    })
+    expect(writes, 'writes of the room while the bar keeps its height').toBe(0)
+    // Leaving the view takes the room with it: the view that left no longer holds it (a view that
+    // left the page keeps its inline style, so the read is made on the view itself), no element holds
+    // it, and the page's own scroll is as it was.
+    const view = await page.evaluateHandle(() => document.querySelector('.setup'))
+    // The sidebar that holds the way out is the desktop layout's.
+    await page.setViewportSize({ width: 1280, height: 720 })
+    await page.getByRole('button', { name: 'Sessions' }).click()
+    await expect(page.getByTestId('setup')).toBeHidden()
+    const gone = await view.evaluate((element) => ({
+      connected: element?.isConnected,
+      room: element instanceof HTMLElement ? element.style.getPropertyValue('--setup-bar-room') : null
+    }))
+    expect(gone.connected, 'the view that was left is out of the page').toBe(false)
+    expect(gone.room, 'the room that the view that left still holds').toBe('')
+    const left = await page.evaluate(() => ({
+      holders: document.querySelectorAll('[style*="--setup-bar-room"]').length,
+      padding: getComputedStyle(document.documentElement).scrollPaddingBottom,
+      margin: getComputedStyle(document.querySelector('main') ?? document.body).scrollMarginBottom
+    }))
+    expect(left.holders, 'elements that still hold the room').toBe(0)
+    expect(left.padding, 'the scroll padding after the view is left').toBe('auto')
+    expect(left.margin, 'the scroll margin after the view is left').toBe('0px')
+  })
 
   test('draws in both colour modes from the same tokens', async ({ page }) => {
     await openSetup(page)

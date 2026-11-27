@@ -26,7 +26,16 @@
  * check does, so nobody runs a check without having been shown it first.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject
+} from 'react'
 
 import type { CapabilityRecord, EnvironmentCapabilitiesResult } from '@kalareach/protocol'
 
@@ -232,6 +241,9 @@ export function Setup(): ReactNode {
   const chosen = listening ? read : undefined
   // Which read of the held file is the newest, so that an answer to an older one is dropped.
   const newestRead = useRef(0)
+  // The bar of Back and Continue, which lies over the end of the page once the view is read.
+  const bar = useRef<HTMLDivElement | null>(null)
+  useRoomUnderBar(bar, loaded)
   // The platform's file dialog is open, and has not been answered yet.
   const [choosing, setChoosing] = useState(false)
   // The environment in which the host last said a run is going, until an answer says it is not. A
@@ -592,7 +604,7 @@ export function Setup(): ReactNode {
         ) : null}
       </div>
 
-      <div className="setup-controls">
+      <div className="setup-controls" ref={bar}>
         <Button
           disabled={step === 0}
           onClick={() => {
@@ -677,6 +689,39 @@ export function Setup(): ReactNode {
       </Sheet>
     </div>
   )
+}
+
+/**
+ * Tells the view how much of the end of the page the bar of Back and Continue lies over.
+ *
+ * That is the bar's own height and the gap above it, which the soft edge covers (`--setup-edge`,
+ * `setup.css`). The height is the platform's to decide (its type, its text size and whether the two
+ * controls stand side by side), so it is measured, as it changes too. What takes focus in the view
+ * keeps that room below itself, so a control that the engine brings into view does not come to rest
+ * under the bar or its edge. The property is written when the room changes and is removed when the
+ * bar goes.
+ */
+function useRoomUnderBar(bar: RefObject<HTMLElement | null>, shown: boolean): void {
+  useLayoutEffect(() => {
+    const element = bar.current
+    const view = element?.parentElement ?? null
+    if (!shown || element === null || view === null) return
+    let written: number | null = null
+    const measure = () => {
+      const gap = Number.parseFloat(getComputedStyle(view).rowGap) || 0
+      const room = element.getBoundingClientRect().height + gap
+      if (room === written) return
+      written = room
+      view.style.setProperty('--setup-bar-room', `${String(room)}px`)
+    }
+    measure()
+    const watching = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure)
+    watching?.observe(element)
+    return () => {
+      watching?.disconnect()
+      view.style.removeProperty('--setup-bar-room')
+    }
+  }, [bar, shown])
 }
 
 /* ---- Step 1: the identity -------------------------------------------------------------------- */

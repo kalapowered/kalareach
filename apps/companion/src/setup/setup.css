@@ -16,7 +16,10 @@
 .setup {
   display: flex;
   flex-direction: column;
-  gap: var(--gap-5);
+  /* The content ends this far above the bar, and the bar's soft edge is this tall: it lies over the
+     gap and no further, so the last line of the content stands clear of it. */
+  --setup-edge: var(--gap-5);
+  gap: var(--setup-edge);
   max-width: 46rem;
   margin: 0 auto;
   padding-bottom: var(--gap-6);
@@ -209,16 +212,43 @@
 }
 
 /*
- * The soft edge where the content meets the bar lies above the bar's box, never inside it. It is two
- * spacing units tall whatever the bar's height, which changes when the two controls stack.
+ * The soft edge where the content meets the bar lies above the bar's box, never inside it. It is
+ * `--setup-edge` tall whatever the bar's height, which changes when the two controls stack.
  */
 .setup-controls::before {
   content: '';
   position: absolute;
   inset: auto 0 100%;
-  height: calc(var(--gap-3) * 2);
+  height: var(--setup-edge);
   background: linear-gradient(to top, var(--bg), transparent);
   pointer-events: none;
+}
+
+/*
+ * The bar lies over the end of the page, and an engine that brings a focused control into view does
+ * not know that. Setup.tsx measures the bar and the gap above it and sets their height as
+ * `--setup-bar-room` on the view. What takes focus in the view keeps that room, and the ring that the
+ * page draws round it, below itself, and the ring above itself, so a control is shown whole, ring
+ * and all, above the soft edge. The room is on what focus reaches and not on the page as scroll
+ * padding: the bar is in the page, and padding that kept the end of the page clear would have focus
+ * on Back or Continue scroll the page to bring the bar out from under itself.
+ *
+ * The ring is a 2px line 4px outside the control (`base.css`); a browser case reads its real reach.
+ */
+.setup {
+  --setup-ring: 6px;
+}
+
+.setup * {
+  scroll-margin-block: var(--setup-ring) calc(var(--setup-bar-room, 0px) + var(--setup-ring));
+}
+
+/* The bar's own controls stand in the room, and the sheet scrolls inside itself and is over the bar. */
+.setup-controls,
+.setup-controls *,
+.setup .sheet,
+.setup .sheet * {
+  scroll-margin-block: 0;
 }
 
 /* ---- Inside a card ---------------------------------------------------------------------------- */
@@ -422,11 +452,11 @@
 }
 
 /*
- * The floating controls are a material over the content. Where transparency is reduced, or the
- * system sets the colours (some engines then drop a gradient altogether), the soft edge gives way
- * to a line along the bar's top.
+ * The floating controls are a material over the content. Where transparency is reduced, more
+ * contrast is asked for, or the system sets the colours (some engines then drop a gradient
+ * altogether), the soft edge gives way to a line along the bar's top.
  */
-@media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more), (forced-colors: active) {
   .setup-controls {
     border-top: 1px solid var(--line);
   }
