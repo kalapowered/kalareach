@@ -225,6 +225,12 @@ export interface SessionSubject {
   readonly agentBindingRevision?: string
 }
 
+/**
+ * The host a slow try is for: the host the person chose, which this device is paired with, or the
+ * host on this computer.
+ */
+export type StillReaching = 'paired' | 'local'
+
 /** What the backend says about the host connection. */
 export interface ConnectionState {
   /** True while a session is live. */
@@ -237,6 +243,14 @@ export interface ConnectionState {
    * reader's own words for a loss with no reason show in its place.
    */
   readonly reason: string | null
+  /**
+   * Which host a try that has run for a while is still trying to reach, or null when no try is
+   * known to be slow. Native code sets it a few seconds into a try that follows a lost or failed
+   * one, and clears it in the write that ends the try. It is a state of its own and not words in
+   * `reason`, so a reader that branches on the reason never sees it; the line that says why there is
+   * no connection says this in its place while it is set.
+   */
+  readonly still_reaching: StillReaching | null
   /**
    * What this connection may do, while it is live, or null when native code has not said. The
    * host checks every right again when an action arrives; this is what a control's visibility is
@@ -322,14 +336,18 @@ export interface ConnectionSince {
 }
 
 /**
- * A connection state as the page takes it in: a blank reason is no reason.
+ * A connection state as the page takes it in: a blank reason is no reason, and a mark of a slow try
+ * that the page does not know is no mark.
  *
  * Every state a port hands the page, read or heard, passes through here, so a reader tells a
- * reason from its absence by null alone. A reason with words is kept exactly as it was sent.
+ * reason from its absence by null alone, and the mark is one of the two hosts or null. A reason with
+ * words is kept exactly as it was sent.
  */
 export function receivedConnection(sent: ConnectionState): ConnectionState {
   const words = sent.reason?.trim() ?? ''
-  return { ...sent, reason: words.length > 0 ? sent.reason : null }
+  const reaching =
+    sent.still_reaching === 'paired' || sent.still_reaching === 'local' ? sent.still_reaching : null
+  return { ...sent, reason: words.length > 0 ? sent.reason : null, still_reaching: reaching }
 }
 
 /**
@@ -2171,7 +2189,8 @@ export interface HostPort {
    * Calls `listener` when what a view's reads depend on changes: the host, whether it is connected,
    * its environment, the rights, whether it is paired, whether its grant answers to an organisation,
    * a replacement or a new connection. It is not called for the host's contact, for the reason, for
-   * the other hosts or for the inbox's epoch, and never for the state the registration finds.
+   * the mark of a slow try, for the other hosts or for the inbox's epoch, and never for the state the
+   * registration finds.
    * Resolves once the port has a state, from a read or from the first change it hears, with the
    * function that stops the listener: a read made after that cannot miss a change. A failed read of
    * the first state does not reject it.

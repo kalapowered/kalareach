@@ -9,6 +9,8 @@
 
 import { useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 
+import type { StillReaching } from '../../host/port'
+import { lostLine } from '../../model/connection-line'
 import { minimumTarget, showsBackControl, type Surface } from '../platform'
 
 /**
@@ -210,7 +212,11 @@ export function TopBar({
   readonly backLabel?: string
   readonly action?: ReactNode
   /** Where the connection stands, or null before anything has answered which. */
-  readonly connection: { readonly connected: boolean; readonly reason: string | null } | null
+  readonly connection: {
+    readonly connected: boolean
+    readonly reason: string | null
+    readonly reaching: StillReaching | null
+  } | null
   readonly surface: Surface
 }): ReactNode {
   const target = minimumTarget(surface)
@@ -219,6 +225,8 @@ export function TopBar({
   // Android has a system back gesture and a system affordance; a second one in the bar would be a
   // second way to do the same thing in a place the platform does not put it.
   const back = onBack && showsBackControl(surface)
+  // The words for a connection that is not live. A slow try's sentence shows whole and has no title.
+  const lost = connection === null || connection.connected ? null : lostLine(connection)
   return (
     <header className="m-topbar" ref={bar}>
       <span className="m-topbar-side">
@@ -245,7 +253,7 @@ export function TopBar({
       </span>
       <h1>{title}</h1>
       <span className="m-topbar-side">{action}</span>
-      <p className="m-connection" title={connection?.reason ?? undefined}>
+      <p className="m-connection" title={lost?.marked === true ? undefined : (connection?.reason ?? undefined)}>
         {connection === null ? (
           // Before the first answer there is no state to show, so there is no dot to colour.
           <span>Checking the connection…</span>
@@ -255,10 +263,8 @@ export function TopBar({
               className={`status-dot${connection.connected ? '' : ' offline'}`}
               aria-hidden="true"
             />
-            <span>
-              {connection.connected
-                ? 'In contact with this host'
-                : (connection.reason ?? 'Not in contact')}
+            <span className={lost?.marked === true ? 'm-connection-whole' : undefined}>
+              {lost === null ? 'In contact with this host' : lost.words}
             </span>
           </>
         )}

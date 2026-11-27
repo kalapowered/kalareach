@@ -1890,6 +1890,7 @@ describe('whether this device is reaching the host', () => {
             connected: false,
             environment_id: null,
             reason: 'this host cannot be contacted right now',
+            still_reaching: null,
             rights: null,
             paired: false,
             organisation: false,

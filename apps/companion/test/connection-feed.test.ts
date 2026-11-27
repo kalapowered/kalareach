@@ -14,6 +14,7 @@ const state = (revision: number, over: Partial<ConnectionState> = {}): Connectio
   connected: true,
   environment_id: 'env-a',
   reason: null,
+  still_reaching: null,
   rights: ['session.view'],
   paired: false,
   organisation: false,
@@ -480,14 +481,20 @@ describe('the feed that orders the connection’s states', () => {
     script.tell(state(3, { contact: { state: 'out_of_contact', since_ms: 1, escalates_at_ms: 2 } }))
     script.tell(state(4, { inbox_epoch: 2 }))
     script.tell(state(5, { reason: 'a new reason' }))
-    // Each of these does.
+    // This does.
     script.tell(state(6, { connected: false, environment_id: null, rights: null }))
-    script.tell(state(7, { replaced: 1 }))
-    script.tell(state(8, { link: 2 }))
-    script.tell(state(9, { host: { kind: 'paired', reference: 'x', name: 'X' } }))
+    // A mark that a slow try is still running moves the revision and the mark, nothing else: a
+    // watcher hears it, and it starts no view's reads, whether it is set or cleared.
+    const lost = { connected: false, environment_id: null, rights: null }
+    script.tell(state(7, { ...lost, still_reaching: 'paired' }))
+    script.tell(state(8, { ...lost, still_reaching: null }))
+    // Each of these does.
+    script.tell(state(9, { replaced: 1 }))
+    script.tell(state(10, { link: 2 }))
+    script.tell(state(11, { host: { kind: 'paired', reference: 'x', name: 'X' } }))
     await settle()
-    expect(watched).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9])
-    expect(triggered).toEqual([6, 7, 8, 9])
+    expect(watched).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    expect(triggered).toEqual([6, 9, 10, 11])
     feed.stop()
   })
 

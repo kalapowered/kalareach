@@ -17,7 +17,7 @@ import type { ActionRight } from '@kalareach/protocol'
 import { ShellConnection } from '../app/rights'
 import { useApp } from '../app/state'
 import { Toast } from '../components/ui'
-import { failureMessage } from '../host/port'
+import { failureMessage, type StillReaching } from '../host/port'
 import {
   AccountGlyph,
   AttentionGlyph,
@@ -120,6 +120,7 @@ export function MobileApp({
     readonly connected: boolean
     readonly environmentId: string | null
     readonly reason: string | null
+    readonly reaching: StillReaching | null
     readonly rights: readonly ActionRight[] | null
     readonly paired: boolean
   } | null>(null)
@@ -209,6 +210,7 @@ export function MobileApp({
             connected: state.connected,
             environmentId: state.environment_id,
             reason: state.reason,
+            reaching: state.still_reaching,
             rights: state.connected ? state.rights : null,
             paired: state.connected && state.paired
           })
@@ -218,6 +220,7 @@ export function MobileApp({
             connected: false,
             environmentId: null,
             reason: failureMessage(failure),
+            reaching: null,
             rights: null,
             paired: false
           })

@@ -393,6 +393,7 @@ describe('the desktop port and the connection state', () => {
     connected: false,
     environment_id: null,
     reason,
+    still_reaching: null,
     rights: null,
     paired: false,
     organisation: false,
@@ -452,6 +453,22 @@ describe('the desktop port and the connection state', () => {
     shell.answers.set('connection_state', live)
     expect(await tauriPort().connectionState()).toEqual(live)
     expect(await heard(live)).toEqual([live])
+  })
+
+  it('takes a slow-try mark it does not know in as no mark, and hands on the two it does', async () => {
+    const unknown: readonly unknown[] = ['remote', '', 'Paired', 1, true, {}]
+    for (const mark of unknown) {
+      const sent = { ...lost('the relay closed this connection'), still_reaching: mark } as ConnectionState
+      shell.answers.set('connection_state', sent)
+      expect(await tauriPort().connectionState()).toEqual(lost('the relay closed this connection'))
+      expect(await heard(sent)).toEqual([lost('the relay closed this connection')])
+    }
+    for (const mark of ['paired', 'local'] as const) {
+      const said = { ...lost('the relay closed this connection'), still_reaching: mark }
+      shell.answers.set('connection_state', said)
+      expect(await tauriPort().connectionState()).toEqual(said)
+      expect(await heard(said)).toEqual([said])
+    }
   })
 
   it('asks native code for what the page missed above a revision, and takes in each state', async () => {
@@ -673,6 +690,7 @@ const published = (environment: string | null, revision: number, over: Record<st
   connected: environment !== null,
   environment_id: environment,
   reason: null,
+  still_reaching: null,
   rights: [],
   paired: true,
   replaced: 0,

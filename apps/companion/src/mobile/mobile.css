@@ -151,6 +151,18 @@
   overflow-wrap: anywhere;
 }
 
+/*
+ * The sentence that says a slow try is still running is this application's own, a fixed one of
+ * about sixty characters, and it has no title to fall back on: at a large text size it wraps in
+ * full and the bar grows with it, so the whole sentence is always on the screen.
+ */
+.m-connection > span.m-connection-whole:last-child {
+  display: block;
+  -webkit-line-clamp: none;
+  line-clamp: none;
+  overflow: visible;
+}
+
 .m-main {
   overflow-y: auto;
   overscroll-behavior-y: contain;

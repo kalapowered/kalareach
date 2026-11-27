@@ -102,6 +102,7 @@ import type {
   SettingsPane,
   SetupIdentity,
   StandingEvent,
+  StillReaching,
   SyncServiceView,
   TerminalControl,
   TerminalAnchor,
@@ -650,6 +651,13 @@ export interface FakeHostControls {
    * it is not). The change is told as a revision of its own.
    */
   setContact(contact: HostContact | null): void
+  /**
+   * Says which host a slow try is still trying to reach, as native code does a few seconds into a
+   * try, or `null` when no try is slow. It is told as a revision of its own that moves nothing else,
+   * and it is kept as given: native code sets it only while no connection is live, and a test may
+   * set it over a live one to see that the page ignores it.
+   */
+  setStillReaching(reaching: StillReaching | null): void
   /**
    * Delivers `state` to everything listening to native code's raw events, as it is: its revision is
    * its own and nothing is recorded. Native code can tell a page a state twice, late, or after a
@@ -1768,6 +1776,8 @@ export function fakeHost(
   const hostDrafts = scriptedHostDrafts()
   /** How contact with the host in use stands when a test said so: otherwise the connection says. */
   let statedContact: HostContact | null = null
+  /** Which host a slow try is still trying to reach when a test said so: otherwise no try is slow. */
+  let statedReaching: StillReaching | null = null
   /** The revision of the newest state, and how many states are kept for a replay. */
   let connectionRevision = 1
   const KEPT_STATES = 256
@@ -1794,6 +1804,7 @@ export function fakeHost(
     connected,
     environment_id: connected ? hostEnvironment : null,
     reason: connected ? null : lostBecause,
+    still_reaching: statedReaching,
     rights: connected ? rights : null,
     paired: connected && pairedDevice,
     organisation: connected && pairedDevice && organisationHost,
@@ -4103,6 +4114,10 @@ export function fakeHost(
     },
     setContact(contact) {
       statedContact = contact
+      publishConnection()
+    },
+    setStillReaching(reaching) {
+      statedReaching = reaching
       publishConnection()
     },
     tellConnection(state) {

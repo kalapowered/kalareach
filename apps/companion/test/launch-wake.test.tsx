@@ -38,6 +38,7 @@ function replaceable(): { readonly port: HostPort; readonly publish: () => void 
     connected: true,
     environment_id: 'environment-1',
     reason: null,
+    still_reaching: null,
     rights: ['host.manage'],
     paired: false,
     organisation: false,

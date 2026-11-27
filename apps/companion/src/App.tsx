@@ -22,6 +22,7 @@ import type { ActionRight } from '@kalareach/protocol'
 import { AccountPanel, useAccount } from './components/AccountPanel'
 import { Brand, Button, INERT_SUPPORTED, Sheet, Toast, closeWithSheets, useModalSurface } from './components/ui'
 import { isSigningIn, type AccountView } from './model/account'
+import { lostLine } from './model/connection-line'
 import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
 import { Attention } from './views/Attention'
@@ -35,7 +36,7 @@ import { setupLinkFor, usePlatform } from './setup/platform'
 import { Setup } from './setup/Setup'
 import { KeptDrafts } from './views/KeptDrafts'
 import { useRebind } from './app/drafts'
-import { failureMessage, type ConnectionState } from './host/port'
+import { failureMessage, type ConnectionState, type StillReaching } from './host/port'
 import { useConfirmations } from './pairing/Confirmations'
 
 const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] = [
@@ -159,6 +160,7 @@ export function App(): ReactNode {
   const [connection, setConnection] = useState<{
     readonly connected: boolean
     readonly reason: string | null
+    readonly reaching: StillReaching | null
     readonly rights: readonly ActionRight[] | null
     readonly paired: boolean
   } | null>(null)
@@ -201,6 +203,7 @@ export function App(): ReactNode {
           setConnection({
             connected: state.connected,
             reason: state.reason,
+            reaching: state.still_reaching,
             rights: state.connected ? state.rights : null,
             paired: state.connected && state.paired
           })
@@ -210,6 +213,7 @@ export function App(): ReactNode {
           setConnection({
             connected: false,
             reason: failureMessage(failure),
+            reaching: null,
             rights: null,
             paired: false
           })
@@ -454,9 +458,7 @@ export function App(): ReactNode {
               ) : (
                 <>
                   <span className={`status-dot${connection.connected ? '' : ' offline'}`} />
-                  {connection.connected
-                    ? 'Connected to this machine'
-                    : (connection.reason ?? 'Not in contact')}
+                  {connection.connected ? 'Connected to this machine' : lostLine(connection).words}
                 </>
               )}
             </span>
