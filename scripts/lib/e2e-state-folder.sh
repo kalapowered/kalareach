@@ -256,7 +256,7 @@ e2e_state_folder_mark() {
 # the name, relative to the working directory, and the system's own error tells "no such entry" (the
 # name is not there) from every other failure (a folder that cannot be searched, an input or output
 # error, a name that is too long), which a test of the name in the shell cannot do. No directory is
-# listed and no pattern is expanded, so no text of a listing and no shell option can change the
+# listed and no pattern is expanded, so no text of a listing and no glob setting can change the
 # answer. The program is a constant text and the name is an argument after it, never part of it; the
 # flags are -I (the working directory is not on the import path, and the PYTHON variables are
 # ignored), -S (no site files, so no path file of a virtual environment runs) and -X utf8 (the
