@@ -137,13 +137,14 @@ impl Exchange {
     /// system's words.
     ///
     /// The rule reads the error's kind, so it reaches only the errors that the standard library
-    /// gives a kind. On Windows, a named pipe's broken-pipe (109) and no-data (232) errors read as
-    /// a broken pipe and are recognised. The "pipe is not connected" error (233) has no kind, and
-    /// it is what a client's write gets after the server forcibly disconnects the pipe, as the
-    /// example for disconnecting a pipe in the Tokio documentation shows. A hello write that fails
-    /// with it is [`ExchangeError::Broken`] with the system's words, not a refusal. No test runs
-    /// this exchange against a Windows pipe, and which of these errors a client's write gets when
-    /// the server end is simply closed has not been measured.
+    /// gives a kind. On Windows, the standard library of the toolchain this repository pins reads
+    /// a named pipe's broken-pipe (109) and no-data (232) errors as a broken pipe, which the rule
+    /// recognises. It gives the "pipe is not connected" error (233) the kind `Uncategorized`, which
+    /// the rule does not recognise. That is the error a client's write gets after the server
+    /// forcibly disconnects the pipe, as the example for disconnecting a pipe in the Tokio
+    /// documentation shows. A hello write that fails with it is [`ExchangeError::Broken`] with the
+    /// system's words, not a refusal. Which of these errors a hello write gets when the server
+    /// end of the pipe is simply closed has not been measured.
     ///
     /// # Errors
     ///
