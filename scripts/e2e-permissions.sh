@@ -139,7 +139,6 @@ mkdir -m 700 "$run_root/bin" "$run_root/r" "$run_root/evidence" "$run_root/scrat
 if [ -z "${E2E_STATE_FOLDER:-}" ]; then
   e2e_state_folder_take "the run's state folder $run_root/s" "$run_root/s" "${run_root##*/}"
 fi
-state_dir="$E2E_STATE_FOLDER"
 programs="${KR_E2E_PROGRAMS:-${CARGO_TARGET_DIR:-$root/target}/debug}"
 for binary in kr-controller kr-worker kr; do
   if [ ! -x "$programs/$binary" ]; then
@@ -154,8 +153,19 @@ for binary in kr-controller kr-worker kr; do
 done
 cp "$checks_binary" "$run_root/bin/disclosed-checks"
 export KR_RUNTIME_DIR="$run_root/r"
-export KR_STATE_DIR="$state_dir"
 kr="$run_root/bin/kr"
+# Every `kr` command runs inside the state folder, looked at again there, with the folder named `.`
+# in its own environment and nowhere else: a name that is exported absolute would be read by every
+# program started from here, and a relative one would mean another folder to each of them. A folder
+# that is no longer the checked one starts nothing and leaves a note for the cleanup to report.
+kr_state() {
+  local status=0
+  e2e_state_folder_kr "$kr" "$@" || status=$?
+  if [ "$status" -eq 125 ]; then
+    : >"$run_root/evidence/state-folder-changed"
+  fi
+  return "$status"
+}
 
 # The file the person authorises this context to read. It is this run's own file, in this run's own
 # directory: a check that read somebody's documents to prove it could would be the wrong check.
@@ -201,7 +211,7 @@ jobs_left() {
 cleanup() {
   local status=$?
   # Only what this script started, by the identifiers it recorded.
-  for session in $("$kr" list --json 2>/dev/null | /usr/bin/python3 -c \
+  for session in $(kr_state list --json 2>/dev/null | /usr/bin/python3 -c \
     'import json,sys
 try:
     document = json.load(sys.stdin)
@@ -209,7 +219,7 @@ except Exception:
     sys.exit(0)
 for entry in document.get("sessions", []):
     print(entry["display_number"])' 2>/dev/null); do
-    "$kr" close "$session" >/dev/null 2>&1 || true
+    kr_state close "$session" >/dev/null 2>&1 || true
   done
   # A closed session's worker ends, and the daemon then removes the worker's launchd job. The daemon
   # is left running until that has happened, within a bound, because a job it has not removed by
@@ -271,20 +281,22 @@ for entry in document.get("sessions", []):
 trap cleanup EXIT
 
 echo "starting the control daemon"
-# Started from the run's own root rather than from this checkout. A daemon's working directory is
-# what the workers it launches inherit, and a launched process that reaches the workspace volume
-# makes the operating system ask the person at the machine for permission. The daemon keeps its
-# signing key in a file store under this run's own directory, so nothing here queues behind the
-# platform's own credential store.
-# The state folder is looked at again from inside before the daemon is given its name.
+# Started inside the state folder, looked at again there, and given the folder by the name `.`: the
+# daemon turns the name into a path when it starts and opens each file by that path, so the folder it
+# is started in is the one that was checked. That folder is below the temporary directory on the
+# internal disk, like the run's root, and a daemon's own working directory is not what its workers
+# inherit: the daemon gives each worker a directory of its own, so a launched process does not reach
+# the workspace volume through it and the person at the machine is not asked for permission. The
+# daemon keeps its signing key in a file store under this run's own directory, so nothing here
+# queues behind the platform's own credential store.
 (
   if ! e2e_state_folder_enter; then
     echo "e2e: the state folder is no longer the one that was checked" >&2
     exit 1
   fi
-  cd "$run_root" && exec "$run_root/bin/kr-controller" \
+  exec "$run_root/bin/kr-controller" \
     --runtime-dir "$run_root/r" \
-    --state-dir "$state_dir" \
+    --state-dir . \
     --secret-store file \
     --worker "$run_root/bin/kr-worker"
 ) >"$run_root/evidence/controller.log" 2>&1 &
@@ -292,13 +304,13 @@ remember_process "$!" "$run_root/bin/kr-controller"
 daemon_started_at="$(date +%s)"
 daemon_deadline=$((daemon_started_at + 180))
 while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
-  if "$kr" doctor --json >/dev/null 2>&1; then
+  if kr_state doctor --json >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
 done
 answered=0
-if "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
+if kr_state doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   answered=1
 fi
 daemon_waited=$(( $(date +%s) - daemon_started_at ))
@@ -384,7 +396,7 @@ echo "\$?" > "$run_root/evidence/checks.status"
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/run-checks.sh"
-"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-checks.sh" --json \
+kr_state new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-checks.sh" --json \
   >"$run_root/evidence/create-checks.json"
 checks_display="$(read_json "$run_root/evidence/create-checks.json" display_number)"
 require "$(read_json "$run_root/evidence/create-checks.json" worker_profile)" "desktop_bound" \
@@ -585,7 +597,7 @@ exec cat
 SCRIPT
 chmod +x "$run_root/bin/run-tools.sh"
 
-"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-tools.sh" --json \
+kr_state new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/run-tools.sh" --json \
   >"$run_root/evidence/create-tools.json"
 tools_display="$(read_json "$run_root/evidence/create-tools.json" display_number)"
 for _ in $(seq 1 900); do
@@ -606,7 +618,7 @@ else
     fail "the tools ran in the graphical login context"
   fi
 fi
-"$kr" close "$tools_display" >/dev/null 2>&1 || true
+kr_state close "$tools_display" >/dev/null 2>&1 || true
 
 echo
 echo "5. no account of any kind on this path"
@@ -631,7 +643,7 @@ echo "  the environment this ran against: $(read_json "$run_root/evidence/doctor
 
 echo
 echo "closing the session the checks ran in"
-"$kr" close "$checks_display" >/dev/null 2>&1 || true
+kr_state close "$checks_display" >/dev/null 2>&1 || true
 
 echo
 if [ "$failed" -eq 0 ]; then

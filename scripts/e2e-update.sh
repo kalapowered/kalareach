@@ -66,8 +66,10 @@ started="$(date '+%Y-%m-%d %H:%M:%S')"
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-e2e-update.XXXXXX")"
 # The folder as the system reads it through its links, with no empty component in the name (the
 # system's TMPDIR can end in a slash): the state folders below it must pass the rule of
-# scripts/lib/e2e-state-folder.sh, which reads a path that way.
-work="$(cd -P "$work" && pwd -P)"
+# scripts/lib/e2e-state-folder.sh, which reads a path that way. The name is the system's own
+# (`/bin/pwd -P`), as the check reads it: the shell's record of its directory can keep a name that
+# has changed.
+work="$(cd -P "$work" && /bin/pwd -P)"
 # The name of this run, which both demonstrations take as the owner of their state folders, on the
 # first run and on the second.
 state_owner="${work##*/}"

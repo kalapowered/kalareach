@@ -103,7 +103,6 @@ mkdir -m 700 "$run_root/bin" "$run_root/r" "$run_root/evidence"
 if [ -z "${E2E_STATE_FOLDER:-}" ]; then
   e2e_state_folder_take "the run's state folder $run_root/s" "$run_root/s" "${run_root##*/}"
 fi
-state_dir="$E2E_STATE_FOLDER"
 # The build products, wherever this workspace's build cache is. They are copied to the internal
 # disk before anything is started, because a process a service manager launches asks the person at
 # the machine for permission the first time it reaches a removable volume.
@@ -120,8 +119,19 @@ for binary in kr-controller kr-worker kr; do
   "$run_root/bin/$binary" --version >/dev/null
 done
 export KR_RUNTIME_DIR="$run_root/r"
-export KR_STATE_DIR="$state_dir"
 kr="$run_root/bin/kr"
+# Every `kr` command runs inside the state folder, looked at again there, with the folder named `.`
+# in its own environment and nowhere else: a name that is exported absolute would be read by every
+# program started from here, and a relative one would mean another folder to each of them. A folder
+# that is no longer the checked one starts nothing and leaves a note for the cleanup to report.
+kr_state() {
+  local status=0
+  e2e_state_folder_kr "$kr" "$@" || status=$?
+  if [ "$status" -eq 125 ]; then
+    : >"$run_root/evidence/state-folder-changed"
+  fi
+  return "$status"
+}
 
 # The launchd jobs this run's daemon defined, by label. The daemon writes one definition per
 # worker's job into its environment's jobs directory and removes it once the job has gone.
@@ -182,7 +192,7 @@ record_marked_textedits() {
 cleanup() {
   local status=$?
   # Only what this script started, by the identifiers it recorded.
-  for session in $("$kr" list --json 2>/dev/null | /usr/bin/python3 -c \
+  for session in $(kr_state list --json 2>/dev/null | /usr/bin/python3 -c \
     'import json,sys
 try:
     document = json.load(sys.stdin)
@@ -190,7 +200,7 @@ except Exception:
     sys.exit(0)
 for entry in document.get("sessions", []):
     print(entry["display_number"])' 2>/dev/null); do
-    "$kr" close "$session" >/dev/null 2>&1 || true
+    kr_state close "$session" >/dev/null 2>&1 || true
   done
   # A closed session's worker ends, and the daemon then removes the worker's launchd job. The daemon
   # is left running until that has happened, within a bound, because a job it has not removed by
@@ -253,22 +263,23 @@ for entry in document.get("sessions", []):
 trap cleanup EXIT
 
 echo "starting the control daemon"
-# Started from the run's own root rather than from this checkout. A daemon's working directory is
-# what the workers it launches inherit, and a launched process that reaches the workspace volume
-# makes the operating system ask the person at the machine for permission.
+# Started inside the state folder, looked at again there, and given the folder by the name `.`: the
+# daemon turns the name into a path when it starts and opens each file by that path, so the folder it
+# is started in is the one that was checked. That folder is below the temporary directory on the
+# internal disk, like the run's root, and a daemon's own working directory is not what its workers
+# inherit: the daemon gives each worker a directory of its own, so a launched process does not reach
+# the workspace volume through it and the person at the machine is not asked for permission.
 # The daemon keeps its signing key in a file store under this run's own directory. The platform's
 # credential store is one file for the whole login, and a demonstration that used it would queue
 # behind every other host on the machine for a key it throws away at the end.
-# The daemon is started from the state folder's own working directory and then moved to the run's
-# root: the state folder is looked at again from inside before the daemon is given its name.
 (
   if ! e2e_state_folder_enter; then
     echo "e2e: the state folder is no longer the one that was checked" >&2
     exit 1
   fi
-  cd "$run_root" && exec "$run_root/bin/kr-controller" \
+  exec "$run_root/bin/kr-controller" \
     --runtime-dir "$run_root/r" \
-    --state-dir "$state_dir" \
+    --state-dir . \
     --secret-store file \
     --worker "$run_root/bin/kr-worker"
 ) >"$run_root/evidence/controller.log" 2>&1 &
@@ -282,7 +293,7 @@ remember_process "$controller_pid" "$run_root/bin/kr-controller"
 daemon_started_at="$(date +%s)"
 daemon_deadline=$((daemon_started_at + 180))
 while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
-  if "$kr" doctor --json >/dev/null 2>&1; then
+  if kr_state doctor --json >/dev/null 2>&1; then
     break
   fi
   sleep 0.2
@@ -290,7 +301,7 @@ done
 # The question that settles it is the one below, so the clock is read after it: a daemon that
 # answered the last attempt at sixty-five seconds took sixty-five, not the sixty the loop allowed.
 answered=0
-if "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
+if kr_state doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   answered=1
 fi
 daemon_waited=$(( $(date +%s) - daemon_started_at ))
@@ -329,7 +340,7 @@ print("" if document is None else document)
 
 echo
 echo "1. a session in the desktop execution context"
-"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --json >"$run_root/evidence/create-desktop.json"
+kr_state new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --json >"$run_root/evidence/create-desktop.json"
 desktop_display="$(read_json "$run_root/evidence/create-desktop.json" display_number)"
 require "$(read_json "$run_root/evidence/create-desktop.json" worker_profile)" \
   "desktop_bound" "the session runs in the desktop execution context"
@@ -385,7 +396,7 @@ cat >"$run_root/bin/session-shell.sh" <<SCRIPT
 exec "$run_root/bin/launch-gui.sh" "$run_root/evidence" "$run_root"
 SCRIPT
 chmod +x "$run_root/bin/session-shell.sh"
-"$kr" new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/session-shell.sh" --json \
+kr_state new --shell-mode native_compat --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/session-shell.sh" --json \
   >"$run_root/evidence/create-gui.json"
 gui_display="$(read_json "$run_root/evidence/create-gui.json" display_number)"
 for _ in $(seq 1 100); do
@@ -418,7 +429,7 @@ fi
 
 echo
 echo "3. the desktop identity read back through kr status"
-"$kr" status "$desktop_display" --json >"$run_root/evidence/status.json"
+kr_state status "$desktop_display" --json >"$run_root/evidence/status.json"
 require "$(read_json "$run_root/evidence/status.json" desktop.desktop_session_id)" "$desktop_id" \
   "kr status reports the desktop the session was created on"
 require "$(read_json "$run_root/evidence/status.json" worker_profile)" "desktop_bound" \
@@ -426,12 +437,12 @@ require "$(read_json "$run_root/evidence/status.json" worker_profile)" "desktop_
 
 echo
 echo "4. the power setting, and the assertion it takes for work the host has accepted"
-"$kr" host power --json >"$run_root/evidence/power-off.json"
+kr_state host power --json >"$run_root/evidence/power-off.json"
 require "$(read_json "$run_root/evidence/power-off.json" power.setting)" "off" \
   "the setting is off until the owner chooses it"
 require "$(read_json "$run_root/evidence/power-off.json" power.active)" "False" \
   "and nothing is held"
-"$kr" host power --set mains_only --json >"$run_root/evidence/power-on.json"
+kr_state host power --set mains_only --json >"$run_root/evidence/power-on.json"
 require "$(read_json "$run_root/evidence/power-on.json" power.setting)" "mains_only" \
   "the owner's choice is recorded"
 require "$(read_json "$run_root/evidence/power-on.json" power.active)" "False" \
@@ -441,11 +452,11 @@ echo "  this host is running on $power_source power"
 
 # A closure the host has accepted and not finished is a request outstanding. Closing the session
 # that started the graphical application is what produces one here.
-"$kr" close "$gui_display" >/dev/null 2>&1 &
+kr_state close "$gui_display" >/dev/null 2>&1 &
 close_job=$!
 held=""
 for _ in $(seq 1 100); do
-  "$kr" host power --json >"$run_root/evidence/power-held.json" 2>/dev/null || true
+  kr_state host power --json >"$run_root/evidence/power-held.json" 2>/dev/null || true
   if [ "$(read_json "$run_root/evidence/power-held.json" power.active)" = "True" ]; then
     held="$(read_json "$run_root/evidence/power-held.json" power.holder)"
     break
@@ -485,7 +496,7 @@ fi
 # And it goes when the work does.
 released=""
 for _ in $(seq 1 150); do
-  "$kr" host power --json >"$run_root/evidence/power-released.json" 2>/dev/null || true
+  kr_state host power --json >"$run_root/evidence/power-released.json" 2>/dev/null || true
   if [ "$(read_json "$run_root/evidence/power-released.json" power.active)" = "False" ]; then
     released="yes"
     break
@@ -498,13 +509,13 @@ if [ -n "$released" ]; then
 else
   fail "the assertion is released when the request finishes"
 fi
-"$kr" host power --set off --json >"$run_root/evidence/power-restored.json"
+kr_state host power --set off --json >"$run_root/evidence/power-restored.json"
 require "$(read_json "$run_root/evidence/power-restored.json" power.setting)" "off" \
   "the setting is restored to off"
 
 echo
 echo "5. an invisible session takes this host's own execution context"
-"$kr" new --shell-mode native_compat --invisible --cwd "$run_root" --json >"$run_root/evidence/create-default.json"
+kr_state new --shell-mode native_compat --invisible --cwd "$run_root" --json >"$run_root/evidence/create-default.json"
 default_display="$(read_json "$run_root/evidence/create-default.json" display_number)"
 require "$(read_json "$run_root/evidence/create-default.json" worker_profile)" "desktop_bound" \
   "an invisible session on a desktop host is not an implicit headless one"
@@ -526,7 +537,7 @@ cat >"$run_root/bin/headless-shell.sh" <<SCRIPT
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/headless-shell.sh"
-"$kr" new --shell-mode native_compat --invisible --headless --cwd "$run_root" --shell "$run_root/bin/headless-shell.sh" --json \
+kr_state new --shell-mode native_compat --invisible --headless --cwd "$run_root" --shell "$run_root/bin/headless-shell.sh" --json \
   >"$run_root/evidence/create-headless.json"
 headless_display="$(read_json "$run_root/evidence/create-headless.json" display_number)"
 for _ in $(seq 1 100); do
@@ -548,7 +559,7 @@ fi
 
 echo
 echo "7. what this host says about itself"
-"$kr" doctor --json >"$run_root/evidence/doctor-final.json" || true
+kr_state doctor --json >"$run_root/evidence/doctor-final.json" || true
 require "$(read_json "$run_root/evidence/doctor-final.json" host.default_worker_profile)" \
   "desktop_bound" "kr doctor reports the execution context new sessions get"
 /usr/bin/python3 -c '
@@ -578,7 +589,7 @@ fi
 echo
 echo "8. closing the sessions this run created"
 for display in "$desktop_display" "$default_display" "$headless_display"; do
-  "$kr" close "$display" --json >"$run_root/evidence/close-$display.json"
+  kr_state close "$display" --json >"$run_root/evidence/close-$display.json"
   require "$(read_json "$run_root/evidence/close-$display.json" state)" "closing" \
     "session $display was asked to close"
 done

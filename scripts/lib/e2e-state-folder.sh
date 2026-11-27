@@ -416,6 +416,27 @@ e2e_state_folder_enter() {
   e2e_state_folder_marker_ok "${E2E_STATE_FOLDER_OWNER:-}"
 }
 
+# e2e_state_folder_run <command> [<argument>...]: in the calling subshell, enters the state folder
+# (e2e_state_folder_enter) and replaces the subshell with the command, started inside it. It returns
+# 125, and starts nothing, where the folder is no longer the one that was checked.
+e2e_state_folder_run() {
+  e2e_state_folder_enter || return 125
+  exec "$@"
+}
+
+# e2e_state_folder_kr <kr> [<argument>...]: runs one `kr` command inside the state folder, in a
+# subshell of its own, with the state folder named `.` in KR_STATE_DIR of that command only. The name
+# is relative: the command turns it into a name when it starts, in the folder it was started in, which
+# is the checked one, so that no name outside the folder is left to be read twice. The caller's own
+# environment is not changed. It returns the command's status, or 125 where the folder is no longer
+# the one that was checked.
+e2e_state_folder_kr() {
+  (
+    export KR_STATE_DIR=.
+    e2e_state_folder_run "$@"
+  )
+}
+
 # e2e_state_folder_left_words <left>: the fixed words that say what the walk made and could not remove
 # (1 the marker, 2 the folder, 3 both); nothing for 0.
 e2e_state_folder_left_words() {

@@ -577,6 +577,54 @@ code=$?
 expect "the run's own folder below a root that others can write is refused" "1|e2e: refusing the run's state folder $t/enter/openrun/s: its folder $t/enter/openrun has mode drwxrwxrwx; every folder from the temporary directory down to the state folder must be closed to writes by its group and others (the temporary directory may instead carry the sticky bit), so remove the write permission of that folder, for example with chmod go-w" "$code|$out"
 expect "nothing is made below it" "$before" "$(snapshot "$t/enter/openrun")"
 
+echo "== a kr command runs inside the state folder, which its own environment names ."
+# A stand-in for `kr` says where it was started and what its environment holds, and ends with 7.
+cat > "$scratch/fakebin/standin-kr" << 'STANDIN'
+#!/bin/bash
+printf '%s|%s|%s\n' "$PWD" "${KR_STATE_DIR-unset}" "$*"
+exit 7
+STANDIN
+chmod 755 "$scratch/fakebin/standin-kr"
+rc="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
+  export KR_E2E_STATE=""
+  e2e_state_folder_check
+  run="$(mktemp -d "${E2E_STATE_TMP%/}/krrun.XXXXXX")"
+  e2e_state_folder_take "the run's state folder $run/s" "$run/s" "${run##*/}"
+  cd / || exit 1
+  said="$(e2e_state_folder_kr "$scratch/fakebin/standin-kr" new --json)"
+  status=$?
+  [ "$said" = "$run/s|.|new --json" ] && said=ok
+  echo "$said|$status|${KR_STATE_DIR-unset}"
+)"
+expect "a kr command is started in the state folder with KR_STATE_DIR set to . for it alone, and its status comes back" "ok|7|unset" "$rc"
+rc="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
+  export KR_E2E_STATE=""
+  e2e_state_folder_check
+  run="$(mktemp -d "${E2E_STATE_TMP%/}/krrun.XXXXXX")"
+  e2e_state_folder_take "the run's state folder $run/s" "$run/s" "${run##*/}"
+  printf '%s\n' "someone-else-1" > "$run/s/.kr-e2e-owner"
+  said="$(e2e_state_folder_kr "$scratch/fakebin/standin-kr" new --json)"
+  status=$?
+  echo "${said:-nothing}|$status"
+)"
+expect "a kr command is not started when the state folder is no longer the checked one, and the status says so" "nothing|125" "$rc"
+rc="$(
+  # shellcheck source=scripts/lib/e2e-state-folder.sh
+. "$root/scripts/lib/e2e-state-folder.sh"
+  export TMPDIR="$t"
+  export KR_E2E_STATE=""
+  e2e_state_folder_check
+  e2e_state_folder_kr "$scratch/fakebin/standin-kr" new --json > /dev/null 2>&1
+  echo "$?"
+)"
+expect "a kr command is not started when no state folder was taken, and the status says so" 125 "$rc"
+
 echo "== a folder on the way that is not the one its name gives"
 # A path that passes every look of the rule and then reaches another folder: another account that
 # could write the parent could put a link in place of a folder between the look at its name and the
@@ -943,7 +991,7 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
 done
 cases=$((cases + 1))
 # shellcheck disable=SC2016
-if grep -Fxq 'state_owner="${work##*/}"' "$update" && grep -Fxq 'work="$(cd -P "$work" && pwd -P)"' "$update"; then
+if grep -Fxq 'state_owner="${work##*/}"' "$update" && grep -Fxq 'work="$(cd -P "$work" && /bin/pwd -P)"' "$update"; then
   ok "e2e-update.sh names its run's folder by its physical path and takes the owner word from its name"
 else
   fail "e2e-update.sh does not take the owner word from the name of its physical work folder"
@@ -959,12 +1007,32 @@ for script in e2e-desktop.sh e2e-permissions.sh; do
     fail "$script does not make its run's root below the physical temporary directory that the check gave"
   elif ! grep -Fq -- "$take_text" "$file"; then
     fail "$script does not walk its own state folder with e2e_state_folder_take"
-  elif ! grep -Fqx 'state_dir="$E2E_STATE_FOLDER"' "$file"; then
-    fail "$script does not take its state folder's name from E2E_STATE_FOLDER"
   elif grep -Fq 'mkdir -m 700 "$state_dir"' "$file" || grep -Fq 'e2e_state_folder_enter "' "$file"; then
     fail "$script still makes its own state folder by hand or enters one by a name it was given"
   else
     ok "$script walks its own state folder like a named one and enters every folder the same way"
+  fi
+done
+
+echo "== scripts/e2e-desktop.sh, scripts/e2e-permissions.sh: the daemon and every kr command start in the state folder"
+# Read as text, like the lines above: on Linux both scripts stop before they start a daemon.
+for script in e2e-desktop.sh e2e-permissions.sh; do
+  cases=$((cases + 1))
+  file="$root/scripts/$script"
+  direct="$(grep -n -F '"$kr" ' "$file" | grep -v -F 'e2e_state_folder_kr "$kr" "$@"')"
+  cleanup_text="$(awk '/^cleanup\(\) \{/,/^trap cleanup EXIT/' "$file")"
+  if grep -Fq 'export KR_STATE_DIR' "$file"; then
+    fail "$script exports KR_STATE_DIR: every program started from it would read one name for the folder"
+  elif [ -n "$direct" ]; then
+    fail "$script runs a kr command outside the state folder: $direct"
+  elif ! grep -Fq 'e2e_state_folder_kr "$kr" "$@"' "$file"; then
+    fail "$script has no kr_state that runs kr through e2e_state_folder_kr"
+  elif ! grep -Fq -- '--state-dir . \' "$file" || grep -Fq -- '--state-dir "$state_dir"' "$file" || grep -Fq 'cd "$run_root" && exec' "$file"; then
+    fail "$script does not start the daemon inside the state folder with the name ."
+  elif ! printf '%s\n' "$cleanup_text" | grep -Fq 'kr_state list' || ! printf '%s\n' "$cleanup_text" | grep -Fq 'kr_state close'; then
+    fail "$script's cleanup does not run its kr commands inside the state folder"
+  else
+    ok "$script starts its daemon inside the state folder, named ., and runs every kr command there, its cleanup included"
   fi
 done
 
