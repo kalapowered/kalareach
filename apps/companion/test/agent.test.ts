@@ -17,6 +17,7 @@ import type {
   PendingResource
 } from '@kalareach/protocol'
 
+import tieRefusals from '../../../tests/fixtures/tie-refusals.json'
 import {
   actionableApprovals,
   hasUnreadRequest,
@@ -559,13 +560,15 @@ describe('a control says why it asks nothing of an agent no package is bound to 
     action_id: 'thread.refresh',
     parameters: { parameters: [] }
   }
-  // What the host writes in an instance's refusal when two or three packages recognise a program
-  // equally well (no package is bound then, and the words say what each makes of the program's
-  // version), and when it adopts a program that a package is bound to (the package is named then).
-  const TIE =
-    'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
-  const TIE_OF_THREE =
-    'it was not launched through the integration, and acme.codex, openai.codex and other.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
+  // The refusals of an instance that two or three packages of different publishers recognise
+  // equally well: no package is bound then, and the words say what each makes of the program's
+  // version. They are read from `tests/fixtures/tie-refusals.json`, the file the worker's own case
+  // holds the host's words to, so these cases show how the page presents the host's text; they do
+  // not run the host.
+  const TIE = tieRefusals.ties.two_publishers.refusal
+  const TIE_OF_THREE = tieRefusals.ties.three_publishers.refusal
+  // The refusal of an adopted program that a package is bound to: the host's `ADOPTED_REFUSAL`,
+  // written out here.
   const ADOPTED =
     'it was not launched through the integration, so no registration names it and none of its bridges is admitted'
   const adopted = (over: Partial<AgentInstanceSummary>): AgentInstanceSummary => ({

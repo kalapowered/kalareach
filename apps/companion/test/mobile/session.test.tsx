@@ -16,6 +16,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, LOST_CONTROL, terminalScreen, type HeldReads } from '../../src/host/fake'
 import { receivedFailure } from '../../src/host/tauri'
 import capacityRefusals from '../fixtures/capacity-refusals.json'
+import tieRefusals from '../../../../tests/fixtures/tie-refusals.json'
 import { DraftBook } from '../../src/model/draft-book'
 import { describeMode } from '../../src/mobile/model/gestures'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
@@ -349,9 +350,10 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
 
-  // What the host writes in the refusal of an agent that two packages recognise equally well.
-  const TIE =
-    'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
+  // The refusal of an agent that two packages of different publishers recognise equally well, read
+  // from `tests/fixtures/tie-refusals.json`, the file the worker's own case holds the host's words
+  // to: these cases show how the phone presents the host's text; they do not run the host.
+  const TIE = tieRefusals.ties.two_publishers.refusal
 
   it("says why no package takes a prompt, in the host's own words, as the desktop does (KR-REQ-12.23)", async () => {
     const person = userEvent.setup()

@@ -18,6 +18,7 @@ import userEvent from '@testing-library/user-event'
 import type { DocumentNode } from '@kalareach/plugin-sdk'
 import type { AgentSnapshotParams, PluginActionInvokeParams } from '@kalareach/protocol'
 
+import tieRefusals from '../../../tests/fixtures/tie-refusals.json'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost, type HeldReads } from '../src/host/fake'
@@ -580,9 +581,10 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
   it("says why no package takes a prompt, in the host's own words, for an agent no package took (KR-REQ-12.23)", async () => {
     const person = userEvent.setup()
     const { port } = fakeHost()
-    // What the host writes in the refusal of an agent that two packages recognise equally well.
-    const tie =
-      'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
+    // The refusal of an agent that two packages of different publishers recognise equally well, read
+    // from `tests/fixtures/tie-refusals.json`, the file the worker's own case holds the host's words
+    // to: this case shows how the page presents the host's text; it does not run the host.
+    const tie = tieRefusals.ties.two_publishers.refusal
     openConversation({
       ...port,
       sessionAgents: async (...args) => {
@@ -610,8 +612,7 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
 
   it('says the tie before the empty draft’s own words (KR-REQ-12.23)', async () => {
     const { port } = fakeHost()
-    const tie =
-      'it was not launched through the integration, and acme.codex and openai.codex each cover version 1.4.0, so no package was chosen for it and none of its bridges is admitted'
+    const tie = tieRefusals.ties.two_publishers.refusal
     openConversation({
       ...port,
       sessionAgents: async (...args) => {
