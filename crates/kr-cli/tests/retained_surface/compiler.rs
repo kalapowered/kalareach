@@ -772,11 +772,13 @@ pub fn check_command(
 }
 
 /// A check for another target links nothing, so the build script of `libsodium-sys-stable` has no
-/// library to supply for it. Given a library folder, that script returns before it compiles or
-/// fetches anything; without one it falls back, for a Windows target, to a prebuilt archive that the
-/// crate does not ship and downloads it, so the check would need the network of the machine that runs
-/// it. The folder is the target folder, which is made first so that it exists. The two variables that
-/// send the script another way are removed: a directory of archives, and pkg-config, which the script
+/// library to supply for it. Given a library folder, that script ends before it compiles anything,
+/// before it reads any setting for an archive and before it fetches anything. Without one it builds
+/// the shipped source; for a Windows target that build returns an error, the script then reads a
+/// prebuilt archive that the crate does not ship from a directory of archives or from its package
+/// folder, and it downloads the archive only when neither holds it, so the check would need the
+/// network of the machine that runs it. Nothing links, so any existing folder serves: the target
+/// folder is used, made first so that it exists. The pkg-config setting is removed, which the script
 /// refuses beside a library folder.
 fn without_library(command: &mut Command, target_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(target_dir)
@@ -784,8 +786,7 @@ fn without_library(command: &mut Command, target_dir: &Path) -> Result<(), Strin
         .map(|folder| {
             command
                 .env("SODIUM_LIB_DIR", folder)
-                .env_remove("SODIUM_USE_PKG_CONFIG")
-                .env_remove("SODIUM_DIST_DIR");
+                .env_remove("SODIUM_USE_PKG_CONFIG");
         })
         .map_err(|error| format!("{}: {error}", target_dir.display()))
 }

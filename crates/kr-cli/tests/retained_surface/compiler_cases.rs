@@ -837,10 +837,11 @@ fn refused(
 }
 
 /// A check for another target gives the build script of `libsodium-sys-stable` a library folder that
-/// exists and removes the variables that send it elsewhere, so that it fetches nothing; a check for the
-/// host leaves that script's environment alone.
+/// exists, so that it fetches nothing, and removes the pkg-config setting, which that script refuses
+/// beside a library folder; a check for the host leaves that script's environment alone. The case reads
+/// the environment of each command and starts no build.
 #[test]
-fn a_check_for_another_target_fetches_no_library_of_libsodium() {
+fn a_check_for_another_target_names_a_library_folder_for_libsodium() {
     let scratch = tempfile::tempdir().expect("a folder");
     let target = scratch.path().join("target");
     let meta = Meta::default();
@@ -854,20 +855,20 @@ fn a_check_for_another_target_fetches_no_library_of_libsodium() {
                 .map(|(_, value)| value)
         };
         if config.target.is_some() {
-            let folder = set("SODIUM_LIB_DIR")
-                .flatten()
-                .unwrap_or_else(|| panic!("{}: no library folder", config.name));
-            assert!(Path::new(folder).is_dir(), "{}: {folder:?}", config.name);
-            for name in ["SODIUM_USE_PKG_CONFIG", "SODIUM_DIST_DIR"] {
-                assert_eq!(
-                    set(name),
-                    Some(None),
-                    "{}: {name} is not removed",
-                    config.name
-                );
-            }
+            let folder = set("SODIUM_LIB_DIR").flatten().map(Path::new);
+            assert!(
+                folder.is_some_and(Path::is_dir),
+                "{}: the library folder is {folder:?}",
+                config.name
+            );
+            assert_eq!(
+                set("SODIUM_USE_PKG_CONFIG"),
+                Some(None),
+                "{}: the pkg-config setting is not removed",
+                config.name
+            );
         } else {
-            for name in ["SODIUM_LIB_DIR", "SODIUM_USE_PKG_CONFIG", "SODIUM_DIST_DIR"] {
+            for name in ["SODIUM_LIB_DIR", "SODIUM_USE_PKG_CONFIG"] {
                 assert_eq!(set(name), None, "{}: {name} is touched", config.name);
             }
         }
