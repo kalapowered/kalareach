@@ -1306,17 +1306,16 @@ mod windows {
     /// creates it, and reads the list back before the caller writes the first byte.
     ///
     /// No handle to the file can exist before the list does, so no account that its directory
-    /// admits can hold one that outlives it. The read back is the reader's own check, with
-    /// protection demanded: where the volume keeps no lists, or the list is not the one that was
-    /// asked for, the file is removed and the write fails, and no file is ever written without one.
+    /// admits can hold one that outlives it. The read back is the reader's own check of the
+    /// accounts the list names, and the file's own descriptor must say the list is protected:
+    /// where the volume keeps no lists, or the list is not the one that was asked for, the file
+    /// is removed and the write fails, and no file is ever written without one.
     ///
     /// # Errors
     ///
     /// Returns an error when the file cannot be created, or when the list it carries is not one
     /// this host accepts.
     pub(super) fn create_owner_only_file(path: &Path) -> Result<std::fs::File> {
-        use std::os::windows::io::AsHandle as _;
-
         let refused = |detail: String| IpcError::io("create", path, std::io::Error::other(detail));
         let user = TokenAccounts::read()
             .and_then(|accounts| {
@@ -1335,8 +1334,7 @@ mod windows {
         let descriptor = owner_only_file_descriptor(&user);
         let file = create_file_with_descriptor(path, &descriptor)
             .map_err(|error| IpcError::io("create", path, error))?;
-        if let Err(refusal) = check_access_list(file.as_handle(), &path.display().to_string(), true)
-        {
+        if let Err(refusal) = check_new_file_list(&file, &path.display().to_string()) {
             drop(file);
             let _ = std::fs::remove_file(path);
             return Err(refused(format!(
@@ -1346,6 +1344,57 @@ mod windows {
             )));
         }
         Ok(file)
+    }
+
+    /// Reads back the list a file just made carries: the accounts it names are checked as the
+    /// reader checks them, and the file's own descriptor must say the list is protected.
+    fn check_new_file_list(
+        file: &std::fs::File,
+        what: &str,
+    ) -> std::result::Result<(), AccessListRefusal> {
+        use std::os::windows::io::AsHandle as _;
+
+        check_access_list(file.as_handle(), what, false)?;
+        if list_is_protected(file.as_handle())? {
+            return Ok(());
+        }
+        Err(AccessListRefusal::Policy(format!(
+            "{what} inherits its access-control list from the directory above it, which can widen \
+             it at any time"
+        )))
+    }
+
+    /// Reads from the kernel's own descriptor whether the discretionary list of an opened file is
+    /// protected from what its directory passes down.
+    ///
+    /// The call [`check_access_list`] reads through reports a list protected when the list records
+    /// no entry as inherited, which is also what a list made without protection in the creating
+    /// call looks like, so it cannot tell the two apart.
+    fn list_is_protected(
+        handle: BorrowedHandle<'_>,
+    ) -> std::result::Result<bool, AccessListRefusal> {
+        let descriptor = query_descriptor(
+            handle,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        )?;
+        let mut control: u16 = 0;
+        let mut revision: u32 = 0;
+        // SAFETY: the descriptor is the one the kernel wrote into this buffer, and both out
+        // parameters are live.
+        let read = unsafe {
+            GetSecurityDescriptorControl(
+                descriptor.as_ptr().cast_mut().cast(),
+                &raw mut control,
+                &raw mut revision,
+            )
+        };
+        if read == 0 {
+            return Err(AccessListRefusal::Unreadable(format!(
+                "the control of its security descriptor could not be read: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(control & SE_DACL_PROTECTED != 0)
     }
 
     /// Checks the access-control list of an opened directory.
@@ -1792,7 +1841,7 @@ mod windows {
                         .to_owned(),
                 ));
             }
-            let descriptor = query_descriptor(file.as_handle())?;
+            let descriptor = query_descriptor(file.as_handle(), ACCESS_CLASSES)?;
             read_descriptor(&descriptor)
         }
 
@@ -1859,10 +1908,11 @@ mod windows {
         }
     }
 
-    /// Reads the security descriptor a handle holds, every class [`ACCESS_CLASSES`] names, into
-    /// a buffer aligned for it.
+    /// Reads the classes `classes` names of the security descriptor a handle holds, into a buffer
+    /// aligned for it.
     fn query_descriptor(
         handle: BorrowedHandle<'_>,
+        classes: u32,
     ) -> std::result::Result<Vec<u64>, AccessListRefusal> {
         let mut buffer = vec![0_u64; 128];
         // A descriptor can grow between the call that measures it and the call that reads it, so
@@ -1875,7 +1925,7 @@ mod windows {
             let read = unsafe {
                 GetKernelObjectSecurity(
                     handle.as_raw_handle(),
-                    ACCESS_CLASSES,
+                    classes,
                     buffer.as_mut_ptr().cast(),
                     length,
                     &raw mut needed,
@@ -5336,6 +5386,51 @@ mod tests {
                 "{what}: nothing is left beside it"
             );
         }
+    }
+
+    /// A new file whose list is not protected and records no entry as inherited is refused by the
+    /// read back of both writers. The call that reads a list for the reader reports such a list
+    /// protected, so the refusal rests on the file's own descriptor: a list made without
+    /// protection in the creating call is what a folder or a volume that overrides the creation
+    /// would leave.
+    #[cfg(windows)]
+    #[test]
+    fn a_new_file_with_an_unprotected_list_that_records_no_inherited_entry_is_refused() {
+        let directory = Inheriting::new("unprotected-bare");
+        pass_the_users_group_down(&directory);
+        let user = this_account();
+        let descriptor = format!("O:{user}D:(A;;GA;;;{user})(A;;GA;;;SY)(A;;GA;;;BA)");
+        let bare = directory.described("bare", &descriptor);
+        assert!(
+            access(&bare).records_nothing_set_here(),
+            "the descriptor makes a file that records nothing set on it and is not protected"
+        );
+        let target = directory.0.join("target");
+        write_owner_only_file(&target, b"kept").expect("a first write");
+        DESCRIPTOR.with(|chosen| *chosen.borrow_mut() = Some(descriptor));
+        let replaced = write_owner_only_file(&target, b"changed");
+        let created = create_new_owner_only_file(&directory.0.join("fresh"), b"changed");
+        DESCRIPTOR.with(|chosen| *chosen.borrow_mut() = None);
+        for (what, written) in [("replacing", replaced), ("creating", created)] {
+            assert!(
+                written.is_err(),
+                "the {what} writer fails on a list that is not protected"
+            );
+            assert!(
+                format!("{written:?}").contains("inherits its access-control list"),
+                "the {what} writer says the list is not protected: {written:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&target).expect("the destination reads"),
+            b"kept",
+            "the destination is as it was"
+        );
+        assert_eq!(
+            names_in(&directory.0),
+            vec!["bare".to_owned(), "target".to_owned()],
+            "nothing is left beside the two files"
+        );
     }
 
     /// The variable that names the folder in which the two cases below meet.
