@@ -28,14 +28,14 @@
 //! # The workflow journal's alerts
 //!
 //! The environment's own source is the workflow journal's attention records: a workflow revision or
-//! a causal chain that one of its own limits paused, a revision paused by one of its own limits or
-//! by a refusal of its definition at admission, and a revision enabled again. The store reads
-//! them as the journal's registered attention consumer. Each pass registers, reads the records past
-//! the store's own cursor, commits what they raise or end, and only then tells the journal how far
-//! the store has read, so a daemon that stops between the two neither loses a record nor counts one
-//! twice. A journal that says the store has read further than the store's cursor holds is a store
-//! that lost what it had written: what the journal still keeps of that range is read again and the
-//! whole range is recorded as a gap, in one write.
+//! a causal chain that one of its own limits paused, a revision that a refusal of its definition at
+//! admission paused, and a revision enabled again. The store reads them as the journal's registered
+//! attention consumer. Each pass registers, reads the records past the store's own cursor, commits
+//! what they raise or end, and only then tells the journal how far the store has read, so a daemon
+//! that stops between the two neither loses a record nor counts one twice. A journal that says the
+//! store has read further than the store's cursor holds is a store that lost what it had written:
+//! what the journal still keeps of that range is read again and the whole range is recorded as a
+//! gap, in one write.
 //!
 //! # Text
 //!
