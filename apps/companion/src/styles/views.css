@@ -1493,6 +1493,11 @@
     /* What the drawer scrolls stays in the drawer: the page behind is held by the shell. */
     overscroll-behavior: contain;
     transform: translateX(var(--drawer-from));
+    /* Closed, it takes no press at once, and once its exit has ended it is not drawn: it takes no
+       focus and no reader reads it. The shell also makes it inert, but a web view that lacks that
+       attribute has only these rules. */
+    visibility: hidden;
+    pointer-events: none;
     -webkit-app-region: no-drag;
     app-region: no-drag;
   }
@@ -1503,13 +1508,15 @@
 
   /* The drawer goes out by a transition once a person has opened it in this form. A window that
      changes form puts the sidebar in its closed place without moving it: a resize is not an act
-     that the drawer answers. */
+     that the drawer answers. Its visibility changes as the exit ends, on the exit's own time. */
   .sidebar[data-used='true'] {
-    transition: transform var(--state) var(--ease-out);
+    transition: transform var(--state) var(--ease-out), visibility var(--state);
   }
 
   .sidebar[data-open='true'] {
     transform: none;
+    visibility: visible;
+    pointer-events: auto;
     box-shadow: var(--shadow-sheet);
     transition: transform var(--surface-in) var(--ease-out);
   }
@@ -1602,7 +1609,7 @@
   }
 
   .sidebar[data-used='true'] {
-    transition: opacity var(--press) ease;
+    transition: opacity var(--press) ease, visibility var(--press);
   }
 
   .sidebar[data-open='true'] {

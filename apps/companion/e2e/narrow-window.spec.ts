@@ -143,9 +143,10 @@ function stopSampling(page: Page): Promise<number[]> {
   })
 }
 
-/** What the page was told of a transition of the sidebar's transform: the event, and the seconds it had run. */
+/** What the page was told of a transition of the sidebar: the event, the property, and the seconds it had run. */
 interface TravelEvent {
   readonly type: string
+  readonly property: string
   readonly elapsed: number
 }
 
@@ -154,15 +155,20 @@ const OPEN_SECONDS = 0.2
 const CLOSE_SECONDS = 0.16
 /** How far the seconds a transition reports may be from the ruled time. */
 const TOLERANCE_SECONDS = 0.01
+/** The reduced-motion fade runs on `--press`. */
+const FADE_SECONDS = 0.12
 
 /**
- * Listens, from now on, for the transitions of the sidebar's transform. A transition is the travel:
- * the engine runs it for its ruled time whatever number of frames it draws in that time, so the
- * events are read and the frames are not counted.
+ * Listens, from now on, for the transitions of the sidebar. A transition is the travel (or, with
+ * reduced motion, the fade): the engine runs it for its ruled time whatever number of frames it draws
+ * in that time, so the events are read and the frames are not counted.
  */
 async function watchTravel(page: Page): Promise<void> {
   await page.evaluate(() => {
-    const holder = window as unknown as { __travel?: { type: string; elapsed: number }[]; __travelListening?: boolean }
+    const holder = window as unknown as {
+      __travel?: { type: string; property: string; elapsed: number }[]
+      __travelListening?: boolean
+    }
     holder.__travel = []
     if (holder.__travelListening === true) return
     holder.__travelListening = true
@@ -171,9 +177,8 @@ async function watchTravel(page: Page): Promise<void> {
         type,
         (event) => {
           const transition = event as TransitionEvent
-          if (transition.propertyName !== 'transform') return
           if (!(transition.target as Element).matches('aside.sidebar')) return
-          holder.__travel?.push({ type, elapsed: transition.elapsedTime })
+          holder.__travel?.push({ type, property: transition.propertyName, elapsed: transition.elapsedTime })
         },
         true
       )
@@ -181,17 +186,21 @@ async function watchTravel(page: Page): Promise<void> {
   })
 }
 
-/** The events of the sidebar's transform since `watchTravel`. */
-function travelOf(page: Page): Promise<TravelEvent[]> {
-  return page.evaluate(() => [...((window as unknown as { __travel?: TravelEvent[] }).__travel ?? [])])
+/** The events of the sidebar's `property` since `watchTravel`. */
+async function travelOf(page: Page, property = 'transform'): Promise<TravelEvent[]> {
+  const all = await page.evaluate(() => [...((window as unknown as { __travel?: TravelEvent[] }).__travel ?? [])])
+  return all.filter((event) => event.property === property)
 }
 
-/** The sidebar's transform ran its transition from start to end for the ruled time, and was not cut short. */
-async function expectTravel(page: Page, seconds: number, what: string): Promise<void> {
+/** The sidebar's `property` ran its transition from start to end for the ruled time, and was not cut short. */
+async function expectTravel(page: Page, seconds: number, what: string, property = 'transform'): Promise<void> {
   await expect
-    .poll(async () => (await travelOf(page)).some((event) => event.type === 'transitionend' || event.type === 'transitioncancel'), what)
+    .poll(
+      async () => (await travelOf(page, property)).some((event) => event.type === 'transitionend' || event.type === 'transitioncancel'),
+      what
+    )
     .toBe(true)
-  const events = await travelOf(page)
+  const events = await travelOf(page, property)
   expect(
     events.map((event) => event.type),
     `${what}: the events of the transition`
@@ -230,6 +239,72 @@ function settledScroll(page: Page, boundMilliseconds = 3000): Promise<number> {
 /** Whether the focus is inside the drawer. */
 function focusInDrawer(page: Page): Promise<boolean> {
   return page.evaluate(() => document.activeElement?.closest('aside.sidebar') != null)
+}
+
+/**
+ * What a person meets while the drawer is closed, whatever the web view does with `inert`: it takes
+ * no press, it is not drawn once its exit has ended, so it takes no focus and is not read, and no
+ * point of the window reaches it. The exit may still be running when this starts, so it is read
+ * until it has ended.
+ */
+async function expectDrawerClosed(page: Page): Promise<void> {
+  // Each part is read and reported, so that a failure says which of them a person would meet.
+  const each = expect.configure({ soft: true })
+  await each(page.locator('aside.sidebar'), 'a closed drawer is not drawn').toBeHidden()
+  await each
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const style = getComputedStyle(document.querySelector('aside.sidebar') as Element)
+          return `${style.visibility} ${style.pointerEvents}`
+        }),
+      'a closed drawer takes no focus and no press'
+    )
+    .toBe('hidden none')
+  each(await page.getByRole('button', { name: 'Close menu' }).count(), 'its controls are not in the accessibility tree').toBe(0)
+  each(await page.getByRole('complementary', { name: 'Workspace navigation' }).count()).toBe(0)
+  each(await page.locator('body').ariaSnapshot(), 'a reader is not told of the closed drawer').not.toContain('Close menu')
+  const reached = await page.evaluate(() => {
+    const found: string[] = []
+    for (const x of [4, 60, 120, 180, 234]) {
+      for (const y of [20, 100, 300, 500, 700]) {
+        if (document.elementFromPoint(x, y)?.closest('aside.sidebar') != null) found.push(`${x},${y}`)
+      }
+    }
+    return found
+  })
+  each(reached, 'no point of the window reaches the closed drawer').toEqual([])
+}
+
+/** How many of `presses` Tab stops from the start of the page are inside the drawer. */
+async function tabStopsInDrawer(page: Page, presses: number): Promise<number> {
+  await page.evaluate(() => {
+    ;(document.activeElement as HTMLElement | null)?.blur()
+  })
+  let inside = 0
+  for (let press = 0; press < presses; press += 1) {
+    await page.keyboard.press(tabKeys().forward)
+    if (await focusInDrawer(page)) inside += 1
+  }
+  return inside
+}
+
+/**
+ * A web view that has no `inert`: no property, and no effect of the attribute either, which the
+ * engine would honour whatever the property says. The page's own rules are all that is left.
+ */
+async function withoutInert(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    delete (HTMLElement.prototype as { inert?: boolean }).inert
+    const setAttribute = Object.getOwnPropertyDescriptor(Element.prototype, 'setAttribute')?.value as Element['setAttribute']
+    Element.prototype.setAttribute = function (this: Element, name: string, value: string): void {
+      if (name.toLowerCase() !== 'inert') setAttribute.call(this, name, value)
+    }
+    const toggleAttribute = Object.getOwnPropertyDescriptor(Element.prototype, 'toggleAttribute')?.value as Element['toggleAttribute']
+    Element.prototype.toggleAttribute = function (this: Element, name: string, force?: boolean): boolean {
+      return name.toLowerCase() === 'inert' ? false : toggleAttribute.call(this, name, force)
+    }
+  })
 }
 
 /**
@@ -276,10 +351,7 @@ for (const width of WIDTHS) {
         const drawer = drawerOf(page)
         await expect(menu, 'the top bar has the control that opens the navigation').toBeVisible()
         await expect(drawer, 'the navigation is out of the way until it is asked for').toBeHidden()
-        expect(
-          await page.evaluate(() => (document.querySelector('aside.sidebar') as HTMLElement).inert),
-          'closed, the navigation takes no focus and is not read'
-        ).toBe(true)
+        await expectDrawerClosed(page)
         // The destination that is shown is chosen too: it closes the drawer like any other.
         const labels = [...DESTINATIONS, DESTINATIONS[0] ?? 'Attention']
         for (const label of labels) {
@@ -295,6 +367,7 @@ for (const width of WIDTHS) {
         await itemOf(page, /^Account/).click()
         await expect(page.getByRole('dialog', { name: 'Account' })).toBeVisible()
         await expect(drawer).toBeHidden()
+        await expectDrawerClosed(page)
       })
 
       test('the keyboard alone reaches every destination and the Account sheet, with the focus where it belongs', async ({
@@ -329,6 +402,7 @@ for (const width of WIDTHS) {
         }
         await page.keyboard.press('Escape')
         await expect(drawer).toBeHidden()
+        await expectDrawerClosed(page)
         await expect(menu, 'Escape returns the focus to the control that opened it').toBeFocused()
 
         for (const label of DESTINATIONS) {
@@ -361,6 +435,7 @@ for (const width of WIDTHS) {
         await expect(drawerOf(page)).toBeVisible()
         await page.mouse.click(width - 6, HEIGHT / 2)
         await expect(drawerOf(page)).toBeHidden()
+        await expectDrawerClosed(page)
         await expect(menu).toBeFocused()
         await expect(menu).toHaveAttribute('aria-expanded', 'false')
       })
@@ -630,20 +705,94 @@ test.describe('what moves', () => {
   test.describe('with reduced motion asked for', () => {
     test.use({ reducedMotion: 'reduce' })
 
-    test('nothing travels when the drawer opens or closes', async ({ page }) => {
+    test('nothing travels when the drawer opens or closes, and it fades to its end', async ({ page }) => {
       await openWindow(page, 600)
       const rest = await sidebarLeft(page)
+      const opacity = (): Promise<string> =>
+        page.evaluate(() => getComputedStyle(document.querySelector('aside.sidebar') as Element).opacity)
+      expect(await opacity(), 'closed, the drawer is not drawn').toBe('0')
       await watchTravel(page)
       await menuOf(page).click()
       await expect(drawerOf(page)).toBeVisible()
+      await expectTravel(page, FADE_SECONDS, 'the drawer fades in', 'opacity')
+      expect(await opacity(), 'open, the drawer is drawn in full').toBe('1')
       expect(await sidebarLeft(page), 'open, the drawer is where it rests').toBe(rest)
+      await watchTravel(page)
       await page.mouse.click(594, HEIGHT / 2)
       await expect(drawerOf(page)).toBeHidden()
       expect(await sidebarLeft(page), 'closed, the drawer is where it rests').toBe(rest)
+      await expectTravel(page, FADE_SECONDS, 'the drawer fades out', 'opacity')
+      expect(await opacity(), 'closed again, the drawer is not drawn').toBe('0')
+      await expectDrawerClosed(page)
       expect(await travelOf(page), 'a pointer-driven open and close run no transition of the transform').toEqual([])
     })
   })
 })
+
+/**
+ * A web view without `inert` (the oldest of the baselines): the shell's attribute does nothing there,
+ * so the closed drawer is out of reach by the page's own rules, or by nothing.
+ */
+for (const [reduced, how] of [
+  [false, 'with the ordinary motion'],
+  [true, 'with reduced motion asked for']
+] as const) {
+  test.describe(`the closed drawer on a web view without the inert attribute, ${how}`, () => {
+    test.use({ reducedMotion: reduced ? 'reduce' : 'no-preference' })
+
+    for (const [width, ratio] of [
+      [600, 1],
+      [480, LARGEST]
+    ] as const) {
+      test(`${width} points: it is out of reach until it is asked for, works when it is, and is out of reach again`, async ({
+        page
+      }) => {
+        await withoutInert(page)
+        await openWindow(page, width, ratio)
+        expect(
+          await page.evaluate(() => ({
+            property: 'inert' in HTMLElement.prototype,
+            attribute: document.querySelector('aside.sidebar')?.hasAttribute('inert')
+          })),
+          'this page has no inert, as the web view it stands for'
+        ).toEqual({ property: false, attribute: false })
+        const menu = menuOf(page)
+        await expect(menu).toBeVisible()
+        await expectDrawerClosed(page)
+        expect.soft(await tabStopsInDrawer(page, 8), 'a Tab from the start of the page never lands in the closed drawer').toBe(0)
+
+        // A press on the control reaches the control, also where the closed drawer rests over it.
+        const box = await rectangleOf(menu)
+        const x = box.x + box.width / 2
+        const y = box.y + box.height / 2
+        expect
+          .soft(
+            await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest('button')?.textContent, [x, y]),
+            'the point on the control is the control, and not the closed drawer'
+          )
+          .toBe('Menu')
+        await page.mouse.click(x, y)
+        await expect(drawerOf(page)).toBeVisible()
+        await expect(closeOf(page)).toBeVisible()
+        await expect(drawerOf(page).locator('[aria-current="page"]'), 'the focus goes to the destination that is shown').toBeFocused()
+
+        // The page behind is not inert here, so the drawer's own Tab cycle is what holds the keyboard.
+        for (const key of [tabKeys().forward, tabKeys().back]) {
+          for (let press = 0; press < 13; press += 1) {
+            await page.keyboard.press(key)
+            expect(await focusInDrawer(page), `${key} ${press + 1} stays inside the drawer`).toBe(true)
+          }
+        }
+
+        await closeOf(page).click()
+        await expect(drawerOf(page)).toBeHidden()
+        await expectDrawerClosed(page)
+        await expect(menu).toBeFocused()
+        expect(await tabStopsInDrawer(page, 8), 'closed again, a Tab never lands in the drawer').toBe(0)
+      })
+    }
+  })
+}
 
 test.describe('under a right-to-left root', () => {
   test('the wide sidebar and the drawer both stand and travel at the end the page starts from', async ({ page }) => {
