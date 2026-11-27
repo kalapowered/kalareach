@@ -335,12 +335,13 @@ pub const LEFT_FOR_A_DAEMON: &str = "left_for_a_daemon";
 /// The most processes a session records at once.
 ///
 /// A session that runs builds for a long time sees thousands of short-lived processes. The record
-/// keeps every one it has seen so that a closure can name what it ended, and the closure's receipt
-/// travels in a frame of at most a megabyte, so the record has a bound. When it is full, the
-/// processes that ended of their own accord are dropped from it first, because a closure has
-/// nothing to say about them; one that is still full refuses to record another and says so. A
-/// server the session starts is always recorded. While a reading is made on a copy of the record,
-/// nothing is dropped, and the record may hold twice as many until the reading is put back.
+/// keeps every one it has seen so that a closure can name what it ended, so the record has a bound.
+/// The closure's own lists are held to a byte budget where the closure is built, not here. When
+/// the record is full, the processes that ended of their own accord are dropped from it first,
+/// because a closure has nothing to say about them; one that is still full refuses to record
+/// another and says so. A server the session starts is always recorded. While a reading is made on
+/// a copy of the record, nothing is dropped, and the record may hold twice as many until the
+/// reading is put back.
 pub const MAX_RECORDED_PROCESSES: usize = 1024;
 
 /// A process read below a backend root: the process, the root it is below, and the process it

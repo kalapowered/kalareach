@@ -34,8 +34,8 @@ use kr_protocol::projection::ProjectionResetReason;
 use kr_protocol::recovery::{EventsSnapshotResult, HistoryPageResult, ResyncReason};
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 use kr_protocol::session::{
-    ApplicationState, ClosureReason, ClosureRecord, Dimensions, Durability, OwnershipCoverage,
-    SessionState, SessionSummary, ShellMode,
+    ApplicationState, CLOSURE_BUDGET_BYTES, ClosureReason, ClosureRecord, Dimensions, Durability,
+    OwnershipCoverage, SessionState, SessionSummary, ShellMode,
 };
 
 use crate::attachments::AttachmentTable;
@@ -5670,7 +5670,11 @@ impl Session {
             ownership_coverage: coverage,
             durability: self.durability(),
             closed_at_ms: kr_ipc::now_ms(),
-        };
+        }
+        // The lists are held to a budget here, once, so the record that is stored, sent to every
+        // attachment and answered to a close is one that a connection can carry. The coverage
+        // above was read from the whole lists and stays as it is.
+        .bounded(CLOSURE_BUDGET_BYTES);
         record.durability = self.commit_closure(&record);
         if !flushed {
             record.durability = Durability::Volatile;

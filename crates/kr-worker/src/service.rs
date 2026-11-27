@@ -12690,6 +12690,13 @@ impl WorkerService {
                 let (acceptance, gate) = self
                     .runtime
                     .close_locked(session, ClosureReason::CloseRequested);
+                // The record travels once: when the answer carries it, the summary leaves its own
+                // copy out, because a record sent twice can be too large for the frame it is
+                // answered in.
+                let mut summary = session.summary();
+                if acceptance.closure.is_some() {
+                    summary.closure = Nullable::null();
+                }
                 let reply = encode(&SessionCloseResult {
                     session_id: params.session_id,
                     state: acceptance.state,
@@ -12697,7 +12704,7 @@ impl WorkerService {
                     closure: Nullable(acceptance.closure),
                     // The session as this worker describes it now the close is admitted, which is
                     // what the daemon answers a read with once this worker has stopped answering.
-                    session: Some(session.summary()),
+                    session: Some(summary),
                 })?;
                 // The gate is held until the acceptance has been written. The requester is often a
                 // command running inside the process group this closure is about to stop.

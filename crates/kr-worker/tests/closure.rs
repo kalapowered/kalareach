@@ -1217,3 +1217,128 @@ async fn a_stubborn_shell_is_closed() -> Result<(), String> {
         Err(missed.join("; "))
     }
 }
+
+/// A session whose host could not establish thousands of things closes with a record that lists
+/// the first of them and counts the rest.
+///
+/// The notes are paths, each one different, since a note already held is not held twice and a path
+/// is a detail that a paired device is shown as a longer sentence. Whole, the record is more than
+/// the codec writes; held to its budget, it is one that the journal stores and a connection
+/// carries, and its coverage still says that the account of the session is incomplete.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closure_that_could_not_establish_thousands_of_things_lists_the_first_and_counts_the_rest()
+ {
+    use kr_protocol::session::{
+        CLOSURE_BUDGET_BYTES, ClosureOmission, NOT_LISTED_KIND, OmissionReason, OwnershipCoverage,
+    };
+
+    const NOTES: usize = 5_000;
+    let host = host("read -r _; exit 0").await;
+    {
+        let session = host.runtime.session();
+        let owned = session
+            .owned()
+            .expect("a launched session owns its processes");
+        for number in 0..NOTES {
+            owned.note_unestablished(format!("/{number}"));
+        }
+    }
+
+    let record = close(&host).await;
+
+    assert!(
+        record.surviving.len() <= kr_cbor::Limits::DEFAULT.max_collection_len,
+        "the record lists no more entries than a list of the codec may hold: {} of them",
+        record.surviving.len()
+    );
+    let omitted = record
+        .omitted()
+        .expect("the record says what it does not list");
+    assert_eq!(omitted.reason, OmissionReason::Budget);
+    assert!(omitted.other > 0, "entries of surviving were left out");
+    assert!(
+        record.terminated.len() as u64 + omitted.ended >= 1,
+        "the shell that the close ended is listed or counted"
+    );
+    assert_eq!(
+        record.surviving.last().map(|entry| entry.kind.as_str()),
+        Some(NOT_LISTED_KIND),
+        "the count is the last entry, so the listed ones keep their order"
+    );
+    assert_eq!(
+        record.surviving.last(),
+        Some(&ClosureOmission::entry(&omitted)),
+        "and it is the entry that the protocol writes"
+    );
+    assert!(
+        record.survivors().len() as u64 + omitted.other >= NOTES as u64,
+        "every note is listed or counted: {} listed, {} counted",
+        record.survivors().len(),
+        omitted.other
+    );
+    assert_eq!(
+        record.ownership_coverage,
+        OwnershipCoverage::Incomplete,
+        "the cut does not make the account look more complete or less"
+    );
+    let written = kr_cbor::to_canonical_vec_within(&record, &kr_cbor::Limits::DEFAULT)
+        .expect("the codec writes the record");
+    assert!(
+        written.len() + record.device_extra() <= CLOSURE_BUDGET_BYTES + 2_048,
+        "the record as a device is shown it fits the budget and the room the entry and the \
+         record's own members take: {} bytes",
+        written.len() + record.device_extra()
+    );
+}
+
+/// The worker answers a close of a closed session with the record once.
+///
+/// The record is in the answer's `closure`, and the summary that the daemon keeps for a read that
+/// meets the worker on its way out says that the session is closed without carrying a second
+/// copy: two copies of a record at its budget do not fit in one frame.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_answer_to_a_close_of_a_closed_session_carries_the_record_once() {
+    let host = host("read -r _; exit 0").await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let record = close(&host).await;
+
+    let answer: kr_protocol::session::SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget {
+                environment_id: host.environment_id,
+                session_id: Nullable::some(host.session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::session::SessionCloseParams {
+                session_id: host.session_id,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the close of a closed session is answered")
+        .to_typed()
+        .expect("decodes");
+
+    assert_eq!(
+        answer.closure.0.as_ref(),
+        Some(&record),
+        "the answer carries the session's record"
+    );
+    let summary = answer
+        .session
+        .expect("the answer carries the session as the worker describes it");
+    assert_eq!(summary.state, kr_protocol::session::SessionState::Closed);
+    assert!(
+        summary.closure.0.is_none(),
+        "and the summary does not carry it a second time: {:?}",
+        summary.closure
+    );
+}
