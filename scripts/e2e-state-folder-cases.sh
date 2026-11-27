@@ -728,7 +728,7 @@ said() {
 }
 # The sentence for a folder of the chain that has an access list entry, for the path $1 and the folder $2.
 acl_sentence() {
-  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has an access list entry that the rule does not accept, since an entry can let another account write the folder whatever its mode says; every folder from the temporary directory down to the state folder must have none, except that a temporary directory with the sticky bit may have entries that only deny; remove the list, for example with chmod -N, or make the temporary directory a private folder of your own by setting TMPDIR' "$1" "$2"
+  printf 'e2e: refusing KR_E2E_STATE %s: its folder %s has an access list entry that the rule does not accept. The rule refuses any entry that allows something, whoever it names, this account included; any line that is neither an allow nor a deny entry; and a deny entry, unless the folder is a temporary directory with the sticky bit. The owner of the folder can remove the list, for example with chmod -N. If this account does not own the temporary directory, set TMPDIR to a private folder of your own and put KR_E2E_STATE below it' "$1" "$2"
 }
 
 # Another closed folder of the caller's is put at the state folder's name after the listing and before
