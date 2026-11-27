@@ -37,8 +37,8 @@ use net_support::worker::{Adopted, Upstream, offer, revoke};
 use net_support::{Host, proposal};
 use serde_json::{Value, json};
 use support::{
-    Companion, LinkControl, Phone, RECONNECT_ROUND, WATCHDOG, pair_under, through_rounds,
-    unpaired_phone, unpaired_phone_controlled,
+    Companion, LinkControl, Phone, RECONNECT_ROUND, WATCHDOG, hostless_phone, pair_under,
+    through_rounds, unpaired_phone, unpaired_phone_controlled,
 };
 
 /// A pairing grant over every session whose history reaches back to the start, holding `rights`.
@@ -3974,6 +3974,92 @@ fn kr_req_19_08_a_wait_through_reconnect_rounds_outlasts_them() {
         WATCHDOG < round,
         "the watchdog alone is shorter than one round of {round:?}"
     );
+}
+
+/// KR-REQ-19.08: the keeper waits between two tries for no longer than the client library's
+/// back-off says for that try, and its tries go on. The waits that pass reconnect rounds hold only
+/// that a connection came back in time, so a keeper that slept longer than its back-off says would
+/// pass them; this case reads the keeper's own sleeps. The keeper runs on a paused clock against
+/// attempts that fail at once, so each gap between two tries is the sleep the keeper chose, to the
+/// instant, and no draw of the back-off changes what is held: only the ceiling of each try is.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn kr_req_19_08_the_keeper_waits_between_tries_no_longer_than_the_back_off_says() {
+    use companion_tauri::connection::{Attempt, keep};
+    use companion_tauri::contact::Target;
+    use companion_tauri::error::CommandError;
+    use tauri::Manager as _;
+
+    const FAILED_TRIES: usize = 10;
+    // The library's own ladder, read ceiling by ceiling: the longest the keeper may wait before
+    // each try that follows a failed one.
+    let mut ladder = kr_client::reconnect::ReconnectLoop::new();
+    let ceilings: Vec<Duration> = (0..FAILED_TRIES)
+        .map(|_| {
+            let ceiling = ladder.ceiling();
+            let _ = ladder.disconnected();
+            ceiling
+        })
+        .collect();
+    let all_of_them: Duration = ceilings.iter().sum();
+
+    let phone = hostless_phone();
+    let app = phone.companion.app.handle().clone();
+    let choice = app
+        .state::<companion_tauri::AppState>()
+        .contact_owner()
+        .choose(&Target::Local, "a host that does not answer")
+        .value;
+    let times: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>> = Arc::default();
+    let attempt = {
+        let times = Arc::clone(&times);
+        move || {
+            let times = Arc::clone(&times);
+            async move {
+                let mut times = times.lock().expect("the record");
+                times.push(tokio::time::Instant::now());
+                if times.len() > FAILED_TRIES {
+                    Attempt::Nothing
+                } else {
+                    Attempt::Failed(Unopened::Unreached(CommandError::unavailable(
+                        "a host that does not answer",
+                    )))
+                }
+            }
+        }
+    };
+
+    // Every try fails at once, so the keeper's tries cost no time of their own: all of the clock's
+    // advance is the keeper's sleeps. A keeper that stops, or sleeps beyond the ladder's sum, ends
+    // the wait here, on the same clock.
+    let ended = tokio::time::timeout(
+        all_of_them + Duration::from_secs(1),
+        keep(app, choice, None, attempt),
+    )
+    .await;
+    let times = times.lock().expect("the record").clone();
+    let gaps: Vec<Duration> = times
+        .windows(2)
+        .map(|pair| pair[1].duration_since(pair[0]))
+        .collect();
+    assert!(
+        ended.is_ok(),
+        "the keeper made {} tries in {all_of_them:?} of the ladder's ceilings and then went on \
+         waiting; the gaps between its tries were {gaps:?}",
+        times.len()
+    );
+    assert_eq!(
+        times.len(),
+        FAILED_TRIES + 1,
+        "the keeper made a try after each failed one until it was told there was nothing to keep"
+    );
+    for (number, (gap, ceiling)) in gaps.iter().zip(&ceilings).enumerate() {
+        assert!(
+            gap <= ceiling,
+            "the keeper waited {gap:?} before try {} and the back-off's ceiling for it is \
+             {ceiling:?}; the gaps were {gaps:?}",
+            number + 2
+        );
+    }
 }
 
 /// KR-REQ-19.08: what a person reads while the main connection is not made is what the last try

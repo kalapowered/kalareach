@@ -1282,6 +1282,49 @@ pub fn unpaired_phone(host: &Host) -> Phone {
     }
 }
 
+/// A room that serves nothing: a phone made with it can pair with no host.
+struct NoRoom;
+
+impl CandidateRoom for NoRoom {
+    fn open<'a>(
+        &'a self,
+        origin: &'a kr_protocol::pairing::RendezvousOrigin,
+        _locator: &'a kr_protocol::pairing::Locator,
+    ) -> BoxFuture<
+        'a,
+        Result<kr_client::pairing::room::RoomSocket, kr_client::pairing::room::RoomError>,
+    > {
+        Box::pin(async move {
+            Err(kr_client::pairing::room::RoomError::Unreachable {
+                origin: origin.as_str().to_owned(),
+                reason: "a test room that serves nothing".to_owned(),
+            })
+        })
+    }
+}
+
+/// A phone that has no host to reach and nothing to pair with: its backend is up and its keeper is
+/// started by no one, so a case can run a keeper of its own against it.
+pub fn hostless_phone() -> Phone {
+    let data = tempfile::tempdir().expect("a directory");
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let room: Arc<dyn CandidateRoom> = Arc::new(NoRoom);
+    let paste = StubIntake::holding("", false);
+    let companion = Companion::start(
+        data.path(),
+        parts(Arc::clone(&secrets), Arc::clone(&room)),
+        Arc::new(NoOwner),
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::IntakePlatform>,
+    );
+    Phone {
+        companion,
+        paste,
+        secrets,
+        room,
+        data,
+    }
+}
+
 /// `phone` paired with `host` as a device holding `rights`, by a direct invitation the person
 /// pastes and the host's owner approves.
 pub async fn pair(phone: &Phone, host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) {
