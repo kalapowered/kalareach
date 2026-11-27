@@ -377,7 +377,8 @@ fn taken(path: &Path) -> CliError {
 /// # Errors
 ///
 /// Returns a usage failure when something is at `path`, and the failure to write otherwise. A
-/// failure leaves nothing at `path`.
+/// failure leaves nothing at `path`, except a failure to flush the folder after the file was
+/// published: the file is then there.
 pub fn write(path: &Path, exported: &Exported) -> Result<()> {
     // A bare file name has no directory to flush once the file is in place, so the name is made
     // whole first: where the file goes is where the command was run.

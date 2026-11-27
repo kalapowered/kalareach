@@ -1307,15 +1307,15 @@ mod windows {
     /// creates it, and reads the list back before the caller writes the first byte.
     ///
     /// No handle to the file can exist before the list does, so no account that its directory
-    /// admits can hold one that outlives it. The read back is the reader's own check of the
-    /// accounts the list names, and the file's own descriptor must say the list is protected:
-    /// where the volume keeps no lists, or the list is not the one that was asked for, the file
-    /// is removed and the write fails, and no file is ever written without one.
+    /// admits can hold one that outlives it. The read back refuses an owner this account could not
+    /// make, a missing list, an entry for an account the reader refuses and, by the file's own
+    /// descriptor, a list that is not protected. It does not compare the list with the one asked
+    /// for. After a refusal the removal of the file is tried, and nothing is written to it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be created, or when the list it carries is not one
-    /// this host accepts.
+    /// Returns an error when the file cannot be created, or when the read back refuses the list it
+    /// carries.
     pub(super) fn create_owner_only_file(path: &Path) -> Result<std::fs::File> {
         let refused = |detail: String| IpcError::io("create", path, std::io::Error::other(detail));
         let user = TokenAccounts::read()
@@ -1368,9 +1368,9 @@ mod windows {
     /// Reads from the kernel's own descriptor whether the discretionary list of an opened file is
     /// protected from what its directory passes down.
     ///
-    /// The call [`check_access_list`] reads through reports a list protected when the list records
-    /// no entry as inherited, which is also what a list made without protection in the creating
-    /// call looks like, so it cannot tell the two apart.
+    /// The call [`check_access_list`] reads through reported protected the one list shape that was
+    /// measured: a list made without protection or the mark of automatic inheritance, with no
+    /// inherited entry. It could not tell that list from a protected one.
     fn list_is_protected(
         handle: BorrowedHandle<'_>,
     ) -> std::result::Result<bool, AccessListRefusal> {
@@ -2471,11 +2471,13 @@ mod windows {
         Ok(file)
     }
 
-    /// Sets a directory's discretionary list, written as SDDL, without carrying it to anything the
-    /// directory already holds: the older call used here changes the one object it names.
+    /// Sets the discretionary list of a file or a directory, written as SDDL, without carrying it
+    /// to anything a directory already holds: the older call used here changes the one object it
+    /// names.
     ///
-    /// For this crate's tests of a file that inherited its list before its directory's changed.
-    /// The owner-only writers make their files with the list in the creating call instead.
+    /// For this crate's tests: a file that inherited its list before its directory's changed, and
+    /// a floor file whose list is set on the file itself. The owner-only writers make their files with
+    /// the list in the creating call instead.
     ///
     /// # Errors
     ///
@@ -3345,9 +3347,11 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 /// is the mode `0600`. On Windows it is an access list that the call creating the file sets, never
 /// the list the directory passes down: the account that writes owns the file, the list is
 /// protected, and it names that account, the local system and the administrators group. The list is
-/// read back from the new file before the first byte is written, and where it is not the one asked
-/// for, or the volume keeps no lists, the write fails and the file is removed. The rename keeps the
-/// list, so the published file does not depend on its directory. On Windows the rename is tried
+/// read back from the new file before the first byte is written. The write fails when the list is
+/// missing or not protected, names an account the reader refuses, or has an owner this account
+/// could not make, and the removal of the file is then tried; the list is not compared with the one
+/// asked for. The rename keeps the list, so the published file does not depend on its directory.
+/// On Windows the rename is tried
 /// again while another program holds the file it replaces or the new one, as
 /// [`kr_flush::retry_while_held`] says; nothing about the destination is checked before it, so
 /// there is nothing to check again.
@@ -3355,7 +3359,7 @@ pub fn read_owner_only_file(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> 
 /// # Errors
 ///
 /// Returns an error when the file cannot be written or renamed into place, and on Windows when the
-/// new file does not carry the list it was made with.
+/// read back refuses the list of the new file.
 pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
     replace_through_temporary(path, contents, make_owner_only)
 }
@@ -3367,8 +3371,8 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// to choose, and what they choose decides who can reach the file, as it does for a file any other
 /// program makes there. The mode is `0600` on Unix. On Windows the file takes the access list of
 /// the directory it is made in, and no list is set on it or read back from it, so a volume that
-/// keeps no lists holds it as it holds any other file. The steps and the errors are those of
-/// [`write_owner_only_file`].
+/// keeps no lists holds it as it holds any other file. The file is written and renamed into place
+/// as [`write_owner_only_file`] writes its file; no list is read back, so none is refused.
 ///
 /// # Errors
 ///
@@ -3478,8 +3482,8 @@ pub fn create_new_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// This is for a file that the person named a place for and hands to somebody, as
 /// [`write_file_in_directory_access`] says: the mode is `0600` on Unix, and on Windows the file
 /// takes the access list of the directory it is made in, with no list set on it or read back from
-/// it, so a volume that keeps no lists holds it as it holds any other file. The publication and the
-/// errors are those of [`create_new_owner_only_file`].
+/// it, so a volume that keeps no lists holds it as it holds any other file. The file is published
+/// as [`create_new_owner_only_file`] publishes its file; no list is read back, so none is refused.
 ///
 /// # Errors
 ///
@@ -5339,10 +5343,11 @@ mod tests {
         );
     }
 
-    /// A file made with a list this host does not accept is never written into, never published and
-    /// never left behind, for either writer, and a file already at the destination is as it was.
-    /// These are the lists a volume that keeps none, or a folder that overrides what a creation
-    /// asks for, would give: one that is not protected, one that names everyone, and none at all.
+    /// A file made with a list this host does not accept is not written into or published by
+    /// either writer, a file already at the destination is as it was, and the folder holds nothing
+    /// else afterwards. The lists are three that a volume that keeps none, or a folder that
+    /// overrides what a creation asks for, could give: one that is not protected, one that names
+    /// everyone, and none at all.
     #[cfg(windows)]
     #[test]
     fn a_file_made_with_a_list_that_is_refused_is_never_written_or_published() {
@@ -5386,7 +5391,7 @@ mod tests {
     /// read back of both writers. The call that reads a list for the reader reports such a list
     /// protected, so the refusal rests on the file's own descriptor: a list made without
     /// protection in the creating call is what a folder or a volume that overrides the creation
-    /// would leave.
+    /// could leave.
     #[cfg(windows)]
     #[test]
     fn a_new_file_with_an_unprotected_list_that_records_no_inherited_entry_is_refused() {
@@ -5622,12 +5627,14 @@ mod tests {
     }
 
     /// The second of the two cases, run by name under the ORDINARY token of the same account, after
-    /// the first. It asserts that token first, so a run under the elevated one does not pass. The
+    /// the first. It has never passed: it needs a session whose token is of medium integrity, and
+    /// no test host of the project gives one today. It asserts that token first, so a run under
+    /// the elevated one does not pass. The
     /// file the elevated token wrote names the account as its owner, so the ordinary reader accepts
     /// it, and the ordinary writer replaces it, over the old file, and writes a new one beside it.
     #[cfg(windows)]
     #[test]
-    #[ignore = "needs the ordinary token of the account the previous case used; run by name after it"]
+    #[ignore = "has never passed: needs a session whose token is of medium integrity, and no test host of the project gives one today; run by name after the previous case"]
     fn an_ordinary_token_reads_and_replaces_the_file_an_elevated_token_of_its_account_made() {
         assert_eq!(
             token_level(),
