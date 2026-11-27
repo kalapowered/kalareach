@@ -1162,6 +1162,39 @@ fn pinned(
     package
 }
 
+/// A package of `publisher` whose rules each recognise the stand-in by its name and declare the
+/// next of `ranges` (none: no range), its signed records naming the stand-in's digest at `named`.
+fn with_rules(
+    store: &Path,
+    program: &Path,
+    publisher: &str,
+    name: &str,
+    ranges: &[Option<&str>],
+    named: &str,
+) -> ConnectorSource {
+    let mut package = fixture::declarative_package_with(store, name, |manifest| {
+        manifest["publisher_id"] = serde_json::json!(publisher);
+        let rules: Vec<serde_json::Value> = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| {
+                let mut rule = manifest["match_rules"][0].clone();
+                rule["id"] = serde_json::json!(format!("rule-{index}"));
+                rule["executable"]["file_stem"] = serde_json::json!(fixture::COMMAND);
+                rule["executable"]["path_suffix"] = serde_json::json!([]);
+                rule["executable"]["version_range"] = serde_json::json!(range);
+                rule["distribution"] = serde_json::Value::Null;
+                rule["confidence"] = serde_json::json!("inferred");
+                rule
+            })
+            .collect();
+        manifest["match_rules"] = serde_json::Value::Array(rules);
+    })
+    .expect("the package");
+    package.qualified = vec![build(program, named)];
+    package
+}
+
 /// What the broker makes of the stand-in once its bytes are hashed.
 fn decision(setup: &Setup) -> Recognition {
     setup.broker.recognise(
@@ -1782,6 +1815,89 @@ fn kr_req_12_19_the_rank_and_the_sentence_agree_on_what_one_publisher_is() {
         selected(&decision(&setup)).as_deref(),
         Some("kalareach/one"),
         "the same claims from one publisher are ranked, and no tie is announced"
+    );
+}
+
+/// KR-REQ-12.19: a package with several rules that recognise a program is read by its best rule. A
+/// tie names the ranges of the rules that rank the package and nothing of those that rank lower: a
+/// rule that covers the version replaces what a refusing rule said, a rule that covers it as well
+/// adds its range, and a rule that ranks lower adds nothing, so that a package never appears to
+/// cover two ranges that contradict each other, or to declare no range beside one that it lists.
+/// Packages of two publishers are not ranked by the version, so every rule of each is in the tie.
+#[test]
+fn kr_req_12_19_a_package_with_several_rules_is_read_by_its_best_rule() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            with_rules(
+                store,
+                &program,
+                "kalareach",
+                "one",
+                &[
+                    Some(">=3.0.0"),
+                    Some(">=1.0.0, <2.0.0"),
+                    Some(">=1.2.0"),
+                    Some("<1.0.0"),
+                ],
+                "1.4.0",
+            ),
+            Claim::new("two")
+                .under("example-vendor")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal_across(
+                "example-vendor/two declares no range for version 1.4.0 and kalareach/one \
+                 (>=1.0.0, <2.0.0 and >=1.2.0) covers version 1.4.0",
+                "neither"
+            )
+            .as_str()
+        ),
+        "the rules that cover the version replace the one that refuses it and add their ranges, and \
+         the rule that refuses it after them adds nothing"
+    );
+}
+
+/// KR-REQ-12.19: a package with a rule that declares no range and a rule that refuses the version
+/// is read by the first, so that its words say that it declares no range and list none beside them.
+#[test]
+fn kr_req_12_19_a_package_with_several_rules_that_declares_no_range_lists_none() {
+    let setup = Setup::with(fixture::COMMAND, |store, bin| {
+        let program = bin.join(fixture::COMMAND);
+        vec![
+            with_rules(
+                store,
+                &program,
+                "kalareach",
+                "one",
+                &[None, Some(">=3.0.0")],
+                "1.4.0",
+            ),
+            Claim::new("two")
+                .under("example-vendor")
+                .named("1.4.0")
+                .package(store, &program),
+        ]
+    });
+    let told = found(&setup);
+    assert_eq!(
+        told.refusal.as_ref().map(String::as_str),
+        Some(
+            refusal_across(
+                "example-vendor/two declares no range for version 1.4.0 and kalareach/one \
+                 declares no range for version 1.4.0",
+                "neither"
+            )
+            .as_str()
+        ),
+        "a rule that declares no range ranks above one that refuses the version, and the package \
+         names no range beside its words"
     );
 }
 
