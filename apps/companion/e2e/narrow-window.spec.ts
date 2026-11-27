@@ -119,6 +119,35 @@ async function rectangleOf(locator: Locator): Promise<Rectangle> {
   return found
 }
 
+/**
+ * The element has come to rest: it has no transition running, and its box is the same in two readings
+ * that a drawn frame separates. A press aimed by a box that was read before this misses an element
+ * that is still moving; a click that the test framework makes waits for this by itself.
+ */
+async function expectAtRest(element: Locator, what: string): Promise<void> {
+  await expect
+    .poll(
+      () =>
+        element.evaluate(
+          (node) =>
+            new Promise<boolean>((resolve) => {
+              const read = (): string => {
+                const box = node.getBoundingClientRect()
+                return `${box.x} ${box.y} ${box.width} ${box.height}`
+              }
+              const before = read()
+              requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                  resolve(node.getAnimations().length === 0 && read() === before)
+                })
+              })
+            })
+        ),
+      what
+    )
+    .toBe(true)
+}
+
 /** Where the sidebar's left edge is, as drawn. */
 function sidebarLeft(page: Page): Promise<number> {
   return page.evaluate(() => Math.round((document.querySelector('.sidebar')?.getBoundingClientRect().left ?? NaN) * 10) / 10)
@@ -1370,6 +1399,7 @@ test.describe('the open drawer on a web view without the inert attribute: the ke
       }, REQUEST)
       const toast = page.locator('.toast')
       await expect(toast).toContainText('needs your confirmation')
+      await expectAtRest(toast, 'the message has come to rest before the press is aimed at it')
       const review = toast.getByRole('button', { name: 'Review' })
       const action = await rectangleOf(review)
       const words = await rectangleOf(toast.locator('.toast-text'))
