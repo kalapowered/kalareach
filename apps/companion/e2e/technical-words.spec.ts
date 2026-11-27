@@ -439,20 +439,35 @@ for (const kind of KINDS) {
   }
 }
 
+/** Where a selection starts and ends, as offsets in the text of the element that holds it. */
+interface Span {
+  readonly from: number
+  readonly to: number
+}
+
 /** What a selection over an element's text holds: the range's own text, the selection's, and the clipboard's after a copy. */
 interface Taken {
   readonly range: string
   readonly selection: string
   readonly breakPlaces: number
+  /** The offsets of the range in the element's text, when it did not take the whole of it. */
+  readonly span: Span | null
+  /** The longest technical word of the element, which the range lies in when it did not take the whole text. */
+  readonly word: string
+  readonly wordBreakPlaces: number
+  /** The places a line may end that lie within the range. */
+  readonly spanned: number
   readonly clipboard?: string
 }
 
 /**
- * Selects the whole text of the first element `selector` matches, or from its second character to the one
- * before its last, and reads what the range and the selection hold. With `control`, the same is read from a
- * copy of the element in which each technical word is plain text, placed after it.
+ * Selects the first element `selector` matches: the whole of its text (`null`), from the second character
+ * of its longest technical word to the one before the word's last (`'word'`, so that the range starts
+ * inside the word's first part and ends inside its last), or the given offsets. It reads what the range and
+ * the selection hold. With `control`, the same is read from a copy of the element in which each technical
+ * word is plain text, placed after it.
  */
-function selectText(page: Page, selector: string, control: boolean, inside: boolean): Promise<Taken> {
+function selectText(page: Page, selector: string, control: boolean, inside: Span | 'word' | null): Promise<Taken> {
   return page.evaluate(
     ({ where, asControl, within }) => {
       let root = document.querySelector<HTMLElement>(where)
@@ -471,7 +486,6 @@ function selectText(page: Page, selector: string, control: boolean, inside: bool
       const texts: Text[] = []
       const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
       for (let current = walk.nextNode(); current !== null; current = walk.nextNode()) texts.push(current as Text)
-      const length = texts.reduce((total, text) => total + text.length, 0)
       /** The text and the offset in it of the boundary before the character at `index` of the element's text. */
       const place = (index: number): [Text, number] => {
         let left = index
@@ -481,12 +495,26 @@ function selectText(page: Page, selector: string, control: boolean, inside: bool
         }
         throw new Error(`no text holds the character at ${index}`)
       }
+      // The longest technical word, which is the one the sample is made of, and where its text starts in the element's.
+      const words = Array.from(root.querySelectorAll<HTMLElement>('.technical-word'))
+      const longest = words.reduce<HTMLElement | null>(
+        (best, one) => (best === null || (one.textContent ?? '').length > (best.textContent ?? '').length ? one : best),
+        null
+      )
+      const word = longest?.textContent ?? ''
+      let wordStart = 0
+      for (const text of texts) {
+        if (longest?.contains(text)) break
+        wordStart += text.length
+      }
+      const span = within === 'word' ? { from: wordStart + 1, to: wordStart + word.length - 1 } : within
+      if (within === 'word' && longest === null) throw new Error(`no technical word in ${where}`)
       const range = document.createRange()
-      if (within) {
-        const [start, from] = place(1)
-        const [end, to] = place(length - 1)
-        range.setStart(start, from)
-        range.setEnd(end, to)
+      if (span !== null) {
+        const [start, startOffset] = place(span.from)
+        const [end, endOffset] = place(span.to)
+        range.setStart(start, startOffset)
+        range.setEnd(end, endOffset)
       } else {
         range.selectNodeContents(root)
       }
@@ -494,7 +522,15 @@ function selectText(page: Page, selector: string, control: boolean, inside: bool
       if (selection === null) throw new Error('the page has no selection')
       selection.removeAllRanges()
       selection.addRange(range)
-      return { range: range.toString(), selection: selection.toString(), breakPlaces: root.querySelectorAll('wbr').length }
+      return {
+        range: range.toString(),
+        selection: selection.toString(),
+        breakPlaces: root.querySelectorAll('wbr').length,
+        span,
+        word,
+        wordBreakPlaces: longest?.querySelectorAll('wbr').length ?? 0,
+        spanned: range.cloneContents().querySelectorAll('wbr').length
+      }
     },
     { where: selector, asControl: control, within: inside }
   )
@@ -502,32 +538,40 @@ function selectText(page: Page, selector: string, control: boolean, inside: bool
 
 for (const kind of KINDS) {
   test.describe(`${kind.name}, copied and measured`, () => {
-    test('is copied as it is written, spaces at both ends included, whole and from the middle of one part to the middle of another', async ({
+    test('is copied as it is written, spaces at both ends included, whole and from inside its first part to inside its last', async ({
       page,
       context,
       browserName
     }) => {
       // Chromium lets a case read the clipboard; WebKit under the driver grants no read of it, so there the
       // text of the range and of the selection, which is what the engine copies, are what is compared.
+      // The selection is set by the page's own range, not by a pointer gesture.
       const clipboard = browserName === 'chromium'
       if (clipboard) await context.grantPermissions(['clipboard-read', 'clipboard-write'])
       const sample = kind.sample(kind.parts.join(''))
       await kind.open(page, sample)
       const shown = kind.shown(sample)
-      const taken = async (control: boolean, inside: boolean): Promise<Taken> => {
+      const taken = async (control: boolean, inside: Span | 'word' | null): Promise<Taken> => {
         const selected = await selectText(page, kind.selector, control, inside)
         if (!clipboard) return selected
         await page.keyboard.press('ControlOrMeta+c')
         return { ...selected, clipboard: await page.evaluate(() => navigator.clipboard.readText()) }
       }
-      const whole = await taken(false, false)
-      const wholeControl = await taken(true, false)
-      const inside = await taken(false, true)
-      const insideControl = await taken(true, true)
+      const whole = await taken(false, null)
+      const wholeControl = await taken(true, null)
+      // The second range lies inside the technical word: it starts after the word's first character, which is
+      // in its first part, and ends before its last, which is in its last part, so that it crosses every place a
+      // line may end in the word. The control takes the same offsets from the same text drawn as plain text.
+      const inside = await taken(false, 'word')
+      if (inside.span === null) throw new Error('the selection inside the word has no offsets')
+      const insideControl = await taken(true, inside.span)
       expect(whole.breakPlaces, 'the word is drawn with places to end a line').toBeGreaterThan(0)
       // The characters of the range are the source's, none added, none dropped, the spaces at the ends kept.
       expect(whole.range).toBe(shown)
-      expect(inside.range).toBe(shown.slice(1, -1))
+      expect(inside.wordBreakPlaces, 'the word is drawn with places to end a line').toBeGreaterThan(0)
+      expect(inside.range, 'the word without its first and its last character').toBe(inside.word.slice(1, -1))
+      expect(inside.range).toBe(shown.slice(inside.span.from, inside.span.to))
+      expect(inside.spanned, 'the places to end a line that the range crosses').toBe(inside.wordBreakPlaces)
       // What the engine copies from the drawn word is what it copies from the same text drawn as plain text.
       expect(whole.selection).toBe(wholeControl.selection)
       expect(inside.selection).toBe(insideControl.selection)
