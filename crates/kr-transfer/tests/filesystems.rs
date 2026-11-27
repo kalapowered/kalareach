@@ -185,7 +185,7 @@ fn a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers() {
             let at = scratch.path().join("volume");
             std::fs::create_dir(&at).expect("a mount point");
             let first = volumes::Volume::attach(&at, scratch.path(), "first")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
 
             // The service records its staging directory on the first filesystem, and accepts it
             // there again.
@@ -206,7 +206,7 @@ fn a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers() {
             // with it, is put on it.
             let second = first
                 .replace(scratch.path(), "second")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             volumes::copy_tree(
                 &kept.join(host.root().file_name().expect("the host's own name")),
                 second.at(),
@@ -250,7 +250,7 @@ fn a_scope_on_another_filesystem_is_refused_whatever_its_numbers() {
             let at = scratch.path().join("volume");
             std::fs::create_dir(&at).expect("a mount point");
             let first = volumes::Volume::attach(&at, scratch.path(), "first")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let harness = Harness::create();
             let tree = first.at().join("tree");
             std::fs::create_dir(&tree).expect("the scope's directory");
@@ -265,7 +265,7 @@ fn a_scope_on_another_filesystem_is_refused_whatever_its_numbers() {
             // Another filesystem takes its place and gives the directory the numbers it had.
             let second = first
                 .replace(scratch.path(), "second")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             std::fs::create_dir(&tree).expect("a directory at the same place");
             std::fs::write(tree.join("notes.txt"), pattern(512)).expect("writes a source");
             let (device, inode) = numbers_of(&tree);
@@ -301,7 +301,7 @@ fn a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_number
             let at = scratch.path().join("volume");
             std::fs::create_dir(&at).expect("a mount point");
             let first = volumes::Volume::attach(&at, scratch.path(), "first")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let environment = kr_protocol::ids::EnvironmentId::new(
                 kr_protocol::scalars::Uuid::from_bytes([3; 16]),
             );
@@ -325,7 +325,7 @@ fn a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_number
 
             let second = first
                 .replace(scratch.path(), "second")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             // The directory at the same place is given the inode the recorded one had, as a
             // filesystem built in the same order gives it, and the record carries the numbers it
             // has now.

@@ -14,6 +14,10 @@
 //! and says so, because a case that returned early would be counted as one that passed. On macOS a
 //! disk image is attached and detached with `hdiutil`.
 //!
+//! A filesystem that cannot be attached comes back as [`NotAttached`], which holds the call that
+//! failed (`hdiutil create`, `hdiutil attach` or `mount`), how it ended and what it printed, and
+//! [`not_attachable`] ends the case with it at the case's own line.
+//!
 //! A disk image on macOS is made so that nothing indexes it, and is detached by asking, by its
 //! disk, until the system lets the disk go: a case holds handles on its volume when it detaches
 //! it, as the cases are about what is open there, so the detach is forced, and a forced detach
@@ -124,18 +128,38 @@ fn namespace_launcher() -> Launcher {
     );
 }
 
+/// Why a filesystem was not attached: the call that failed, how it ended, and what the tool
+/// printed. The only paths it holds are inside the folders the case gave the attachment, and
+/// device names.
+#[derive(Debug)]
+pub struct NotAttached(String);
+
+impl std::fmt::Display for NotAttached {
+    fn fmt(&self, to: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        to.write_str(&self.0)
+    }
+}
+
 /// Ends a case whose host would not attach a filesystem, as a failure rather than as a check that
-/// passed: on Linux the namespace's exit code, which the half outside it turns into that failure,
-/// and on macOS the failure itself.
+/// passed, and says why: on Linux the reason goes to standard error with the case's line and the
+/// process ends with the namespace's exit code, which the half outside it turns into that failure,
+/// and on macOS the failure itself carries the reason and is reported at the case's line.
 ///
 /// # Panics
 ///
 /// Panics on macOS, and ends the process on Linux.
-pub fn not_attachable() -> ! {
+#[track_caller]
+pub fn not_attachable(why: NotAttached) -> ! {
     #[cfg(target_os = "linux")]
-    std::process::exit(NOT_EXERCISED);
+    {
+        eprintln!(
+            "{}: this host would not attach a filesystem: {why}",
+            std::panic::Location::caller()
+        );
+        std::process::exit(NOT_EXERCISED);
+    }
     #[cfg(not(target_os = "linux"))]
-    panic!("this host would not attach a filesystem, so this check cannot run here");
+    panic!("this host would not attach a filesystem, so this check cannot run here: {why}");
 }
 
 /// A filesystem attached at a path.
@@ -150,12 +174,15 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// Attaches a new, empty filesystem at `at`, a directory that exists, or returns `None` where
-    /// this host will not. `scratch` is where an image is kept, on the filesystem the case runs
-    /// on, and `tag` keeps one image's name from another's.
-    #[must_use]
-    pub fn attach(at: &Path, scratch: &Path, tag: &str) -> Option<Self> {
-        attach_new(at, scratch, tag).then(|| Self {
+    /// Attaches a new, empty filesystem at `at`, a directory that exists, or says why this host
+    /// would not. `scratch` is where an image is kept, on the filesystem the case runs on, and
+    /// `tag` keeps one image's name from another's.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the failed call printed and how it ended, for [`not_attachable`].
+    pub fn attach(at: &Path, scratch: &Path, tag: &str) -> Result<Self, NotAttached> {
+        attach_new(at, scratch, tag).map(|()| Self {
             at: at.to_path_buf(),
             attached: true,
         })
@@ -164,29 +191,36 @@ impl Volume {
     /// Binds the directory `source` over `at`, a directory that exists, so that `at` shows
     /// `source` and `..` from it leads to the directory `at` is in. The bound directory is on the
     /// filesystem it is a directory of: it has that filesystem's device number and its own mount.
-    /// Returns `None` where this host will not.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the failed call printed and how it ended, for [`not_attachable`].
     #[cfg(target_os = "linux")]
-    #[must_use]
-    pub fn bind(source: &Path, at: &Path) -> Option<Self> {
-        std::process::Command::new("mount")
-            .arg("--bind")
-            .arg(source)
-            .arg(at)
-            .status()
-            .is_ok_and(|status| status.success())
-            .then(|| Self {
-                at: at.to_path_buf(),
-                attached: true,
-            })
+    pub fn bind(source: &Path, at: &Path) -> Result<Self, NotAttached> {
+        run(
+            "mount",
+            std::process::Command::new("mount")
+                .arg("--bind")
+                .arg(source)
+                .arg(at),
+            &own_folders(&[source, at]),
+        )
+        .map(|()| Self {
+            at: at.to_path_buf(),
+            attached: true,
+        })
     }
 
     /// Takes this filesystem off and attaches another, new and empty, at the same path.
     ///
+    /// # Errors
+    ///
+    /// Returns what the failed call printed and how it ended, for [`not_attachable`].
+    ///
     /// # Panics
     ///
     /// Panics when this filesystem stays attached.
-    #[must_use]
-    pub fn replace(self, scratch: &Path, tag: &str) -> Option<Self> {
+    pub fn replace(self, scratch: &Path, tag: &str) -> Result<Self, NotAttached> {
         let at = self.at.clone();
         self.detach();
         Self::attach(&at, scratch, tag)
@@ -253,15 +287,114 @@ pub fn copy_tree(from: &Path, into: &Path) {
     assert!(status.success(), "the tree was copied: {status}");
 }
 
+/// The folders a text about `folders` may name: each of them, and where the system resolves it to,
+/// which is another path where a temporary folder is a link, as it is on macOS.
+fn own_folders(folders: &[&Path]) -> Vec<PathBuf> {
+    folders
+        .iter()
+        .flat_map(|folder| [Some(folder.to_path_buf()), folder.canonicalize().ok()])
+        .flatten()
+        .collect()
+}
+
+/// Runs `command` with its output taken, and returns why it failed when it did. `tool` names the
+/// call in what the failure says, and `own` holds the folders whose paths that text may keep.
+fn run(
+    tool: &str,
+    command: &mut std::process::Command,
+    own: &[PathBuf],
+) -> Result<(), NotAttached> {
+    let ended = command.output();
+    if ended.as_ref().is_ok_and(|output| output.status.success()) {
+        return Ok(());
+    }
+    Err(NotAttached(call_failed(tool, &ended, own)))
+}
+
+/// What a call that failed says: its name, how it ended, and what it printed, its error output
+/// first, in one line.
+fn call_failed(
+    tool: &str,
+    ended: &std::io::Result<std::process::Output>,
+    own: &[PathBuf],
+) -> String {
+    let output = match ended {
+        Ok(output) => output,
+        Err(error) => return format!("{tool} could not be run: {error}"),
+    };
+    let printed: Vec<String> = [&output.stderr, &output.stdout]
+        .into_iter()
+        .flat_map(|text| {
+            String::from_utf8_lossy(text)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let said = if printed.is_empty() {
+        "the tool printed nothing".to_owned()
+    } else {
+        without_foreign_paths(&printed.join("; "), own)
+    };
+    format!("{tool} ended with {}: {said}", output.status)
+}
+
+/// `text` with each absolute path in it that is neither inside one of `own` nor a device name
+/// replaced by `<path>`, so that what a tool says about the host's other folders, the person's
+/// home among them, does not reach a log.
+fn without_foreign_paths(text: &str, own: &[PathBuf]) -> String {
+    // A path ends at white space or at a character that quotes or separates it; a stop or a mark
+    // after its last name belongs to the sentence.
+    const ENDS_A_PATH: &str = "\"'`<>()[]{},;:";
+    let mut kept = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let begins_a_path = rest.starts_with('/')
+            && rest[1..]
+                .chars()
+                .next()
+                .is_some_and(|next| !next.is_whitespace())
+            && text[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !(before.is_alphanumeric() || "_-.~".contains(before)));
+        if !begins_a_path {
+            let next = rest.chars().next().expect("text is left");
+            kept.push(next);
+            at += next.len_utf8();
+            continue;
+        }
+        let end = rest
+            .find(|next: char| next.is_whitespace() || ENDS_A_PATH.contains(next))
+            .unwrap_or(rest.len());
+        let token = &rest[..end];
+        let path = token.trim_end_matches(['.', '!', '?']);
+        let named = Path::new(path);
+        if named.starts_with("/dev") || own.iter().any(|folder| named.starts_with(folder)) {
+            kept.push_str(token);
+        } else {
+            kept.push_str("<path>");
+            kept.push_str(&token[path.len()..]);
+        }
+        at += end;
+    }
+    kept
+}
+
 #[cfg(target_os = "linux")]
-fn attach_new(at: &Path, _scratch: &Path, _tag: &str) -> bool {
+fn attach_new(at: &Path, _scratch: &Path, _tag: &str) -> Result<(), NotAttached> {
     // A new tmpfs for every attachment: its own filesystem id and, in this namespace, the device
     // number the last one had.
-    std::process::Command::new("mount")
-        .args(["-t", "tmpfs", "-o", "mode=0700", "tmpfs"])
-        .arg(at)
-        .status()
-        .is_ok_and(|status| status.success())
+    run(
+        "mount",
+        std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "mode=0700", "tmpfs"])
+            .arg(at),
+        &own_folders(&[at]),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -310,51 +443,65 @@ pub fn never_indexed_contents(parent: &Path, name: &str) -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn attach_new(at: &Path, scratch: &Path, tag: &str) -> bool {
+fn attach_new(at: &Path, scratch: &Path, tag: &str) -> Result<(), NotAttached> {
     let image = scratch.join(format!("volume-{tag}.dmg"));
     let contents = never_indexed_contents(scratch, &format!("volume-{tag}-contents"));
-    let made = std::process::Command::new("/usr/bin/hdiutil")
-        .args([
-            "create",
-            "-size",
-            "8m",
-            "-fs",
-            "HFS+",
-            "-volname",
-            "volume",
-            "-format",
-            "UDRW",
-            "-quiet",
-            "-srcfolder",
-        ])
-        .arg(&contents)
-        .arg(&image)
-        .status();
-    if !made.is_ok_and(|status| status.success()) {
-        return false;
-    }
-    let attached = std::process::Command::new("/usr/bin/hdiutil")
-        .args([
-            "attach",
-            "-nobrowse",
-            "-noverify",
-            "-noautoopen",
-            "-quiet",
-            "-mountpoint",
-        ])
-        .arg(at)
-        .arg(&image)
-        .status()
-        .is_ok_and(|status| status.success());
+    let own = own_folders(&[scratch, at]);
+    create_image(&contents, &image, &own)?;
+    attach_image(at, &image, &own)?;
     // Owner-only, as the root of the filesystem a tmpfs is given on Linux and as a staging
     // directory is made: a volume's root is open to everyone, and a removal that checks who may
     // change a directory would refuse it for that reason and not for the one a case is about.
-    if attached {
+    {
         use std::os::unix::fs::PermissionsExt as _;
 
         let _ = std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o700));
     }
-    attached
+    Ok(())
+}
+
+/// Makes the disk image `image` from the directory `contents`. `hdiutil` is not told to be quiet,
+/// so that what it prints when it fails is what the failure says.
+#[cfg(target_os = "macos")]
+fn create_image(contents: &Path, image: &Path, own: &[PathBuf]) -> Result<(), NotAttached> {
+    run(
+        "hdiutil create",
+        std::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "create",
+                "-size",
+                "8m",
+                "-fs",
+                "HFS+",
+                "-volname",
+                "volume",
+                "-format",
+                "UDRW",
+                "-srcfolder",
+            ])
+            .arg(contents)
+            .arg(image),
+        own,
+    )
+}
+
+/// Attaches the disk image `image` at `at`, with the same output as [`create_image`].
+#[cfg(target_os = "macos")]
+fn attach_image(at: &Path, image: &Path, own: &[PathBuf]) -> Result<(), NotAttached> {
+    run(
+        "hdiutil attach",
+        std::process::Command::new("/usr/bin/hdiutil")
+            .args([
+                "attach",
+                "-nobrowse",
+                "-noverify",
+                "-noautoopen",
+                "-mountpoint",
+            ])
+            .arg(at)
+            .arg(image),
+        own,
+    )
 }
 
 /// How long a detach asks for a disk to be let go of before the volume is taken for stuck.
@@ -825,5 +972,153 @@ mod tests {
             super::image_of(listing, "/dev/disk99"),
             (Vec::new(), Vec::new())
         );
+    }
+
+    /// A call that failed says which call it was, how it ended, and what the tool printed: its
+    /// error output first, then its other output, a line at a time.
+    #[test]
+    fn a_failed_call_says_which_call_how_it_ended_and_what_the_tool_printed() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::{ExitStatus, Output};
+
+        let own = [std::path::PathBuf::from("/case")];
+        // A program that exited with `code` is waited for as `code << 8`; one that a signal ended,
+        // as the signal's number.
+        let ended = |status: i32, stdout: &str, stderr: &str| {
+            Ok(Output {
+                status: ExitStatus::from_raw(status),
+                stdout: stdout.into(),
+                stderr: stderr.into(),
+            })
+        };
+        assert_eq!(
+            super::call_failed(
+                "hdiutil create",
+                &ended(
+                    3 << 8,
+                    "",
+                    "hdiutil: create failed - No such file or directory\n"
+                ),
+                &own
+            ),
+            "hdiutil create ended with exit status: 3: hdiutil: create failed - No such file or \
+             directory"
+        );
+        assert_eq!(
+            super::call_failed(
+                "mount",
+                &ended(1 << 8, "third\n", "first\n\nsecond\n"),
+                &own
+            ),
+            "mount ended with exit status: 1: first; second; third"
+        );
+        assert_eq!(
+            super::call_failed("hdiutil attach", &ended(1 << 8, "", "\n"), &own),
+            "hdiutil attach ended with exit status: 1: the tool printed nothing"
+        );
+        let killed = super::call_failed("hdiutil attach", &ended(9, "", ""), &own);
+        assert!(
+            killed.starts_with("hdiutil attach ended with signal: 9"),
+            "{killed}"
+        );
+        let missing = super::call_failed(
+            "hdiutil create",
+            &Err(std::io::ErrorKind::NotFound.into()),
+            &own,
+        );
+        assert!(
+            missing.starts_with("hdiutil create could not be run: "),
+            "{missing}"
+        );
+    }
+
+    /// What a tool printed keeps the paths inside the folders the case gave and the device names,
+    /// and not another path, whatever stands around it.
+    #[test]
+    fn a_path_outside_the_cases_folders_is_not_kept_in_what_a_tool_printed() {
+        let own = [std::path::PathBuf::from("/case")];
+        assert_eq!(
+            super::without_foreign_paths(
+                "attach failed at /case/mnt: image \"/home/person/x.dmg\" on /dev/disk4s2 \
+                 (see /case/images/volume-a.dmg.) in /home/person/y and/or /private/var/z!",
+                &own
+            ),
+            "attach failed at /case/mnt: image \"<path>\" on /dev/disk4s2 \
+             (see /case/images/volume-a.dmg.) in <path> and/or <path>!"
+        );
+        // A folder that only begins with the same name is another folder.
+        assert_eq!(
+            super::without_foreign_paths("/casework/x /case/x", &own),
+            "<path> /case/x"
+        );
+        // A slash that does not begin a path is text.
+        assert_eq!(
+            super::without_foreign_paths("a / b and 3/4 and /", &own),
+            "a / b and 3/4 and /"
+        );
+    }
+
+    /// An image that cannot be made fails with the call, its exit status and what `hdiutil`
+    /// printed, so that a host that fails once leaves a cause in the log. This case runs on macOS
+    /// only, where `hdiutil` is the tool that makes the image; on other systems it is not built.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_image_that_cannot_be_made_says_so_with_the_exit_status_and_what_hdiutil_printed() {
+        let scratch = crate::testing::PrivateTempDir::create();
+        let contents = super::never_indexed_contents(scratch.path(), "failing-contents");
+        // An image cannot be made below a file.
+        let file = scratch.path().join("a-file");
+        std::fs::write(&file, b"").expect("a file");
+        let image = file.join("volume.dmg");
+        let own = super::own_folders(&[scratch.path()]);
+        let why = super::create_image(&contents, &image, &own)
+            .expect_err("an image below a file cannot be made");
+        let text = why.to_string();
+        assert!(
+            text.starts_with("hdiutil create ended with exit status: "),
+            "{text}"
+        );
+        assert!(!text.contains("the tool printed nothing"), "{text}");
+    }
+
+    /// A case that cannot attach a volume fails with the reason, and the panic is reported at the
+    /// line in the case that ended it, not in this file. This case runs on macOS only, where the
+    /// case fails by a panic; on Linux the process ends.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_case_that_cannot_attach_a_volume_fails_with_the_reason_at_its_own_line() {
+        use std::sync::{Arc, Mutex};
+
+        let mine = std::thread::current().id();
+        let seen = Arc::new(Mutex::new(None));
+        let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+            Arc::from(std::panic::take_hook());
+        {
+            let (previous, seen) = (Arc::clone(&previous), Arc::clone(&seen));
+            std::panic::set_hook(Box::new(move |info| {
+                if std::thread::current().id() == mine {
+                    *seen.lock().expect("the place") = info
+                        .location()
+                        .map(|place| (place.file().to_owned(), place.line()));
+                } else {
+                    previous(info);
+                }
+            }));
+        }
+        let why = super::NotAttached("hdiutil attach ended with exit status: 1: no way".to_owned());
+        let line = line!() + 1;
+        let ended = std::panic::catch_unwind(|| super::not_attachable(why));
+        std::panic::set_hook(Box::new(move |info| previous(info)));
+        let text = said(&*ended.expect_err("the case fails"));
+        assert!(
+            text.ends_with("hdiutil attach ended with exit status: 1: no way"),
+            "{text}"
+        );
+        let (file, at) = seen
+            .lock()
+            .expect("the place")
+            .clone()
+            .expect("the panic was reported");
+        assert_eq!((file.as_str(), at), (file!(), line));
     }
 }

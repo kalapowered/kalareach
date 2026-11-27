@@ -2943,7 +2943,7 @@ fn a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers(
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume =
                 kr_ipc::testing::volumes::Volume::attach(fixture.work(), scratch.path(), "other")
-                    .unwrap_or_else(|| kr_ipc::testing::volumes::not_attachable());
+                    .unwrap_or_else(|why| kr_ipc::testing::volumes::not_attachable(why));
             let destination = ordinary_repository(fixture.work(), "elsewhere-destination");
             let staged = destination.join(&entry);
             std::fs::DirBuilder::new()

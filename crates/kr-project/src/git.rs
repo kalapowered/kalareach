@@ -5262,7 +5262,7 @@ mod tests {
                 let at = temporary.join(&name);
                 let scratch = tempfile::tempdir().expect("a place for an image");
                 let volume = kr_ipc::testing::volumes::Volume::attach(&at, scratch.path(), "other")
-                    .unwrap_or_else(|| kr_ipc::testing::volumes::not_attachable());
+                    .unwrap_or_else(|why| kr_ipc::testing::volumes::not_attachable(why));
                 std::fs::create_dir(at.join(&token)).expect("a mark on the other filesystem");
                 let directory = std::fs::metadata(&at).expect("the mounted directory");
                 let mark = std::fs::metadata(at.join(&token)).expect("its mark");

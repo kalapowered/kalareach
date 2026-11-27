@@ -3217,7 +3217,7 @@ mod root_tests {
         let mut before = 0;
         let why = make_root(&base, &mut || "ffffffff".to_owned(), &mut |place| {
             let attached =
-                Volume::attach(place, &images, "root").unwrap_or_else(|| not_attachable());
+                Volume::attach(place, &images, "root").unwrap_or_else(|why| not_attachable(why));
             std::fs::write(place.join("theirs"), b"a file of the person's").expect("a file");
             before = std::fs::read_dir(place).expect("the volume").count();
             volume = Some(attached);
@@ -3547,8 +3547,8 @@ mod root_tests {
         let root = base.join("run");
         std::fs::create_dir_all(root.join("mnt")).expect("a run");
         let pin = RootPin::of(&root).expect("a pin");
-        let volume =
-            Volume::attach(&root.join("mnt"), &images, "below").unwrap_or_else(|| not_attachable());
+        let volume = Volume::attach(&root.join("mnt"), &images, "below")
+            .unwrap_or_else(|why| not_attachable(why));
         std::fs::write(root.join("mnt/theirs"), b"a file on the volume").expect("a file");
         let through = read_tail_below(&root, &pin, Path::new("mnt/theirs"), 0);
         let at_the_point = read_tail_below(&root, &pin, Path::new("mnt"), 0);

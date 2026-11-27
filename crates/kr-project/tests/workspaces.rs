@@ -724,7 +724,7 @@ fn a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
             // was built in the same order.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(fixture.work(), scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let other = ordinary_repository(fixture.work(), "elsewhere");
             let (device, tree) = numbers_of(&other);
             let (_, git_dir) = numbers_of(&other.join(".git"));
@@ -791,7 +791,7 @@ fn a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers() 
             // directory of its own at the tree's path that has the inode the tree had.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(&trees, scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             std::fs::create_dir(trees.join("tree")).expect("a directory at the tree's path");
             std::fs::write(trees.join("tree/theirs.txt"), b"not this host's\n")
                 .expect("their file");
@@ -2034,7 +2034,7 @@ fn a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers() {
             // directory of its own at the tree's path that has the inode the tree had.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(&trees, scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             std::fs::create_dir(trees.join("tree")).expect("a directory at the tree's path");
             std::fs::write(trees.join("tree/theirs.txt"), b"not this host's\n")
                 .expect("their file");
@@ -2229,7 +2229,7 @@ fn a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it() 
             std::fs::create_dir_all(elsewhere.join("below")).expect("another directory tree");
             write(&elsewhere, "below/theirs.txt", "not this workspace's\n");
             let volume = volumes::Volume::bind(&elsewhere, &top.join("middle"))
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let held = measured(&fixture, bound, 105);
             assert!(
                 held.iter().any(|item| item
@@ -2340,7 +2340,7 @@ fn a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it() {
             // Another filesystem is mounted over it.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(&below, scratch.path(), "over")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let held = measured(&fixture, mounted, 96);
             assert!(
                 held.iter().any(|item| item

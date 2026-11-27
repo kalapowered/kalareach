@@ -3045,7 +3045,7 @@ fn owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem() {
             // that name, and the row carries the numbers that directory has.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(&workspaces, scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             support::staging_directory(&leftover);
             std::fs::write(leftover.join("theirs.txt"), b"not this host's\n").expect("their file");
             let found =

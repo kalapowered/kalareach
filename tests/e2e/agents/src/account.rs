@@ -2989,7 +2989,7 @@ mod tests {
         let key = b"the-key-value-0123456789";
         std::fs::write(run.join("a/own"), key).expect("a file of the run's own that holds the key");
         let volume = Volume::attach(&run.join("a/mounted"), &images, "scan")
-            .unwrap_or_else(|| not_attachable());
+            .unwrap_or_else(|why| not_attachable(why));
         std::fs::write(run.join("a/mounted/theirs"), key)
             .expect("a file with one name, on the volume, that holds the key");
         let scans = [

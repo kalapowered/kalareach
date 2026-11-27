@@ -21,7 +21,7 @@ fn attached(scratch: &kr_ipc::testing::PrivateTempDir, tag: &str) -> (std::path:
     let at = scratch.path().join(format!("volume-{tag}"));
     std::fs::create_dir(&at).expect("a mount point");
     let volume =
-        Volume::attach(&at, scratch.path(), tag).unwrap_or_else(|| volumes::not_attachable());
+        Volume::attach(&at, scratch.path(), tag).unwrap_or_else(|why| volumes::not_attachable(why));
     (at, volume)
 }
 

@@ -5070,7 +5070,8 @@ mod tests {
         // The record's own directory is the mount point: the look at it, on the way to the record,
         // gives another file system.
         let record = run.join("agent-config/sessions");
-        let volume = Volume::attach(&record, &images, "root").unwrap_or_else(|| not_attachable());
+        let volume =
+            Volume::attach(&record, &images, "root").unwrap_or_else(|why| not_attachable(why));
         std::fs::write(record.join("outside-name.jsonl"), format!("{line}\n"))
             .expect("a file of the person's, with one name, on the volume");
         let mut read = Vec::new();
@@ -5093,7 +5094,8 @@ mod tests {
         refused(&said.expect_err("the record is on a mount"));
         assert!(read.is_empty(), "nothing on the volume was read");
         // A directory below the record is the mount point.
-        let volume = Volume::attach(&mount, &images, "record").unwrap_or_else(|| not_attachable());
+        let volume =
+            Volume::attach(&mount, &images, "record").unwrap_or_else(|why| not_attachable(why));
         std::fs::write(mount.join("outside-name.jsonl"), format!("{line}\n"))
             .expect("a file of the person's, with one name, on the volume");
         let mut read = Vec::new();
@@ -5119,8 +5121,8 @@ mod tests {
             &mut |_, content| read.push(content.to_vec()),
             &mut |moment, name| {
                 if moment == Moment::Looked && name == b"11" {
-                    let volume =
-                        Volume::attach(&mount, &images, "race").unwrap_or_else(|| not_attachable());
+                    let volume = Volume::attach(&mount, &images, "race")
+                        .unwrap_or_else(|why| not_attachable(why));
                     std::fs::write(mount.join("outside-name.jsonl"), format!("{line}\n"))
                         .expect("a file on the volume");
                     attached = Some(volume);
@@ -5853,7 +5855,7 @@ mod tests {
         let run = made();
         let pin = pinned(&run);
         let volume = Volume::attach(&run.join("a/mounted"), &images, "below")
-            .unwrap_or_else(|| not_attachable());
+            .unwrap_or_else(|why| not_attachable(why));
         std::fs::write(run.join("a/mounted/theirs"), b"a file of the person's")
             .expect("a file on the volume");
         let before = std::fs::read_dir(run.join("a/mounted"))
@@ -5874,7 +5876,7 @@ mod tests {
         assert!(own, "the run was left whole");
         // Below the run, by the end of the search: the search meets the volume, and the run stays.
         let volume = Volume::attach(&run.join("a/mounted"), &images, "finish")
-            .unwrap_or_else(|| not_attachable());
+            .unwrap_or_else(|why| not_attachable(why));
         std::fs::write(run.join("a/mounted/theirs"), b"a file of the person's")
             .expect("a file on the volume");
         let held = HeldKeys {
@@ -5897,7 +5899,8 @@ mod tests {
         // On the run's root: a volume put at its path is not the directory the run made.
         let run = made();
         let pin = pinned(&run);
-        let volume = Volume::attach(&run, &images, "root").unwrap_or_else(|| not_attachable());
+        let volume =
+            Volume::attach(&run, &images, "root").unwrap_or_else(|why| not_attachable(why));
         std::fs::write(run.join("theirs"), b"a file of the person's")
             .expect("a file on the volume");
         let removal = remove_run_directory(&run, &pin);

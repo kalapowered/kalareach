@@ -74,7 +74,7 @@ fn a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers() {
             // it was given the device number the first had, and was built in the same order.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(fixture.work(), scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             let other = ordinary_repository(fixture.work(), "elsewhere");
             let (device, tree) = numbers_of(&other);
             let (_, git_dir) = numbers_of(&other.join(".git"));
@@ -139,7 +139,7 @@ fn a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_n
             // journal carries the numbers its root has.
             let scratch = tempfile::tempdir().expect("a directory on the host's own filesystem");
             let volume = volumes::Volume::attach(directory, scratch.path(), "other")
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
             std::fs::write(directory.join("theirs.txt"), b"not this host's\n").expect("their file");
             let (device, inode) = numbers_of(directory);
             changeset_journal(&fixture)
@@ -212,7 +212,7 @@ fn a_directory_bound_into_a_materialisation_from_its_own_filesystem_is_not_chang
             let bound = directory.join("bound");
             std::fs::create_dir(&bound).expect("the place for the bound directory");
             let volume = volumes::Volume::bind(&outside, &bound)
-                .unwrap_or_else(|| volumes::not_attachable());
+                .unwrap_or_else(|why| volumes::not_attachable(why));
 
             let refused = materialise::release(fixture.service(), made.materialisation_id);
             let mode_of = |path: &std::path::Path| {
