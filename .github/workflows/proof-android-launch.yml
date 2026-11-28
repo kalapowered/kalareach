@@ -1,0 +1,252 @@
+name: proof-android-launch
+
+# Runs the android-app job's steps that start the application three times, each in a job of its own,
+# and keeps each run's evidence: the screenshot, the device's log and the emulator's log.
+on:
+  push:
+    branches: ["proof/android-launch"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  android-app-proof:
+    name: android-app-proof (run ${{ matrix.run }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    steps:
+      - name: Free the disk the build needs
+        timeout-minutes: 6
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - name: Check out
+        timeout-minutes: 5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install pnpm
+        timeout-minutes: 5
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+        with:
+          version: 11.14.0
+
+      - name: Install Node
+        timeout-minutes: 5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.1
+          package-manager-cache: false
+
+      - name: Install the pinned toolchain
+        timeout-minutes: 5
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Install the Android targets
+        timeout-minutes: 5
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Install the Android NDK, the emulator and a system image
+        timeout-minutes: 5
+        run: |
+          manager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            echo "::error::the runner's Android SDK has no command-line tools at $manager"
+            exit 1
+          fi
+          yes | "$manager" --licenses > "$RUNNER_TEMP/sdkmanager.log"
+          yes | "$manager" --install "ndk;28.2.13676358" "emulator" \
+            "system-images;android-36;google_apis_playstore_ps16k;x86_64" >> "$RUNNER_TEMP/sdkmanager.log"
+          tail -n 5 "$RUNNER_TEMP/sdkmanager.log"
+          "$manager" --list_installed | grep -E 'ndk;28|emulator|system-images'
+          {
+            echo "NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/28.2.13676358"
+            echo "ANDROID_NDK=$ANDROID_HOME/ndk/28.2.13676358"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        timeout-minutes: 5
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch the Gradle distribution
+        timeout-minutes: 12
+        working-directory: apps/companion/src-tauri/gen/android
+        run: |
+          attempt=1
+          until sh gradlew --version; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "::error::the Gradle distribution could not be fetched in $attempt tries"
+              exit 1
+            fi
+            echo "the fetch failed (try $attempt of 5): trying again in $((attempt * 30)) seconds"
+            sleep "$((attempt * 30))"
+            attempt=$((attempt + 1))
+          done
+          echo "the Gradle distribution was fetched at try $attempt of 5"
+
+      - name: Let Gradle wait longer between its fetch tries
+        timeout-minutes: 5
+        run: |
+          android=apps/companion/src-tauri/gen/android
+          gradle_version=8.14.3
+          distribution="$(grep '^distributionUrl=' "$android/gradle/wrapper/gradle-wrapper.properties" || true)"
+          case "$distribution" in
+            *"/gradle-$gradle_version-"*) echo "the wrapper names Gradle $gradle_version, the version whose resolver source the settings were read from" ;;
+            *)
+              echo "::error::the wrapper names '$distribution', not Gradle $gradle_version: read the resolver's source for the new version, confirm both setting names, then change gradle_version in this step"
+              exit 1
+              ;;
+          esac
+          tries_name=org.gradle.internal.repository.max.tentatives
+          wait_name=org.gradle.internal.repository.initial.backoff
+          tries=6
+          first_wait=4000
+          gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_home"
+          {
+            echo "systemProp.$tries_name=$tries"
+            echo "systemProp.$wait_name=$first_wait"
+          } >> "$gradle_home/gradle.properties"
+          probe="$RUNNER_TEMP/gradle-probe"
+          mkdir -p "$probe"
+          echo "rootProject.name = 'probe'" > "$probe/settings.gradle"
+          cat > "$probe/print-fetch-settings.init.gradle" <<EOF
+          println "gradle took: tries=" + System.getProperty("$tries_name") + " first wait=" + System.getProperty("$wait_name") + " ms"
+          println "gradle runs: version=" + gradle.gradleVersion
+          EOF
+          sh "$android/gradlew" -p "$probe" --no-daemon --console=plain \
+            -I "$probe/print-fetch-settings.init.gradle" help > "$RUNNER_TEMP/gradle-probe.log" 2>&1 || {
+            cat "$RUNNER_TEMP/gradle-probe.log"
+            exit 1
+          }
+          grep -E '^gradle (took|runs):' "$RUNNER_TEMP/gradle-probe.log"
+          if ! grep -qxF "gradle took: tries=$tries first wait=$first_wait ms" "$RUNNER_TEMP/gradle-probe.log"; then
+            echo "::error::Gradle did not take the fetch settings that this step wrote"
+            exit 1
+          fi
+          if ! grep -qxF "gradle runs: version=$gradle_version" "$RUNNER_TEMP/gradle-probe.log"; then
+            echo "::error::the Gradle that runs is not version $gradle_version, whose resolver source the settings were read from: read the resolver's source for the version that runs, confirm both setting names, then change gradle_version in this step"
+            exit 1
+          fi
+
+      - name: Build the debug application
+        timeout-minutes: 31
+        run: |
+          set -euo pipefail
+          build() { pnpm -C apps/companion android --debug --apk --target aarch64 x86_64; }
+          log="$RUNNER_TEMP/debug-build.log"
+          refusal="^[[:space:]]*> Could not GET 'https?://[^' ]+'[.] Received status code 429 from server: Too Many Requests[[:space:]]*\$"
+          set +e
+          build 2>&1 | tee "$log"
+          statuses=("${PIPESTATUS[@]}")
+          set -e
+          build_status="${statuses[0]}"
+          copy_status="${statuses[1]}"
+          if [ "$copy_status" -ne 0 ]; then
+            echo "the copy of the build's output failed (status $copy_status, the build's status $build_status): the step fails, and no second build runs"
+            exit 1
+          fi
+          if [ "$build_status" -eq 0 ]; then
+            exit 0
+          fi
+          if ! grep -qE -- "$refusal" "$log"; then
+            echo "the build failed, and not with the package repository's refusal: not trying again"
+            exit "$build_status"
+          fi
+          echo "the build failed with the package repository's refusal: waiting 600 seconds, then running it once more"
+          sleep 600
+          echo "the second run of the build"
+          build
+
+      - name: Let the emulator use the runner's virtual machine device
+        timeout-minutes: 5
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' |
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Run the native library and start the application on the emulator
+        timeout-minutes: 73
+        run: |
+          set -uo pipefail
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          . scripts/lib/artifacts-dir.sh
+          kr_artifacts_dir
+          mkdir -p "$kr_artifacts/android-app"
+          avd=kalareach-ci
+          # The device is made where the emulator looks for it: the tools take their own place for
+          # it from the SDK's settings unless it is named.
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd --force --name "$avd" \
+            --package "system-images;android-36;google_apis_playstore_ps16k;x86_64" --device pixel
+          # The application and the libraries it unpacks are more than the default data partition.
+          config="$ANDROID_AVD_HOME/$avd.avd/config.ini"
+          if [ ! -f "$config" ]; then
+            echo "::error::the virtual device has no configuration file at $config"
+            exit 1
+          fi
+          sed -i '/^disk\.dataPartition\.size=/d' "$config"
+          echo "disk.dataPartition.size=8192M" >> "$config"
+          # The device profile's memory is less than this system image runs in (the emulator raises
+          # it to 2560 MB by itself), and Google Play's own processes fill what is left. A device
+          # short of memory has its low-memory killer end the application's web view, which ends
+          # the application, or the application itself, so the launch check failed on those runs.
+          # The hosted runner has 16 GB, which the next line prints.
+          free -m
+          "$ANDROID_HOME/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim -no-snapshot \
+            -memory 4096 -gpu swiftshader_indirect -accel on > "$kr_artifacts/android-app/emulator.log" 2>&1 &
+          emulator=$!
+          trap 'kill "$emulator" 2> /dev/null || true' EXIT
+          serial="emulator-5554"
+          started=$SECONDS
+          until [ "$(adb -s "$serial" shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; do
+            if ! kill -0 "$emulator" 2> /dev/null; then
+              echo "::error::the emulator ended before it finished starting"
+              tail -n 40 "$kr_artifacts/android-app/emulator.log"
+              exit 1
+            fi
+            if [ $((SECONDS - started)) -gt 600 ]; then
+              echo "::error::the emulator did not finish starting"
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "the emulator finished starting after $((SECONDS - started)) seconds"
+          failed=0
+          bash scripts/native-library-tests.sh android --serial "$serial" || failed=1
+          bash scripts/android-app-launch.sh \
+            apps/companion/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk \
+            "$kr_artifacts/android-app/launch.png" --serial "$serial" || failed=1
+          adb -s "$serial" logcat -d -b all > "$kr_artifacts/android-app/logcat.txt" || true
+          exit "$failed"
+
+      - name: Keep the Android evidence
+        id: keep-the-android-evidence
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-android-${{ matrix.run }}
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
