@@ -324,6 +324,7 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
     let _conversation = to_the_approval(&server).await;
     let command = command_of(&server).await;
     assert!(!gone(&command), "the command runs while the server does");
+    let members = named(&[server.identity().clone(), command.clone()]);
 
     let record = Record::default();
     let retirement = server.retire(&record, Instant::now().into()).await;
@@ -331,7 +332,12 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(retirement.survivors.is_empty());
     assert_eq!(retirement.emptiness, Emptiness::Empty);
-    assert!(gone(server.identity()) && gone(&command));
+    // The ending waits on no handle of the command, so each is read until it reads ended.
+    let lags = read_ended(&members, ENDS_BY).await;
+    assert!(
+        lags.iter().all(|lag| lag.state == ProcessState::Ended),
+        "a member did not read ended within {ENDS_BY:?}: {lags:?}"
+    );
 }
 
 /// A server that ignores the end of its input is ended by force when the five seconds are over, and
@@ -343,6 +349,7 @@ async fn kr_req_07_66_a_server_that_ignores_its_input_is_forced_when_the_window_
     let server = start(&stand_in, &session, "ignore-eof", PLAIN).await;
     let _conversation = to_the_approval(&server).await;
     let command = command_of(&server).await;
+    let members = named(&[server.identity().clone(), command.clone()]);
 
     let record = Record::default();
     let begun = Instant::now();
@@ -362,7 +369,12 @@ async fn kr_req_07_66_a_server_that_ignores_its_input_is_forced_when_the_window_
         retirement.forced,
         "what the ending noted is what it reports"
     );
-    assert!(gone(server.identity()) && gone(&command));
+    // The ending waits on the server alone, so the command is read until it reads ended.
+    let lags = read_ended(&members, ENDS_BY).await;
+    assert!(
+        lags.iter().all(|lag| lag.state == ProcessState::Ended),
+        "a member did not read ended within {ENDS_BY:?}: {lags:?}"
+    );
     // KR-REQ-07.53: both were there until the five seconds were over, and no longer.
     for (what, went) in ["the server", "its command"]
         .into_iter()
@@ -428,7 +440,7 @@ fn image_name(pid: u64) -> String {
                 .next()
                 .map(|name| name.trim().trim_matches('"').to_owned())
         })
-        .filter(|name| name.ends_with(".exe"))
+        .filter(|name| name.to_ascii_lowercase().ends_with(".exe"))
         .unwrap_or_else(|| "unnamed".to_owned())
 }
 
