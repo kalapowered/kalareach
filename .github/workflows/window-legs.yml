@@ -6,7 +6,10 @@ name: window-legs
 # The macOS job installs a published host release (the default below, or the one a manual run
 # names), writes the profile into the real preferences of Terminal on the runner's account, and
 # opens a window, a window of another profile, a tab and a second window through Terminal's Shell
-# menu. It shows that release's writers and its `kr new` on one hosted image and one account, not a
+# menu, once in the release's default store and once in a store with no space in its path (the
+# command the profile holds is split at a space by Terminal, so the default store's decisions about
+# sessions are a named known red that does not fail the job). It shows that release's writers and its
+# `kr new` on one hosted image and one account, not a
 # person's own Mac, own profiles or own default. A change to a writer shows in the command cases
 # until a release carries it; when a new host release is published, its tag and the digest of its
 # macOS archive become the defaults here in the same change.
