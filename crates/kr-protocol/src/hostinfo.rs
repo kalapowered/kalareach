@@ -1405,7 +1405,7 @@ impl ComposedBundle {
 /// ```json
 /// {
 ///   "version": 3,
-///   "level": 1,
+///   "level": 8,
 ///   "revision": 3,
 ///   "preferences": { "sleep_inhibition": "mains_only" },
 ///   "profiles": { "review": { "worker_profile": "headless_user" } },
