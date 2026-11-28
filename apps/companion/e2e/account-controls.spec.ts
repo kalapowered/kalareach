@@ -510,8 +510,24 @@ for (const form of [...PHONES, ...DESKTOPS]) {
 // ---- The recovery card of the desktop's sync service -----------------------------------------------
 
 const RECOVERY_ARCHIVES = [
-  { archive_id: 'a1', generation: 3, published_at_ms: 1_700_000_000_000, withheld: null },
-  { archive_id: 'a2', generation: null, published_at_ms: null, withheld: 'refused' }
+  {
+    archive_id: 'a1',
+    generation: '3',
+    published_at_ms: 1_700_000_000_000,
+    withheld: null,
+    held_generation: null,
+    checkpoint_generation: null,
+    host: null
+  },
+  {
+    archive_id: 'a2',
+    generation: null,
+    published_at_ms: null,
+    withheld: 'refused',
+    held_generation: null,
+    checkpoint_generation: null,
+    host: null
+  }
 ] as const
 
 /** The host answers the cover of its backups as one set up under another kit, which offers a new start. */
