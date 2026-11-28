@@ -390,6 +390,12 @@ impl WorkerTerminal {
     /// Types one line into the session's root shell, ending it with the carriage return the Enter
     /// key sends, which is what the pseudo-console takes as the end of a line.
     pub async fn type_line(&mut self, line: &str) {
+        self.type_bytes(format!("{line}\r").as_bytes()).await;
+    }
+
+    /// Types `bytes` into the session's root shell exactly as given, with nothing added: a control
+    /// character such as the end-of-file key is one byte, and no Enter follows it.
+    pub async fn type_bytes(&mut self, bytes: &[u8]) {
         let _: kr_protocol::input::InputWriteResult = self
             .client
             .request(
@@ -400,7 +406,7 @@ impl WorkerTerminal {
                     epoch: self.epoch,
                     sequence: kr_protocol::ids::InputSequence::new(self.sequence),
                     input: kr_protocol::input::InputContent::Bytes {
-                        bytes: kr_protocol::scalars::Bytes::new(format!("{line}\r").into_bytes()),
+                        bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
                     },
                 },
             )
