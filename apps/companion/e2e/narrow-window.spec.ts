@@ -98,6 +98,42 @@ async function openWindow(page: Page, width: number, ratio = 1, height = HEIGHT)
   }, SIGNED_IN)
 }
 
+/**
+ * What a case asks for of the two preferences that put a plain line at the lower edge of the top
+ * bar's words in place of the fade: more contrast, and reduced transparency. The page then reads
+ * what the case says, and not what the machine's own settings say. `emulateMedia` knows the first
+ * in every engine. The second is known only to Chromium, which reads it from the system's setting
+ * when none is given (WebKit has no such feature and draws the fade), so Chromium is given it
+ * through its own protocol. That call replaces the whole list that `emulateMedia` sent, so it
+ * repeats the other preferences at the values Playwright gives them; a case that calls
+ * `emulateMedia` after this one ends what this one set.
+ */
+async function askFor(
+  page: Page,
+  asked: { readonly contrast: 'no-preference' | 'more'; readonly transparency: 'no-preference' | 'reduce' }
+): Promise<void> {
+  await page.emulateMedia({ contrast: asked.contrast })
+  if (page.context().browser()?.browserType().name() !== 'chromium') return
+  const session = await page.context().newCDPSession(page)
+  await session.send('Emulation.setEmulatedMedia', {
+    features: [
+      { name: 'prefers-color-scheme', value: 'light' },
+      { name: 'prefers-reduced-motion', value: 'no-preference' },
+      { name: 'forced-colors', value: 'none' },
+      { name: 'prefers-contrast', value: asked.contrast },
+      { name: 'prefers-reduced-transparency', value: asked.transparency }
+    ]
+  })
+  const reads = await page.evaluate(() => ({
+    contrast: matchMedia('(prefers-contrast: more)').matches,
+    transparency: matchMedia('(prefers-reduced-transparency: reduce)').matches
+  }))
+  expect(reads, 'the page reads the preferences that the case asked for').toEqual({
+    contrast: asked.contrast === 'more',
+    transparency: asked.transparency === 'reduce'
+  })
+}
+
 const menuOf = (page: Page): Locator =>
   page.locator('.topbar').getByRole('button', { name: 'Menu', exact: true })
 /** The drawer while it is open: nothing matches while it is closed, and then it is not visible. */
@@ -632,6 +668,13 @@ for (const width of WIDTHS) {
 
 test.describe('the words in the top bar', () => {
   const wordsOf = (page: Page): Locator => page.locator('.topbar .connection')
+  // Whether the fade is drawn depends on two preferences, and Chromium on a Mac reads one of them from
+  // the host (a CI runner may have Reduce Transparency on). Each case starts with neither asked for,
+  // and the two that test the plain line ask for one of them.
+  test.beforeEach(async ({ page }) => {
+    await askFor(page, { contrast: 'no-preference', transparency: 'no-preference' })
+  })
+
   const shown = (page: Page): Promise<{ more: string | null; mask: string; line: string; scrolled: number }> =>
     page.evaluate(() => {
       const element = document.querySelector('.topbar .connection') as HTMLElement
@@ -701,7 +744,23 @@ test.describe('the words in the top bar', () => {
   })
 
   test('with more contrast asked for, a plain line says that more follows, in place of the fade', async ({ page }) => {
-    await page.emulateMedia({ contrast: 'more' })
+    await askFor(page, { contrast: 'more', transparency: 'no-preference' })
+    await openWindow(page, 480, LARGEST)
+    await page.evaluate((reason) => {
+      window.krTestHost?.setConnected(false, reason)
+    }, LONG_REASON)
+    await expect(wordsOf(page)).toHaveAttribute('data-more', 'true')
+    const state = await shown(page)
+    expect(state.mask, 'no fade').toBe('none')
+    expect(state.line, 'a plain line at the lower edge').not.toBe('none')
+  })
+
+  test('with reduced transparency asked for, a plain line says that more follows, in place of the fade', async ({
+    browserName,
+    page
+  }) => {
+    test.skip(browserName !== 'chromium', 'only this engine has the preference: the others draw the fade')
+    await askFor(page, { contrast: 'no-preference', transparency: 'reduce' })
     await openWindow(page, 480, LARGEST)
     await page.evaluate((reason) => {
       window.krTestHost?.setConnected(false, reason)
