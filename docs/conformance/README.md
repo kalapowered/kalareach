@@ -187,6 +187,8 @@ and the desktop controls, `test-evidence-ios` and `test-evidence-android` for th
 `scripts/check-test-evidence.sh` fails the browser job when it kept no screenshot there or left one
 named `kr-*.png` in the temporary directory.
 
+The opted-in terminal profile's windows run apart from the landing workflow, in `.github/workflows/window-legs.yml`: on a hosted `macos-15` account it installs a published host release, writes the profile into Terminal's real preferences and opens a window, a tab and a second window through Terminal's Shell menu, and each `check=<name> ok=<0|1>` line of its log is one decision about the session list. It runs when its own files change and once a week, shows that release's writers and `kr new` on that image's account, and does not show a person's own Mac.
+
 Three things stay outside the hosted workflow. Peekaboo's tests drive a person's own macOS desktop
 and the permissions it has granted, so they run on the machines of the people who qualify a
 release. Parallels virtual machines run there too, since the hosted macOS runners offer no nested

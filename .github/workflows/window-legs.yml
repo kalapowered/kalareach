@@ -1,0 +1,80 @@
+name: window-legs
+
+# Opens windows and a tab of a real terminal application through the opted-in terminal profile on a
+# GitHub-hosted runner, and holds each one to the host's session list.
+#
+# The macOS job installs a published host release (the default below, or the one a manual run
+# names), writes the profile into the real preferences of Terminal on the runner's account, and
+# opens a window, a window of another profile, a tab and a second window through Terminal's Shell
+# menu. It shows that release's writers and its `kr new` on one hosted image and one account, not a
+# person's own Mac, own profiles or own default. A change to a writer shows in the command cases
+# until a release carries it; when a new host release is published, its tag and the digest of its
+# macOS archive become the defaults here in the same change.
+#
+# The run's log has one `check=<name> ok=<0|1>` line for each decision. What leaves the runner is
+# that log and the pictures of the runner's own screen that the job uploads as an artifact.
+# It is not part of the landing workflow: a red here is a check of its own.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: The host release tag to install. Its archive is checked against the release's own SHA256SUMS only.
+        required: false
+        default: host/v0.1.0+7c68ef8cf3c0
+        type: string
+  pull_request:
+    paths:
+      - scripts/window-leg-macos.sh
+      - scripts/window-leg-guard-test.sh
+      - .github/workflows/window-legs.yml
+  push:
+    branches: ["main", "proof/window-leg"]
+    paths:
+      - scripts/window-leg-macos.sh
+      - scripts/window-leg-guard-test.sh
+      - .github/workflows/window-legs.yml
+  schedule:
+    # Weekly, so that a change of the runner image or of the application shows within a week.
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  PINNED_RELEASE: host/v0.1.0+7c68ef8cf3c0
+  # The SHA-256 of that release's aarch64-apple-darwin archive, which is what a macos-15 runner takes.
+  PINNED_ARCHIVE_SHA256: 2c17f4389efbe16d4fa02c78e51dbd66adbbd3f277e7ac09397fcba30296c442
+
+jobs:
+  refusal:
+    name: the refusal
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: The leg refuses outside a hosted macOS account
+        run: bash scripts/window-leg-guard-test.sh
+
+  macos:
+    name: terminal on macos-15
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Open windows and a tab through the profile
+        env:
+          KR_WINDOW_LEG: "1"
+          RELEASE: ${{ inputs.release || env.PINNED_RELEASE }}
+          ARCHIVE_SHA256: ${{ (inputs.release == '' || inputs.release == env.PINNED_RELEASE) && env.PINNED_ARCHIVE_SHA256 || '' }}
+        run: bash scripts/window-leg-macos.sh "$RELEASE" "$ARCHIVE_SHA256" "$RUNNER_TEMP/window-leg-pictures"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: window-leg-macos
+          path: ${{ runner.temp }}/window-leg-pictures
+          if-no-files-found: ignore
