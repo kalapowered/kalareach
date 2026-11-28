@@ -144,12 +144,15 @@ impl Server {
         );
         let cancelled = Arc::new(AtomicBool::new(false));
         let _given_up = GivenUp(Arc::clone(&cancelled));
-        let mut child = {
+        let (mut child, held) = {
             let arguments = spec.arguments.to_vec();
             let directory = spec.directory.to_path_buf();
             let job = Arc::clone(&job);
             let cancelled = Arc::clone(&cancelled);
             tokio::task::spawn_blocking(move || {
+                // This closure owns `held` (it is returned with the process): the future that
+                // awaits it can be dropped while the pipes are made, and a file nothing holds is
+                // one another program can take the place of before the process is created from it.
                 #[cfg(feature = "testing")]
                 kr_ipc::testing::created::note_words_here(
                     "backend",
@@ -168,12 +171,15 @@ impl Server {
                     stderr: Stdio::Overlapped,
                 })?;
                 // The caller stopped waiting while the process was being created: what was made
-                // is ended here, since nothing else holds it.
+                // is ended here, with the file still held. The job's kill-on-close would end it too
+                // when the closure's handle to the job closes; this makes the end independent of
+                // which handle closes last, and the closure returns an error and not a process that
+                // nobody receives.
                 if cancelled.load(Ordering::Acquire) {
                     let _ = job.terminate(1);
                     return Err(std::io::Error::other("the start was given up"));
                 }
-                Ok(child)
+                Ok((child, held))
             })
             .await
             .map_err(|error| format!("the server could not be started: {error}"))?

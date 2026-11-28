@@ -786,12 +786,14 @@ async fn kr_req_07_60_a_server_that_is_dropped_is_ended_with_its_command() {
     drop(conversation);
 }
 
-/// A start that is given up while its process is being created ends what that creates: the future
-/// that awaits the start is dropped at the moment the pipe's two ends are being made, and no
-/// process of the file is left. A running program holds its file, so the case can delete the copy
-/// only once nothing runs from it.
+/// A start that is given up while its process is being created keeps the program's file held
+/// until the process exists and is ended: the future that awaits the start is dropped at the
+/// moment the pipes are being made, and while the creation is paused nothing can delete, rename or
+/// write the file, so no other program can take its place before the process is created from it.
+/// Then the creation goes on, the session's job counts the process it created, and the process
+/// ends, so that nothing runs from the file and it can be removed.
 #[tokio::test]
-async fn kr_req_07_60_a_start_dropped_during_the_create_leaves_no_process() {
+async fn kr_req_07_60_a_start_dropped_during_the_create_keeps_its_file_and_leaves_no_process() {
     /// Clears the hook when the case ends, however it ends.
     struct ClearsTheHook;
     impl Drop for ClearsTheHook {
@@ -813,7 +815,9 @@ async fn kr_req_07_60_a_start_dropped_during_the_create_leaves_no_process() {
     );
 
     // Told from the blocking thread the start's create runs on, and awaited here: this test's
-    // runtime has one thread, so a wait that blocks it would stop the start it waits for.
+    // runtime has one thread, so a wait that blocks it would stop the start it waits for. The
+    // create makes three pipes and the hook runs at each: closing the sending end lets every one
+    // of them go on at once.
     let (reached, mut wait_reached) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let released = Mutex::new(released);
@@ -850,17 +854,60 @@ async fn kr_req_07_60_a_start_dropped_during_the_create_leaves_no_process() {
     );
     starting.abort();
     let _ = starting.await;
-    release.send(()).expect("the start is released");
 
-    // The program the closure created is ended by the closure, so the copy can be removed.
-    let started = Instant::now();
-    loop {
-        if std::fs::remove_file(&executable).is_ok() {
-            break;
-        }
+    // The creation is paused and no process exists yet. The start is given up, and the file it
+    // holds is still held: it cannot be removed, renamed or written, which is all that taking its
+    // place needs.
+    assert_eq!(
+        session.job.total_processes().expect("the job is read"),
+        0,
+        "no process was created before the creation went on"
+    );
+    assert!(
+        std::fs::remove_file(&executable).is_err(),
+        "the file was removable while the start that was given up held it"
+    );
+    assert!(
+        std::fs::rename(&executable, own.path().join("moved.exe")).is_err(),
+        "the file was renamable while the start that was given up held it"
+    );
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&executable)
+            .is_err(),
+        "the file was writable while the start that was given up held it"
+    );
+
+    // The creation goes on: the process is created from the file, which the job counts however
+    // briefly it runs, and the start's own cleanup ends it.
+    drop(release);
+    let created = Instant::now();
+    while session.job.total_processes().expect("the job is read") == 0 {
         assert!(
-            started.elapsed() < PROMPT,
-            "a process of the file the start was given up on is still running"
+            created.elapsed() < PROMPT,
+            "the creation that went on made no process"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    while !session
+        .job
+        .process_ids()
+        .expect("the job is read")
+        .is_empty()
+    {
+        assert!(
+            created.elapsed() < PROMPT,
+            "the process the start was given up on is still running"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Nothing runs from the file, so it can be removed once the closure that held it has ended.
+    let released = Instant::now();
+    while std::fs::remove_file(&executable).is_err() {
+        assert!(
+            released.elapsed() < PROMPT,
+            "the file is still held after the start was given up"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

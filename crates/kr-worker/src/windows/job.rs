@@ -192,6 +192,16 @@ impl SessionJob {
         self.job.process_ids()
     }
 
+    /// Returns how many processes the job has held in all, those that have ended included.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when the job will not say.
+    #[cfg(feature = "testing")]
+    pub fn total_processes(&self) -> std::io::Result<u32> {
+        self.job.total_processes()
+    }
+
     /// Ends every process the job holds, at once.
     ///
     /// # Errors
