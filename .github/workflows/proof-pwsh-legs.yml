@@ -59,5 +59,17 @@ jobs:
           pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString(); Get-Module PSReadLine -ListAvailable | Select-Object Name, Version, Path | Format-List'
           whoami /priv
 
-      - name: Measure the idle tick of a parked reader
-        run: cargo test --locked -p kr-shell-integration --test pwsh_idle_spike -- --ignored --nocapture --test-threads=1
+      - name: Build the control daemon, the worker and the forwarder the suites run
+        run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
+
+      - name: The PowerShell bridge client over a named pipe
+        run: cargo test --locked -p kr-shell-integration --test pwsh_windows
+
+      - name: The worker's library
+        run: cargo test --locked -p kr-worker --lib fence::bridge
+
+      - name: PowerShell sessions through a real daemon and worker
+        timeout-minutes: 40
+        env:
+          KR_ALLOW_PROFILE_WRITE: "1"
+        run: cargo test --locked -p kr-cli --test shell_windows -- --ignored --exact --test-threads=1 --nocapture a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition another_chord_is_the_editors_own_on_windows ctrl_d_in_a_foreground_program_reaches_the_program ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows
