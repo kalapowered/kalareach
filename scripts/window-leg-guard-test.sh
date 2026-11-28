@@ -53,7 +53,7 @@ for name in GITHUB_ACTIONS RUNNER_ENVIRONMENT RUNNER_OS KR_WINDOW_LEG HOME; do
 done
 refuses "a self-hosted runner" "$as_runner; $stand_in" "${hosted[@]/github-hosted/self-hosted}"
 refuses "another home" "$as_runner; $stand_in" "${hosted[@]/\/Users\/runner/\/Users\/someone}"
-refuses "another account" "id() { echo someone; }; $stand_in" "${hosted[@]}"
+refuses "another account" "id() { echo someone; }; uname() { echo Darwin; }; $stand_in" "${hosted[@]}"
 refuses "another system" "$as_runner; uname() { echo Linux; }; $stand_in" "${hosted[@]}"
 refuses "no agent file" "$as_runner; ${guard//\/opt\/hca\/hosted-compute-agent/$0.absent}" "${hosted[@]}"
 refuses "a preferences variable set to a directory" "$as_runner; $stand_in" "${hosted[@]}" KR_TERMINAL_PREFERENCES_DIR=/tmp
