@@ -2813,18 +2813,18 @@ jobs:
   # pause 2 and its second try 3, as in the macOS jobs.
   # The step that fetches the Gradle distribution has 12: five tries, each of which downloads one
   # file, and the waits between them, 30, 60, 90 and 120 seconds, 300 in all. The step that sets
-  # Gradle's waits has 5, as the steps that only set up. The step that starts the emulator has 65:
-  # its own waits can add up to 3510 seconds, the boot's 600, the launch script's twelve deadlines
-  # of 240 seconds (the install's four, seven waits and the two looks after them) and 30 for its
-  # clean-up, and a run that waits that long should still reach its own error line and keep the
-  # device's log; the 6.5 minutes over are for the device's creation and the library's cases, which
-  # took 4.7 minutes in all in the longest of 63 runs. All the limits add up to 226 of the job's 229
-  # minutes, which leaves 3 for the set-up and clean-up that no step limit counts. The whole job
-  # took 42.4 minutes at most (run 45051604117).
+  # Gradle's waits has 5, as the steps that only set up. The step that starts the emulator has 73:
+  # its own waits can add up to 3990 seconds, the boot's 600, the launch script's fourteen deadlines
+  # of 240 seconds (the install's four, nine waits, two of them for a quiet device, and the two
+  # looks after them) and 30 for its clean-up, and a run that waits that long should still reach
+  # its own error line and keep the device's log; the 6.5 minutes over are for the device's
+  # creation and the library's cases, which took 4.7 minutes in all in the longest of 63 runs. All
+  # the limits add up to 234 of the job's 237 minutes, which leaves 3 for the set-up and clean-up
+  # that no step limit counts. The whole job took 42.4 minutes at most (run 45051604117).
   android-app:
     name: android-app
     runs-on: ubuntu-24.04
-    timeout-minutes: 229
+    timeout-minutes: 237
     steps:
       # The runner arrives with toolchains this project never uses; the Android SDK stays, with the
       # emulator and a system image to be added to it.
@@ -3074,7 +3074,7 @@ jobs:
       # on the x86-64 architecture the emulator runs, then the application started and looked at.
       # Both run whatever the other did, and the log of the device is kept either way.
       - name: Run the native library and start the application on the emulator
-        timeout-minutes: 65
+        timeout-minutes: 73
         run: |
           set -uo pipefail
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
