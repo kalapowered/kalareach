@@ -530,23 +530,23 @@ scripts/android-app-launch.sh path/to/app-universal-debug.apk screenshot.png --s
 scripts/ios-app-launch.sh path/to/KalaReach.app <simulator identifier> screenshot.png
 ```
 
-`scripts/android-app-launch.sh` waits until the device is quiet, before it installs the application
-and again before it starts it: the device's low-memory killer has ended no process for 20 seconds by
-the device's own clock, and at least 1536 MiB of memory are available to the system. The device's
-own programs fill its memory while they start after the boot and after an install, and the killer
-then ends the application with them. The figures of the last look are in the output, and a device
-that is not quiet by the deadline fails the run with them. It then checks that the application
-installs and its main activity starts; that its process has native code of the package mapped (the
-Rust library, which the package stores uncompressed and the system maps from the package); that the
-web view lists the interface's own document, titled `KalaReach` and served by the application's own
-protocol (`tauri.localhost`); that the document's root holds what the interface drew and the page
-has text on it, which it asks the web view over its debugging protocol; that the screen shows the
-page, and keeps the frame it found to show it as the screenshot; and that the log holds no fatal
-exception or signal for the application's process and the process is still the one that started.
-Once the application has a process, every wait ends when that process is found gone, and not at the
-deadline, and says how it ended from the device's log: a crash, or a device short of memory, whose
-low-memory killer ends the web view's renderer (which ends the application with it) or the
-application itself.
+`scripts/android-app-launch.sh` first waits for a quiet device, before it installs the application
+and again before it starts it. A device is quiet when its low-memory killer has ended no process for
+20 seconds by the device's own clock and at least 1536 MiB of memory are available to the system.
+The device's own programs fill its memory as they start after the boot and after an install, and the
+killer then ends the application along with them. The output gives the figures of the last look, and
+a device that is not quiet by the deadline fails the run with those figures. The script then checks
+that the application installs and its main activity starts; that its process has native code of the
+package mapped (the Rust library, which the package stores uncompressed and the system maps from the
+package); that the web view lists the interface's own document, titled `KalaReach` and served by the
+application's own protocol (`tauri.localhost`); that the document's root holds what the interface
+drew and the page has text on it, which it asks the web view over its debugging protocol; that the
+screen shows the page, and keeps the frame it found to show it as the screenshot; and that the log
+holds no fatal exception or signal for the application's process and the process is still the one
+that started. Once the application has a process, every wait ends when that process is found gone,
+and not at the deadline, and says how it ended from the device's log: a crash, or a device short of
+memory, whose low-memory killer ends the web view's renderer (which ends the application with it) or
+the application itself.
 
 `scripts/ios-app-launch.sh` checks that the built application defines the Swift plugin's entry
 point (`init_plugin_companion_platform`); that the application runs in the simulator and that a web
