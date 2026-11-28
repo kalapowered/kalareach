@@ -286,9 +286,9 @@ impl Server {
         if retirement.ended == Ended::Alive && !retirement.survivors.contains(&self.identity) {
             retirement.survivors.push(self.identity.clone());
         }
-        // A server that is still running is not retired, whatever its job reads: dropping it ends
-        // its job again.
-        if retirement.emptiness == Emptiness::Empty && retirement.ended != Ended::Alive {
+        // A server that is still running is not empty, so it is not retired: dropping it ends its
+        // job again.
+        if retirement.emptiness == Emptiness::Empty {
             self.retired.store(true, Ordering::Release);
         }
         retirement

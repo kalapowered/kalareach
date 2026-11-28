@@ -137,12 +137,14 @@ pub enum Ended {
 /// Whether what a server started is all gone, as far as the ending could tell.
 ///
 /// A conversation the server ran against is free for another session only when this is
-/// [`Self::Empty`]: a process that may still be running could be writing to it.
+/// [`Self::Empty`]: a process that may still be running could be writing to it. A server that has
+/// not ended ([`Ended::Alive`]) is [`Self::Nonempty`] on every platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Emptiness {
     /// Nothing the server started is running: the tree was read and was empty.
     Empty,
-    /// A process the server started is still running, and the survivors name it.
+    /// A process the server started is still running, or the server itself has not ended, and the
+    /// survivors name it.
     Nonempty,
     /// The tree could not be read, or a process in it could not be asked about, so nothing can be
     /// said either way. It becomes [`Self::Empty`] only by a later reading that succeeds and finds
@@ -418,10 +420,10 @@ async fn read_until_empty(
 /// server's own process, which the system ends on its own time after the terminate: the server is
 /// waited for until the same moment, so that it is found gone as soon as it is, and is
 /// [`Ended::Alive`] only if it is still running then. The last reading is the emptiness: an empty
-/// one is
-/// [`Emptiness::Empty`] and a later empty one settles an earlier failed one; a held process is
-/// [`Emptiness::Nonempty`] and is named; a reading that failed, or that lists a process it could
-/// not ask about and holds none it could, is [`Emptiness::Unknown`].
+/// one is [`Emptiness::Empty`] and a later empty one settles an earlier failed one; a held process
+/// is [`Emptiness::Nonempty`] and is named; a reading that failed, or that lists a process it could
+/// not ask about and holds none it could, is [`Emptiness::Unknown`]. A server that is
+/// [`Ended::Alive`] is [`Emptiness::Nonempty`] whatever the last reading says.
 ///
 /// The clock is the caller's `begun`, which a session that is closing takes from the moment its own
 /// stop began, so that its forcing and this ending keep one clock.
@@ -482,7 +484,13 @@ pub(crate) async fn end_tree(
     } else {
         Ended::Alive
     };
-    let emptiness = settled.emptiness();
+    // A server that has not ended is a process that may still run, whatever its job reads: it is
+    // not empty, and the platform that holds the server names it among the survivors.
+    let emptiness = if ended == Ended::Alive {
+        Emptiness::Nonempty
+    } else {
+        settled.emptiness()
+    };
     Retirement {
         ended,
         forced,
@@ -957,8 +965,9 @@ mod tests {
     }
 
     /// A server that is still running when what a forced process is given is over is alive, though
-    /// its tree reads empty: it is waited for for that time and not longer, and never reported as
-    /// ended.
+    /// its tree reads empty: it is waited for for that time and not longer, never reported as
+    /// ended, and its tree is not empty, because a server that has not ended is a process that may
+    /// still run.
     #[tokio::test(start_paused = true)]
     async fn kr_req_07_66_a_server_still_running_after_the_wait_for_it_is_alive_not_forced() {
         let begun = Instant::now();
@@ -968,7 +977,7 @@ mod tests {
 
         let retirement = ending(&tree, &notes, begun).await;
         assert_eq!(retirement.ended, Ended::Alive);
-        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
         let waits = tree.waits.lock().expect("the waits").clone();
         assert_eq!(waits.len(), 1, "{waits:?}");
         assert!(
