@@ -2593,6 +2593,102 @@ fn a_root_row_whose_name_is_not_a_name_is_refused_and_the_invocation_is_unreadab
     }
 }
 
+/// A snapshot row as the build before the exclude file was recorded wrote it: the members it had,
+/// in its order, and no `info_exclude`.
+const SNAPSHOT_BEFORE_THE_EXCLUDE_FILE: &str = concat!(
+    r#"{"row":"RepositorySnapshot","id":1,"kind":"initial","#,
+    r#""config_digest":"abababababababababababababababababababababababababababababababab","#,
+    r#""hooks":[{"name":"hooks/pre-commit","key":"000000000000abcd:1e000000000000000000000000000000","#,
+    r#""size":12,"sha256":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}],"#,
+    r#""info_attributes":{"name":"info/attributes","key":"000000000000abcd:1f000000000000000000000000000000","#,
+    r#""size":7,"sha256":"efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"},"#,
+    r#""absent_names":["info/exclude.lock"]}"#,
+);
+
+fn digested(name: &str, n: u64, size: u64, sha256: &str) -> DigestedFile {
+    DigestedFile {
+        name: name.to_owned(),
+        key: key(n),
+        size,
+        sha256: sha256.repeat(32),
+    }
+}
+
+#[test]
+fn a_snapshot_row_written_before_the_exclude_file_was_recorded_reads_with_that_member_absent() {
+    let expected = Row::RepositorySnapshot {
+        id: 1,
+        kind: SnapshotKind::Initial,
+        config_digest: "ab".repeat(32),
+        hooks: vec![digested("hooks/pre-commit", 30, 12, "cd")],
+        info_attributes: Some(digested("info/attributes", 31, 7, "ef")),
+        info_exclude: None,
+        absent_names: vec!["info/exclude.lock".to_owned()],
+    };
+    let older = SNAPSHOT_BEFORE_THE_EXCLUDE_FILE.as_bytes();
+    assert_eq!(Row::from_bytes(older).unwrap(), expected);
+    // In a journal file it is a row like any other: the file reads, in order, as an invocation
+    // that did not end.
+    let mut bytes = file_of(&[begin()]);
+    bytes.extend_from_slice(&framing::encode(older).unwrap());
+    let found = invocation(&bytes, BOOT);
+    assert_eq!(found.damage, None);
+    assert_eq!(found.standing, Standing::Unfinished);
+    assert_eq!(found.rows, vec![begin(), expected]);
+}
+
+/// The snapshot row as the build before the exclude file was recorded declared it. Like that
+/// build's row type, it takes no side against a member it does not know.
+#[derive(Debug, PartialEq, serde::Deserialize)]
+#[serde(tag = "row")]
+enum SnapshotBeforeTheExcludeFile {
+    RepositorySnapshot {
+        id: u32,
+        kind: SnapshotKind,
+        config_digest: String,
+        hooks: Vec<DigestedFile>,
+        info_attributes: Option<DigestedFile>,
+        absent_names: Vec<String>,
+    },
+}
+
+#[test]
+fn a_reader_of_the_row_before_the_exclude_file_was_recorded_ignores_the_member_in_this_builds_row()
+{
+    for info_exclude in [None, Some(digested("info/exclude", 32, 9, "01"))] {
+        let row = Row::RepositorySnapshot {
+            id: 2,
+            kind: SnapshotKind::Changed,
+            config_digest: "ab".repeat(32),
+            hooks: vec![digested("hooks/pre-commit", 30, 12, "cd")],
+            info_attributes: Some(digested("info/attributes", 31, 7, "ef")),
+            info_exclude: info_exclude.clone(),
+            absent_names: vec!["info/exclude.lock".to_owned()],
+        };
+        let bytes = row.to_bytes();
+        // The member is in the bytes, so there is something for the older reader to ignore.
+        let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written["info_exclude"].is_object(),
+            info_exclude.is_some(),
+            "{info_exclude:?}"
+        );
+        let older: SnapshotBeforeTheExcludeFile = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("{info_exclude:?}: {error}"));
+        assert_eq!(
+            older,
+            SnapshotBeforeTheExcludeFile::RepositorySnapshot {
+                id: 2,
+                kind: SnapshotKind::Changed,
+                config_digest: "ab".repeat(32),
+                hooks: vec![digested("hooks/pre-commit", 30, 12, "cd")],
+                info_attributes: Some(digested("info/attributes", 31, 7, "ef")),
+                absent_names: vec!["info/exclude.lock".to_owned()],
+            }
+        );
+    }
+}
+
 #[cfg(windows)]
 mod native {
     use std::path::PathBuf;

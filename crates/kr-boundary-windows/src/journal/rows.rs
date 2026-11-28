@@ -163,6 +163,14 @@ mod hex_bytes {
 }
 
 /// One row of an invocation's journal.
+///
+/// The journal has no production writer yet: the broker's service does not run an invocation, and
+/// only the cases write it. It carries no format marker. A member that a later build adds to a row
+/// reads as absent in a row written before it when the member is an `Option`, and a build that
+/// does not know a member ignores it; a build that meets a kind of row it does not know reads the
+/// file as damaged. Nothing else says how the format may grow. Before the first production writer
+/// lands, the journal gets a format marker and the stored-format discipline: a version that a
+/// change raises, and an entry in the lock of the stored formats.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "row")]
 pub enum Row {
