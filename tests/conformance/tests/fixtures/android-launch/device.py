@@ -28,6 +28,17 @@ The device's state is a directory, named by the environment variable KR_FAKE_DEV
              a number: once the log was read, that many queries for the application's process
              fail as above, the next is answered, and every later one fails; the file
              `unanswered-after-the-log` counts the queries that failed
+  device-time
+             the device's clock when the case's own clock (`clock`) reads its first value, as
+             HH:MM:SS (12:00:00 when absent); the device's clock moves with that clock
+  meminfo    what `/proc/meminfo` holds (a device with 2.3 GiB to spare when absent)
+  kills-at-install
+             when present, the system logs a low-memory kill at the moment the package is installed
+  rolled-log what the log holds from the second look at the device on: a log that has rolled over
+             and no longer holds what the first look found in it
+  installed-at, started-at
+             written by the device: its clock, in seconds since midnight, when the package was
+             installed and when the main activity was started
 
 The screen is a small raw frame in the shape `screencap` writes it: a header of width, height,
 format and colour space, then four bytes a pixel. A frame the picture of which was asked for
@@ -46,6 +57,8 @@ import time
 
 PACKAGE = "to.kala.reach"
 WIDTH, HEIGHT = 64, 128
+# A device with 3920 MiB, of which 2344 MiB are to spare.
+MEMINFO = "MemTotal:        4014080 kB\nMemFree:          412000 kB\nMemAvailable:    2400000 kB\n"
 
 
 def state_file(name):
@@ -81,6 +94,33 @@ def nth_call(name):
 def count(name):
     """The number a state file of that name holds, or nought."""
     return int(read(name, "0").strip() or 0)
+
+
+def device_seconds():
+    """The device's clock in seconds since midnight: the time the case gave it, moved on by the
+    seconds the case's own clock has moved since its first reading."""
+    hours, minutes, seconds = (int(part) for part in read("device-time", "12:00:00").strip().split(":"))
+    moved = int(read("clock", "1000000").strip() or 1000000) - 1000000
+    return (hours * 3600 + minutes * 60 + seconds + moved) % 86400
+
+
+def clock_text(seconds):
+    return "%02d:%02d:%02d" % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
+
+
+def note_time(name):
+    with open(state_file(name), "w") as handle:
+        handle.write(str(device_seconds()))
+
+
+def log_a_kill():
+    """The system's low-memory killer ended a process of Google Play just now."""
+    with open(state_file("log"), "a") as log:
+        log.write(
+            "11-28 %s.500   200   200 I lowmemorykiller: Kill 'com.google.android.gms' (5460), uid 10147, "
+            "oom_score_adj 100 to free 344228kB rss, 0kB swap; reason: min watermark is breached even after kill\n"
+            % clock_text(device_seconds())
+        )
 
 
 def ends_at(stage):
@@ -119,6 +159,10 @@ def adb(arguments):
     if command == "devices":
         out.write(b"List of devices attached\nemulator-5554\tdevice\n\n")
     elif command in ("uninstall", "install"):
+        if command == "install":
+            note_time("installed-at")
+            if os.path.exists(state_file("kills-at-install")):
+                log_a_kill()
         out.write(b"Success\n")
     elif command == "logcat" and "-c" in rest:
         open(state_file("log"), "w").close()
@@ -153,7 +197,16 @@ def adb(arguments):
         elif words.startswith("getprop"):
             out.write(b"36\n" if "sdk" in words else b"x86_64,arm64-v8a\n")
         elif words.startswith("am start"):
+            note_time("started-at")
             out.write(b"Status: ok\nActivity: to.kala.reach/.MainActivity\n")
+        elif words.startswith("date +%T"):
+            # One look at the device: its clock, then its memory, then its log.
+            out.write((clock_text(device_seconds()) + "\n").encode())
+            out.write(read("meminfo", MEMINFO).encode())
+            log = read("log")
+            if os.path.exists(state_file("rolled-log")) and nth_call("look") > 1:
+                log = read("rolled-log")
+            out.write(log.encode())
         elif words.startswith("pidof"):
             if os.path.exists(state_file("log-read")) and os.path.exists(state_file("silent-after-the-log")):
                 after = nth_call("pidof-after-the-log")
@@ -181,7 +234,7 @@ def adb(arguments):
             out.flush()
             ends_at("socket")
         elif words == "cat /proc/meminfo":
-            out.write(b"MemTotal:        2564080 kB\nMemAvailable:     933648 kB\n")
+            out.write(read("meminfo", MEMINFO).encode())
         else:
             sys.exit(f"adb stand-in: no answer for shell {words}")
     else:

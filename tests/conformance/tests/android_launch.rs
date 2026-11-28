@@ -409,3 +409,179 @@ fn the_looks_after_the_log_was_read_share_one_deadline() {
         run.count("unanswered-after-the-log")
     );
 }
+
+/// The seconds without a low-memory kill that the script asks of the device before it installs or
+/// starts the application.
+const QUIET_SPAN: u32 = 20;
+
+/// The device's clock, in seconds since midnight, for a time of day.
+fn seconds_at(hours: u32, minutes: u32, seconds: u32) -> u32 {
+    hours * 3600 + minutes * 60 + seconds
+}
+
+/// A device whose low-memory killer ended twenty-two processes in the seconds before the install
+/// (the log of a hosted runner: its last kill is at 15:46:14.341) is not installed on until it has
+/// been quiet for the span, and the figures it was waited for are in the output.
+#[test]
+fn kills_before_the_install_keep_the_script_waiting_until_the_device_is_quiet() {
+    let kills = fs::read_to_string(fixtures().join("low-memory-kills.log")).expect("the log");
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("log", kills.as_str()), ("device-time", "15:46:15")],
+        120,
+        true,
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    let installed = run.count("installed-at");
+    assert!(
+        installed > seconds_at(15, 46, 14) + QUIET_SPAN,
+        "the application was installed at {installed} seconds, before the device had been without a kill for {QUIET_SPAN} seconds after 15:46:14.341\n{}",
+        run.output
+    );
+    assert!(
+        run.output
+            .contains("ok: the device to be quiet before the application is installed"),
+        "{}",
+        run.output
+    );
+    assert!(
+        run.output.contains("the device is quiet: no low-memory kill in the last 20 s (the last one 20 s ago: com.google.android.webview:webview_apk, 145 MiB), MemAvailable 2343 MiB of 3920 MiB (floor 1536 MiB)"),
+        "{}",
+        run.output
+    );
+}
+
+/// A device that has had no kill for longer than the span, and memory to spare, is not waited for:
+/// the application is installed and started at the moment the script looked, and the figures say why.
+#[test]
+fn a_quiet_device_is_not_waited_for() {
+    let kills = fs::read_to_string(fixtures().join("low-memory-kills.log")).expect("the log");
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("log", kills.as_str()), ("device-time", "15:50:00")],
+        120,
+        true,
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    let looked = seconds_at(15, 50, 0);
+    assert_eq!(run.count("installed-at"), looked, "{}", run.output);
+    assert_eq!(run.count("started-at"), looked, "{}", run.output);
+    for what in ["installed", "started"] {
+        assert!(
+            run.output.contains(&format!(
+                "ok: the device to be quiet before the application is {what}"
+            )),
+            "{}",
+            run.output
+        );
+    }
+    assert!(
+        run.output.contains("the device is quiet: no low-memory kill in the last 20 s (the last one 225 s ago: com.google.android.webview:webview_apk, 145 MiB), MemAvailable 2343 MiB of 3920 MiB (floor 1536 MiB)"),
+        "{}",
+        run.output
+    );
+}
+
+/// A device that never has the memory to spare is not installed on: the wait ends at the deadline,
+/// says it was waiting for the quiet device and names the figures of its last look, and the run
+/// does not go on to the application.
+#[test]
+fn a_device_short_of_memory_ends_the_wait_at_the_deadline_with_its_figures() {
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[
+            (
+                "meminfo",
+                "MemTotal:        4014080 kB\nMemAvailable:     628000 kB\n",
+            ),
+            ("device-time", "15:50:00"),
+        ],
+        30,
+        true,
+    );
+    assert_eq!(run.status, Some(1), "{}", run.output);
+    assert!(
+        run.output.contains(
+            "gave up waiting for the device to be quiet before the application is installed"
+        ),
+        "{}",
+        run.output
+    );
+    assert!(
+        run.output.contains(
+            "the last look at the device: MemAvailable 613 MiB of 3920 MiB is below the floor of 1536 MiB"
+        ),
+        "{}",
+        run.output
+    );
+    assert_eq!(run.count("installed-at"), 0, "{}", run.output);
+    assert!(
+        !run.output.contains("ended while waiting"),
+        "{}",
+        run.output
+    );
+}
+
+/// The install itself can set the killer off: a kill logged as the package was installed keeps the
+/// script from starting the application until the span has passed, and the wait is the second one.
+#[test]
+fn a_kill_as_the_package_is_installed_keeps_the_start_waiting() {
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[("kills-at-install", ""), ("device-time", "15:50:00")],
+        120,
+        true,
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    let installed = run.count("installed-at");
+    assert_eq!(installed, seconds_at(15, 50, 0), "{}", run.output);
+    let started = run.count("started-at");
+    assert!(
+        started >= installed + QUIET_SPAN,
+        "the application was started {} seconds after the install, which logged a kill\n{}",
+        started.saturating_sub(installed),
+        run.output
+    );
+    assert!(
+        run.output
+            .contains("ok: the device to be quiet before the application is started"),
+        "{}",
+        run.output
+    );
+}
+
+/// A kill the script has seen counts for the span even when the log no longer shows it: a log that
+/// has rolled over on a busy device holds the kill for seconds, not for the span. The first look
+/// finds one kill five seconds old; the later looks find none.
+#[test]
+fn a_kill_that_rolled_out_of_the_log_still_counts_for_the_span() {
+    let kill = "11-28 15:49:55.100   200   200 I lowmemorykiller: Kill 'com.google.android.gms' (5460), uid 10147, oom_score_adj 100 to free 344228kB rss, 0kB swap; reason: min watermark is breached even after kill\n";
+    let rolled = "11-28 15:49:59.000  1373  1412 W HWUI    : Image decoding logging dropped!\n";
+    let run = launch_with_deadline(
+        "7072",
+        "application-killed.log",
+        "never",
+        &[
+            ("log", kill),
+            ("rolled-log", rolled),
+            ("device-time", "15:50:00"),
+        ],
+        120,
+        true,
+    );
+    assert_eq!(run.status, Some(0), "{}", run.output);
+    let installed = run.count("installed-at");
+    assert!(
+        installed > seconds_at(15, 49, 55) + QUIET_SPAN,
+        "the application was installed at {installed} seconds, before {QUIET_SPAN} seconds had passed since the kill at 15:49:55.1\n{}",
+        run.output
+    );
+}

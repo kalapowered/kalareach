@@ -1,0 +1,37 @@
+11-28 15:46:08.863   200   200 I lowmemorykiller: Kill 'com.google.android.gms' (5460), uid 10147, oom_score_adj 100 to free 344228kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:08.961   200   200 I lowmemorykiller: Kill 'com.google.android.googlequicksearchbox:search' (5239), uid 10148, oom_score_adj 100 to free 275112kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:09.061   200   200 I lowmemorykiller: Kill 'com.google.android.googlequicksearchbox:interactor' (5662), uid 10148, oom_score_adj 100 to free 245292kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:09.136   200   200 I lowmemorykiller: Kill 'com.google.android.gms.unstable' (5667), uid 10147, oom_score_adj 100 to free 214696kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:09.235   200   200 I lowmemorykiller: Kill 'android.process.acore' (1725), uid 10094, oom_score_adj 700 to free 133900kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:09.253   200   204 W lowmemorykiller: Failed to open /proc/1725/task; errno=2: process pid(1725) might have died
+11-28 15:46:09.253   200   204 E lowmemorykiller: process_mrelease 1725 failed: No such process
+11-28 15:46:09.500   200   200 W lowmemorykiller: Failed to open /proc/5239/oom_score_adj; errno=2: process 5239 might have been killed
+11-28 15:46:09.951   200   200 I lowmemorykiller: Kill 'com.google.android.packageinstaller' (6124), uid 10106, oom_score_adj 905 to free 112196kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:10.052   200   200 I lowmemorykiller: Kill 'com.google.android.permissioncontroller' (2400), uid 10199, oom_score_adj 100 to free 158732kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:10.149   200   200 I lowmemorykiller: Kill 'com.google.android.gms.persistent' (2344), uid 10147, oom_score_adj 0 to free 336088kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:10.456   200   204 E lowmemorykiller: process_mrelease 2400 failed: No such process
+11-28 15:46:10.582   200   200 W lowmemorykiller: Failed to open /proc/2400/oom_score_adj; errno=2: process 2400 might have been killed
+11-28 15:46:10.656   200   200 I lowmemorykiller: Kill 'com.google.android.tts' (4088), uid 10151, oom_score_adj 915 to free 138812kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:10.680   200   203 E lowmemorykiller: process_mrelease 4088 failed: No such process
+11-28 15:46:10.989   200   200 I lowmemorykiller: Kill 'com.google.android.dialer' (6062), uid 10141, oom_score_adj 905 to free 158200kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:11.090   200   200 I lowmemorykiller: Kill 'com.google.android.gms.ui' (6094), uid 10147, oom_score_adj 500 to free 186516kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:11.321   200   203 W lowmemorykiller: Failed to open /proc/6094/task; errno=2: process pid(6094) might have died
+11-28 15:46:11.321   200   203 E lowmemorykiller: process_mrelease 6094 failed: No such process
+11-28 15:46:12.710   200   200 I lowmemorykiller: Kill 'com.google.android.partnersetup' (6434), uid 10140, oom_score_adj 905 to free 113988kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:12.810   200   200 I lowmemorykiller: Kill 'com.android.vending:background' (6198), uid 10142, oom_score_adj 227 to free 187060kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:12.846   200   204 W lowmemorykiller: Failed to open /proc/6434/task; errno=2: process pid(6434) might have died
+11-28 15:46:12.846   200   204 E lowmemorykiller: process_mrelease 6434 failed: No such process
+11-28 15:46:12.910   200   200 I lowmemorykiller: Kill 'com.google.android.apps.nexuslauncher' (1373), uid 10181, oom_score_adj 100 to free 300088kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.011   200   200 I lowmemorykiller: Kill 'com.google.android.apps.wellbeing' (1638), uid 10146, oom_score_adj 100 to free 185676kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.111   200   200 I lowmemorykiller: Kill 'com.google.android.webview:webview_service' (6310), uid 10166, oom_score_adj 100 to free 120388kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.212   200   200 I lowmemorykiller: Kill 'to.kala.reach' (6176), uid 10213, oom_score_adj 0 to free 277892kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.241   200   204 E lowmemorykiller: process_mrelease 6176 failed: No such process
+11-28 15:46:13.251   200   200 I lowmemorykiller: Kill 'com.google.android.gms' (6179), uid 10147, oom_score_adj 0 to free 220236kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.320   200   200 I lowmemorykiller: Kill 'com.google.android.gms.persistent' (6253), uid 10147, oom_score_adj 0 to free 195648kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:13.344   200   204 E lowmemorykiller: process_mrelease 6253 failed: No such process
+11-28 15:46:13.359   200   200 I lowmemorykiller: Kill 'com.android.vending' (6144), uid 10142, oom_score_adj 0 to free 189280kB rss, 0kB swap; reason: min watermark is breached even after kill
+11-28 15:46:14.105   200   200 I lowmemorykiller: Kill 'com.google.android.webview:webview_service' (6666), uid 10166, oom_score_adj 915 to free 122308kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:14.131   200   204 E lowmemorykiller: process_mrelease 6666 failed: No such process
+11-28 15:46:14.341   200   200 I lowmemorykiller: Kill 'com.google.android.webview:webview_apk' (6317), uid 10166, oom_score_adj 905 to free 149396kB rss, 0kB swap; reason: min watermark is breached
+11-28 15:46:14.397   200   203 W lowmemorykiller: Failed to open /proc/6317/task; errno=2: process pid(6317) might have died
+11-28 15:46:14.397   200   203 E lowmemorykiller: process_mrelease 6317 failed: No such process

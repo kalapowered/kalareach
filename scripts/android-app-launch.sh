@@ -7,6 +7,12 @@
 # that does not load, a plugin the system cannot instantiate and a page that never opens all leave a
 # green build. This holds, one condition at a time, that on the device
 #
+#   * the device is quiet before the application is installed and again before it is started: its
+#     low-memory killer has ended no process for 20 seconds by the device's own clock and log, and
+#     at least 1536 MiB of memory are available to the system (its /proc/meminfo). A device whose
+#     own programs are still starting, after its boot or after an install, fills its memory, and the
+#     killer then ends the application with them. The figures of the last look are printed, and a
+#     device that is not quiet by the deadline fails the run with them;
 #   * the application installs and its main activity starts;
 #   * the application's process is running with native code mapped from its package, which is the
 #     Rust library (libcompanion_tauri.so): the package stores it uncompressed and the system maps
@@ -48,6 +54,12 @@ set -uo pipefail
 package=to.kala.reach
 activity="$package/.MainActivity"
 deadline="${KR_LAUNCH_DEADLINE:-240}"
+# What a device has to be before the application is installed and again before it is started: no
+# process ended by its low-memory killer for this many seconds of its own clock, and this many MiB
+# of memory available to the system. A hosted emulator's own Google programs fill its 4 GB while
+# they start after the boot and after an install, and the killer ends the application with them.
+quiet_span=20
+quiet_floor_mib=1536
 
 die() {
     printf 'android-app-launch: %s\n' "$*" >&2
@@ -285,6 +297,7 @@ wait_for() {
             printf 'android-app-launch: FAIL: gave up waiting for %s\n' "$what" >&2
             [ -z "${mount_answers:-}" ] || printf 'android-app-launch: the page check answered:%s\n' "$mount_answers" >&2
             [ -z "${screen_note:-}" ] || printf 'android-app-launch: the last look at the screen: %s\n' "$screen_note" >&2
+            [ -z "${quiet_note:-}" ] || printf 'android-app-launch: the last look at the device: %s\n' "$quiet_note" >&2
             exit 1
         fi
         sleep 1
@@ -297,12 +310,110 @@ booted() { [ "$(dev shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')"
 wait_for "the device to finish starting" booted
 say "device: $serial, API $(dev shell getprop ro.build.version.sdk | tr -d '\r'), $(dev shell getprop ro.product.cpu.abilist | tr -d '\r')"
 
+# Whether the device is quiet, decided from one look at it: its clock (`date +%T`), then
+# /proc/meminfo, then its log, on the standard input. The arguments are the span in seconds, the
+# floor of MemAvailable in MiB, and the newest kill an earlier look found (`<second of the day>
+# <process> <MiB>`, or `-`). The device's own clock is used for the age of a kill, since the log is
+# stamped by it. A log of a busy device rolls over in seconds, so a kill that an earlier look found
+# is kept and counts for the span after the log no longer holds it. The first line printed says how
+# the device was found, the second is the newest kill known, to be given to the next look. The
+# status is 0 for a quiet device, 1 when a kill is younger than the span, and 2 when memory is
+# short or the device gave no clock or no memory figures.
+IFS= read -r -d '' quiet_program << 'PYTHON' || true
+import re
+import sys
+
+span, floor, seen = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split()
+lines = sys.stdin.read().splitlines()
+
+
+def age(now, then):
+    # Both are seconds of the day; the difference is taken round the clock.
+    return (now - then + 43200) % 86400 - 43200
+
+
+clock = re.fullmatch(r"(\d\d):(\d\d):(\d\d)", lines[0].strip()) if lines else None
+newest = (float(seen[0]), seen[1], int(seen[2])) if len(seen) == 3 else None
+
+
+def remembered():
+    return "%s %s %d" % newest if newest else "-"
+
+
+if not clock:
+    print("the device gave no clock")
+    print(remembered())
+    sys.exit(2)
+now = int(clock.group(1)) * 3600 + int(clock.group(2)) * 60 + int(clock.group(3))
+total = available = None
+for line in lines[1:]:
+    memory = re.match(r"(MemTotal|MemAvailable):\s+(\d+) kB", line)
+    if memory:
+        if memory.group(1) == "MemTotal":
+            total = int(memory.group(2)) // 1024
+        else:
+            available = int(memory.group(2)) // 1024
+    kill = re.match(r"\d\d-\d\d (\d\d):(\d\d):(\d\d\.\d+) .*lowmemorykiller: Kill '([^']*)' \(\d+\).* to free (\d+)kB rss", line)
+    if kill:
+        when = int(kill.group(1)) * 3600 + int(kill.group(2)) * 60 + float(kill.group(3))
+        if newest is None or age(now, when) < age(now, newest[0]):
+            newest = (when, kill.group(4), int(kill.group(5)) // 1024)
+if available is None or total is None:
+    print("the device gave no memory figures")
+    print(remembered())
+    sys.exit(2)
+figures = "MemAvailable %d MiB of %d MiB (floor %d MiB)" % (available, total, floor)
+since = int(max(age(now, newest[0]), 0)) if newest else None
+if newest and age(now, newest[0]) < span:
+    print("the last low-memory kill was %d s ago (%s, %d MiB), and the device needs %d s without one; %s" % (since, newest[1], newest[2], span, figures))
+    print(remembered())
+    sys.exit(1)
+if available < floor:
+    print("MemAvailable %d MiB of %d MiB is below the floor of %d MiB" % (available, total, floor))
+    print(remembered())
+    sys.exit(2)
+last = "the last one %d s ago: %s, %d MiB" % (since, newest[1], newest[2]) if newest else "none in the log"
+print("no low-memory kill in the last %d s (%s), %s" % (span, last, figures))
+print(remembered())
+PYTHON
+
+quiet_note=""
+quiet_newest_kill="-"
+quiet_looks=0
+# One look at the device, which says what it found when it is not quiet, on the first look and on
+# every tenth after it.
+device_is_quiet() {
+    local answer status note newest
+    answer="$(dev shell 'date +%T; cat /proc/meminfo; logcat -d -b all' 2> /dev/null | tr -d '\r' | python3 -I -c "$quiet_program" "$quiet_span" "$quiet_floor_mib" "$quiet_newest_kill")"
+    status=$?
+    { IFS= read -r note; IFS= read -r newest; } <<< "$answer"
+    quiet_note="${note:-the device gave no answer}"
+    [ -z "$newest" ] || quiet_newest_kill="$newest"
+    quiet_looks=$((quiet_looks + 1))
+    [ "$status" -ne 0 ] || return 0
+    [ $(((quiet_looks - 1) % 10)) -ne 0 ] || say "waiting for the device to be quiet: $quiet_note"
+    return 1
+}
+
+# The Google programs of the device start after the boot and again when a package is installed, and
+# fill its memory while they do: the application is installed, and then started, on a device that has
+# stopped losing programs to its low-memory killer.
+quiet_looks=0
+wait_for "the device to be quiet before the application is installed" device_is_quiet
+say "the device is quiet: $quiet_note"
+quiet_note=""
+
 dev uninstall "$package" > /dev/null 2>&1 || true
 # An install of the whole package is not a question to the device and takes as long as the device
 # takes to write it: it is held to four deadlines, which only a hung call reaches.
 bounded $((deadline * 4)) "$adb" -s "$serial" install -r "$apk" > /dev/null || { echo "android-app-launch: FAIL: the application did not install" >&2; exit 1; }
 installed=1
 say "ok: the application installed"
+
+quiet_looks=0
+wait_for "the device to be quiet before the application is started" device_is_quiet
+say "the device is quiet: $quiet_note"
+quiet_note=""
 
 dev logcat -b all -c
 started="$(dev shell am start -W -n "$activity" | tr -d '\r')"
