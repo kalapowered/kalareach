@@ -332,17 +332,20 @@ impl Tree for Server {
     async fn members(&self) -> Result<Vec<Member>, String> {
         let job = Arc::clone(&self.job);
         tokio::task::spawn_blocking(move || {
-            let mut members = Vec::new();
-            for pid in job.process_ids().map_err(|error| error.to_string())? {
-                match job.member(pid) {
-                    MemberReading::Held(identity) => members.push(Member::Held(identity)),
-                    // Listed, and not in the job when it was asked: it ended, or a stranger holds
-                    // the number.
-                    MemberReading::NotHeld => {}
-                    MemberReading::Unreadable(why) => members.push(Member::Unreadable(why)),
-                }
-            }
-            Ok(members)
+            // Every listed process is named, whatever reading it came to: one that ended after it
+            // was listed (or whose number a stranger took) is `Gone`, not left out, because the
+            // process it started in the meantime is in the job and not in the listing. Only a
+            // listing of nothing is an empty job.
+            Ok(job
+                .process_ids()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|pid| match job.member(pid) {
+                    MemberReading::Held(identity) => Member::Held(identity),
+                    MemberReading::NotHeld => Member::Gone,
+                    MemberReading::Unreadable(why) => Member::Unreadable(why),
+                })
+                .collect())
         })
         .await
         .map_err(|error| format!("the job could not be read: {error}"))?

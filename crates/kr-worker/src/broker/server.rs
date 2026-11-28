@@ -146,9 +146,9 @@ pub enum Emptiness {
     /// A process the server started is still running, or the server itself has not ended, and the
     /// survivors name it.
     Nonempty,
-    /// The tree could not be read, or a process in it could not be asked about, so nothing can be
-    /// said either way. It becomes [`Self::Empty`] only by a later reading that succeeds and finds
-    /// nothing.
+    /// The tree could not be read, or a process in it could not be asked about, or one it listed
+    /// was gone when it was asked about, so nothing can be said either way. It becomes
+    /// [`Self::Empty`] only by a later reading that succeeds and finds nothing.
     Unknown,
 }
 
@@ -301,6 +301,10 @@ pub(crate) enum Member {
     Held(ProcessStartIdentity),
     /// The tree lists it and it could not be asked about, for the reason given.
     Unreadable(String),
+    /// The tree listed it, and it had ended, or another process had taken its number, by the time
+    /// it was asked about. The listing is out of date: a process the listed one started in the
+    /// meantime is in the tree and may not be named by it.
+    Gone,
 }
 
 /// What a server's tree lets the ending read and do: the processes the server's own job holds.
@@ -324,7 +328,9 @@ pub(crate) trait Tree: Send + Sync {
     fn close_input(&self);
 
     /// Reads the processes the tree holds now: each as it is named, or why one could not be read,
-    /// or why the tree could not be read at all.
+    /// or that one it listed was gone when it was asked about, or why the tree could not be read at
+    /// all. The reading names every process the tree listed and never leaves one out: an empty
+    /// answer is a tree that listed nothing.
     fn members(&self) -> impl std::future::Future<Output = Result<Vec<Member>, String>> + Send;
 
     /// Ends every process the tree holds, at once.
@@ -336,10 +342,11 @@ pub(crate) trait Tree: Send + Sync {
 enum Reading {
     /// The tree could not be read.
     Failed,
-    /// The tree was read: the processes it holds, and whether it lists one it could not ask about.
+    /// The tree was read: the processes it holds, and whether it lists one it could not ask about
+    /// or that was gone when it was asked about, so that the listing may be out of date.
     Seen {
         held: Vec<ProcessStartIdentity>,
-        unreadable: bool,
+        unsure: bool,
     },
 }
 
@@ -350,22 +357,23 @@ impl Reading {
             Err(_) => Self::Failed,
             Ok(members) => {
                 let mut held = Vec::new();
-                let mut unreadable = false;
+                let mut unsure = false;
                 for member in members {
                     match member {
                         Member::Held(process) => held.push(process),
-                        Member::Unreadable(_) => unreadable = true,
+                        Member::Unreadable(_) | Member::Gone => unsure = true,
                     }
                 }
-                Self::Seen { held, unreadable }
+                Self::Seen { held, unsure }
             }
         }
     }
 
     /// Whether the reading shows a tree with nothing in it: only a reading that succeeded and
-    /// listed nothing does.
+    /// listed nothing does. A listing that names a process that was gone when it was read does not:
+    /// what that process started may be in the tree and not in the listing.
     const fn is_empty(&self) -> bool {
-        matches!(self, Self::Seen { held, unreadable: false } if held.is_empty())
+        matches!(self, Self::Seen { held, unsure: false } if held.is_empty())
     }
 
     fn held(&self) -> Vec<ProcessStartIdentity> {
@@ -376,14 +384,12 @@ impl Reading {
     }
 
     /// What the reading says about whether the tree is empty: a process that is held is running
-    /// whatever else could not be read; nothing held and something unread, or no reading, says
-    /// nothing.
+    /// whatever else could not be read; nothing held and something unread or gone, or no reading,
+    /// says nothing.
     fn emptiness(&self) -> Emptiness {
         match self {
             Self::Seen { held, .. } if !held.is_empty() => Emptiness::Nonempty,
-            Self::Seen {
-                unreadable: false, ..
-            } => Emptiness::Empty,
+            Self::Seen { unsure: false, .. } => Emptiness::Empty,
             Self::Seen { .. } | Self::Failed => Emptiness::Unknown,
         }
     }
@@ -422,8 +428,9 @@ async fn read_until_empty(
 /// [`Ended::Alive`] only if it is still running then. The last reading is the emptiness: an empty
 /// one is [`Emptiness::Empty`] and a later empty one settles an earlier failed one; a held process
 /// is [`Emptiness::Nonempty`] and is named; a reading that failed, or that lists a process it could
-/// not ask about and holds none it could, is [`Emptiness::Unknown`]. A server that is
-/// [`Ended::Alive`] is [`Emptiness::Nonempty`] whatever the last reading says.
+/// not ask about or that was gone when it was asked about and holds none it could, is
+/// [`Emptiness::Unknown`], and is read again. A server that is [`Ended::Alive`] is
+/// [`Emptiness::Nonempty`] whatever the last reading says.
 ///
 /// The clock is the caller's `begun`, which a session that is closing takes from the moment its own
 /// stop began, so that its forcing and this ending keep one clock.
@@ -874,6 +881,54 @@ mod tests {
 
         let begun = Instant::now();
         let beside = stubborn(begun).after(vec![Ok(vec![unreadable, Member::Held(process(13))])]);
+        let retirement = ending(&beside, &Notes::default(), begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Nonempty);
+        assert_eq!(retirement.survivors, vec![process(13)]);
+    }
+
+    /// The server has ended, and the job lists its command A. A starts B and exits before the
+    /// listing's entry for A is read, so the listing names nothing that runs and B is in the job
+    /// all the same. The tree is not taken to be empty on that listing: it is read again, B is
+    /// found, waited for until the window is over, and ended by the terminate.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_listed_process_gone_before_it_is_read_does_not_make_the_tree_empty() {
+        const A: u64 = 11;
+        const B: u64 = 12;
+        let begun = Instant::now();
+        let mut tree = Fake::new(begun, |at| {
+            if at < Duration::from_millis(20) {
+                // A was listed and had gone when it was read; B, its child, is not listed.
+                Ok(vec![Member::Gone])
+            } else {
+                Ok(held(&[B]))
+            }
+        });
+        tree.root_ends_at = Some(Duration::ZERO);
+        let notes = Notes::default();
+
+        let retirement = ending(&tree, &notes, begun).await;
+        let terminated = tree.when(Call::Terminate);
+        assert_eq!(terminated.len(), 1, "the tree was taken to be empty");
+        assert!(terminated[0] >= GRACE_WINDOW, "{:?}", terminated[0]);
+        assert_eq!(retirement.ended, Ended::Already);
+        assert_eq!(retirement.forced, vec![process(B)]);
+        assert!(!retirement.forced.contains(&process(A)));
+        assert_eq!(retirement.emptiness, Emptiness::Empty);
+        assert!(retirement.survivors.is_empty());
+    }
+
+    /// A listing whose every entry was gone when it was read says nothing about the tree: it is
+    /// not empty. A process that is held beside such an entry is running, so the tree is not.
+    #[tokio::test(start_paused = true)]
+    async fn kr_req_07_60_a_listing_of_processes_gone_when_read_is_unknown_unless_one_is_held() {
+        let begun = Instant::now();
+        let alone = stubborn(begun).after(vec![Ok(vec![Member::Gone])]);
+        let retirement = ending(&alone, &Notes::default(), begun).await;
+        assert_eq!(retirement.emptiness, Emptiness::Unknown);
+        assert!(retirement.survivors.is_empty());
+
+        let begun = Instant::now();
+        let beside = stubborn(begun).after(vec![Ok(vec![Member::Gone, Member::Held(process(13))])]);
         let retirement = ending(&beside, &Notes::default(), begun).await;
         assert_eq!(retirement.emptiness, Emptiness::Nonempty);
         assert_eq!(retirement.survivors, vec![process(13)]);
