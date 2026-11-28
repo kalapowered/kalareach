@@ -1,0 +1,492 @@
+name: window-probe
+
+# Asks what a GitHub-hosted runner's terminal applications allow, and writes each answer down
+# whichever way it falls.
+#
+# A terminal window leg starts the real terminal application on a hosted runner, installs the
+# opted-in terminal profile into the preferences that application reads, and opens a window and a
+# tab through that profile. Whether a runner image allows it is a fact about the image, so this
+# probe asks first: it starts Terminal and iTerm2 on a macOS runner, and one pinned Windows
+# Terminal build on a Windows runner, and prints one line per fact. A line says what its command
+# returned and nothing more. Every System Events answer, its status and a timed-out call included,
+# is printed, and every wait ends at its own limit.
+#
+# What leaves the runner: the run's log, which is public like this repository, and the pictures of
+# the runner's own screen that the macOS job uploads as a workflow artifact. Nothing is pushed to
+# the repository and no setting of the repository or of an account is changed. Everything the
+# probe writes lands on the runner, which is discarded after the run. The downloads (iTerm2 and
+# Windows Terminal) are pinned by name, size and SHA-256 digest, and a mismatch ends the job
+# before anything is unpacked or started.
+#
+# It runs only on a hosted runner, and only for a push of a branch whose name has WINDOW in it and
+# ends in -probe. It is not part of the landing workflow.
+
+on:
+  push:
+    branches: ["task/*WINDOW*-probe"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macos terminals
+    runs-on: macos-15
+    timeout-minutes: 30
+    defaults:
+      run:
+        # No `-e`: a command that answers "no" is a fact to print, and must not end the step.
+        shell: bash --noprofile --norc {0}
+    steps:
+      - name: Refuse anywhere else, write the helpers
+        run: |
+          if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || [ "${RUNNER_OS:-}" != macOS ] || [ "$(id -un)" != runner ]; then
+            echo "refused: this runs only in the account of a GitHub-hosted macOS runner"
+            exit 2
+          fi
+          cat > "$RUNNER_TEMP/probe-lib.sh" << 'LIB'
+          ax_log="$RUNNER_TEMP/probe-ax-status.txt"
+          fail_log="$RUNNER_TEMP/probe-failures.txt"
+          tag=P0
+          last_ax=""
+
+          refuse() {
+            if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] || [ "${RUNNER_OS:-}" != macOS ] || [ "$(id -un)" != runner ]; then
+              echo "refused: this runs only in the account of a GitHub-hosted macOS runner"
+              exit 2
+            fi
+          }
+
+          # One System Events statement against a process, with a 20 second alarm (status 142 is the
+          # alarm). Prints the answer or the error text, records the status, returns the status.
+          ax() {
+            local out rc
+            out=$(/usr/bin/perl -e 'alarm 20; exec @ARGV' osascript -e "tell application \"System Events\" to tell process \"$1\" to $2" 2>&1)
+            rc=$?
+            echo "$rc" >> "$ax_log"
+            printf '%s\n' "$out"
+            return "$rc"
+          }
+
+          # One line for a System Events statement: its text, its status and its answer.
+          show() {
+            local out rc
+            out=$(ax "$2" "$3")
+            rc=$?
+            printf '%s | ax %s: %s | rc=%s | %s\n' "$1" "$2" "$3" "$rc" "$out"
+            return "$rc"
+          }
+
+          # One line for a command: its status and its output on one line.
+          cap() {
+            local label=$1 out rc
+            shift
+            out=$("$@" 2>&1)
+            rc=$?
+            printf '%s | %s | rc=%s | %s\n' "$tag" "$label" "$rc" "$(printf '%s' "$out" | tr '\n' ' ' | head -c 700)"
+            return "$rc"
+          }
+
+          # Runs `$3...` once a second until it succeeds, or ends the wait at `$2` seconds.
+          until_ok() {
+            local what=$1 limit=$2 started=$SECONDS
+            shift 2
+            until "$@"; do
+              if [ $((SECONDS - started)) -ge "$limit" ]; then
+                printf '%s | WAIT TIMEOUT after %ss: %s\n' "$tag" "$limit" "$what"
+                echo "$tag: $what" >> "$fail_log"
+                return 1
+              fi
+              sleep 1
+            done
+            printf '%s | wait ok after %ss: %s\n' "$tag" $((SECONDS - started)) "$what"
+          }
+
+          # True when the process `$1` has at least `$2` windows; keeps the last answer for a timeout.
+          has_windows() {
+            local n rc
+            n=$(ax "$1" 'count windows')
+            rc=$?
+            last_ax="rc=$rc answer=[$n]"
+            [ "$rc" -eq 0 ] && [ "$n" -ge "$2" ] 2> /dev/null
+          }
+
+          # Waits at most `$2` seconds for a window of the process `$1`.
+          w() {
+            until_ok "a window of $1" "$2" has_windows "$1" 1 || { printf '%s | last System Events answer: %s\n' "$tag" "$last_ax"; return 1; }
+          }
+
+          gone() { ! pgrep -x -u "$(id -u)" "$1" > /dev/null; }
+
+          # Chooses the last item of the application menu (Quit) and waits at most `$2` seconds for
+          # the process `$1` to end.
+          q() {
+            show "$tag" "$1" 'click (last menu item of menu 1 of menu bar item 2 of menu bar 1)'
+            until_ok "$1 has ended" "$2" gone "$1"
+          }
+
+          # How many login processes are children of the process named `$1`.
+          logins() {
+            local p
+            p=$(pgrep -x -u "$(id -u)" "$1" | head -1)
+            if [ -n "$p" ]; then pgrep -x -P "$p" login | wc -l | tr -d ' '; else echo 0; fi
+          }
+          has_logins() { [ "$(logins "$1")" -ge "$2" ]; }
+
+          # Terminal's Shell menu: item `$2` of the submenu `$1`.
+          choose() {
+            show "$tag" Terminal "click menu item \"$2\" of menu 1 of menu item \"$1\" of menu 1 of menu bar item \"Shell\" of menu bar 1"
+          }
+
+          # The window count and the login processes that Terminal has, after `$1` happened.
+          report() {
+            printf '%s | after %s | windows=%s logins=%s\n' "$tag" "$1" "$(ax Terminal 'count windows')" "$(logins Terminal)"
+          }
+
+          # What Terminal's preferences hold about its profiles, labelled `$1`.
+          ws_state() {
+            local out rc k
+            out=$(defaults read com.apple.Terminal 'Window Settings' 2>&1)
+            rc=$?
+            printf '%s | Window Settings %s | defaults rc=%s | profile keys: %s\n' "$tag" "$1" "$rc" "$(printf '%s\n' "$out" | grep -E '^    "?[A-Za-z]' | tr -d '\n' | tr -s ' ' | head -c 500)"
+            for k in 'Default Window Settings' 'Startup Window Settings'; do
+              out=$(defaults read com.apple.Terminal "$k" 2>&1)
+              rc=$?
+              printf '%s | %s %s | defaults rc=%s | %s\n' "$tag" "$k" "$1" "$rc" "$out"
+            done
+          }
+
+          # A picture of the runner's own screen, `$1` the file name under the runner's temp folder.
+          shot() {
+            screencapture -x "$RUNNER_TEMP/$1"
+            printf '%s | screencapture %s | rc=%s | %s\n' "$tag" "$1" "$?" "$(stat -f '%z bytes' "$RUNNER_TEMP/$1" 2>&1 | head -c 200)"
+          }
+          LIB
+          echo "helpers written: $(wc -l < "$RUNNER_TEMP/probe-lib.sh" | tr -d ' ') lines"
+
+      - name: P1 and P4, the account, the permissions and the session
+        if: always()
+        timeout-minutes: 3
+        run: |
+          . "$RUNNER_TEMP/probe-lib.sh" || exit 2
+          refuse
+          tag=P1
+          cap "sw_vers" sw_vers
+          cap "id" id
+          echo "$tag | HOME=$HOME | SHELL=${SHELL:-unset}"
+          echo "$tag | runner markers | GITHUB_ACTIONS=${GITHUB_ACTIONS:-} RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-} RUNNER_OS=${RUNNER_OS:-} RUNNER_ARCH=${RUNNER_ARCH:-} ImageOS=${ImageOS:-} ImageVersion=${ImageVersion:-}"
+          cap "ls -ld /Applications" ls -ld /Applications
+          if touch /Applications/.write-check 2> /dev/null; then
+            echo "$tag | write to /Applications as this account | yes"
+          else
+            echo "$tag | write to /Applications as this account | no"
+          fi
+          cap "ls -ld /opt/hca/hosted-compute-agent" ls -ld /opt/hca/hosted-compute-agent
+          cap "ls -la /opt/hca" ls -la /opt/hca
+          tag=P4
+          echo "$tag | TMPDIR=${TMPDIR:-unset}"
+          cap "getconf DARWIN_USER_TEMP_DIR" getconf DARWIN_USER_TEMP_DIR
+          cap "account login shell" dscl . -read "/Users/$(id -un)" UserShell
+          cap "launchctl managername" launchctl managername
+          cap "launchctl print gui/$(id -u), as this shell, output dropped" bash -c "launchctl print gui/$(id -u) > /dev/null"
+          cap "security show-keychain-info (reports the keychain's settings, not whether it is unlocked)" security show-keychain-info "$HOME/Library/Keychains/login.keychain-db"
+          cap "security default-keychain" security default-keychain
+          exit 0
+
+      - name: P2 and P3, Terminal
+        if: always()
+        timeout-minutes: 12
+        run: |
+          . "$RUNNER_TEMP/probe-lib.sh" || exit 2
+          refuse
+          tag=P2
+          ws_state "before the first start"
+          open -a Terminal
+          echo "$tag | open -a Terminal | rc=$?"
+          w Terminal 90
+          tag=P3
+          show "$tag" Terminal 'set frontmost to true'
+          tag=P2
+          show "$tag" Terminal 'get name of every window'
+          show "$tag" Terminal 'get name of every menu item of menu 1 of menu bar item "Shell" of menu bar 1'
+          for m in "New Window" "New Tab"; do
+            show "$tag" Terminal "get name of every menu item of menu 1 of menu item \"$m\" of menu 1 of menu bar item \"Shell\" of menu bar 1"
+          done
+          report "the first start"
+          shot terminal-start.png
+          ws_state "while the first start runs"
+          # The route a leg would use: a window and then a tab through a profile of the Shell menu.
+          # The profile is Terminal's own Basic, so that nothing of ours is needed to find out
+          # whether the menu click opens a window and a tab, and whether each has a login process.
+          choose "New Window" Basic
+          until_ok "two login processes of Terminal after New Window" 30 has_logins Terminal 2
+          report "Shell, New Window, Basic"
+          choose "New Tab" Basic
+          until_ok "three login processes of Terminal after New Tab" 30 has_logins Terminal 3
+          report "Shell, New Tab, Basic"
+          shot terminal-window-and-tab.png
+          q Terminal 60
+          if ! gone Terminal; then
+            show "$tag" Terminal 'get name of every window'
+            show "$tag" Terminal 'get name of every sheet of window 1'
+          fi
+          ws_state "after one start and quit"
+          cap "Terminal's preferences file" ls -l "$HOME/Library/Preferences/com.apple.Terminal.plist"
+          exit 0
+
+      - name: P5 and P6, iTerm2
+        if: always()
+        timeout-minutes: 10
+        env:
+          ITERM_URL: https://iterm2.com/downloads/stable/iTerm2-3_7_9.zip
+          ITERM_SIZE: "78118306"
+          ITERM_SHA256: beb96a1089b061c80e030101947aee13d54ba5e4058ad00b82e79633be29d3d2
+        run: |
+          . "$RUNNER_TEMP/probe-lib.sh" || exit 2
+          refuse
+          tag=P5
+          zip="$RUNNER_TEMP/iterm.zip"
+          curl -fL -o "$zip" "$ITERM_URL"
+          echo "$tag | curl rc=$?"
+          size=$(wc -c < "$zip" | tr -d ' ')
+          sum=$(shasum -a 256 "$zip" | cut -d ' ' -f 1)
+          echo "$tag | download | size=$size (pinned $ITERM_SIZE) sha256=$sum (pinned $ITERM_SHA256)"
+          if [ "$sum" != "$ITERM_SHA256" ] || [ "$size" != "$ITERM_SIZE" ]; then
+            echo "$tag | DIGEST MISMATCH: nothing is unpacked and nothing is started"
+            echo "$tag: iTerm2 digest" >> "$fail_log"
+            exit 1
+          fi
+          dest=/Applications
+          if ! [ -w /Applications ]; then
+            dest="$HOME/Applications"
+            mkdir -p "$dest"
+            echo "$tag | /Applications is not writable here, so iTerm2 goes to $dest"
+          fi
+          ditto -x -k "$zip" "$dest"
+          echo "$tag | ditto into $dest | rc=$?"
+          cap "codesign -dv of iTerm.app" codesign -dv --verbose=2 "$dest/iTerm.app"
+          open -a "$dest/iTerm.app"
+          echo "$tag | open iTerm.app | rc=$?"
+          w iTerm2 90
+          show "$tag" iTerm2 'get name of every window'
+          shot iterm-start.png
+          tag=P6
+          # Names only: nothing in these menus is chosen, so a name here shows that the item exists
+          # and nothing about what choosing it opens.
+          for m in Shell Profiles; do
+            show "$tag" iTerm2 "get name of every menu item of menu 1 of menu bar item \"$m\" of menu bar 1"
+          done
+          q iTerm2 60
+          exit 0
+
+      - name: P4, the same values from inside a Terminal window
+        if: always()
+        timeout-minutes: 6
+        run: |
+          . "$RUNNER_TEMP/probe-lib.sh" || exit 2
+          refuse
+          tag=P4
+          out="$RUNNER_TEMP/p4-window.txt"
+          cmdfile="$RUNNER_TEMP/p4-window.command"
+          cat > "$cmdfile" << EOF
+          #!/bin/bash
+          {
+            echo "TMPDIR=\${TMPDIR:-unset}"
+            echo "DARWIN_USER_TEMP_DIR=\$(getconf DARWIN_USER_TEMP_DIR)"
+            echo "SHELL=\${SHELL:-unset}"
+            echo "managername=\$(launchctl managername)"
+            launchctl print "gui/\$(id -u)" > /dev/null 2>&1
+            echo "launchctl print gui domain rc=\$?"
+            echo "tty=\$(tty)"
+          } > "$out"
+          EOF
+          chmod +x "$cmdfile"
+          # Opened by LaunchServices, so this sends no Apple event; whether a prompt shows anyway is
+          # what this step finds out, which is why it comes after the others.
+          open -a Terminal "$cmdfile"
+          echo "$tag | open -a Terminal on the command file | rc=$?"
+          until_ok "the window's output file" 90 test -s "$out"
+          echo "$tag | values read inside the Terminal window: $(tr '\n' ' ' < "$out" 2>&1)"
+          shot terminal-command-window.png
+          q Terminal 60
+          exit 0
+
+      - name: Summary of the System Events statuses and of the timeouts
+        if: always()
+        run: |
+          . "$RUNNER_TEMP/probe-lib.sh" || exit 2
+          refuse
+          echo "P3 | status of every System Events call (count, status; 0 is an answer, 142 is the 20 second alarm)"
+          if [ -s "$ax_log" ]; then sort "$ax_log" | uniq -c; else echo "P3 | no call was recorded"; fi
+          if [ -s "$fail_log" ]; then
+            echo "FAILED waits and checks:"
+            cat "$fail_log"
+            exit 1
+          fi
+          echo "no wait timed out and no digest differed"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: window-probe-macos
+          path: "${{ runner.temp }}/*.png"
+          if-no-files-found: ignore
+
+  windows:
+    name: windows terminal
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # One release and one asset of Windows Terminal, pinned by name, size and digest. The digest
+      # is the release's own, and the file's hash is compared with it before anything is extracted.
+      WT_TAG: v1.25.3131.0
+      WT_ASSET: Microsoft.WindowsTerminal_1.25.3131.0_x64.zip
+      WT_SIZE: "12126938"
+      WT_SHA256: 273d6f1502eca1b5bd95c43f5d4d7ec72cc503df340102f8659717e5bead3437
+    steps:
+      - name: P7, Windows Terminal from its portable archive
+        timeout-minutes: 15
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') {
+            Write-Host 'refused: this runs only on a GitHub-hosted Windows runner'
+            exit 2
+          }
+          $bad = New-Object System.Collections.Generic.List[string]
+          function Say([string] $text) { Write-Host "P7 | $text" }
+          function Wait-Until([string] $what, [int] $seconds, [scriptblock] $condition) {
+            $started = Get-Date
+            while (-not (& $condition)) {
+              if (((Get-Date) - $started).TotalSeconds -ge $seconds) {
+                Say "WAIT TIMEOUT after ${seconds}s: $what"
+                $bad.Add("timeout: $what")
+                return $false
+              }
+              Start-Sleep -Seconds 1
+            }
+            Say ('wait ok after {0:N0}s: {1}' -f ((Get-Date) - $started).TotalSeconds, $what)
+            return $true
+          }
+
+          # Facts about the account and the image. Each line says only what its command returned.
+          Say "account | user=$(whoami) | profile=$env:USERPROFILE | localappdata=$env:LOCALAPPDATA | image=$env:ImageOS $env:ImageVersion | os=$([Environment]::OSVersion.VersionString)"
+          $check = Join-Path $env:LOCALAPPDATA 'write-check'
+          try { New-Item -ItemType Directory -Path $check -ErrorAction Stop | Out-Null; Say 'write to LOCALAPPDATA as this account | yes' } catch { Say "write to LOCALAPPDATA as this account | no: $($_.Exception.Message)" }
+          Say "wt.exe on PATH | $([bool](Get-Command wt.exe -ErrorAction SilentlyContinue))"
+          Say "winget on PATH | $([bool](Get-Command winget -ErrorAction SilentlyContinue))"
+          try { $appx = @(Get-AppxPackage -AllUsers -Name '*Terminal*' -ErrorAction Stop | ForEach-Object PackageFullName); Say "appx packages named Terminal | count=$($appx.Count) $($appx -join ' ')" } catch { Say "appx query | error: $($_.Exception.Message)" }
+          Say "session | id=$((Get-Process -Id $PID).SessionId) | UserInteractive=$([Environment]::UserInteractive)"
+          $notepad = Start-Process notepad -PassThru
+          Wait-Until 'a window handle for Notepad' 30 { try { (Get-Process -Id $notepad.Id -ErrorAction Stop).MainWindowHandle -ne 0 } catch { $false } } | Out-Null
+          try { Say "notepad | pid=$($notepad.Id) window handle=$((Get-Process -Id $notepad.Id -ErrorAction Stop).MainWindowHandle)"; Stop-Process -Id $notepad.Id } catch { Say "notepad | error: $($_.Exception.Message)" }
+
+          # The pinned download, compared with its digest before anything is extracted.
+          $zip = Join-Path $env:RUNNER_TEMP $env:WT_ASSET
+          try {
+            Invoke-WebRequest -Uri "https://github.com/microsoft/terminal/releases/download/$($env:WT_TAG)/$($env:WT_ASSET)" -OutFile $zip -MaximumRetryCount 3 -RetryIntervalSec 5 -ErrorAction Stop
+          } catch {
+            Say "download | error: $($_.Exception.Message)"
+            exit 1
+          }
+          $size = (Get-Item $zip).Length
+          $sum = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          Say "download | tag=$env:WT_TAG asset=$env:WT_ASSET size=$size (pinned $env:WT_SIZE) sha256=$sum (pinned $env:WT_SHA256)"
+          if ($sum -ne $env:WT_SHA256 -or "$size" -ne $env:WT_SIZE) {
+            Say 'DIGEST MISMATCH: nothing is extracted and nothing is started'
+            exit 1
+          }
+          $extracted = Join-Path $env:RUNNER_TEMP 'wt-build'
+          Expand-Archive -Path $zip -DestinationPath $extracted
+          $wt = (Get-ChildItem -Path $extracted -Recurse -Filter wt.exe | Select-Object -First 1).FullName
+          if (-not $wt) { Say 'extracted | no wt.exe in the archive'; exit 1 }
+          $dir = Split-Path -Parent $wt
+          Say "extracted | dir=$dir | wt.exe file version=$((Get-Item $wt).VersionInfo.FileVersion) | files=$((Get-ChildItem $dir).Name -join ' ')"
+          Say "portable marker file | .portable present=$(Test-Path (Join-Path $dir '.portable')) | settings folder beside wt.exe present=$(Test-Path (Join-Path $dir 'settings'))"
+
+          # A fragment profile that prints a marker and then waits, so that every command launch is a
+          # cmd.exe process that carries the marker.
+          $fragments = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\KalaReach'
+          New-Item -ItemType Directory -Path $fragments -Force | Out-Null
+          '{"profiles":[{"guid":"{b4c63c26-b403-43b0-a8fd-20e5747d3446}","name":"KalaReach","commandline":"cmd.exe /c echo window-probe & ping -n 300 127.0.0.1 > nul"}]}' | Set-Content -Path (Join-Path $fragments 'kalareach.json')
+          Say "fragment written | $fragments"
+
+          # Windows Terminal's tab items are read through UI Automation, in Windows PowerShell,
+          # which carries the automation assemblies that PowerShell 7 may lack.
+          $tabFile = Join-Path $env:RUNNER_TEMP 'wt-tabs.ps1'
+          @'
+          param([Int64] $Handle)
+          $ErrorActionPreference = 'Stop'
+          try {
+            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Handle)
+            $type = [System.Windows.Automation.ControlType]::TabItem
+            $condition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $type)
+            $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+            $names = @()
+            foreach ($e in $found) { $names += $e.Current.Name }
+            "tabs=$($found.Count) names=$($names -join '|')"
+          } catch { "error: $($_.Exception.Message)" }
+          '@ | Set-Content -Path $tabFile
+          function Get-Markers { @(Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" | Where-Object { $_.CommandLine -match 'window-probe' }) }
+          function Get-WtWindows { @(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }) }
+          function Get-WtState([string] $label) {
+            $windows = Get-WtWindows
+            $tabs = -1
+            foreach ($p in $windows) {
+              $answer = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tabFile -Handle ([int64] $p.MainWindowHandle) 2>&1 | Out-String).Trim()
+              Say "$label | window pid=$($p.Id) handle=$($p.MainWindowHandle) title=[$($p.MainWindowTitle)] | $answer"
+              if ($answer -match 'tabs=(\d+)') { $tabs = [int] $Matches[1] }
+            }
+            [pscustomobject]@{ Windows = $windows.Count; Tabs = $tabs; Pids = @($windows | ForEach-Object Id) }
+          }
+          function Show-Markers([string] $label, $markers) {
+            foreach ($m in $markers) { Say "$label | marker cmd.exe pid=$($m.ProcessId) parent=$($m.ParentProcessId) created=$($m.CreationDate)" }
+          }
+
+          Say "windows terminal processes before | $(@(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue).Count)"
+          Say "markers before | $((Get-Markers).Count)"
+
+          # A window.
+          $launchWindow = Start-Process -FilePath $wt -ArgumentList '-w', 'probe', '-p', 'KalaReach' -PassThru
+          Say "wt -w probe -p KalaReach | started pid=$($launchWindow.Id)"
+          Wait-Until 'one marker process after the window' 60 { (Get-Markers).Count -ge 1 } | Out-Null
+          Wait-Until 'one Windows Terminal window' 30 { (Get-WtWindows).Count -ge 1 } | Out-Null
+          $afterWindow = Get-Markers
+          Show-Markers 'after the window' $afterWindow
+          $stateWindow = Get-WtState 'after the window'
+          Say "after the window | markers=$($afterWindow.Count) windows=$($stateWindow.Windows) tabs=$($stateWindow.Tabs)"
+          if ($afterWindow.Count -ne 1) { $bad.Add("markers after the window: $($afterWindow.Count), expected 1") }
+          if ($stateWindow.Windows -ne 1) { $bad.Add("windows after the window: $($stateWindow.Windows), expected 1") }
+          if ($stateWindow.Tabs -ge 0 -and $stateWindow.Tabs -ne 1) { $bad.Add("tabs after the window: $($stateWindow.Tabs), expected 1") }
+          $first = $afterWindow | Select-Object -First 1
+
+          # A tab of the same named window.
+          $launchTab = Start-Process -FilePath $wt -ArgumentList '-w', 'probe', 'new-tab', '-p', 'KalaReach' -PassThru
+          Say "wt -w probe new-tab -p KalaReach | started pid=$($launchTab.Id)"
+          Wait-Until 'two marker processes after the tab' 60 { (Get-Markers).Count -ge 2 } | Out-Null
+          $afterTab = Get-Markers
+          Show-Markers 'after the tab' $afterTab
+          $stateTab = Get-WtState 'after the tab'
+          Say "after the tab | markers=$($afterTab.Count) windows=$($stateTab.Windows) tabs=$($stateTab.Tabs)"
+          if ($afterTab.Count -ne 2) { $bad.Add("markers after the tab: $($afterTab.Count), expected 2") }
+          if ($stateTab.Windows -ne 1) { $bad.Add("windows after the tab: $($stateTab.Windows), expected 1") }
+          if ($stateTab.Tabs -ge 0 -and $stateTab.Tabs -ne 2) { $bad.Add("tabs after the tab: $($stateTab.Tabs), expected 2") }
+          if ($first) {
+            $kept = @($afterTab | Where-Object { $_.ProcessId -eq $first.ProcessId -and $_.CreationDate -eq $first.CreationDate })
+            Say "first marker process still the same one | $($kept.Count -eq 1)"
+            if ($kept.Count -ne 1) { $bad.Add("the first marker process (pid $($first.ProcessId)) is gone or replaced") }
+          }
+          if ($stateWindow.Pids.Count -eq 1 -and $stateTab.Pids.Count -eq 1 -and $stateWindow.Pids[0] -ne $stateTab.Pids[0]) { $bad.Add('the tab opened in another window process') }
+
+          # Where the build keeps its settings.
+          foreach ($candidate in @((Join-Path $dir 'settings\settings.json'), (Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\settings.json'), (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json'))) {
+            Say "settings file | $candidate | present=$(Test-Path $candidate)"
+          }
+          if ($bad.Count -gt 0) {
+            Say "RESULT FAIL: $($bad -join '; ')"
+            exit 1
+          }
+          Say 'RESULT ok: one marker after a window, two after a tab, one window, the first process kept'
