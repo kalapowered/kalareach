@@ -135,7 +135,7 @@ impl LeftoverClass {
     }
 }
 
-/// A file the end check digests: a hook or the attributes file.
+/// A file the end check digests: a hook, the attributes file or the exclude file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestedFile {
     /// The name, relative to the Git directory.
@@ -170,7 +170,8 @@ mod hex_bytes {
 /// does not know a member ignores it; a build that meets a kind of row it does not know reads the
 /// file as damaged. Nothing else says how the format may grow. Before the first production writer
 /// lands, the journal gets a format marker and the stored-format discipline: a version that a
-/// change raises, and an entry in the lock of the stored formats.
+/// change raises, and an entry in the lock of the stored formats or the reason that the boundary's
+/// data stand outside it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "row")]
 pub enum Row {

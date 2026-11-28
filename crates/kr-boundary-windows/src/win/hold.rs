@@ -277,7 +277,7 @@ impl TreeHold {
     }
 
     /// The journal row that records what the hold took: the configuration's digest, the hooks, the
-    /// attributes file and the names that must be absent.
+    /// attributes file, the exclude file and the names that must be absent.
     #[must_use]
     pub fn snapshot_row(&self, id: u32, kind: SnapshotKind) -> Row {
         Row::RepositorySnapshot {

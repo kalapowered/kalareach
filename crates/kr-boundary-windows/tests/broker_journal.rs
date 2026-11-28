@@ -2638,7 +2638,9 @@ fn a_snapshot_row_written_before_the_exclude_file_was_recorded_reads_with_that_m
 }
 
 /// The snapshot row as the build before the exclude file was recorded declared it. Like that
-/// build's row type, it takes no side against a member it does not know.
+/// build's row type, it takes no side against a member it does not know. Its members are typed with
+/// this build's `DigestedFile`, `SnapshotKind` and `FileKey`: the case shows that an older reader
+/// ignores the new member, and does not pin the forms of those three.
 #[derive(Debug, PartialEq, serde::Deserialize)]
 #[serde(tag = "row")]
 enum SnapshotBeforeTheExcludeFile {
@@ -2666,13 +2668,17 @@ fn a_reader_of_the_row_before_the_exclude_file_was_recorded_ignores_the_member_i
             absent_names: vec!["info/exclude.lock".to_owned()],
         };
         let bytes = row.to_bytes();
-        // The member is in the bytes, so there is something for the older reader to ignore.
+        // The member is in the bytes, as `null` when there is no file and as an object when there is
+        // one, so there is something for the older reader to ignore.
         let written: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            written["info_exclude"].is_object(),
-            info_exclude.is_some(),
-            "{info_exclude:?}"
-        );
+        let member = written.get("info_exclude");
+        match &info_exclude {
+            None => assert_eq!(member, Some(&serde_json::Value::Null), "{info_exclude:?}"),
+            Some(_) => assert!(
+                member.is_some_and(serde_json::Value::is_object),
+                "{info_exclude:?}: {member:?}"
+            ),
+        }
         let older: SnapshotBeforeTheExcludeFile = serde_json::from_slice(&bytes)
             .unwrap_or_else(|error| panic!("{info_exclude:?}: {error}"));
         assert_eq!(
