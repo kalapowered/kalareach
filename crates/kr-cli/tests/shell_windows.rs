@@ -175,6 +175,19 @@ struct Profiles {
 }
 
 impl Profiles {
+    /// Puts a line of the person's own at the end of the first profile, before any entry goes in.
+    /// The file, and the directories above it that did not exist, are among what is put back.
+    fn the_person_adds(&self, line: &str) {
+        let (path, _) = &self.files[0];
+        if let Some(directory) = path.parent() {
+            std::fs::create_dir_all(directory).expect("the profile's directory");
+        }
+        let mut text = std::fs::read_to_string(path).unwrap_or_default();
+        text.push_str(line);
+        text.push_str("\r\n");
+        std::fs::write(path, text).expect("the profile takes the person's line");
+    }
+
     /// Records the files the package's own PowerShell names for the account.
     ///
     /// # Panics
@@ -317,7 +330,7 @@ struct Managed {
     host: WorkerHost,
     packages: tempfile::TempDir,
     /// After the daemon, so the profiles come back after the shell that read them has ended.
-    _profiles: Profiles,
+    profiles: Profiles,
     /// Last, so the turn is given up once the profiles are back and the programs placed beside the
     /// test have gone.
     _turn: Turn,
@@ -336,7 +349,7 @@ impl Managed {
         Self {
             host,
             packages,
-            _profiles: profiles,
+            profiles,
             _turn: turn,
         }
     }
@@ -607,6 +620,195 @@ async fn a_default_session_is_refused_without_the_entry_and_managed_with_it() {
         .kr(&["--json", "close", &session_id.to_string()], &[])
         .await;
     assert!(closed.status.success());
+}
+
+/// A session that the managed shell runs, with a terminal attached at a prompt that answers.
+async fn a_managed_prompt() -> (Managed, Created, WorkerTerminal) {
+    let (turn, prepared) = take_a_turn();
+    let managed = Managed::start(turn, prepared).await;
+    managed.install_entries().await;
+    managed_session(managed).await
+}
+
+/// Starts a session on a host whose entries are installed.
+async fn managed_session(managed: Managed) -> (Managed, Created, WorkerTerminal) {
+    let created = managed.host.kr_new(&[]).await;
+    assert_eq!(
+        created.document["shell_mode"], "managed",
+        "{}",
+        created.document
+    );
+    let mut terminal = managed.terminal(&created).await;
+    answering(&mut terminal).await;
+    (managed, created, terminal)
+}
+
+/// The attachments the session's worker lists now.
+async fn attached(managed: &Managed, created: &Created) -> Vec<kr_protocol::ids::AttachmentId> {
+    let (session_id, _) = created.session();
+    windows_session::attachments_of(&managed.host.tree.environment(), session_id)
+        .await
+        .expect("the worker lists its attachments")
+}
+
+/// Closes the session the way a person does.
+async fn close_session(managed: &Managed, created: &Created) {
+    let (session_id, _) = created.session();
+    let closed = managed
+        .host
+        .kr(&["--json", "close", &session_id.to_string()], &[])
+        .await;
+    assert!(closed.status.success());
+}
+
+/// The words the module prints when it consumes the end-of-file key instead of detaching.
+fn no_hint_was_printed(terminal: &WorkerTerminal) {
+    let shown = terminal.text();
+    assert!(
+        !shown.contains("Use kr detach --attachment"),
+        "the module consumed a key that was the editor's own: {shown}"
+    );
+}
+
+/// KR-REQ-07.52: Ctrl-D in a foreground application keeps its native behaviour. A program that
+/// reads a key from the console while the managed shell waits for it gets the end-of-file key, and
+/// no attachment is removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = writes_profiles!()]
+async fn ctrl_d_in_a_foreground_program_reaches_the_program() {
+    let (managed, created, mut terminal) = a_managed_prompt().await;
+    let attachments = attached(&managed, &created).await;
+    let folder = stand_ins();
+    let script = folder.path().join("read-key.ps1");
+    std::fs::write(
+        &script,
+        "Write-Output ('kr-' + 'reading')\r\n\
+         $key = [Console]::ReadKey($true)\r\n\
+         Write-Output ('kr-' + 'key-' + [int]$key.KeyChar)\r\n",
+    )
+    .expect("the program is written");
+    terminal
+        .type_line(&format!(
+            "& pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File '{}'",
+            script.display()
+        ))
+        .await;
+    terminal
+        .shown("kr-reading", "the program waits for a key")
+        .await;
+    terminal.type_bytes(&[0x04]).await;
+    terminal
+        .shown("kr-key-4", "the program read the end-of-file key")
+        .await;
+    back_at_the_prompt(&mut terminal, "after-program").await;
+
+    assert_eq!(
+        attached(&managed, &created).await,
+        attachments,
+        "the end-of-file key removed an attachment while a program held the console"
+    );
+    drop(terminal);
+    close_session(&managed, &created).await;
+}
+
+/// KR-REQ-07.52, KR-REQ-07.73: with text in the buffer the end-of-file key is the editor's own, in
+/// the Windows edit mode, which binds nothing on it. The module does not consume it with the hint
+/// and the attachment stays. The key that follows runs after the end-of-file key, so a line the
+/// shell then runs shows that it has been handled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = writes_profiles!()]
+async fn ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows() {
+    let (managed, created, mut terminal) = a_managed_prompt().await;
+    let attachments = attached(&managed, &created).await;
+    terminal.type_bytes(b"kr-text").await;
+    terminal.type_bytes(&[0x04]).await;
+    // Ctrl+c ends the line the key was typed into, and the next line is the first the shell runs.
+    terminal.type_bytes(&[0x03]).await;
+    back_at_the_prompt(&mut terminal, "after-text").await;
+
+    no_hint_was_printed(&terminal);
+    assert_eq!(
+        attached(&managed, &created).await,
+        attachments,
+        "the end-of-file key removed an attachment while the buffer held text"
+    );
+    drop(terminal);
+    close_session(&managed, &created).await;
+}
+
+/// KR-REQ-07.52, KR-REQ-07.73: another chord at an empty prompt is the editor's own. Ctrl+k stands
+/// on nothing in the Windows edit mode, so nothing happens and the module prints no hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = writes_profiles!()]
+async fn another_chord_is_the_editors_own_on_windows() {
+    let (managed, created, mut terminal) = a_managed_prompt().await;
+    let attachments = attached(&managed, &created).await;
+    terminal.type_bytes(&[0x0b]).await;
+    back_at_the_prompt(&mut terminal, "after-chord").await;
+
+    no_hint_was_printed(&terminal);
+    assert_eq!(
+        attached(&managed, &created).await,
+        attachments,
+        "another chord removed an attachment"
+    );
+    drop(terminal);
+    close_session(&managed, &created).await;
+}
+
+/// KR-REQ-07.52, KR-REQ-07.73: on Windows the worker names the chord, so the module's decision
+/// stands on Ctrl+d in a session it manages, and the editor lists it under the module's name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = writes_profiles!()]
+async fn ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session() {
+    let (managed, created, mut terminal) = a_managed_prompt().await;
+    terminal
+        .type_line(
+            "Write-Output ('kr-' + 'bound-' + (Get-PSReadLineKeyHandler -Bound | \
+             Where-Object { $_.Key -eq 'Ctrl+d' }).Function)",
+        )
+        .await;
+    terminal
+        .shown(
+            "kr-bound-KalaReachDetach",
+            "the editor lists the module's decision on Ctrl+d",
+        )
+        .await;
+    drop(terminal);
+    close_session(&managed, &created).await;
+}
+
+/// KR-REQ-07.73: a handler the person had on Ctrl+d before the module came is kept, and it runs
+/// whenever the key is outside the detach condition. The person's profile binds a script that puts
+/// words into the line; with text in the buffer the key runs that script.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = writes_profiles!()]
+async fn a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition() {
+    let (turn, prepared) = take_a_turn();
+    let managed = Managed::start(turn, prepared).await;
+    managed.profiles.the_person_adds(
+        "Set-PSReadLineKeyHandler -Chord Ctrl+d -ScriptBlock { \
+         [Microsoft.PowerShell.PSConsoleReadLine]::Insert('kr-person-' + 'said') }",
+    );
+    managed.install_entries().await;
+    let (managed, created, mut terminal) = managed_session(managed).await;
+    let attachments = attached(&managed, &created).await;
+    terminal.type_bytes(b"x").await;
+    terminal.type_bytes(&[0x04]).await;
+    terminal
+        .shown("kr-person-said", "the person's own handler ran on the key")
+        .await;
+    terminal.type_bytes(&[0x03]).await;
+    back_at_the_prompt(&mut terminal, "after-handler").await;
+
+    no_hint_was_printed(&terminal);
+    assert_eq!(
+        attached(&managed, &created).await,
+        attachments,
+        "the end-of-file key removed an attachment while the buffer held text"
+    );
+    drop(terminal);
+    close_session(&managed, &created).await;
 }
 
 /// The directory the bundle ships a package in.
@@ -2287,7 +2489,7 @@ async fn with_a_plugin_host_running_the_session_is_set_up_and_the_account_signed
     let Managed {
         host: daemon,
         packages,
-        _profiles: profiles,
+        profiles,
         _turn: turn,
     } = managed;
     drop(profiles);

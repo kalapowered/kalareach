@@ -2031,6 +2031,19 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-shell-integration --test pwsh_windows_package
 
+      # The managed PowerShell session through a real daemon and worker on this platform: the
+      # end-of-file key reaches a program that reads it, is the editor's own with text in the buffer
+      # or on another chord, stands bound to the module's decision, and leaves a handler the person
+      # bound on it running outside the detach condition. The cases write this runner's PowerShell
+      # profiles and put them back, which is why they are ignored in an ordinary run and the switch
+      # is set on this step alone; the runner is discarded after the job.
+      - name: PowerShell sessions through a real daemon and worker
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        timeout-minutes: 25
+        env:
+          KR_ALLOW_PROFILE_WRITE: "1"
+        run: cargo test --locked -p kr-cli --test shell_windows -- --ignored --exact --test-threads=1 a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition another_chord_is_the_editors_own_on_windows ctrl_d_in_a_foreground_program_reaches_the_program ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows
+
       # The reference bridge against a real endpoint on this platform. The published Windows
       # address carries the pipe prefix and the endpoint layer supplies it again, so a client that
       # passes the address through unchanged asks for a name no listener holds.

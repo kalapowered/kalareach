@@ -1427,6 +1427,32 @@ command = [
 ]
 
 [[step]]
+id = 'rust-powershell-sessions-through-a-real-daemon-and-worker'
+group = 'rust'
+what = 'PowerShell sessions through a real daemon and worker'
+platforms = ['windows']
+reading = 'cargo'
+needs = ['KR_ALLOW_PROFILE_WRITE']
+command = [
+    'cargo',
+    'test',
+    '--locked',
+    '-p',
+    'kr-cli',
+    '--test',
+    'shell_windows',
+    '--',
+    '--ignored',
+    '--exact',
+    '--test-threads=1',
+    'a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition',
+    'another_chord_is_the_editors_own_on_windows',
+    'ctrl_d_in_a_foreground_program_reaches_the_program',
+    'ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session',
+    'ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows',
+]
+
+[[step]]
 id = 'rust-the-reference-bridge-over-a-real-endpoint'
 group = 'rust'
 what = 'the reference bridge over a real endpoint'
@@ -2610,6 +2636,21 @@ cases = ['a_task_the_task_scheduler_does_not_start_is_named_with_where_to_sign_i
 [ignored_run.runs]
 kind = 'by_hand'
 why = 'it needs an account signed in to no session, which no step of this repository arranges'
+
+[[ignored_run]]
+package = 'kr-cli'
+target = '--test shell_windows'
+cases = [
+    'a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition',
+    'another_chord_is_the_editors_own_on_windows',
+    'ctrl_d_in_a_foreground_program_reaches_the_program',
+    'ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session',
+    'ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows',
+]
+[ignored_run.runs]
+kind = 'command'
+file = '.github/workflows/core-ci.yml'
+line = 'run: cargo test --locked -p kr-cli --test shell_windows -- --ignored --exact --test-threads=1 a_handler_the_person_bound_on_ctrl_d_runs_outside_the_detach_condition another_chord_is_the_editors_own_on_windows ctrl_d_in_a_foreground_program_reaches_the_program ctrl_d_is_bound_to_the_detach_decision_in_a_managed_session ctrl_d_with_text_in_the_buffer_is_the_editors_own_on_windows'
 
 [[ignored_run]]
 package = 'kr-cli'
