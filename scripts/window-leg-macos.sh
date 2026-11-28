@@ -30,10 +30,10 @@ set -uo pipefail
 # guard begin
 refuse() { printf 'window-leg-macos: %s\n' "$*" >&2; exit 2; }
 if [ "${GITHUB_ACTIONS:-}" != true ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ] \
-    || [ "${RUNNER_OS:-}" != macOS ] || [ "${KR_WINDOW_LEG:-}" != 1 ] \
+    || [ "${RUNNER_OS:-}" != macOS ] || [ "$(uname -s)" != Darwin ] || [ "${KR_WINDOW_LEG:-}" != 1 ] \
     || [ "$(id -un)" != runner ] || [ "${HOME:-}" != /Users/runner ] \
     || ! [ -e /opt/hca/hosted-compute-agent ] || [ -n "${KR_TERMINAL_PREFERENCES_DIR+set}" ]; then
-    refuse "this writes a real account's Terminal preferences and runs only in the account of a GitHub-hosted runner (GITHUB_ACTIONS, RUNNER_ENVIRONMENT, RUNNER_OS and KR_WINDOW_LEG set by the workflow, the account runner, its home, the hosted agent's file, and KR_TERMINAL_PREFERENCES_DIR unset)"
+    refuse "this writes a real account's Terminal preferences and runs only in the account of a GitHub-hosted runner (GITHUB_ACTIONS, RUNNER_ENVIRONMENT, RUNNER_OS and KR_WINDOW_LEG set by the workflow, a Darwin system, the account runner, its home, the hosted agent's file, and KR_TERMINAL_PREFERENCES_DIR unset)"
 fi
 # guard end
 
@@ -161,6 +161,8 @@ check shell-mode-native krc host shell-mode --set native_compat
 install_ok() { [ "$(krc host terminal-profile install apple-terminal --json | tee "$work/install.json" | jq -r '.ok')" = true ]; }
 check profile-install install_ok
 entry > "$work/entry-after-install.xml"
+say "the entry's command: $(defaults export com.apple.Terminal - | plutil -extract 'Window Settings.KalaReach.CommandString' raw -o - - 2>&1)"
+say "the entry runs its command inside a shell: $(defaults export com.apple.Terminal - | plutil -extract 'Window Settings.KalaReach.RunCommandAsShell' raw -o - - 2>&1)"
 status_matches() { [ "$(krc host terminal-profile status --json | jq -r '.terminals[] | select(.terminal == "apple-terminal") | .profile')" = matches ]; }
 check profile-status-matches status_matches
 check shell-files-after-install unchanged

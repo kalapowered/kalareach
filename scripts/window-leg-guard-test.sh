@@ -4,7 +4,7 @@
 # its `guard begin` and `guard end` lines is run, each time in an empty environment, and the lines
 # before the guard are read as text. The guard only reads. Two cases name the machine's real
 # account, where the guard must refuse; the others stand in for the account (a function `id` that
-# answers runner, and this file for the hosted agent's file), so that each condition of the guard
+# answers runner, a function `uname` that answers Darwin, and this file for the hosted agent's file), so that each condition of the guard
 # alone is what refuses.
 #
 #   scripts/window-leg-guard-test.sh
@@ -24,7 +24,7 @@ stray="$(awk '/^# guard begin$/{exit} !/^#/ && !/^[[:space:]]*$/ && !/^set -uo p
 
 stand_in="${guard//\/opt\/hca\/hosted-compute-agent/$0}"
 [ "$stand_in" != "$guard" ] || fail "the guard names no agent file"
-as_runner='id() { echo runner; }'
+as_runner='id() { echo runner; }; uname() { echo Darwin; }'
 hosted=(GITHUB_ACTIONS=true RUNNER_ENVIRONMENT=github-hosted RUNNER_OS=macOS KR_WINDOW_LEG=1 HOME=/Users/runner)
 
 # `refuses <label> <text> <variable assignments...>` runs the text under exactly those variables.
@@ -54,7 +54,8 @@ done
 refuses "a self-hosted runner" "$as_runner; $stand_in" "${hosted[@]/github-hosted/self-hosted}"
 refuses "another home" "$as_runner; $stand_in" "${hosted[@]/\/Users\/runner/\/Users\/someone}"
 refuses "another account" "id() { echo someone; }; $stand_in" "${hosted[@]}"
-refuses "no agent file" "$as_runner; $guard" "${hosted[@]}"
+refuses "another system" "$as_runner; uname() { echo Linux; }; $stand_in" "${hosted[@]}"
+refuses "no agent file" "$as_runner; ${guard//\/opt\/hca\/hosted-compute-agent/$0.absent}" "${hosted[@]}"
 refuses "a preferences variable set to a directory" "$as_runner; $stand_in" "${hosted[@]}" KR_TERMINAL_PREFERENCES_DIR=/tmp
 refuses "a preferences variable set to an empty value" "$as_runner; $stand_in" "${hosted[@]}" KR_TERMINAL_PREFERENCES_DIR=
 
