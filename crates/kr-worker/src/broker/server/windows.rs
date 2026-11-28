@@ -25,7 +25,10 @@
 //! does not hold.
 //!
 //! **A limit.** The job holds no process that a service creates on a descendant's behalf, and none
-//! that a descendant creates under a parent outside the job.
+//! that a descendant creates under a parent outside the job. A process in the job that runs as the
+//! same person can put another process of that person into a job below the server's, since a
+//! process in no job can join any job; the ending then ends that process too. That is no power the
+//! member lacked: it can end that process itself.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};

@@ -38,7 +38,10 @@
 //! kernel proves nothing here; a job does. The agent joins its job before it runs and breakaway is
 //! disabled, so the job holds the agent and every process the agent starts, and nothing else. It
 //! is not kill-on-close: it is a record of who belongs to the agent, not a second owner of the
-//! agent's lifetime, which stays what it is without one.
+//! agent's lifetime, which stays what it is without one. The exception is the job of an
+//! application server the worker starts itself ([`AgentJob::create_owning`]): that job is
+//! kill-on-close, because the worker is the server's only owner and the job is what ends the server
+//! and everything it started.
 
 #![expect(
     unsafe_code,
@@ -254,10 +257,11 @@ impl AgentJob {
         Ok(created)
     }
 
-    /// Creates a job of its own for a process that runs in no session's job, as a launch probe
-    /// does: unnamed, breakaway disabled, and kill-on-close with this the only handle to it.
-    /// Nothing else ends what it holds. Closing that handle does, so a worker that dies takes the
-    /// process and everything it started down with it.
+    /// Creates a job of its own for a process this host owns alone, as a launch probe does (in no
+    /// session's job) and an application server does (inside the session's job as well, which
+    /// nests this one): unnamed, breakaway disabled, and kill-on-close with this the only handle to
+    /// it. Nothing else ends what it holds. Closing that handle does, so a worker that dies takes
+    /// the process and everything it started down with it.
     ///
     /// # Errors
     ///
@@ -788,9 +792,12 @@ pub fn holding(root: u32) -> Option<Arc<SessionJob>> {
 /// The agent is started where the broker's launch is, and placed where a caller is verified, so the
 /// two need somewhere to meet, as a session's root shell and its boundary do. The reference is
 /// strong and kept until the broker lets it go with [`release_agent`], when the last instance that
-/// names the agent ends: an agent's job is not kill-on-close, so keeping it keeps no process alive,
-/// and the broker asks about an agent only for as long as one of its instances lasts. It costs one
-/// handle for each agent with a live instance.
+/// names the agent ends: the job of a launched agent is not kill-on-close, so keeping it keeps no
+/// process alive, and the broker asks about an agent only for as long as one of its instances
+/// lasts. The job of an application server is kill-on-close ([`AgentJob::create_owning`]): the
+/// kept reference is then one of the handles that hold what it started, and a server that was
+/// retired keeps it until the broker releases it. It costs one handle for each agent with a live
+/// instance.
 static AGENTS: OnceLock<Mutex<Vec<KeptAgent>>> = OnceLock::new();
 
 /// One launched agent and the job it was started in.
@@ -815,8 +822,10 @@ pub fn keep_agent(agent: ProcessStartIdentity, job: Arc<AgentJob>) {
 /// Forgets the job `agent` was started in.
 ///
 /// Nothing is placed under the agent afterwards: a process it started is found in no job this
-/// worker keeps. Closing the handle ends nothing, because an agent's job is not kill-on-close, and
-/// forgetting an agent that was never kept changes nothing.
+/// worker keeps. Closing the handle ends nothing for a launched agent, whose job is not
+/// kill-on-close. For an application server the handle may be the last one to a kill-on-close job,
+/// and closing the last handle ends what the job holds. Forgetting an agent that was never kept
+/// changes nothing.
 pub fn release_agent(agent: &ProcessStartIdentity) {
     let mut kept = agents()
         .lock()
