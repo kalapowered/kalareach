@@ -1,0 +1,63 @@
+name: proof-pwsh-legs
+
+# Runs the PowerShell cases that need a real Windows console on a hosted runner.
+on:
+  push:
+    branches: ["proof/pwsh-legs"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proof-pwsh-legs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    name: windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Choose where the tests keep their artefacts
+        run: |
+          $temporary = (Get-Item $env:TEMP).FullName
+          "KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV
+
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - name: Place libsodium's archives
+        id: libsodium
+        uses: ./.github/actions/libsodium-archive
+
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: windows
+
+      - name: What this runner is
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          $PSVersionTable.PSVersion.ToString()
+          (Get-Command pwsh).Source
+          pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString(); Get-Module PSReadLine -ListAvailable | Select-Object Name, Version, Path | Format-List'
+          whoami /priv
+
+      - name: Measure the idle tick of a parked reader
+        run: cargo test --locked -p kr-shell-integration --test pwsh_idle_spike -- --ignored --nocapture --test-threads=1
