@@ -188,7 +188,8 @@ for (const width of [390, 1280]) {
 
         // The picture is taken first, so that a case that fails leaves it behind.
         await tallEnoughFor(page, copies)
-        await copies.screenshot({ path: shot(`${width}-${size}-${scheme}`) })
+        // At a device scale of 2 this list passes WebKit's 32,767-pixel picture limit: take it at the CSS scale.
+        await copies.screenshot({ path: shot(`${width}-${size}-${scheme}`), scale: 'css' })
 
         // The sentences are there, with the way beneath each of the three that a host causes.
         await expect(copies).toContainText(
