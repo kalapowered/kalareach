@@ -636,18 +636,15 @@ handles the key normally.
 The default is Ctrl-D, read from the line discipline rather than assumed. A `VEOF` reassignment is a
 user change to the gesture: the bridge records it with the prompt it takes effect at, and the
 character typed at the current prompt is still judged by the gesture that was in force when it was
-typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. On Windows the
-worker supplies the same default as on Unix, the terminal's end-of-file byte 4, in the accept, and the
-PSReadLine module puts its decision on Ctrl+d when its hooks go live. A Windows console has no line
-discipline to read an end-of-file character from, so when the first prompt begins the module reports
-the gesture as disabled, in every edit mode, effective at that prompt. It takes its decision off
-Ctrl+d when it promotes that report, which is at the first Ctrl+d that reaches the module at that
-prompt or a later one (one pressed in the Vi command table does not) or at the next prompt's entry
-while the bridge is registered, whichever comes first, and the Ctrl+d that promotes it runs what stood on the key before the
-module's decision went there, as every Ctrl+d outside the detach condition does. Where the editor
-binds none, as its Windows edit mode does not, that is the editor's handling of an unbound key. From
-then on no key detaches the session there, and
-`kr detach --attachment <id>` is the way. The protocol also carries a gesture
+typed. Disabled `VEOF` leaves the terminal with no gesture, so no character is one. A Windows console
+has no line discipline to read an end-of-file character from, so for a PowerShell root on Windows the
+worker names the chord Ctrl+d in the accept, and the PSReadLine module puts its decision on that chord
+when its hooks go live, in every edit mode. Ctrl+d at an empty prompt then removes the attachment it
+was typed in when a fence is held for that prompt, and is consumed with one hint per prompt when none
+is. Outside the detach condition (text in the buffer, or the Vi command table) the key runs what stood
+on it before the module's decision went there, as does every other chord. Where the editor binds none,
+as its Windows edit mode does not, that is the editor's handling of an unbound key, which puts the
+key's character into the line. No other root and no other platform receives the chord. The protocol also carries a gesture
 as a chord (`chord` with `keys`), which the module honours and the worker does not send.
 
 ## The fence and detach state machine
@@ -1091,8 +1088,8 @@ method, and that is exactly what it cannot do:
   `psreadline_key_read_unreadable`.
 
 Running the module on Windows, where the endpoint is a named pipe and the console has no line
-discipline to name an end-of-file character, so that the module reports the gesture as disabled at its
-first prompt, is qualified separately.
+discipline to name an end-of-file character, so that the worker names the chord Ctrl+d for it, is
+qualified separately.
 
 ## The scenarios
 
@@ -1136,7 +1133,7 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 | `eof-stale-fence`, `eof-missing-fence` | A detach the worker refuses, and a gesture the bridge consumes with one hint per prompt |
 | `eof-repeated-after-detach` | A repeated gesture that cannot adopt the next attachment's identity, and the hint a refused detach prints |
 | `eof-after-detach-succession` | No new fence until the old queues drain, and the next attachment's own fence when they do |
-| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and a gesture the accept names as a chord, which the contract carries and the worker does not send |
+| `veof-change`, `veof-disabled`, `psreadline-chord-gesture` | A reassigned gesture taking effect at the next prompt, a terminal with no gesture, and a gesture the accept names as a chord, which the worker sends for a PowerShell root on Windows |
 | `acceptance-mixed-context` | A recorded origin, a mixed one and an unverifiable one, what `kr detach` resolves to in each case, and a lease change that does not move it |
 | `acceptance-read-builtin` | Input a running command reads through the line editor: it is accepted like a line and is not one, so the record stays with the line that started the command and an unqualified `kr detach` still belongs to the terminal that line was typed in |
 | `editor-leave-boundaries` | The five reader boundaries a leave is reported at, and a stale leave that is ignored |

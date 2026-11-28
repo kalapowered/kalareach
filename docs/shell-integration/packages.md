@@ -476,10 +476,11 @@ Losing the bridge does not turn a managed root shell back into an ordinary one. 
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
 eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D, wherever the
 terminal has an end-of-file character, except in the PowerShell module's Vi command table, where
-Ctrl+d is the editor's own. The PowerShell module on Windows has no such character: once its report
-that the gesture is disabled has taken effect, its decision is off Ctrl+d and the key runs what it
-held before the decision went there, which in the Emacs edit mode and the Vi insert table is the
-module's own wrapper of the editor's operation, as the contract's PSReadLine section describes.
+Ctrl+d is the editor's own. The PowerShell module on Windows has no such character: the worker
+names the chord Ctrl+d in the accept and the module's decision stands on that chord, which outside the
+detach condition runs what the key held before the decision went there. In the Emacs edit mode and
+the Vi insert table that is the module's own wrapper of the editor's operation, as the contract's
+PSReadLine section describes.
 
 ## The guarded startup entry
 
@@ -611,8 +612,8 @@ library with no link-time dependency on either shell.
 ## What is not here
 
 Running the PSReadLine module on Windows, where the endpoint is a named pipe and the console has no
-line discipline to name an end-of-file character, so that the module reports the gesture as disabled
-at its first prompt, is qualified separately.
+line discipline to name an end-of-file character, so that the worker names the chord Ctrl+d for it,
+is qualified separately.
 
 Signing the built executables and modules, and qualifying the hardened-runtime loading
 configuration they are signed for, belongs to packaging rather than to the build script here.

@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use kr_protocol::root::FencePublication;
-use kr_shell_integration::contract::qualification::IntegrationLoss;
+use kr_shell_integration::contract::events::EofGesture;
+use kr_shell_integration::contract::qualification::{IntegrationLoss, ShellKind};
 use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
 use kr_shell_integration::host::endpoint::HostEndpoint;
 use kr_shell_integration::host::handshake::{Registration, admit, observe};
@@ -20,6 +21,25 @@ use kr_shell_integration::host::phase::is_root_method_name;
 
 use crate::fence::driver::Outbound;
 use crate::runtime::SessionRuntime;
+
+/// The end-of-file gesture the worker accepts for a root shell of `kind`.
+///
+/// A Unix terminal has an end-of-file character, and the integration reads it from the line
+/// discipline, so the worker accepts the default and the reader tracks the change. A console has no
+/// such character: the PowerShell module reads none on Windows, and with no chord configured it
+/// announces the gesture disabled, so Ctrl-D at an empty prompt would stay the editor's own. The
+/// worker therefore names the chord for a PowerShell root there. Every other root and platform
+/// keeps the default.
+#[must_use]
+pub fn eof_gesture_for(kind: ShellKind, windows: bool) -> EofGesture {
+    if windows && kind == ShellKind::PowerShell {
+        EofGesture::Chord {
+            keys: "Ctrl+d".to_owned(),
+        }
+    } else {
+        EofGesture::default()
+    }
+}
 
 /// Serves one session's root-integration endpoint.
 ///
@@ -477,6 +497,40 @@ mod tests {
     use crate::session::{Session, SessionConfig};
 
     use super::*;
+
+    /// KR-REQ-07.52, KR-REQ-07.73
+    ///
+    /// A console has no end-of-file character for the module to read, so the worker names the
+    /// chord for a PowerShell root on Windows, and nothing else changes: every other shell on
+    /// Windows and every shell on another platform keeps the default the reader tracks.
+    #[test]
+    fn only_a_powershell_root_on_windows_is_given_the_chord() {
+        let chord = EofGesture::Chord {
+            keys: "Ctrl+d".to_owned(),
+        };
+        let cases = [
+            (ShellKind::PowerShell, true, chord),
+            (ShellKind::PowerShell, false, EofGesture::default()),
+            (ShellKind::Zsh, true, EofGesture::default()),
+            (ShellKind::Zsh, false, EofGesture::default()),
+            (ShellKind::Bash, true, EofGesture::default()),
+            (ShellKind::Bash, false, EofGesture::default()),
+            (ShellKind::Fish, true, EofGesture::default()),
+            (ShellKind::Fish, false, EofGesture::default()),
+        ];
+        assert_eq!(
+            cases.len(),
+            ShellKind::ALL.len() * 2,
+            "every shell is read on both kinds of platform"
+        );
+        for (kind, windows, expected) in cases {
+            assert_eq!(
+                eof_gesture_for(kind, windows),
+                expected,
+                "the gesture for {kind} with windows={windows}"
+            );
+        }
+    }
 
     /// A session with a managed editor, on a shell that says nothing.
     fn session(host: &kr_ipc::testing::TempHost, clock: Arc<dyn ContinuousClock>) -> Session {

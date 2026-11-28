@@ -422,7 +422,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 // tree is not the package this session launched.
                 launched_package: Some(package.declaration()),
                 already_registered: false,
-                gesture: kr_shell_integration::contract::events::EofGesture::default(),
+                gesture: kr_worker::fence::bridge::eof_gesture_for(package.kind(), cfg!(windows)),
             };
             (expectation, driver)
         };
