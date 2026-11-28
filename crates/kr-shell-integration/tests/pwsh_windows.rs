@@ -568,6 +568,45 @@ async fn the_module_applies_the_chord_the_worker_configures_over_the_hosts_named
     );
 }
 
+/// KR-REQ-07.73
+///
+/// A worker that names no gesture is as much a configuration as one that names a chord, and the
+/// accept is where the module learns it. The client reports the gesture disabled, with no chord and
+/// the terminal byte at its default beside it, so it read the disabled gesture off the pipe. What a
+/// disabled gesture does to Ctrl+d at a live editor is the shell package's case on Unix; this proves
+/// the configuration reaches the module over the pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_module_applies_a_disabled_gesture_the_worker_configures_over_the_hosts_named_pipe() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let session_id = a_session();
+    let endpoint = HostEndpoint::open(session_id, directory.path()).expect("binds");
+    let mut client = start_client(&endpoint, directory.path(), "exchange", &[]);
+
+    let (mut reader, mut writer, peer) = accept_client(&endpoint).await;
+    let id = register(
+        &endpoint,
+        &mut reader,
+        &mut writer,
+        &peer,
+        EofGesture::Disabled,
+    )
+    .await;
+    within(
+        "the answer to the event",
+        writer.send_event_result(id, EventOutcome::Received),
+    )
+    .await
+    .expect("answers the event");
+
+    let status = ends(&mut client, || report(directory.path(), "exchange")).await;
+    let observed = report(directory.path(), "exchange");
+    assert!(status.success(), "the client ended {status}:\n{observed}");
+    assert!(
+        observed.contains("accepted gesture_byte=4 gesture_chord= gesture_disabled=True "),
+        "the client did not apply the disabled gesture the worker sent:\n{observed}"
+    );
+}
+
 /// KR-ACC-010, KR-REQ-07.37
 ///
 /// The other direction of the same teardown: the worker drops the pipe while the client is between
