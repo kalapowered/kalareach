@@ -18,12 +18,12 @@ name: window-probe
 # Windows Terminal) are pinned by name, size and SHA-256 digest, and a mismatch ends the job
 # before anything is unpacked or started.
 #
-# It runs only on a hosted runner, and only for a push of a branch whose name has WINDOW in it and
-# ends in -probe. It is not part of the landing workflow.
+# It runs only on a hosted runner, and only for a push of the branch proof/window-probe. It is not
+# part of the landing workflow.
 
 on:
   push:
-    branches: ["task/*WINDOW*-probe"]
+    branches: ["proof/window-probe"]
 
 permissions:
   contents: read
